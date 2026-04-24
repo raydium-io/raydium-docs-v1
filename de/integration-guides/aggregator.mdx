@@ -1,0 +1,202 @@
+---
+title: "Aggregator-Integration"
+description: "Wie man Raydium-Pools entdeckt, über CPMM / CLMM / AMM v4 notiert und atomare Swaps durch die richtige Abfolge von Programmen routet. Geschrieben für DEX-Aggregatoren und Wallet-Swap-Oberflächen."
+---
+
+<Info>
+  **Diese Seite wurde mit KI automatisch übersetzt. Maßgeblich ist stets die englische Version.**
+
+  [Englische Version ansehen →](/integration-guides/aggregator)
+</Info>
+
+<Info>
+  Aufgabe eines Aggregators ist es, dem Nutzer den besten möglichen Preis über viele Pools zu bieten — möglicherweise durch Aufteilung eines einzelnen Inputs auf mehrere Pool-Routen — und dies atomar auszuführen. Diese Seite dokumentiert die Raydium-spezifischen Aspekte dieser Aufgabe: Entdeckung, Kursermittlung und Transaktionserstellung.
+</Info>
+
+## Entdeckung
+
+### Pool-Bestand
+
+Sie benötigen die vollständige Liste aller aktiven Raydium-Pools für jedes Produkt. Drei Möglichkeiten:
+
+1. **REST-API** (einfachste Variante): `GET https://api-v3.raydium.io/pools/info/list?poolType=all&pageSize=1000&page=1` gibt Pools in Blöcken von 1000 zurück. Paginieren Sie, bis Sie alle haben. Cache für 1–5 Minuten.
+2. **On-Chain-Scan**: `getProgramAccounts` auf den Programm-IDs von CPMM, CLMM und AMM v4, gefiltert nach dem Discriminator des State-Accounts. Liefert etwa jeden aktiven Pool mit etwa 10s RPC-Zeit. Sinnvoll, wenn die API ausfällt oder rate-limited ist.
+3. **Hybrid**: Verwenden Sie die API als primäre Quelle; führen Sie einen täglichen On-Chain-Scan als Plausibilitätsprüfung durch. Das Team verpflichtet sich, die API umfassend zu halten, aber Pools, die durch direktes CPI erstellt werden (ohne Frontend), können gelegentlich hinterherhinken.
+
+### Mint-Pair-Suche
+
+Für ein spezifisches `(mintA, mintB)`-Paar verwenden Sie `GET /pools/info/mint?mint1=...&mint2=...&poolType=all&sort=liquidity`. Gibt jeden Pool bei jeder Gebührenstufe und für jeden Produkttyp zurück. Bis zu etwa 10 Ergebnisse pro Pair sind bei gut genutzten Mints üblich; sortieren Sie nach TVL und nehmen Sie die Top-Pools für die Routenvergabe.
+
+## Kursermittlung
+
+Die Kursermittlungsmathematik unterscheidet sich je nach Produkt. Verwenden Sie die Pure-Math-Funktionen des SDK, um nicht neu implementieren zu müssen:
+
+```ts
+// CPMM
+const cpmmQuote = raydium.cpmm.computeAmountOut({
+  poolInfo: cpmmPool,
+  amountIn,
+  mintIn,
+  mintOut,
+  slippage: 0,        // compute exact expected; layer slippage at route level
+});
+
+// CLMM — crosses ticks; deterministic but more expensive.
+// `computeAmountOutFormat` is the canonical helper exposed via `PoolUtils` in
+// raydium-sdk-v2: the `*Format` suffix signals that it returns the output
+// pre-shaped for transaction building (including `remainingAccounts` for tick arrays).
+const { output: clmmOut, remainingAccounts } = PoolUtils.computeAmountOutFormat({
+  poolInfo:  clmmPool,
+  poolState: clmmPoolState,
+  tickArrayCache,
+  amountIn,
+  tokenIn:   mintIn,
+  slippage:  0,
+});
+
+// AMM v4
+const ammV4Quote = raydium.liquidity.computeAmountOut({
+  poolInfo: ammV4Pool,
+  amountIn,
+  mintIn: mintIn,
+  mintOut: mintOut,
+  slippage: 0,
+});
+```
+
+Rückgabe für alle drei: `{ amountOut, fee, priceImpact, minAmountOut }`. Für Aggregator-Vergleiche verwenden Sie `amountOut` (vor Slippage).
+
+### Cache-Aktualität
+
+Der Pool-State wird schnell veraltet. Empfohlene Aktualitätsziele:
+
+| Pool-Typ | Aktualisierungshäufigkeit | Begründung |
+|-----------|---------------------|-----|
+| CPMM mit `<$100k` TVL | `<10s` | Reserven ändern sich bei jedem Trade. |
+| CPMM mit `>$10M` TVL | 30–60s | Reserven dominieren; kleine Trades sind Rauschen. |
+| CLMM | `<30s` | Tick-Grenzen; ein einzelner großer Trade kann die Liquiditätskonfiguration neu anordnen. |
+| AMM v4 | `<30s` | OpenBook-seitige Bewegungen werden nicht in Vaults erfasst. |
+
+Für einen Aggregator, der Kurse mit interaktiven Latenzen abruft, abonnieren Sie WebSocket-Account-Updates (`accountSubscribe`) für jeden relevanten Pool-State. Dies dreht das Modell von Polling zu Push um.
+
+### Token-2022-Anpassungen
+
+Wenn ein Mint in der Route eine Token-2022-Transfergebühr hat, muss die Kursermittlungsmathematik Eingaben und Ausgaben gemäß [`algorithms/token-2022-transfer-fees`](/de/algorithms/token-2022-transfer-fees) anpassen. Das SDK handhabt dies, wenn `poolInfo.mintA.extensions.transferFeeConfig` ausgefüllt ist. Bestätigen Sie dies, indem Sie das Feld `.extensions` vor dem Vertrauen auf den Kurs prüfen.
+
+## Routenvergabe
+
+### Single-Pool-Routen
+
+Die meisten Routen sind Single-Pool. Wählen Sie den Pool mit dem höchsten `amountOut`. Wenn mehrere ähnlich sind, lösen Sie Gleichstand nach Gebührenstufe auf (niedriger ist besser), dann nach TVL (höher ist sicherer).
+
+### Split-Routing
+
+Für große Trades, bei denen ein einzelner Pool >5% Preisauswirkung hat, teilen Sie auf mehrere Pools auf. Ein einfacher Greedy-Algorithmus:
+
+```
+remaining = amountIn
+routes    = []
+while remaining > 0:
+    best_pool, best_size = argmax over pools of:
+        marginal_out_per_in(pool, current_size_toward_pool + epsilon)
+    size = min(remaining, best_pool.max_size_at_target_impact)
+    routes.append((best_pool, size))
+    remaining -= size
+```
+
+Dies erzeugt einen Routing-Vektor `[(pool_A, 0.6), (pool_B, 0.3), (pool_C, 0.1)]`, der die Gesamtauswirkung minimiert. Eine ordnungsgemäße konvexe Optimierungslösung (z. B. Ausgleich von Grenzpreisen über Pools) liegt in der Praxis etwa 1% vom Greedy-Ergebnis entfernt.
+
+### Multi-Hop-Routen
+
+`USDC → RAY → SOL` über zwei separate Pools ist üblich, wenn kein direkter `USDC-SOL`-Pool einen guten Kurs bietet (selten). Wenden Sie Pro-Hop-Slippage-Grenzen an; jeder Hop setzt sein eigenes `minAmountOut` durch. Siehe [`algorithms/slippage-and-price-impact`](/de/algorithms/slippage-and-price-impact).
+
+Multi-Hop über den gleichen Pool (z. B. zwei CLMM-Hops auf `SOL-USDC`) ist gegenüber einem einzelnen Hop immer suboptimal — generieren Sie solche Routen nicht.
+
+## Transaktionserstellung
+
+### Single-Hop, Single-Pool
+
+Verwenden Sie direkt `raydium.trade.swap` des SDK:
+
+```ts
+const { execute } = await raydium.trade.swap({
+  poolKeys:        poolInfo,
+  amountIn,
+  amountOut:       quote.minAmountOut,
+  fixedSide:       "in",
+  inputMint:       mintIn,
+  txVersion:       TxVersion.V0,
+  computeBudgetConfig: {
+    units:         250_000,
+    microLamports: priorityFee,
+  },
+});
+```
+
+### Split und Multi-Hop
+
+Schreiben Sie ATAs + Anweisungen manuell. Muster:
+
+```
+[1] ComputeBudget set_compute_unit_limit
+[2] ComputeBudget set_compute_unit_price
+[3] createATA (if needed, once per mint the user doesn't hold)
+[4..N] SwapInstruction for each (pool, size) in routes
+[N+1] CloseAccount (if you wrap/unwrap SOL)
+```
+
+Alle in einer Transaktion für Atomarität. Für einen 3-Pool-Split auf V0 mit Address-Lookup-Tables passt dies normalerweise in etwa 1100 Bytes. Für 4+ Pools zwingt die Transaktionsgrößenbegrenzung Sie entweder zu Multi-Tx oder zur Konsolidierung an einem Hub-Mint.
+
+### Atomarität
+
+Aggregatoren müssen Atomarität garantieren: Entweder wird die vollständige Route ausgeführt oder keine. Raydium-Swap-Anweisungen revertieren bei `ExceededSlippage`, daher führt eine Multi-Pool-Route, bei der ein Hop fehlschlägt, zum Revert der gesamten Transaktion. Kostenlos.
+
+Die eine Ausnahme: Wenn Ihre Route durch Raydium + einen Drittanbieter-DEX geht, stellen Sie sicher, dass dieser DEX auch ein Revert-bei-Slippage-Modell hat. Einige Programme ignorieren Slippage-Grenzen (selten).
+
+## Fallstricke
+
+### 1. Veraltete Kurse
+
+Zwischen dem Moment, in dem der Nutzer „Sie erhalten 125,43 RAY" sieht, und dem Moment, in dem die Transaktion landet, können sich Reserven verschieben. Pool-State unmittelbar vor der Einreichung abrufen; neu notieren; wenn der neue Kurs >1% schlechter ist, pausieren und mit dem Nutzer neu bestätigen.
+
+### 2. Pool-Blacklisten
+
+Einige Raydium-Pools sind Scam-Tokens mit Transfergebühren auf 99% oder mit nicht übertragbaren Extensions. Die REST-API kennzeichnet diese (siehe das `tags`-Feld); überspringen Sie jeden Pool mit Tag `scam` oder `honeypot`. Zusätzliche Sicherheitsprüfungen neben Raydiums Tags durchzuführen ist ratsam.
+
+### 3. Observation-State-Anforderung auf CLMM
+
+CLMM `SwapV2` benötigt einen `observation_state`-Account. Das SDK füllt ihn für Sie aus; manuell erstellte Anweisungen vergessen ihn oft, was dazu führt, dass das Programm mit `AccountNotFound` revertiert. Beziehen Sie ihn immer ein.
+
+### 4. Address-Lookup-Tables
+
+Raydium verwaltet öffentliche Lookup-Tables für seine am häufigsten genutzten Accounts (Hauptmints, Programm-IDs, AmmConfigs). Aggregatoren sollten diese nutzen — dies spart etwa 100 Bytes pro Transaktion und ermöglicht größeren Routen, in V0 zu passen. Die LUT-Adressen abrufen:
+
+```ts
+const raydiumLUTs = await raydium.getRaydiumLutAddresses();
+```
+
+### 5. Umgang mit Überlastung
+
+Während Phasen mit hohem Volumen können Transaktionen mehrere Blöcke im Mempool hängen. Aggressives Retry bei TX-Ablauf (nicht bei Revert — Reverts sind deterministisch) wird empfohlen. Die `sendAndConfirm`-Option des SDK führt grundlegende Retries durch; produktive Aggregatoren schichten eine eigene Logik darauf (Jito-Bundles, Multi-RPC-Broadcast).
+
+## Checkliste
+
+Bevor Sie live gehen, überprüfen Sie:
+
+- [ ] Pool-Entdeckung umfasst CPMM + CLMM + AMM v4 umfassend.
+- [ ] Kurse stimmen innerhalb von 1 Basispunkt mit Raydiums eigenem UI-Kurs bei einigen Test-Trades überein.
+- [ ] Split-Routing tritt bei Trades mit >5% Auswirkung auf einen Pool auf.
+- [ ] Priority Fees sind gegen aktuelle Pool-Programm-Gebühren bemessen (siehe [`integration-guides/priority-fee-tuning`](/de/integration-guides/priority-fee-tuning)).
+- [ ] Token-2022-Transfergebühren werden berechnet und dem Nutzer angezeigt.
+- [ ] Transaktionen revertieren sauber, wenn Slippage überschritten wird.
+- [ ] Retry-Logik unterscheidet TX-Ablauf (Retry) von Revert (kein Retry).
+
+## Verweise
+
+- [`integration-guides/routing-and-mev`](/de/integration-guides/routing-and-mev) — Sandwich-Resistenz, Bundles.
+- [`integration-guides/priority-fee-tuning`](/de/integration-guides/priority-fee-tuning) — Dimensionierung von Compute-Budget-Anweisungen.
+- [`sdk-api/rest-api`](/de/sdk-api/rest-api) — Pool-List-Endpunkte.
+
+Quellen:
+
+- [Raydium SDK v2 `trade` module](https://github.com/raydium-io/raydium-sdk-V2)

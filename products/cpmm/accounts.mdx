@@ -1,0 +1,282 @@
+---
+title: "CPMM accounts"
+description: "Every PDA and shared account a CPMM pool touches: PoolState, AmmConfig, authority, LP mint, token vaults, and the observation ring buffer."
+---
+
+<Info>
+  Program ID and PDA seeds for CPMM are listed canonically in [`reference/program-addresses`](/reference/program-addresses). This page focuses on **what each account is for and the invariants it maintains**, not the hardcoded addresses.
+</Info>
+
+## The six accounts of a CPMM pool
+
+Every CPMM pool is fully described by six program-derived addresses (PDAs) under the CPMM program, plus one shared `AmmConfig` account it references. Once you have the two mints, you can derive everything deterministically without touching the network.
+
+| Account | Seed(s) | Owner | Purpose |
+|---------|---------|-------|---------|
+| `authority` | `"vault_and_lp_mint_auth_seed"` | CPMM | The signer for every vault move and every LP mint/burn. Shared across **all** CPMM pools. |
+| `poolState` | `"pool"`, `ammConfig`, `token0Mint`, `token1Mint` **or** any signer-provided random keypair | CPMM | The pool's state struct — mint pair, vault balances, LP supply, fee accrual, observation pointer. The CPMM `Initialize` instruction accepts either the canonical PDA derived from the four seeds **or** an arbitrary keypair signed by the creator. The random-keypair path exists to defeat a front-running attack where an adversary watches mempool and races to occupy the canonical PDA before the legitimate creator. |
+| `lpMint` | `"pool_lp_mint"`, `poolState` | SPL Token | The pool's LP token. Supply = total LP outstanding. Mint authority = the CPMM authority PDA. |
+| `vault0` | `"pool_vault"`, `poolState`, `token0Mint` | SPL Token / Token-2022 | Holds the pool's balance of token0. Owned by the authority PDA. |
+| `vault1` | `"pool_vault"`, `poolState`, `token1Mint` | SPL Token / Token-2022 | Holds the pool's balance of token1. Owned by the authority PDA. |
+| `observation` | `"observation"`, `poolState` | CPMM | Ring buffer of price samples used for the TWAP. Written on every swap. |
+
+And the shared config:
+
+| Account | Seed(s) | Owner | Purpose |
+|---------|---------|-------|---------|
+| `ammConfig` | `"amm_config"`, `index: u16` | CPMM | Holds the trade/protocol/fund/creator fee rates and admin keys. One per "fee tier". Poolstate binds to one at creation and cannot change later. |
+
+## Deriving a pool from nothing but two mints
+
+```ts
+import { PublicKey } from "@solana/web3.js";
+import BN from "bn.js";
+
+const CPMM_PROGRAM_ID = new PublicKey(
+  "CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C"
+); // mainnet — see reference/program-addresses
+
+function u16ToBytes(n: number): Buffer {
+  const b = Buffer.alloc(2);
+  b.writeUInt16BE(n);
+  return b;
+}
+
+// token0 < token1 by byte order. Getting this wrong yields a valid PDA
+// that points at a nonexistent pool.
+function sortMints(a: PublicKey, b: PublicKey): [PublicKey, PublicKey] {
+  return Buffer.compare(a.toBuffer(), b.toBuffer()) < 0 ? [a, b] : [b, a];
+}
+
+export function deriveCpmmAccounts(
+  mintA: PublicKey,
+  mintB: PublicKey,
+  ammConfigIndex = 0,
+) {
+  const [token0Mint, token1Mint] = sortMints(mintA, mintB);
+
+  const [ammConfig] = PublicKey.findProgramAddressSync(
+    [Buffer.from("amm_config"), u16ToBytes(ammConfigIndex)],
+    CPMM_PROGRAM_ID,
+  );
+  const [authority] = PublicKey.findProgramAddressSync(
+    [Buffer.from("vault_and_lp_mint_auth_seed")],
+    CPMM_PROGRAM_ID,
+  );
+  const [poolState] = PublicKey.findProgramAddressSync(
+    [
+      Buffer.from("pool"),
+      ammConfig.toBuffer(),
+      token0Mint.toBuffer(),
+      token1Mint.toBuffer(),
+    ],
+    CPMM_PROGRAM_ID,
+  );
+  const [lpMint] = PublicKey.findProgramAddressSync(
+    [Buffer.from("pool_lp_mint"), poolState.toBuffer()],
+    CPMM_PROGRAM_ID,
+  );
+  const [vault0] = PublicKey.findProgramAddressSync(
+    [Buffer.from("pool_vault"), poolState.toBuffer(), token0Mint.toBuffer()],
+    CPMM_PROGRAM_ID,
+  );
+  const [vault1] = PublicKey.findProgramAddressSync(
+    [Buffer.from("pool_vault"), poolState.toBuffer(), token1Mint.toBuffer()],
+    CPMM_PROGRAM_ID,
+  );
+  const [observation] = PublicKey.findProgramAddressSync(
+    [Buffer.from("observation"), poolState.toBuffer()],
+    CPMM_PROGRAM_ID,
+  );
+
+  return {
+    ammConfig,
+    authority,
+    poolState,
+    lpMint,
+    token0Mint,
+    token1Mint,
+    vault0,
+    vault1,
+    observation,
+  };
+}
+```
+
+<Tip>
+  **Always sort mints before deriving the pool PDA.** The seed hashes the two mints in byte order, not in user order. Two pools with `(A, B)` and `(B, A)` would collide on-chain — sorting is how the program makes the mapping canonical.
+</Tip>
+
+<Note>
+  **Pool ID is not always the canonical PDA.** `Initialize` accepts an arbitrary signer keypair as `pool_state` in addition to the PDA above. If the passed account does not match the canonical PDA, the program requires it to be a signer — i.e., the creator passes a fresh keypair that they sign with. This is the front-run defence: any third party racing to grab the canonical PDA can be sidestepped by the legitimate creator using a random keypair instead. The downstream PDAs (`lpMint`, `vault0`, `vault1`, `observation`) are still derived from `poolState.key()`, so they remain unique to whichever address was used. When you index pools, always discover the pool ID from the on-chain state (e.g., `PoolState` accounts under the CPMM program), not by deriving the canonical PDA — the latter will miss random-keypair pools.
+</Note>
+
+## Account layouts
+
+The full Rust definitions live in the [`raydium-cp-swap`](https://github.com/raydium-io/raydium-cp-swap) source. The fields below are the ones you will read from an integration.
+
+### `PoolState`
+
+```rust
+// programs/cp-swap/src/states/pool.rs
+pub struct PoolState {
+    pub amm_config: Pubkey,               // binds this pool to an AmmConfig
+    pub pool_creator: Pubkey,             // who ran initialize
+    pub token_0_vault: Pubkey,            // == vault0 PDA
+    pub token_1_vault: Pubkey,            // == vault1 PDA
+
+    pub lp_mint: Pubkey,
+    pub token_0_mint: Pubkey,
+    pub token_1_mint: Pubkey,
+
+    pub token_0_program: Pubkey,          // SPL Token or Token-2022 program
+    pub token_1_program: Pubkey,
+
+    pub observation_key: Pubkey,          // == observation PDA
+    pub auth_bump: u8,
+    pub status: u8,                       // bitmask: deposit | withdraw | swap
+    pub lp_mint_decimals: u8,
+    pub mint_0_decimals: u8,
+    pub mint_1_decimals: u8,
+
+    pub lp_supply: u64,                   // mirrors lp_mint supply
+    pub protocol_fees_token_0: u64,
+    pub protocol_fees_token_1: u64,
+    pub fund_fees_token_0: u64,
+    pub fund_fees_token_1: u64,
+
+    pub open_time: u64,                   // unix; swaps rejected before this
+    pub recent_epoch: u64,
+
+    // Creator-fee state (added after the original layout):
+    pub creator_fee_on: u8,               // 0=BothToken, 1=OnlyToken0, 2=OnlyToken1
+    pub enable_creator_fee: bool,
+    pub padding1: [u8; 6],
+    pub creator_fees_token_0: u64,
+    pub creator_fees_token_1: u64,
+
+    pub padding: [u64; 28],
+}
+```
+
+What to actually read:
+
+- **`lp_supply`** — the pool's internal mirror of the LP mint's total supply. Use it for LP-share math; the value should match the mint's on-chain supply, but reading it from `PoolState` avoids an extra account fetch.
+- **`protocol_fees_token{0,1}`**, **`fund_fees_token{0,1}`** — *accrued* fees not yet swept. These do not affect swap pricing; they sit in the vaults until `CollectProtocolFee` / `CollectFundFee` is called.
+- **`status`** — a bitmask controlling whether `Swap`, `Deposit`, `Withdraw` are allowed. Updated by the admin via `UpdatePoolStatus`. The SDK checks this before building a transaction; if you are CPI-ing directly, check it yourself.
+- **`token0_program` / `token1_program`** — the token program to CPI into for each vault. One can be classic SPL Token and the other Token-2022; they are independent.
+- **`open_time`** — a Unix timestamp. Swaps before this time fail. Deposits are permitted before `open_time` so the pool can be seeded.
+- **`creator_fee_on` / `enable_creator_fee`** — together control whether the optional creator fee is active for this pool and which side of the swap it is collected from. `enable_creator_fee == false` zeroes the creator-fee path entirely. When enabled, `creator_fee_on` selects: `0` = take fee from whichever token is the swap input (`BothToken`); `1` = take fee from `token_0` only (skip on `token_1 → token_0` swaps); `2` = take fee from `token_1` only. Set at pool creation via `InitializeWithPermission`; cannot change later.
+- **`creator_fees_token_{0,1}`** — accrued creator fees, swept by `CollectCreatorFee`.
+
+### `AmmConfig`
+
+```rust
+pub struct AmmConfig {
+    pub bump: u8,
+    pub disable_create_pool: bool,
+    pub index: u16,                       // matches the seed
+    pub trade_fee_rate: u64,              // e.g., 2500 = 0.25%
+    pub protocol_fee_rate: u64,           // fraction of trade fee to protocol
+    pub fund_fee_rate: u64,               // fraction of trade fee to fund
+    pub create_pool_fee: u64,             // paid once at init (in SOL or token)
+    pub protocol_owner: Pubkey,           // can call CollectProtocolFee
+    pub fund_owner: Pubkey,               // can call CollectFundFee
+    pub creator_fee_rate: u64,            // optional pool-creator fee rate (1/1_000_000 of volume)
+    pub padding: [u64; 15],
+}
+```
+
+Three things to be careful about:
+
+1. **`trade_fee_rate` and `creator_fee_rate` are fractions of volume**, both denominated in units of `1/1_000_000`. `2500` means 0.25% of the trade volume. **`protocol_fee_rate` and `fund_fee_rate` are fractions of the *trade fee*** (not of volume), in the same `1/1_000_000` denominator. The creator fee is **not** a fraction of the trade fee — it is its own independent rate. Full arithmetic is in [`products/cpmm/fees`](/products/cpmm/fees).
+2. **`index` is a `u16`**, so the seed hash uses 2 bytes big-endian. Off-by-one on the byte order is a common integration bug.
+3. **`AmmConfig` is immutable at pool level.** A pool points at one `AmmConfig` at creation and never switches. Fee changes propagate because the pool reads the config each swap — but the pool cannot be moved between fee tiers.
+
+A note on creator fees: the **rate** itself (`creator_fee_rate`) lives on `AmmConfig` and is shared across the fee tier. Whether a particular pool actually charges it (`enable_creator_fee`) and which side of the swap it lands on (`creator_fee_on`) live on `PoolState`. The creator fee is **independent** of the trade fee — it is its own rate, accrued to its own counters (`creator_fees_token_{0,1}`), and never reduces the LP / protocol / fund shares of the trade fee. Sweep is via `CollectCreatorFee`. See [`products/cpmm/fees`](/products/cpmm/fees) for the full mechanics.
+
+### `Permission`
+
+A small access-control account used by `InitializeWithPermission`. The CPMM program supports a permissioned pool-creation path so that other programs (e.g. LaunchLab when graduating a token to CPMM) can prove they are entitled to create a pool against a given `AmmConfig`.
+
+```rust
+pub struct Permission {
+    pub authority: Pubkey,    // who is allowed to call InitializeWithPermission
+    pub padding: [u64; 8],
+}
+```
+
+The Permission PDA is created by the CPMM admin via `CreatePermissionPda` and revoked via `ClosePermissionPda`. End users do not interact with this account directly — it is plumbing for cross-program flows.
+
+### Vaults and Token-2022
+
+`vault0` and `vault1` are owned by the CPMM authority PDA, and their token-program owner (`token_program`) is either SPL Token or Token-2022, determined at pool creation by the mint's program. The pool handles the two cases transparently — you pass the right token-program ID for each side in the `Swap` / `Deposit` / `Withdraw` instruction accounts.
+
+CPMM enforces a strict **extension allow-list** at pool creation (`is_supported_mint` in `utils/token.rs`). A Token-2022 mint can be used in a CPMM pool only if **every** extension it carries is on this list:
+
+- **`TransferFeeConfig`.** Applied by the mint on every transfer. The pool is on the receiving side for `SwapBaseInput` deposits and the sending side for withdrawals. The program computes the **net** amount landing in the vault and sets the curve accordingly. See [`algorithms/token-2022-transfer-fees`](/algorithms/token-2022-transfer-fees).
+- **`MetadataPointer`** and **`TokenMetadata`.** Standard on-mint metadata. No effect on swap math.
+- **`InterestBearingConfig`.** The mint's UI amount accrues interest. The vault stores raw amounts; the curve operates on raw amounts only. UIs that show APR should call the Token-2022 helpers to render the UI amount.
+- **`ScaledUiAmount`.** UI-display scaling extension. Same treatment as `InterestBearingConfig` — the curve uses raw amounts.
+
+Any other extension — `PermanentDelegate`, `TransferHook`, `DefaultAccountState`, `NonTransferable`, `ConfidentialTransfer`, `Group`/`GroupMember`, `MintCloseAuthority`, etc. — causes `Initialize` to reject with `NotSupportMint`. The exception is a small hard-coded **mint whitelist** in the program (a handful of specific pubkeys) that bypasses the extension check; it is used to onboard specific mints case-by-case.
+
+The vetted-extension list and the mint whitelist live in the CP-Swap source under `programs/cp-swap/src/utils/token.rs` and can change with future program upgrades.
+
+### Observation
+
+The observation account is a ring buffer of `ObservationState` entries, each storing a `block_timestamp` and a **cumulative price**. On every swap the program appends a new observation if enough time has passed since the last one. TWAPs are computed by reading two observations and dividing `Δcumulative / Δtime`.
+
+```rust
+// OBSERVATION_NUM is hardcoded in the program to 100.
+pub const OBSERVATION_NUM: usize = 100;
+
+pub struct Observation {
+    pub block_timestamp:              u64,
+    pub cumulative_token_0_price_x32: u128,   // Q32.32, top 64 bits left for overflow
+    pub cumulative_token_1_price_x32: u128,
+}
+
+pub struct ObservationState {
+    pub initialized:           bool,
+    pub observation_index:     u16,                            // circular index
+    pub pool_id:               Pubkey,
+    pub observations:          [Observation; OBSERVATION_NUM], // 100 entries
+    pub last_update_timestamp: u64,                            // timestamp of the most recent append
+    pub padding:               [u64; 3],
+}
+```
+
+The ring buffer is sized for **100 observations**. Each observation is 40 bytes, so the array alone is 4,000 bytes; the full `ObservationState` PDA is around 4,100 bytes after the surrounding fields and discriminator.
+
+Two consumer rules:
+
+- **Do not use a single observation as a price.** It is a *cumulative*, not a spot price. Use two of them to compute a TWAP.
+- **Pick observations at least one block apart.** Swaps within the same block may not produce a new observation; reading back-to-back can return the same record.
+
+More math in [`products/clmm/accounts`](/products/clmm/accounts).
+
+## Account lifecycle
+
+| Event | Accounts created | Accounts destroyed |
+|-------|------------------|---------------------|
+| `Initialize` | `poolState`, `lpMint`, `vault0`, `vault1`, `observation` | — |
+| `Deposit` | — (may create user LP ATA) | — |
+| `Withdraw` | — | — |
+| `Swap` | — (may create user destination ATA) | — |
+| `CollectProtocolFee` | — | — |
+| `CollectFundFee` | — | — |
+| `UpdatePoolStatus` | — | — |
+
+CPMM pools and their PDAs are **never closed**. Even at zero liquidity the `poolState` remains. This is deliberate: re-seeding the same pool later preserves its historical observation buffer and its PDA derivation remains stable.
+
+## What to read where
+
+- **Instruction account lists** (which of the above are writable/signer for each instruction): [`products/cpmm/instructions`](/products/cpmm/instructions).
+- **Fee-accrual semantics**: [`products/cpmm/fees`](/products/cpmm/fees).
+- **Swap math / observation update rule**: [`products/cpmm/math`](/products/cpmm/math).
+- **Canonical seeds / program IDs**: [`reference/program-addresses`](/reference/program-addresses).
+
+Sources:
+
+- [`raydium-io/raydium-cp-swap` — PoolState, AmmConfig, ObservationState](https://github.com/raydium-io/raydium-cp-swap)

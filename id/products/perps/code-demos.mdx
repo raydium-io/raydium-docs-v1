@@ -1,0 +1,312 @@
+---
+title: "Demo kode Perps"
+description: "Akses terprogram ke Raydium Perps melalui API Orderly Network: simpan USDC, daftarkan akun perdagangan, buat / batalkan / ubah order, ambil posisi, berlangganan WebSocket pasar, dan tarik dana."
+---
+
+<Info>
+  **Halaman ini diterjemahkan secara otomatis oleh AI. Versi bahasa Inggris adalah acuan resmi.**
+
+  [Lihat versi bahasa Inggris →](/products/perps/code-demos)
+</Info>
+
+<Info>
+  **Raydium Perps adalah deployment white-labeled di Orderly Network.** Order book, matching engine, dan account state semuanya berada di Orderly. Raydium SDK v2 (`@raydium-io/raydium-sdk-v2`) **tidak** mencakup perps — untuk akses terprogram, gunakan REST + WebSocket API Orderly secara langsung. Cuplikan di bawah menunjukkan alur yang paling umum; referensi resmi ada di [orderly.network/docs](https://orderly.network/docs/build-on-omnichain/evm-api/introduction).
+</Info>
+
+<Info>
+  **Banner versi.**
+
+  - Backend: Orderly Network REST + WebSocket API
+  - Skema cuplikan diverifikasi terhadap API Orderly per 2026-04
+  - Cluster Solana untuk deposit on-chain: `mainnet-beta`
+  - Penandatanganan: Solana ed25519 melalui payload gaya EIP-712 Orderly (Orderly menggunakan skema EIP-712 bahkan untuk chain non-EVM; lihat dokumen Orderly untuk daftar field terbaru)
+
+  Permukaan API Orderly berkembang; periksa [orderly.network/docs](https://orderly.network/docs/build-on-omnichain/evm-api/introduction) sebelum menyalin cuplikan ini ke produksi.
+</Info>
+
+## Yang ada di halaman ini
+
+Alur di bawah mencakup siklus hidup yang relevan bagi integrator:
+
+1. Penyiapan akun — simpan USDC dan daftarkan akun dengan Orderly.
+2. Panggilan REST yang diautentikasi — permintaan penandatanganan untuk penempatan order, pembatalan, dan kueri akun.
+3. Perdagangan — menempatkan order pasar / limit, pembatalan, pengambilan posisi dan fill.
+4. Data pasar — berlangganan orderbook dan WebSocket perdagangan.
+5. Penarikan — memulai penarikan kembali ke dompet.
+
+Cuplikan ini menargetkan Node.js + TypeScript dengan `@solana/web3.js` dan `tweetnacl` untuk penandatanganan Ed25519. Ini adalah **titik awal** — permukaan API Orderly luas dan berubah lebih cepat dari halaman ini; selalu periksa dokumen live Orderly sebelum mengirim kode produksi.
+
+## Penyiapan
+
+```ts
+import { Connection, Keypair, PublicKey, clusterApiUrl } from "@solana/web3.js";
+import nacl from "tweetnacl";
+import bs58 from "bs58";
+import fs from "node:fs";
+
+// 1. Dompet Solana — memiliki USDC, menandatangani transaksi deposit/penarikan.
+const connection = new Connection(process.env.RPC_URL ?? clusterApiUrl("mainnet-beta"));
+const owner = Keypair.fromSecretKey(
+  new Uint8Array(JSON.parse(fs.readFileSync(process.env.KEYPAIR!, "utf8"))),
+);
+
+// 2. Kunci perdagangan Orderly — keypair Ed25519 terpisah yang digunakan untuk menandatangani permintaan API.
+//    BUKAN dompet Solana. Hasilkan sekali, simpan dengan aman, gunakan kembali di seluruh sesi.
+const orderlyKey = nacl.sign.keyPair();   // ed25519
+const orderlyPubB58 = "ed25519:" + bs58.encode(orderlyKey.publicKey);
+
+// 3. URL dasar Orderly. Raydium menggunakan host mainnet Orderly.
+const ORDERLY_BASE = "https://api.orderly.org";
+const BROKER_ID    = "raydium";   // namespace broker Raydium di Orderly
+const CHAIN_ID     = "solana";    // untuk pendaftaran akun lintas chain
+```
+
+Kunci perdagangan Orderly **bukan** keypair dompet Anda. Ini adalah kunci penandatanganan permintaan yang Anda daftarkan terhadap dompet Anda pada penggunaan pertama; Anda dapat memutar ulang tanpa menyentuh dana. Perlakukan sebagai kredensial sesi.
+
+## Pendaftaran akun
+
+Sebelum menempatkan order apa pun, daftarkan dompet dengan Orderly:
+
+```ts
+import { encodeUserSettlement } from "./eip712-helpers"; // lihat dokumen Orderly untuk payload yang tepat
+
+// 1. Minta nonce pendaftaran dari Orderly.
+const nonceResp = await fetch(`${ORDERLY_BASE}/v1/registration_nonce`).then(r => r.json());
+const registrationNonce = nonceResp.data.registration_nonce;
+
+// 2. Tandatangani payload pendaftaran dengan dompet Solana (gaya EIP-712 di Solana
+//    diimplementasikan sebagai pesan terstruktur; SDK Orderly menyediakan encoder).
+const payload = encodeUserSettlement({
+  brokerId: BROKER_ID,
+  chainId: CHAIN_ID,
+  registrationNonce,
+  timestamp: Date.now(),
+});
+const walletSig = nacl.sign.detached(Buffer.from(payload), owner.secretKey);
+
+// 3. Daftarkan, termasuk kunci perdagangan Ed25519 Orderly.
+const reg = await fetch(`${ORDERLY_BASE}/v1/register_account`, {
+  method: "POST",
+  headers: { "Content-Type": "application/json" },
+  body: JSON.stringify({
+    message: payload,
+    signature: bs58.encode(walletSig),
+    userAddress: owner.publicKey.toBase58(),
+    orderlyKey: orderlyPubB58,
+  }),
+}).then(r => r.json());
+
+console.log("ID Akun:", reg.data.account_id);
+```
+
+ID akun adalah deterministik per pasangan `(broker_id, wallet_address)` — pendaftaran adalah idempoten. Jika dompet telah terdaftar dengan broker Raydium, panggilan mengembalikan ID akun yang sama tanpa membuat yang baru.
+
+## Simpan USDC
+
+Deposit memindahkan USDC dari ATA dompet ke vault settlement Orderly. Ini adalah transaksi Solana on-chain:
+
+```ts
+// Bangun deposit ix menggunakan program Solana Orderly (vault program ID dipublikasikan
+// dalam dokumen mereka; tarik secara dinamis daripada hard-code).
+const vaultProgramId = new PublicKey("<orderly_solana_vault_program_id>");
+
+const depositIx = await buildOrderlyDepositIx({
+  vaultProgramId,
+  user: owner.publicKey,
+  brokerId: BROKER_ID,
+  amountUsdc: BigInt(100_000_000),    // 100 USDC (6 desimal)
+});
+
+const tx = new Transaction().add(depositIx);
+const sig = await connection.sendTransaction(tx, [owner]);
+await connection.confirmTransaction(sig, "confirmed");
+console.log("Tx deposit:", sig);
+```
+
+Setelah ~30 detik, relayer Orderly mengindeks deposit dan saldo muncul di bawah margin bebas akun. Kueri `/v1/client/holding` untuk memastikan:
+
+```ts
+const holdingResp = await orderlyAuthGet("/v1/client/holding");
+console.log("Saldo:", holdingResp.data.holding);
+```
+
+(`orderlyAuthGet` didefinisikan di bawah — setiap panggilan yang diautentikasi melaluinya.)
+
+## Helper penandatanganan permintaan
+
+Setiap panggilan REST yang diautentikasi ke Orderly membawa tanda tangan Ed25519 di atas `(timestamp + method + path + body)`:
+
+```ts
+async function orderlyAuthRequest(
+  method: "GET" | "POST" | "PUT" | "DELETE",
+  path: string,
+  body?: unknown,
+): Promise<any> {
+  const ts   = Date.now().toString();
+  const json = body ? JSON.stringify(body) : "";
+  const msg  = `${ts}${method}${path}${json}`;
+  const sig  = nacl.sign.detached(Buffer.from(msg), orderlyKey.secretKey);
+
+  const resp = await fetch(ORDERLY_BASE + path, {
+    method,
+    headers: {
+      "Content-Type": "application/json",
+      "orderly-account-id":  /* account_id terdaftar */ "",
+      "orderly-key":         orderlyPubB58,
+      "orderly-signature":   bs58.encode(sig),
+      "orderly-timestamp":   ts,
+    },
+    body: json || undefined,
+  });
+  return resp.json();
+}
+
+const orderlyAuthGet  = (p: string)            => orderlyAuthRequest("GET",  p);
+const orderlyAuthPost = (p: string, b: object) => orderlyAuthRequest("POST", p, b);
+const orderlyAuthDel  = (p: string)            => orderlyAuthRequest("DELETE", p);
+```
+
+Proteksi replay: permintaan dengan `timestamp` lebih dari 5 detik dari jam server ditolak. Sinkronkan jam Anda (NTP) dan hindari penandatanganan permintaan sebelumnya.
+
+## Tempatkan order pasar
+
+```ts
+const marketResp = await orderlyAuthPost("/v1/order", {
+  symbol:        "PERP_SOL_USDC",
+  order_type:    "MARKET",
+  side:          "BUY",
+  order_quantity: 1.0,        // 1 SOL posisi
+  reduce_only:    false,
+});
+
+if (marketResp.success) {
+  console.log("ID Order:", marketResp.data.order_id);
+} else {
+  console.error("Tolak:", marketResp.message);
+}
+```
+
+Order pasar dieksekusi segera. Respons mengembalikan `order_id` yang dihasilkan plus status. Fill datang melalui WebSocket (lihat di bawah); respons REST itu sendiri tidak memblokir sampai sepenuhnya terisi.
+
+## Tempatkan order limit dengan Post-Only
+
+```ts
+const limitResp = await orderlyAuthPost("/v1/order", {
+  symbol:         "PERP_SOL_USDC",
+  order_type:     "LIMIT",
+  side:           "SELL",
+  order_quantity: 0.5,
+  order_price:    140.50,
+  // kombinasi flag:
+  // post_only: true membuat ini order maker-only — batalkan jika akan cross.
+  // reduce_only / time_in_force dapat diatur secara independen.
+  post_only:      true,
+});
+console.log(limitResp);
+```
+
+Untuk `IOC` / `FOK`, atur `time_in_force: "IOC"` atau `"FOK"`. Lihat [`products/perps/order-types`](/id/products/perps/order-types) untuk semantik setiap flag.
+
+## Batalkan order
+
+```ts
+// Berdasarkan ID order
+await orderlyAuthDel(`/v1/order?order_id=${orderId}&symbol=PERP_SOL_USDC`);
+
+// Batalkan SEMUA order pada simbol
+await orderlyAuthDel(`/v1/orders?symbol=PERP_SOL_USDC`);
+```
+
+Pembatalan diakui secara sinkron tetapi pembatalan aktual dapat race dengan fill. Selalu rekonsiliasi dengan polling `/v1/orders` atau menonton WebSocket — mengasumsikan pembatalan berhasil tanpa konfirmasi dapat menyebabkan posisi duplikat atau tidak disengaja.
+
+## Ambil posisi terbuka
+
+```ts
+const posResp = await orderlyAuthGet("/v1/positions");
+for (const p of posResp.data.rows) {
+  console.log(
+    p.symbol,
+    "ukuran:",  p.position_qty,
+    "entry:", p.average_open_price,
+    "unrealized:", p.unsettled_pnl,
+  );
+}
+```
+
+`position_qty` negatif adalah short, positif adalah long. `position_qty == 0` berarti posisi ditutup tetapi baris masih mungkin muncul sampai pembersihan berikutnya.
+
+## Ambil riwayat fill
+
+```ts
+const fills = await orderlyAuthGet(
+  "/v1/trades?symbol=PERP_SOL_USDC&start_t=" + (Date.now() - 86_400_000)
+);
+for (const t of fills.data.rows) {
+  console.log(t.executed_timestamp, t.side, t.executed_quantity, "@", t.executed_price);
+}
+```
+
+Argumen waktu adalah timestamp Unix milidetik. Ukuran halaman default adalah 25 baris; gunakan parameter kueri `page` dan `size` untuk paginasi.
+
+## WebSocket: data pasar
+
+```ts
+import WebSocket from "ws";
+
+const ws = new WebSocket(`wss://ws.orderly.org/ws/stream/${accountId}`);
+
+ws.on("open", () => {
+  // Data pasar publik: delta orderbook + perdagangan untuk satu simbol
+  ws.send(JSON.stringify({ id: "ob1", topic: "orderbook@PERP_SOL_USDC" }));
+  ws.send(JSON.stringify({ id: "tr1", topic: "trade@PERP_SOL_USDC" }));
+});
+
+ws.on("message", (raw) => {
+  const msg = JSON.parse(raw.toString());
+  if (msg.topic?.startsWith("orderbook@")) {
+    // depth diff: { bids: [[price, qty], ...], asks: [[price, qty], ...] }
+    applyOrderbookDelta(msg.data);
+  } else if (msg.topic?.startsWith("trade@")) {
+    console.log("perdagangan:", msg.data);
+  }
+});
+```
+
+Untuk stream **privat** (fill Anda, pembaruan posisi, perubahan saldo), WebSocket harus diautentikasi. Kirim payload `subscribe` yang ditandatangani dengan cara yang sama seperti permintaan REST, terlingkup ke ID akun Anda. Dokumen Orderly memiliki bentuk payload yang tepat; itu berubah sesekali, jadi jangan hard-code skema tertentu di sini.
+
+## Tarik USDC
+
+```ts
+// 1. Minta penarikan.
+const wRes = await orderlyAuthPost("/v1/withdraw_request", {
+  token:  "USDC",
+  chain_id: CHAIN_ID,
+  amount: 50.0,                          // unit manusia
+  receiver: owner.publicKey.toBase58(),
+});
+
+console.log("ID permintaan penarikan:", wRes.data.withdraw_id);
+```
+
+Orderly menyampaikan penarikan on-chain ke alamat penerima. Ada biaya penarikan datar **1 USDC** (lihat [`products/perps/fees`](/id/products/perps/fees)). Transfer on-chain terjadi dalam 1–2 menit dalam kondisi normal; harapkan lebih lama selama kemacetan.
+
+## Jebakan
+
+- **Jangan gunakan kembali kunci perdagangan di seluruh lingkungan.** Satu kunci perdagangan Orderly terdaftar terhadap dompet Anda terkait dengan satu akun mainnet Solana. Jika Anda juga membutuhkan devnet atau staging, hasilkan kunci terpisah untuk masing-masing.
+- **Sinkronisasi waktu.** Toleransi skew jam Orderly ketat (±5s). Pada layanan yang berjalan lama, drift NTP pada akhirnya akan mengganggu penandatanganan. Sinkronkan ulang secara berkala.
+- **Reconnect WebSocket.** WS publik sesekali menghentikan koneksi selama upgrade Orderly. Implementasikan backoff eksponensial dan relanggani saat membuka kembali.
+- **Batasan laju.** Panggilan REST dibatasi laju per-tier per akun. Bulk-cancel melalui `cancel_all` daripada loop `cancel`-by-id ketika Anda memiliki >5 order untuk dibatalkan.
+- **Arah posisi implisit.** Order `BUY` di `PERP_SOL_USDC` membuka atau memperpanjang long; `SELL` membuka atau memperpanjang short — tetapi jika Anda sudah long, `SELL` *mengurangi* (dan mungkin membalik) posisi karena Raydium Perps adalah mode one-way. Selalu periksa posisi saat ini sebelum menempatkan order jika arahnya penting.
+- **Pendanaan dan likuidasi terpisah dari alur order.** Pembayaran pendanaan dan likuidasi muncul sebagai alur peristiwa terpisah; mereka bukan "order". Berlangganan topik WS privat yang relevan jika Anda perlu mengamatinya.
+
+## Ke mana selanjutnya
+
+- [`products/perps/trading-basics`](/id/products/perps/trading-basics) — primer konseptual tentang mekanik perpetual.
+- [`products/perps/order-types`](/id/products/perps/order-types) — semantik setiap tipe order dan flag.
+- [`products/perps/collateral`](/id/products/perps/collateral) — aset collateral yang didukung dan batasan per-chain.
+- [`products/perps/fees`](/id/products/perps/fees) — jadwal maker/taker dan biaya penarikan.
+
+Sumber:
+
+- [Dokumentasi pengembang Orderly Network](https://orderly.network/docs/build-on-omnichain/evm-api/introduction) — referensi resmi untuk permukaan API yang digunakan di atas. Raydium Perps mengonsumsi ini secara langsung.
+- [SDK TypeScript Orderly](https://github.com/OrderlyNetwork/orderly-sdk-js) — membungkus layer REST/WebSocket yang sama dengan helper yang diketik; berguna jika Anda ingin melewati penulisan layer penandatanganan sendiri.

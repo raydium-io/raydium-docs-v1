@@ -1,0 +1,174 @@
+---
+title: "預言機與代幣風險"
+description: "Raydium 如何處理預言機輸入及 Token-2022 擴展所帶來的特定風險——凍結授權、轉移掛鉤、永久委託人、預設凍結——包括程式保護的內容與使用者必須接受的風險。"
+---
+
+<Info>
+  **本頁內容由 AI 自動翻譯，所有內容以英文版本為準。**
+
+  [查看英文版 →](/security/oracle-and-token-risks)
+</Info>
+
+<Info>
+  Raydium 的核心產品不依賴外部預言機進行定價——資金池狀態本身就是預言機。但 API 和 SDK 使用外部預言機為使用者顯示 USD 定價，而 Token-2022 Mint 提供比 SPL Token 更豐富的控制機制，其中某些根本改變了資金池的信任模型。本頁詳列兩者。
+</Info>
+
+## Raydium 中的預言機
+
+### 內部：資金池本身是預言機
+
+對於 AMM v4、CPMM 和 CLMM，協議對「當前價格」的定義純粹由資金池狀態得出：
+
+- AMM v4 / CPMM：`price = vaultB_balance / vaultA_balance`（考慮小數位）。
+- CLMM：`price = (sqrtPriceX64 / 2^64)^2 × 10^(decimalsA - decimalsB)`。
+
+交換、存入或提取期間不查詢任何外部預言機。這是 AMM 設計的「無信任」部分：如果資金池數學正確，外部對價格饋送的任何操縱都無法破壞它。
+
+### CLMM `ObservationState` 作為 TWAP 預言機
+
+CLMM 資金池維護一個 `ObservationState` 帳戶，記錄歷史 `sqrt_price` 快照。其他程式可以針對此進行組合，以推導出抗操縱的時間加權平均價格：
+
+```rust
+// 簡化的 TWAP：(current, N slots ago) 的平均值。
+let obs_now  = load_observation(pool, Clock::slot());
+let obs_past = load_observation(pool, Clock::slot() - 300);  // ~2 min ago
+let twap = (obs_now.price_cumulative - obs_past.price_cumulative)
+         / (obs_now.slot - obs_past.slot);
+```
+
+這與 Uniswap V3 使用的模式相同。短期價格操縱（鯨魚暫時推動資金池）不會破壞 TWAP，因為它是在數百個 slot 上平均的。
+
+需要 CLMM Mint 更安全價格饋送的程式（清算預言機、期權定價等）應使用 ObservationState TWAP 而非即時價格。
+
+**不要使用即時 CLMM 價格進行可組合性。** 單次大規模交換可在淺層資金池上將現貨價格推升 10% 以上；TWAP 可以消除這種波動。有關資料配置，請參閱 [`products/clmm/accounts#observation-state`](/zh-Hant/products/clmm/accounts)。
+
+### 外部：前端/API 上的 USD 定價
+
+Raydium 前端和 `api-v3.raydium.io` 顯示 USD 價值（TVL、費用 APR、\$ 交易量）。這些來自：
+
+- **Pyth** 作為主要預言機，用於主要 Mint。
+- **Jupiter 的聚合器價格** 作為後備。
+- **資金池衍生價格** 用於缺乏外部預言機覆蓋的長尾 Mint。
+
+USD 顯示純粹是表面化的——鏈上操作永不讀取 Pyth，資金池數學也不使用 USD。如果 Pyth 停止為某個 Mint 提供資料，UI 顯示「——」；資金池繼續運作。
+
+### 預言機操縱不適用於 Raydium 資金池
+
+由於資金池狀態是預言機，在漏洞賞金文獻所指的意義上不存在「預言機攻擊」——沒有可被攻擊者破壞的外部可操縱資料來源。針對資金池狀態的經濟攻擊（閃電貸風格操縱）包含在 [`security/attack-vectors`](/zh-Hant/security/attack-vectors) 中。
+
+## Token-2022 擴展風險
+
+SPL Token-2022（又名「Token Extensions」）通過擴展為 Mint 添加可配置行為。某些擴展改變了包含它們的資金池的信任屬性。Raydium 程式自動處理某些擴展並將其他擴展作為使用者警告浮出。
+
+### 轉移費用
+
+**它是什麼：** 可配置的費用（轉移百分比，以絕對值上限 `maximum_fee` 為上限），由發送者支付給 Mint 授權人於每次轉移時。
+
+**風險：** 費用可由 Mint 的費用配置授權人更改。如果你在費用為 1% 時存入流動性，而授權人將其提高到 50%，後續交換返回的遠少於預期。
+
+**Raydium 中的防止措施：** 資金池在交換時讀取當前 `transferFeeConfig` 並調整數學。資金池本身不被破壞，但使用者看到更差的輸出。費用授權人還可以安排延遲的費用變更；Raydium 的 UI 標誌有即將到來費用變更的資金池。
+
+**殘餘風險：** 如果惡意費用授權人在你的交換進行中更改費用，你的 `minimumAmountOut` 保護下行——交易恢復。如果你信任 Mint 發行人，這沒問題；如果你不信任，不要做市商。
+
+### 轉移掛鉤
+
+**它是什麼：** 轉移調用單獨的程式（「掛鉤」）來運行自訂驗證或副作用。
+
+**風險：** 掛鉤可以阻止任何轉移，包括交換期間資金池的內部轉移。可升級的掛鉤稍後可能變得惡意——在存入時安全的東西在提取時可能變得無法交換。
+
+**Raydium 中的防止措施：** Raydium 在資金池狀態中列出掛鉤程式 ID。整合應向使用者顯示掛鉤程式 ID，以便他們可以驗證它是預期的（非可升級、已審計）程式。
+
+**殘餘風險：** 如果掛鉤可升級且其授權人變得敵對，資金池可能被凍結。Raydium 不阻止帶有轉移掛鉤的資金池，但會標誌它們。只有在掛鉤經過驗證安全時，才進入轉移掛鉤資金池作為流動性提供者。
+
+### 凍結授權
+
+**它是什麼：** Mint 的凍結授權可以凍結任何持有該 Mint 的代幣帳戶，防止所有轉移。
+
+**風險：** 具有凍結資金池的保管庫帳戶能力的凍結授權實際上關閉了資金池——使用者無法提取，交易者無法交換。這適用於 SPL Token *和* Token-2022；它不是 Token-2022 的新功能，但仍然是一個風險。
+
+**Raydium 中的防止措施：** 程式層級沒有防止措施——SPL Token 的凍結對資金池是不透明的。Raydium 的 UI 在具有可凍結 Mint 的資金池上警告。存入的使用者應驗證凍結授權為空或他們信任的多簽（USDC 有凍結授權；它是發行人 Circle）。
+
+**殘餘風險：** 接受可凍結 Mint 可能被凍結的事實。主要 Mint（USDC、USDT、USDY）的凍結授權由發行人持有並僅用於監管合規；這通常是可接受的。
+
+### 永久委託人
+
+**它是什麼：** Token-2022 擴展，指定永久委託人可以在不需批准的情況下從任何持有者轉移代幣。
+
+**風險：** 永久委託人可以隨時清空資金池的保管庫。
+
+**Raydium 中的防止措施：** CPMM 和 CLMM **拒絕為具有永久委託人的 Mint 創建資金池**。初始化恢復。沒有執行的 Raydium 資金池具有永久委託人 Mint。
+
+**殘餘風險：** 零（只要檢查正確，兩次審計都驗證了）。
+
+### 不可轉移
+
+**它是什麼：** 持有者無法轉移的 Mint。
+
+**風險：** 資金池依賴可轉移性在使用者 ATA 與資金池保管庫之間移動代幣。不可轉移的 Mint 輕易破壞資金池。
+
+**Raydium 中的防止措施：** 資金池創建在不可轉移的 Mint 上恢復。農場也拒絕不可轉移的質押 Mint。
+
+### 預設凍結 / 關閉授權 / 計息
+
+由 Raydium 處理的低衝擊擴展：
+
+- **預設凍結**：新代幣帳戶需要在使用前解凍。Raydium 在 ATA 創建時透明地處理此事。
+- **關閉授權**：指定授權可以關閉代幣帳戶。資金池保管庫由資金池的程式衍生授權擁有，因此 Mint 上的關閉授權不適用於保管庫。
+- **計息**：顯示的餘額累積利息；`amount` 保持固定但 `uiAmount` 增長。Raydium 資金池數學使用 `amount`，而非利息累積；顯示分開調整。
+
+### Mint 授權
+
+不是 Token-2022 特定的風險，但值得一提：如果 Mint 保留 Mint 授權，持有者可以隨意膨脹供應。對於已啟動的代幣，這在資金池當前價格稀釋 LP。LaunchLab 拒絕創建啟動，除非 Mint 授權為空。
+
+## UI 中的風險標籤
+
+Raydium 前端用適用的風險標籤標記每個資金池：
+
+- **TRANSFER_FEE** —— 非零轉移費用。
+- **TRANSFER_HOOK** —— 轉移掛鉤擴展處於活動狀態。
+- **FREEZE** —— Mint 有凍結授權。
+- **MINT** —— Mint 有 Mint 授權（供應可以膨脹）。
+- **CLOSE** —— Mint 有關閉授權。
+
+使用 Raydium API 的聚合器應向使用者浮出這些標籤。
+
+## 整合者檢查清單
+
+在與 Raydium 資金池組合之前：
+
+- [ ] 通過 `getMint(mint, TOKEN_2022_PROGRAM_ID)` 檢查每個 Mint 的擴展。
+- [ ] 跳過任何 Mint 具有 permanent_delegate 或 non_transferable 的資金池（這些不應在 Raydium 中存在，但深度防禦）。
+- [ ] 檢查兩個 Mint 的凍結授權；僅空或受信授權。
+- [ ] 對於轉移掛鉤資金池，根據白名單驗證掛鉤程式 ID。
+- [ ] 根據轉移費用情景調整敞口大小（費用上升到最大時怎麼樣？）。
+- [ ] 對衍生品定價使用 CLMM TWAP（ObservationState）而非現貨價格。
+
+## 殘餘風險接受聲明
+
+Raydium 程式強制執行可在程式層級強制執行的內容：
+
+- 資金池創建拒絕永久委託人 / 不可轉移的 Mint。
+- 交換數學為當前轉移費用正確調整。
+- ObservationState 提供抗操縱的預言機。
+
+使用者必須接受的殘餘風險：
+
+- Mint 的凍結授權可以凍結資金池。
+- Mint 的費用授權可以隨時提高轉移費用（上至 `maximum_fee` 上限）。
+- 轉移掛鉤程式可升級為惡意代碼。
+- 計息 Mint 的累積率可以更改。
+
+正確的防禦是作為流動性提供者前的勤奮：不要存入具有你不信任的集中授權的 Mint 的資金池。Raydium 無法代你決定信任；它只能浮出相關事實。
+
+## 相關指針
+
+- [`algorithms/token-2022-transfer-fees`](/zh-Hant/algorithms/token-2022-transfer-fees) —— 轉移費用 Mint 的數學調整。
+- [`security/attack-vectors`](/zh-Hant/security/attack-vectors) —— 這些風險如何表現為具體攻擊。
+- [`integration-guides/wallet-integration`](/zh-Hant/integration-guides/wallet-integration) —— 顯示 Token-2022 風險標籤。
+- [`products/clmm/accounts`](/zh-Hant/products/clmm/accounts) —— ObservationState 配置。
+
+來源：
+
+- [SPL Token-2022 擴展文件](https://spl.solana.com/token-2022/extensions)。
+- 資金池初始化驗證邏輯：`src/raydium/cpmm/instrument.ts`、`src/raydium/clmm/instrument.ts`。
+- [Pyth](https://pyth.network) —— 前端使用的外部價格預言機。

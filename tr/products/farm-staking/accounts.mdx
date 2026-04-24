@@ -1,0 +1,224 @@
+---
+title: "Farm / Staking Hesapları"
+description: "FarmState, UserStake / Ledger, reward vault'ları ve authority PDA'ları — farm v3, v5 ve v6 için düzenler ve PDA seed'leri."
+---
+
+<Info>
+  **Bu sayfa yapay zekâ tarafından otomatik olarak çevrilmiştir. İngilizce sürüm esas alınır.**
+
+  [İngilizce sürümü görüntüle →](/products/farm-staking/accounts)
+</Info>
+
+<Info>
+  **Üç program, üç şema.** Farm v3, v5 ve v6 ayrı programlardır ve ayrı durum düzenlerine sahiptir. Bu sayfa her birini yan yana belgelemektedir. Uygulamada çoğu yeni entegrasyon v6'yı hedefler; v3 ve v5, çoğu entegratör için salt okunurdur (staking çok zamanlar önce orada gerçekleşti ve havuzlar durdurma aşamasındadır).
+</Info>
+
+## Hesap envanteri (havuz başına, herhangi bir versiyon)
+
+| Hesap | Sahibi | Amaç |
+|---------|-------|---------|
+| `FarmState` | Farm programı (v3/v5/v6) | Kök durum: staking mint'i, toplam stake edilmiş, reward stream'leri. |
+| `farm_authority` | Farm programı | Staking vault'u ve reward vault'larını sahiplenen PDA. |
+| `staking_vault` | SPL Token | Stake edilmiş LP'yi (veya staking mint'ini) tutar. |
+| `reward_vault_{i}` | SPL Token | Reward stream `i` için dağıtılmamış bütçeyi tutar. Stream başına bir tane. |
+| `UserStake` (v3/v5) / `UserLedger` (v6) | Farm programı | `(farm, user)` başına defter: stake edilmiş tutar + stream başına reward-per-share'in anlık görüntüsü. |
+
+SDK, `raydium.farm.getFarmById` üzerinde tam seti döndürür. Keyfi üçüncü taraf havuzlar için, API uç noktası `GET https://api-v3.raydium.io/main/farms/info?ids=<FARM_ID>` da bunları döndürür.
+
+## `FarmState` düzeni — v6
+
+v6 güncel sürümdür. Hesap yapısı en geneldir.
+
+```rust
+// programs/farm_v6/src/state/farm.rs (kısaltılmış)
+pub struct FarmState {
+    pub state: u64,                // bitfield: 0 = live, 1 = paused, ...
+    pub nonce: u64,                 // farm_authority için bump
+    pub creator: Pubkey,            // orijinal yaratıcı (reward ekleyebilir / admin'i transfer edebilir)
+    pub staking_mint: Pubkey,
+    pub staking_vault: Pubkey,
+    pub staking_token_program: Pubkey, // SPL Token veya Token-2022
+    pub lp_mint_decimals: u8,
+    pub reward_period_len: u64,     // SetRewards düzenlemeleri arasındaki minimum süre
+    pub reward_period_min: u64,
+    pub total_staked: u64,
+    pub reward_info_count: u8,
+    pub _reserved: [u8; ...],
+    pub reward_infos: [RewardInfo; 5], // en fazla 5 reward stream'i
+}
+
+pub struct RewardInfo {
+    pub reward_state: u8,           // 0 = kullanılmayan, 1 = çalışıyor, 2 = sonlandı
+    pub open_time: u64,             // start_time
+    pub end_time: u64,
+    pub last_update_time: u64,
+    pub emission_per_second_x64: u128, // Q64.64 fixed-point rate
+    pub reward_total_emissioned: u64,   // şimdiye kadarki emission'ların toplamı
+    pub reward_claimed: u64,            // stake edenlere ödenen toplam
+    pub reward_vault: Pubkey,
+    pub reward_mint: Pubkey,
+    pub reward_sender: Pubkey,          // bütçeyi yatıran; toplandırabilir
+    pub reward_token_program: Pubkey,   // SPL veya Token-2022
+    pub reward_per_share_x64: u128,     // Q64.64 sayacı
+}
+```
+
+Entegratör açısından ilgili alanlar:
+
+- **`staking_mint`, `staking_vault`** — stake edilen ve kaldığı yer.
+- **`total_staked`** — güncel toplam. APR hesaplamak için gerekli: `reward_per_second × 86400 / total_staked`.
+- **`reward_infos[i].emission_per_second_x64`** — Q64.64 oranı. Saniyedeki gerçek token sayısı için `2^64` ile bölün.
+- **`reward_infos[i].open_time` / `end_time`** — UI "X gün kaldı" ekranları için.
+- **`reward_infos[i].reward_per_share_x64`** — `UserLedger` borç hesabının yaptığı sayaç.
+
+## `FarmState` düzeni — v5
+
+```rust
+pub struct FarmStateV5 {
+    pub state: u64,
+    pub nonce: u64,
+    pub lp_vault: Pubkey,            // alias staking_vault
+    pub reward_vaults: [Pubkey; 2],
+    pub owner: Pubkey,
+    pub reward_mints: [Pubkey; 2],
+    pub reward_total_emissioned: [u64; 2],
+    pub reward_claimed: [u64; 2],
+    pub reward_per_second: [u64; 2],  // tamsayı, fixed-point değil
+    pub reward_open_time: [u64; 2],
+    pub reward_end_time: [u64; 2],
+    pub reward_per_share: [u128; 2],  // Q56.8 veya benzer; program kaynağını kontrol edin
+    pub total_staked: u64,
+    pub last_slot: u64,               // v5 mainnet'te slot başına günceller
+    pub _reserved: [u8; 256],
+}
+```
+
+v6'dan farklar:
+
+- **Saniyede değil slot başına.** v5'in güncelleme döngüsü duvar saati yerine slot'lar üzerinde çalışır. SDK bunu UI için "saniye başına" normalize eder ancak zincir üzerinde birim slot'tur.
+- **Tamsayı emission oranı.** `reward_per_second`, `u64`'tür. Bu, minimum ifade edilebilir oranı saniye başına 1 birim ile sınırlar, bu da 9 ondalak mint'lerde düşük-emission stream'leri için çok kabadır. v6 bunu Q64.64 oranıyla düzeltti.
+- **`reward_sender` yok.** v5'te sahip örtülü göndericidir; yalnızca `owner` toplandırabilir.
+
+## `FarmState` düzeni — v3
+
+```rust
+pub struct FarmStateV3 {
+    pub state: u64,
+    pub nonce: u64,
+    pub lp_vault: Pubkey,
+    pub reward_vault: Pubkey,          // tek reward
+    pub owner: Pubkey,
+    pub reward_mint: Pubkey,
+    pub reward_total_emissioned: u64,
+    pub reward_claimed: u64,
+    pub reward_per_slot: u64,
+    pub reward_per_share: u128,
+    pub total_staked: u64,
+    pub last_slot: u64,
+    pub _reserved: [u8; 256],
+}
+```
+
+Tek reward. Slot tabanlı. En eski program nesleri, v5'ten önceki RAY-USDC ve SOL-USDC havuzları için canlı tutulan.
+
+## `UserLedger` (v6) / `UserStake` (v5/v3)
+
+Kullanıcı başına durum, `(farm, user)` çifti başına bir hesap. Seeded PDA:
+
+```ts
+// v6
+const [ledgerPda] = PublicKey.findProgramAddressSync(
+  [farmId.toBuffer(), user.toBuffer(), Buffer.from("user_stake_info_v2")],
+  FARM_V6_PROGRAM_ID,
+);
+
+// v5
+const [stakePda] = PublicKey.findProgramAddressSync(
+  [farmId.toBuffer(), user.toBuffer(), Buffer.from("user_stake_info")],
+  FARM_V5_PROGRAM_ID,
+);
+
+// v3
+const [stakePda] = PublicKey.findProgramAddressSync(
+  [farmId.toBuffer(), user.toBuffer(), Buffer.from("staker_info")],
+  FARM_V3_PROGRAM_ID,
+);
+```
+
+(Seed dizgileri SDK'nın kullandığı değerlerdir; program sürümleri tarihsel olarak bunları değiştirmişlerdir. Güvenlikle ilgili herhangi bir şey için v6 kaynağına karşı doğrulayın.)
+
+```rust
+// v6
+pub struct UserLedger {
+    pub version: u64,
+    pub farm_id: Pubkey,
+    pub owner: Pubkey,
+    pub deposited: u64,                          // güncel stake
+    pub reward_debts: [u128; 5],                 // reward_per_share_x64 × deposited'in anlık görüntüsü
+}
+```
+
+Stream başına borç, özette açıklanan muhasebe ofseti:
+
+```
+pending_for_stream_i = deposited × reward_per_share_x64[i] / 2^64  − reward_debts[i]
+```
+
+Her `Deposit`, `Withdraw` veya `Harvest` sonra, borç güncel `deposited × reward_per_share_x64[i] / 2^64`'e sıfırlanır.
+
+## Authority PDA'ları
+
+```ts
+// v6
+const [farmAuthorityV6] = PublicKey.findProgramAddressSync(
+  [farmId.toBuffer()],
+  FARM_V6_PROGRAM_ID,
+);
+
+// v5
+const [farmAuthorityV5] = PublicKey.findProgramAddressSync(
+  [farmId.toBuffer()],
+  FARM_V5_PROGRAM_ID,
+);
+
+// v3
+const [farmAuthorityV3] = PublicKey.findProgramAddressSync(
+  [farmId.toBuffer()],
+  FARM_V3_PROGRAM_ID,
+);
+```
+
+Üç sürümün tümü, farm authority'i havuz başına tek bir seed ile türetir. Bu PDA, staking vault'u ve her reward vault'u üzerinde authority'dir. Farm'ın yaptığı her transfer'i imzalar.
+
+## Vault'lar
+
+Staking ve reward vault'ları, `owner`'ı farm authority PDA olan standart SPL Token hesaplarıdır. Adresler `FarmState`'de saklanır — yeniden türetmeyin; durumdan okuyun. Freeze authority'leri v5/v6'da staking mint'inde devre dışı bırakılmalıdır (program kontrol eder).
+
+Token-2022 notları:
+
+- **v3**: Yalnızca SPL Token.
+- **v5**: Yalnızca SPL Token.
+- **v6**: `staking_token_program` / `reward_token_program` alanlarıyla kontrol edilen staking ve reward mint'lerinde Token-2022'yi destekler. Token-2022 reward mint'lerinde transfer ücretleri emit sırasında tahsil edilir (vault → user).
+
+## Gözlem ve APR
+
+Havuzlar APR'yi zincir üzerinde saklamaz. Hesaplamak için:
+
+```
+annualized_rewards_value_usd = reward_per_second × 86400 × 365 × reward_usd_price
+tvl_usd                     = total_staked / 10^decimals × staking_mint_usd_price
+apr                         = annualized_rewards_value_usd / tvl_usd
+```
+
+Tüketiciler genellikle `staking_mint_usd_price`'ı LP'nin ait olduğu havuzdan (`api-v3.raydium.io/pools/info/ids` aracılığıyla) ve `reward_usd_price`'ı herhangi bir fiyat oracle'dan çekerler.
+
+## Sıradaki nedir?
+
+- [`products/farm-staking/instructions`](/tr/products/farm-staking/instructions) — sürüm başına talimat referansı.
+- [`products/farm-staking/code-demos`](/tr/products/farm-staking/code-demos) — SDK aracılığıyla staking, harvesting ve farm oluşturma.
+- [`reference/program-addresses`](/tr/reference/program-addresses) — üç program ID'si.
+
+Kaynaklar:
+
+- [Raydium SDK v2 `Farm` modülü](https://github.com/raydium-io/raydium-sdk-V2)
+- Farm v6 program kaynağı şu anda bağımsız repo olarak yayınlanmamaktadır; IDL SDK'da [`raydium-io/raydium-sdk-V2`](https://github.com/raydium-io/raydium-sdk-V2) altında `src/raydium/farm/` içinde bulunur.

@@ -1,0 +1,183 @@
+---
+title: "Mathématiques d'AMM v4"
+description: "Invariant de produit constant avec la convention de frais d'AMM v4, conversion du prix réserves-carnet d'ordres, construction de la grille d'ordres cibles et l'étape de règlement du PnL."
+---
+
+<Info>
+  **Cette page est traduite automatiquement par IA. La version anglaise fait foi.**
+
+  [Voir la version anglaise →](/products/amm-v4/math)
+</Info>
+
+## L'invariant
+
+Le pool maintient `coin_reserve × pc_reserve = k`, où :
+
+```
+coin_reserve = coin_vault_balance
+             + orders_posted_on_openbook.base
+             + pending_coin_fill_not_yet_settled
+pc_reserve   = pc_vault_balance
+             + orders_posted_on_openbook.quote
+             + pending_pc_fill_not_yet_settled
+             - accrued_pnl_pc
+```
+
+Deux points à noter :
+
+1. Les réserves incluent **les montants engagés sur OpenBook**. Les ordres limites de l'AMM font partie de sa liquidité — ils ne sont pas « perdus » dans le carnet d'ordres, simplement bloqués là. Calculer `k` uniquement à partir des soldes des coffres on-chain sous-estime les réserves.
+2. L'accumulation de PnL (`need_take_pnl_*`) est soustraite pour que la courbe soit conservée lorsque l'administrateur prélève les frais. Même principe que l'exclusion `protocol_fees_*` du CPMM.
+
+Chaque opération `Swap*` applique `k' ≥ k` après ajout de la part de frais de l'LP aux réserves.
+
+## Convention de frais
+
+AMM v4 utilise des **frais sous forme de ratio** (paires numérateur/dénominateur) plutôt que la convention `1/1_000_000` du CPMM / CLMM. La structure `Fees` on-chain (voir [`Fees::initialize`](https://github.com/raydium-io/raydium-amm/blob/master/program/src/state.rs) dans la source du programme) utilise par défaut :
+
+```
+Fees {
+  min_separate_numerator:    5,
+  min_separate_denominator:  10_000,   //  5/10_000 = 0,05%
+
+  trade_fee_numerator:      25,
+  trade_fee_denominator:    10_000,    // 25/10_000 = 0,25% — utilisé pour la tarification des ordres limites OpenBook
+
+  pnl_numerator:            12,
+  pnl_denominator:          100,       // 12/100   = 12%   — part du protocole du frais de swap
+
+  swap_fee_numerator:       25,
+  swap_fee_denominator:     10_000,    // 25/10_000 = 0,25% — frais bruts sur les swaps via AMM
+}
+```
+
+Interprétation (valeurs par défaut publiées sur mainnet) :
+
+- **Frais totaux de swap :** `swap_fee = amount_in × 25 / 10_000 = 0,25 %` de l'entrée brute.
+- **Part du protocole :** `pnl_numerator / pnl_denominator = 12 / 100 = 12 %` **du frais de swap**, ce qui correspond à `0,25 % × 12 % = 0,03 %` du volume. Cette part s'accumule dans les compteurs de PnL et est prélevée par `WithdrawPnl`.
+- **Part du LP :** les `88 %` restants du frais de swap, ce qui correspond à `0,25 % × 88 % = 0,22 %` du volume. Reste dans le pool et augmente `k`.
+- **Pas de part de fonds.** AMM v4 n'a pas la division des frais fonds du CPMM/CLMM.
+
+Notez que `pnl_numerator / pnl_denominator` est une fraction **du frais**, non du volume de trading — une mauvaise lecture courante de ces noms de champs.
+
+`trade_fee_numerator / trade_fee_denominator` (également `25 / 10_000`) est un champ séparé utilisé par l'intégration OpenBook lors du calcul des prix incluant les frais pour la grille d'ordres limites de l'AMM ; il égale `swap_fee` par défaut mais est lu depuis un chemin de code différent.
+
+Les écarts par rapport à ces valeurs par défaut sont rares mais existent sur quelques pools hérités ; lisez toujours les frais depuis `AmmInfo.fees` avant de cotiser.
+
+## Mathématiques directes du swap (chemin AMM)
+
+Le cas le plus simple : l'utilisateur fait un swap contre les coffres du pool sans interagir avec OpenBook. Les réserves internes du pool (incluant les allocations on-book) sont le dénominateur.
+
+**SwapBaseIn (entrée exacte) :**
+
+```
+amount_after_fee = amount_in − ceil(amount_in × swap_fee_numerator / swap_fee_denominator)
+amount_out = amount_after_fee × out_reserve
+           / (in_reserve + amount_after_fee)
+require(amount_out >= minimum_amount_out)
+```
+
+Les réserves utilisées ici sont les réserves **effectives**. Historiquement, c'était `coin_vault_balance + coin_posted_on_openbook + ...` (le coffre de l'AMM plus les jetons verrouillés dans les ordres OpenBook). **Depuis la désactivation d'OpenBook, le solde on-book est zéro**, donc les réserves effectives égalent les soldes bruts des coffres. Le chemin `MonitorStep` / settlement implicite qui actualisait autrefois le côté OpenBook n'est plus nécessaire en pratique.
+
+**SwapBaseOut (sortie exacte) :**
+
+```
+amount_in_after_fee = ceil(in_reserve × amount_out / (out_reserve − amount_out))
+amount_in_gross     = ceil(amount_in_after_fee × swap_fee_denominator
+                            / (swap_fee_denominator − swap_fee_numerator))
+require(amount_in_gross <= maximum_amount_in)
+```
+
+## Interaction avec le carnet d'ordres (historique)
+
+<Note>
+  **N'est plus actif.** La construction de grille décrite dans cette section reflète comment AMM v4 **originellement** reflétait la courbe sur un marché OpenBook. L'intégration OpenBook a été désactivée ; les pools ne placent plus ou ne maintiennent plus d'ordres sur OpenBook. Les mathématiques ci-dessous sont conservées pour le contexte — elles expliquent ce pour quoi les comptes on-chain `target_orders` / `amm_open_orders` étaient dimensionnés et pourquoi le programme valide toujours les paramètres liés à `MonitorStep` même si le keeper ne les exécute plus.
+</Note>
+
+Séparément des swaps utilisateur, AMM v4 plaçait historiquement une **grille** d'ordres limites sur le marché OpenBook. La grille était calculée à partir des paramètres `AmmInfo` :
+
+- **`depth`** — nombre de niveaux de prix par côté.
+- **`amount_wave`** — unité de base de taille par niveau.
+- **`min_size`**, **`coin_lot_size`**, **`pc_lot_size`** — contraintes du marché OpenBook.
+- **`state_data.swap_acc_coin_fee`**, **`swap_acc_pc_fee`** — compteurs cumulatifs de frais depuis le dernier `TakePnl`.
+
+Le programme dérive les prix par niveau en avançant à partir du prix actuel de la courbe par étapes de ratio constant :
+
+```
+price_level(k) = curve_price × (1.0001 ^ k)       # conceptuellement
+size_level(k)  = amount_wave × f(depth, k)        # diminué par depth
+```
+
+Les prix et tailles exactes sont déterminés par `target_orders` calculé dans `build_orders` et comparés avec `amm_open_orders` chaque `MonitorStep`. Toute divergence entraîne des annulations + de nouveaux postes. Les ordres fraîchement remplis sur OpenBook se règlent dans les coffres du pool lors de la prochaine opération qui actualise le côté OpenBook.
+
+Les intégrateurs ont rarement besoin de calculer la grille — le keeper Raydium la maintient — mais il est utile de savoir que :
+
+- Un pool avec une liquidité significative **on-book** a cette liquidité contribuant à `k`, plutôt que d'être inactive.
+- Un marché OpenBook obsolète (file d'événements pleine, les cranks bloqués) empêche les mises à jour de grille ; l'AMM peut alors cotiser des prix qui divergent du carnet d'ordres visible jusqu'au prochain crank.
+
+## Étape de règlement (PnL)
+
+La part du protocole de 0,03 % s'accumule dans `state_data.need_take_pnl_coin` et `state_data.need_take_pnl_pc`. `TakePnl` déplace ces montants hors des coffres vers la destination spécifiée par l'administrateur, puis remet les compteurs à zéro.
+
+Propriété cruciale : les réserves dans l'invariant sont toujours calculées **moins** le PnL accumulé, donc `TakePnl` ne modifie pas la courbe. Cela correspond à la convention du CPMM.
+
+## Exemple travaillé
+
+État du pool :
+
+- `coin_reserve = 1_000_000_000_000` (1 000 000 côté coin ; 6 décimales)
+- `pc_reserve   = 2_000_000_000_000` (2 000 000 côté pc ; 6 décimales)
+- Frais : `swap = 25/10_000`, `pnl = 3/10_000` par défaut.
+
+Utilisateur : `SwapBaseIn` entrée exacte `1_000_000_000` coin (1 000 coin).
+
+```
+swap_fee        = ceil(1_000_000_000 * 25 / 10_000)    = 2_500_000
+amount_after_fee =                                      997_500_000
+
+amount_out = amount_after_fee * pc_reserve
+           / (coin_reserve + amount_after_fee)
+           = 997_500_000 * 2_000_000_000_000
+           / (1_000_000_000_000 + 997_500_000)
+           ≈ 1_995_015_009  (1 995,015 pc)
+
+// Du frais de swap de 2_500_000 :
+pnl_share = 2_500_000 * 3 / 25  = 300_000    (va au protocole via need_take_pnl_coin)
+lp_share  = 2_500_000 * 22 / 25 = 2_200_000  (reste dans coin_reserve)
+
+new coin_reserve = 1_000_000_000_000 + 1_000_000_000                 = 1_001_000_000_000
+                   (dont 300_000 est du PnL accumulé)
+  curve coin_reserve = 1_001_000_000_000 − 300_000 = 1_000_999_700_000
+new pc_reserve   = 2_000_000_000_000 − 1_995_015_009                 ≈ 1_998_004_984_991
+
+k' = curve_coin_reserve * new_pc_reserve
+   ≈ 2.000_002_701E24
+k  = 1_000_000_000_000 * 2_000_000_000_000
+   = 2.0E24
+k' > k   ✓
+```
+
+La part du LP (`2_200_000`) n'est brisée nulle part — c'est simplement la résidu qui augmente `k'`.
+
+## Règles de précision
+
+- Les multiplications de réserves utilisent `u128` ; les divisions finales s'arrondissent vers zéro.
+- `swap_fee` s'arrondit vers le haut (donc le pool ne sous-facture pas).
+- `amount_in` pour `SwapBaseOut` s'arrondit vers le haut (donc l'utilisateur ne sous-paie pas).
+- Les pools avec des ratios de réserve extrêmes peuvent atteindre `ZeroTradingTokens` sur très petites entrées ; même convention que le CPMM.
+
+## Limitations par rapport au CPMM
+
+- Les réserves d'AMM v4 incluent la portion bloquée sur OpenBook, donc un intégrateur ne peut pas coter correctement uniquement à partir de `getTokenAccountBalance`. Récupérez toujours l'état complet (coffres + `open_orders.free` + `open_orders.locked`), ou utilisez la cotation SDK / API.
+- AMM v4 n'expose pas une TWAP structurée on-chain. Les consommateurs externes qui veulent un prix soutenu par AMM v4 doivent le calculer eux-mêmes à partir des journaux de trading.
+- Token-2022 n'est pas supporté.
+
+## Où aller ensuite
+
+- [`products/amm-v4/instructions`](/fr/products/amm-v4/instructions) — où `SwapBaseIn`, `Deposit`, etc. se branchent.
+- [`products/amm-v4/fees`](/fr/products/amm-v4/fees) — mécanique complète des frais, détails `TakePnl`.
+- [`algorithms/constant-product`](/fr/algorithms/constant-product) — la dérivation partagée.
+
+Sources :
+
+- [Source du programme Raydium AMM — `raydium-io/raydium-amm`](https://github.com/raydium-io/raydium-amm)
+- Module `Liquidity` Raydium SDK v2

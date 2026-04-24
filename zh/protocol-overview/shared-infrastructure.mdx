@@ -1,0 +1,187 @@
+---
+title: "共享基础设施"
+description: "每个 Raydium 程序共享的基础原语 — 权限 PDA、AmmConfig 账户、协议/基金/创建者费用分配、观察账户和公共 REST API 表面 — 一次定义后由产品专章引用。"
+---
+
+<Info>
+  **本页内容由 AI 自动翻译，所有内容以英文版本为准。**
+
+  [查看英文版 →](/protocol-overview/shared-infrastructure)
+</Info>
+
+<Info>
+  Raydium 的产品程序是独立的代码库，但它们是基于一套共享的约定设计的。本页是这些约定的规范参考。产品专章描述这些约定在其账户中的*实例化*方式；本页描述约定本身。
+</Info>
+
+## "共享"在这里的含义
+
+代码库中运行着三种共享方式：
+
+- **约定共享。** 每个程序都使用相同的 PDA 推导模式、相同的费用分配形状和相同的观察账户思想 — 但每个都在自己的程序中用自己的种子实现它们。
+- **账户共享。** 少数几个账户在许多池之间是*字面上*相同的记录（CPMM 中的全局权限 PDA、AmmConfig 账户）。
+- **链下共享。** 一个 REST API 和一个 TypeScript SDK 为所有四个程序提供前端。集成者与一个 HTTP 主机和一个 NPM 包交互，无论他们最终调用哪个程序。
+
+下面的五个基础原语涵盖了所有跨越程序边界的内容。
+
+## 1. 权限 PDA
+
+每个 Raydium 程序都有一个拥有其代币金库的 PDA。用户永远不会直接持有金库权限 — 权限 PDA 是唯一可以移出资金的签署者，并且只在有效的程序指令告诉它时才签署。
+
+模式在各个产品中是相同的；种子不同：
+
+| 程序 | 权限 PDA 种子 | 备注 |
+|---------|---------------------|-------|
+| **AMM v4** | `[poolId]` | 每个池的权限。与 v4 的每个池设计形状相同。 |
+| **CPMM** | `[b"vault_and_lp_mint_auth_seed"]` | **由所有 CPMM 池共享的单个 PDA。** 没有特定池的种子。 |
+| **CLMM** | `[b"pool_vault_and_lp_mint_auth_seed"]` | 跨所有 CLMM 池共享的单个 PDA。 |
+| **Farm v3 / v5 / v6** | `[farmId]` | 每个农场。PDA 拥有该农场的质押 + 奖励金库。 |
+| **LaunchLab** | `[b"vault_auth", launchId]` | 每次启动。拥有毕业前的基础 + 报价金库。 |
+
+这有几个后续影响：
+
+- 对于 CPMM 和 CLMM，权限 PDA 是**一个全局账户** — 该类型的每个池都使用它。如果你在 CPI 到 CPMM，你只需要一次，不需要按池。
+- 对于按池 / 按农场的权限，你从池/农场 ID 推导 PDA。SDK 在 `getPoolKeys` / `getFarmKeys` 中执行此操作；如果你直接集成，你使用 `findProgramAddressSync` 推导。
+- **金库所有权不能更改。** 一旦创建了权限 PDA 作为所有者的代币账户，只有该 PDA — 由程序调用 — 才能转出。没有管理员覆盖。
+
+关于每个程序的确切种子和 ATA 布局，请参见 [`products/cpmm/accounts`](/zh/products/cpmm/accounts)、[`products/clmm/accounts`](/zh/products/clmm/accounts)、[`products/amm-v4/accounts`](/zh/products/amm-v4/accounts)、[`products/farm-staking/accounts`](/zh/products/farm-staking/accounts)、[`products/launchlab/accounts`](/zh/products/launchlab/accounts)。
+
+## 2. 管理和配置账户
+
+CPMM 和 CLMM 共享一个称为 **`AmmConfig`** 的配置账户模式：一个小的全局账户，由 `u16` 索引，持有适用于整个*费用层级*的费率和管理目标。池在创建时绑定到配置，永不重新绑定。
+
+```rust
+// CPMM AmmConfig（简化 — CLMM 版本在结构上相似）
+pub struct AmmConfig {
+    pub bump: u8,
+    pub disable_create_pool: bool,        // 在此层级中禁止新池创建
+    pub index: u16,                       // 层级索引
+    pub trade_fee_rate: u64,              // 交易费用的分数
+    pub protocol_fee_rate: u64,           // 交易费用中分配给协议的分数
+    pub fund_fee_rate: u64,               // 交易费用中分配给基金的分数
+    pub create_pool_fee: u64,             // 每个池的一次性创建费用
+    pub protocol_owner: Pubkey,           // CollectProtocolFee 的签署者
+    pub fund_owner: Pubkey,               // CollectFundFee 的签署者
+    pub padding: [u64; 16],
+}
+```
+
+**规则：**
+
+- **费用层级是全局的。** 当一个池说"这是一个 0.25% 的池"时，它意味着它绑定到在创建时 `trade_fee_rate` 为 0.25% 的 AmmConfig。没有按池的费率覆盖。
+- **配置可以更改但池不跟随。** 如果配置权限编辑 AmmConfig，每个绑定到该配置的现有池立即获取新费率。这是一个功能，不是错误；这是协议级经济变化如何传播而不需要按池迁移的方式。
+- **`disable_create_pool` 是弃用杠杆。** 当费用层级被弃用时，协议多签设置此标志 — 现有池继续工作但没有新池可以选择该层级。
+- **`protocol_owner` / `fund_owner`** 是费用收集调用的*签署者*。将它们设置为多签是费用提取的门控方式。它们*不是*费用本身的目标地址；那是相同账户上的 `protocol_fee_destination` / `fund_fee_destination`。
+
+AMM v4 没有 `AmmConfig` — 其费用参数是按池的，在创建时硬编码。Farm 和 LaunchLab 有自己的等价物（`FarmConfig`、`LaunchConfig`）在各自的章节中介绍。
+
+谁可以更改什么的完整表格在 [`security/admin-and-multisig`](/zh/security/admin-and-multisig) 中。当前面向用户的费用分配在 [`ray/protocol-fees`](/zh/ray/protocol-fees) 中。
+
+## 3. 协议 / 基金 / 创建者费用分配
+
+每个 CPMM 和 CLMM 交换费都在输出时分配到最多四个目标：
+
+```
+                         总交换费
+                              │
+              ┌───────────────┼───────────────┬──────────────┐
+              ▼               ▼               ▼              ▼
+        LP 池边          协议           基金         创建者
+        （提高 k）       金库            多签       （LaunchLab 池）
+```
+
+从机制上讲：
+
+1. **交易费累积到池中。** 费用从交换的输入端移除，*扣费后*的金额是常数乘积数学看到的。这就是"LP 赚取费用"的意思 — `k` 上升，隐含的每个 LP 代币价值也上升。
+2. **协议/基金/创建者部分从该 LP 端累积中扣除到按池计数器账户。** 它们驻留在池状态中（`protocol_fees_token{0,1}`、`fund_fees_token{0,1}` 等），直到某人调用 `CollectProtocolFee` / `CollectFundFee` / `CollectCreatorFee`。在那之前它们不会离开池的金库；从交换的角度看它们仍然"在池中"。
+3. **收集将它们移出。** 相应的签署者（AmmConfig 上的 `protocol_owner` / `fund_owner` 键，或 LaunchLab 池的启动创建者）调用收集指令，程序从池金库转账到目标 ATA。
+
+几个至关重要的观察：
+
+- **分割百分比是交易费的，而不是交易的。** 一个 0.25% 交易费加上 12% 的协议份额意味着协议获得 `0.25% × 12% = 0.03%` 的交易 — 不是交易的 12%。
+- **创建者费用仅存在于 LaunchLab 毕业池中。** 标准 CPMM/CLMM 池有三向分割（LP / 协议 / 基金）。LaunchLab 添加了第四个槽位，路由给启动代币的人，在 `Initialize` 时配置且不可变。
+- **AMM v4 只分割两种方式**，按池硬编码：LP 和协议。没有基金槽位，没有创建者槽位。
+- **基金 vs 协议** — 两者都是协议库目标，但它们有不同的签署者和不同的预期用途。`protocol` 历史上为运营融资；`fund` 是较长期的库。两者之间的分割本身是可调的。
+
+具体费率在 [`reference/fee-comparison`](/zh/reference/fee-comparison) 和 [`ray/protocol-fees`](/zh/ray/protocol-fees) 中。
+
+## 4. 观察账户（TWAP 环形缓冲区）
+
+CPMM 和 CLMM 都为每个池维护一个**观察账户** — 一个固定大小的 `(timestamp, cumulative_price)` 样本环形缓冲区，其他合约可以用来推导抗操纵的 TWAP。
+
+```rust
+// CPMM ObservationState（简化）
+pub struct ObservationState {
+    pub initialized: bool,
+    pub observation_index: u16,            // 下一个要覆盖的槽位
+    pub pool_id: Pubkey,
+    pub observations: [Observation; OBSERVATION_NUM],
+    pub padding: [u64; 4],
+}
+
+pub struct Observation {
+    pub block_timestamp: u64,
+    pub cumulative_token_0_price_x32: u128,  // 自初始化以来 (price × dt) 的总和
+    pub cumulative_token_1_price_x32: u128,
+}
+```
+
+它是如何工作的：
+
+- **每个交换都调用 `update_observation`。** 程序读取当前价格，乘以自前一个观察以来经过的秒数，并将其加入累积计数器。新条目覆盖最旧的槽位（环形缓冲区样式）。
+- **时间窗口上的 TWAP** = `(cumul[end] − cumul[start]) / (timestamp[end] − timestamp[start])`。消费者选择两个观察括起所需窗口并进行除法。
+- **Raydium 本身不使用 TWAP 来定价。** AMM 数学直接读取现货储备。观察是一个外部性 — Raydium 支付写入它们的成本，以便其他合约可以读取。
+- **AMM v4 没有观察账户。** 它比 ObservationState 设计更早；想要 v4 TWAP 的集成者必须从日志历史中离链计算一个。
+
+布局细节和索引数学在 [`products/cpmm/accounts`](/zh/products/cpmm/accounts) 和 [`products/clmm/accounts`](/zh/products/clmm/accounts) 中。
+
+## 5. REST API + SDK + IDL
+
+链下表面是每个产品使用的单个三元组：
+
+- **REST API** — `https://api-v3.raydium.io`。所有链上状态加上报价引擎的只读索引视图。一个主机，一个架构。
+- **TypeScript SDK** — NPM 上的 `@raydium-io/raydium-sdk-v2`。为每个程序构建和签署交易。与 API 通话获取报价/元数据，与 Solana RPC 通话进行签前状态刷新。
+- **IDL 注册表** — 每个已发布程序的 Anchor IDL 存在于 [`raydium-idl`](https://github.com/raydium-io/raydium-idl) 仓库中（每个程序一个 JSON：CPMM、CLMM、LaunchLab）。TypeScript SDK 在内部使用这些 IDL；下游 Rust / Python 客户端从相同文件重新生成。
+
+它们之间的边界很清晰：
+
+| 部分 | 读取自 | 写入到 | 过期容差 |
+|-------|-----------|-----------|-----------------|
+| REST API | 索引器（解析链日志） | — （对集成者为只读） | 几秒 |
+| SDK | API + RPC | 构建交易；不广播 | 无 — 必须在签前重新获取状态 |
+| IDL | 程序源 | — | 按程序升级版本化 |
+
+一个常见错误是直接将 REST API 输出提供给交易。不要这样做 — 从你签署的槽位中的 Solana RPC 重新获取相关池/头寸状态。SDK 对第一方流自动执行此操作；如果你绕过 SDK，你必须自己做。
+
+完整参考在 [`sdk-api/`](/zh/sdk-api) 中，IDL 表面特别在 [`sdk-api/anchor-idl`](/zh/sdk-api/anchor-idl) 中。
+
+## 6. 索引器和价格源
+
+REST API 由 Raydium 自己的索引器提供，该索引器订阅来自 Solana RPC 集群的程序日志，并将去规范化记录写入 SQL 存储。对集成者的两个后果：
+
+- **索引器是唯一"知道"跨程序状态的东西。** 将 CPMM 池映射到其 CLMM 对应物、计算跨程序版本的 24 小时交易量、获取与 LP 铸币相关的农场 — 所有这些都是索引器工作。程序本身不做这些。
+- **索引器停机是 API 停机。** 如果 API 返回过期或空数据，索引器就是嫌疑人。链上状态不受影响；拥有自己的 RPC 和 SDK 的集成者可以继续交易。
+
+价格源是一个单独的问题。API 在大多数池响应上发布 `priceUsd` 字段；这是从索引器对池储备的视图的快照和引用价格（USDC 池作为常见支点）的快照离链计算的。它对 UI 足够好；使用它作为链上预言机不安全。为此使用观察 TWAP。
+
+## 什么不共享
+
+值得明确列出，因为新读者经常假设有比实际存在的更多共享：
+
+- **程序不相互调用。** CPMM 交换永远不会 CPI 到 CLMM 或 AMM v4。唯一组合多个 AMM 的程序是 AMM 路由程序 — 而且那个本身很薄，只是按顺序对每个 AMM 发出 CPI。
+- **整个程序中没有共享升级权限。** 每个链上程序有自己的程序升级密钥（3/4 多签加 24 小时时间锁）。它们不相关联。
+- **农场和 AMM 之间没有共享状态。** 一个农场不知道它质押的 LP 是来自 CPMM 池、CLMM 头寸 NFT 铸币还是不相关的 SPL 代币。农场程序将质押铸币视为不透明。
+- **无预言机依赖。** 定价是链上储备。没有 Pyth/Switchboard 备用；AMM 在清算前不检查预言机。
+
+## 指针
+
+- [`protocol-overview/architecture`](/zh/protocol-overview/architecture) — 显示这些部分如何组合的规范图。
+- [`protocol-overview/versions-and-migration`](/zh/protocol-overview/versions-and-migration) — 约定如何跨程序版本演变。
+- [`security/admin-and-multisig`](/zh/security/admin-and-multisig) — 谁控制 AmmConfigs 背后的密钥。
+- [`reference/fee-comparison`](/zh/reference/fee-comparison) — 每个产品的费率矩阵。
+- [`reference/program-addresses`](/zh/reference/program-addresses) — 规范程序 ID。
+
+来源：
+
+- [Raydium SDK v2](https://github.com/raydium-io/raydium-sdk-V2) — PDA 种子、账户布局和 IDL 定义的真实来源。
+- [Raydium IDL 注册表](https://github.com/raydium-io/raydium-idl) — Anchor IDL。
+- 上面内联引用的按产品账户页面。

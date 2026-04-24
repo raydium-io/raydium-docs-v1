@@ -1,0 +1,369 @@
+---
+title: "CLMM 数学"
+description: "Sqrt-price 表示、流动性 ↔ 代币数量、单个 tick 交换步骤、多 tick 迭代以及费用增长计算。"
+---
+
+<Info>
+  **本页内容由 AI 自动翻译，所有内容以英文版本为准。**
+
+  [查看英文版 →](/products/clmm/math)
+</Info>
+
+## Sqrt-price 表示
+
+CLMM 将价格存储为 `sqrt_price_x64`——token1 相对于 token0 的价格的平方根，采用 Q64.64 定点数格式：
+
+$$
+\text{sqrt\_price\_x64} = \lfloor \sqrt{p} \cdot 2^{64} \rfloor
+$$
+
+其中 `p = token1_amount / token0_amount`。在 sqrt 空间而非 p 空间中工作使得交换数学线性化（代币数量增量相对于 `Δsqrt_price` 是线性的），而 `x64` 定点格式在多 tick 交换过程中保持精度。
+
+Tick ↔ sqrt-price 转换通过 `bit-by-bit` 对数近似预计算：
+
+$$
+\text{sqrt\_price\_x64}(t) \approx 2^{64} \cdot (1.0001)^{t/2}
+$$
+
+在 `tick_math::get_sqrt_price_at_tick` 中实现为基于查表的指数运算。
+
+## 流动性作为规范单位
+
+在范围 `[sqrt_a, sqrt_b]`（其中 `sqrt_a < sqrt_b`）内，**流动性 `L`** 的头寸对应的代币数量如下。设 `sqrt_c = sqrt_price_x64` 为池当前价格。
+
+| 情况 | `amount0` | `amount1` |
+|------|-----------|-----------|
+| `sqrt_c <= sqrt_a`（池价格低于范围） | `L · (sqrt_b - sqrt_a) / (sqrt_a · sqrt_b)` | `0` |
+| `sqrt_a < sqrt_c < sqrt_b`（在范围内） | `L · (sqrt_b - sqrt_c) / (sqrt_c · sqrt_b)` | `L · (sqrt_c - sqrt_a)` |
+| `sqrt_c >= sqrt_b`（池价格高于范围） | `0` | `L · (sqrt_b - sqrt_a)` |
+
+这三个恒等式都来自于集中流动性在某个范围内满足的不变量 `x = L / sqrt_p`、`y = L · sqrt_p`。
+
+集成者通常需要反向计算：给定 `amount0` / `amount1` 的存款，计算能放入该范围的最大 `L`。SDK 的 `LiquidityMath.getLiquidityFromTokenAmounts` 就是做这个的。在范围内情况下的公式为：
+
+$$
+L_0 = \text{amount0} \cdot \frac{\text{sqrt\_c} \cdot \text{sqrt\_b}}{\text{sqrt\_b} - \text{sqrt\_c}},
+\qquad
+L_1 = \frac{\text{amount1}}{\text{sqrt\_c} - \text{sqrt\_a}},
+\qquad
+L = \min(L_0, L_1)
+$$
+
+哪一边受限决定了实际消耗的比例；另一边可能有剩余。
+
+## 单个 tick 交换步骤
+
+交换以**步骤**进行。每个步骤要么 (a) 在当前 tick 范围内消耗所有可用输入而不跨越 tick，要么 (b) 将价格精确移动到下一个已初始化的 tick。
+
+给定当前状态 `(sqrt_c, L)` 和**向上**的交换（token0 输入、token1 输出、`sqrt_price` 上升），到下一个已初始化 tick 的距离为 `sqrt_t`。在这个微小间隔内，输入与价格之间的关系为：
+
+$$
+\Delta\text{amount0} = L \cdot \left( \frac{1}{\text{sqrt\_c}} - \frac{1}{\text{sqrt\_t}} \right)
+= \frac{L \cdot (\text{sqrt\_t} - \text{sqrt\_c})}{\text{sqrt\_c} \cdot \text{sqrt\_t}}
+$$
+
+和
+
+$$
+\Delta\text{amount1} = L \cdot (\text{sqrt\_t} - \text{sqrt\_c})
+$$
+
+程序执行以下两个操作之一：
+
+- **整个输入能否放下？** 如果剩余输入（扣除费用后）小于到达 `sqrt_t` 所需的 `Δamount0`，则精确求解新的 `sqrt_c'`：
+
+  $$
+  \text{sqrt\_c}' = \frac{L \cdot \text{sqrt\_c}}{L + \Delta\text{input} \cdot \text{sqrt\_c}}
+  $$
+
+  （对于精确输入的 `token0 → token1` 交换）。交换在此步骤完成，不跨越 tick。
+
+- **输入超过 `Δamount0`？** 设置 `sqrt_c' = sqrt_t`，跨越 tick（应用 `liquidity_net`），将剩余输入减少 `Δamount0`，将输出增加 `Δamount1`，然后重复。
+
+对于相反方向（`token1 → token0`、价格下降），公式中 `sqrt_c` 和 `sqrt_t` 交换，另一处进行反演。
+
+完整的 Rust 实现位于 `raydium-clmm/programs/amm/src/libraries/swap_math.rs`。该处的逻辑与 Uniswap v3 的 `SwapMath.computeSwapStep` 一一对应。
+
+## 每个步骤的费用
+
+交易费从**输入**金额扣除，与 CPMM 的约定相同：
+
+```
+step_fee_amount  = ceil(step_input * trade_fee_rate / 1_000_000)
+step_net_input   = step_input - step_fee_amount
+protocol_portion = floor(step_fee_amount * protocol_fee_rate / 1_000_000)
+fund_portion     = floor(step_fee_amount * fund_fee_rate     / 1_000_000)
+lp_portion       = step_fee_amount - protocol_portion - fund_portion
+```
+
+LP 部分按当前在范围内的流动性比例分配，通过更新全局费用增长累加器：
+
+$$
+\text{fee\_growth\_global}_{\text{in}} \mathrel{+}= \text{lp\_portion} \cdot \frac{2^{64}}{L}
+$$
+
+——即，它以*每单位流动性的费用*表示，Q64.64 格式，因此一个在此交换过程中保持在范围内、大小为 `L_i` 的头寸以后会读回 `L_i · Δfee_growth_global / 2^{64}` 欠款代币。
+
+协议和基金部分分别累加到 `PoolState.protocol_fees_token_{0,1}` 和 `PoolState.fund_fees_token_{0,1}`，与 CPMM 相同。它们由 `CollectProtocolFee` / `CollectFundFee` 扫除。
+
+## 范围外和范围内的费用增长
+
+CLMM 费用会计的难点在于：头寸只有在池价格**在其范围内**时才能获得费用。池跟踪全局累积费用；头寸需要知道*在其特定范围内时*的累积费用。
+
+解决方案是基于 **tick 的**累加器。每个 tick 存储：
+
+```
+fee_growth_outside_0_x64
+fee_growth_outside_1_x64
+```
+
+在 tick 初始化时：
+
+- 如果池的价格**高于**该 tick（`tick_current >= this_tick`），则 `fee_growth_outside = fee_growth_global`。（到目前为止赚取的所有内容相对于当前价格都是"范围外"——即在该 tick 下方。）
+- 否则 `fee_growth_outside = 0`。
+
+当价格跨越一个 tick 时，程序**翻转**该 tick 的 `fee_growth_outside`：
+
+$$
+\text{fee\_growth\_outside} \gets \text{fee\_growth\_global} - \text{fee\_growth\_outside}
+$$
+
+这个不变量保证了：对于任何 tick `t`，`fee_growth_outside(t)` 等于当 `tick_current` 在 `t` 的对侧时累积的费用。
+
+**范围 `[tick_lower, tick_upper]` 内的费用增长**然后派生为：
+
+```
+if tick_current >= tick_upper:
+    fee_growth_below = fee_growth_outside(tick_lower)
+    fee_growth_above = fee_growth_global - fee_growth_outside(tick_upper)
+elif tick_current >= tick_lower:
+    fee_growth_below = fee_growth_outside(tick_lower)
+    fee_growth_above = fee_growth_outside(tick_upper)
+else:
+    fee_growth_below = fee_growth_global - fee_growth_outside(tick_lower)
+    fee_growth_above = fee_growth_outside(tick_upper)
+
+fee_growth_inside = fee_growth_global - fee_growth_below - fee_growth_above
+```
+
+这是 Uniswap-v3 的费用增长公式，未做改动。
+
+## 头寸存储的内容及其读取方式
+
+`PersonalPositionState` 存储 `fee_growth_inside_0_last_x64` 和 `fee_growth_inside_1_last_x64`：上次触及头寸时的 `fee_growth_inside` 值。
+
+在任何后续触及（增加、减少、收集）时，程序：
+
+1. 使用上述公式计算当前的 `fee_growth_inside_{0,1}_x64`。
+2. 计算 `Δ = fee_growth_inside_now − fee_growth_inside_last`（u128 上的模运算）。
+3. 向 `tokens_fees_owed_{0,1}` 加上 `Δ × position.liquidity / 2^{64}`。
+4. 将 `fee_growth_inside_last` 更新为新值。
+
+代币实际只在 `CollectFees` / `DecreaseLiquidity` 时从金库中移出，针对 `tokens_fees_owed`。
+
+## 奖励
+
+池最多 3 个奖励流中的每一个都使用相同的增长内机制，在其自己的 `reward_growth_global_x64` 累加器中。在发放时：
+
+$$
+\text{reward\_growth\_global} \mathrel{+}= \text{emission\_per\_second} \cdot \Delta t \cdot \frac{2^{64}}{L}
+$$
+
+——排放量与活跃流动性成反比，因此密集池中的每个头寸每秒支付的比例更低，但总位置数更多。每个头寸欠的奖励为
+
+$$
+\text{reward\_owed} = (\text{reward\_growth\_inside}_{\text{now}} - \text{reward\_growth\_inside}_{\text{last}}) \cdot L / 2^{64}
+$$
+
+并通过 `CollectReward` 领取。见 [`products/clmm/fees`](/zh/products/clmm/fees)。
+
+## 工作示例：精确输入交换
+
+假设：
+
+- `tick_spacing = 60`
+- `sqrt_price_x64 = 1 × 2^{64}`——价格 = 1.0，所以 `tick_current = 0`。
+- 活跃流动性 `L = 1_000_000 × 2^{64}`。
+- 上方下一个已初始化 tick：`t = 60`（sqrt_price_b ≈ `1.003004 × 2^{64}`）。
+- 交易费率：500（0.05%）。
+
+用户：`SwapBaseInput` 精确输入 1,000 token0。
+
+步骤 1——费用：
+
+```
+trade_fee       = ceil(1000 * 500 / 1_000_000)  = 1
+step_net_input  = 999
+```
+
+步骤 2——999 是否适合当前 tick 范围内？
+
+```
+到下一个 tick 的 Δ（amount0）：
+  L · (sqrt_t - sqrt_c) / (sqrt_c * sqrt_t)
+  ≈ 1_000_000 · (1.003004 − 1) / (1 · 1.003004)
+  ≈ 2995.5 token0
+```
+
+`999 < 2995.5`，所以整个输入适合而无需跨越 tick。
+
+步骤 3——新价格：
+
+```
+sqrt_c' = L · sqrt_c / (L + Δin · sqrt_c)
+        = 1_000_000 · 1 / (1_000_000 + 999 · 1)
+        ≈ 0.999001
+```
+
+即 `sqrt_c'` 略低于 `sqrt_c`。请注意，上述公式是针对 `token1 → token0` 交换的。这里的例子是 `token0 → token1`，它驱动价格**上升**而不是下降——所以我们使用 `token0 输入`对应的形式：
+
+```
+sqrt_c' = sqrt_c + Δin / L
+        = 1 + 999 / 1_000_000
+        = 1.000999
+```
+
+（这符合 `token0 → token1` 交换的预期交换方向：`sqrt_c` 随价格上升。）
+
+步骤 4——输出数量：
+
+```
+Δout token1 = L · (sqrt_c' − sqrt_c)
+            = 1_000_000 · 0.000999
+            = 999.00
+```
+
+考虑舍入后，用户收到约 999 token1。费用（1 token0）按 `trade_fee_rate × protocol_fee_rate / 1e6`（基金也类似）在 LP、协议和基金之间分割；LP 部分流入 `fee_growth_global_0_x64`。
+
+## 交换过程中的限价单匹配
+
+当交换步骤跨越持有未平仓限价单的 tick 时，这些订单在 LP 曲线之前以该 tick 的精确价格**消耗交换输入**。在该 tick 内按 `order_phase` 队列 FIFO 匹配。
+
+### `TickState` 上的每队列状态
+
+```
+order_phase                  : u64    单调递增的队列 id
+orders_amount                : u64    当前（最新）队列中输入代币总额
+part_filled_orders_remaining : u64    交换当前填充的队列剩余输入
+unfilled_ratio_x64           : u128   部分填充队列的 Q64.64 填充比率
+```
+
+两队列布局的存在是因为新订单可能在较旧队列仍在被填充**时**在 tick 上开设。新开设的订单加入 `orders_amount` 并继承下一个 `order_phase`；它们直到前一队列完全消耗才能填充。
+
+### 匹配步骤
+
+在交换期间每个 tick 交叉处发生的匹配的伪代码：
+
+```
+fn match_limit_orders_at_tick(tick, swap_input_remaining, sqrt_p):
+    # 1. 首先尝试填充部分填充的队列。
+    if tick.part_filled_orders_remaining > 0:
+        consume = min(tick.part_filled_orders_remaining, swap_input_remaining)
+        # 更新该队列的未填充比率。
+        tick.unfilled_ratio_x64 *= (1 - consume / tick.part_filled_orders_remaining)
+        tick.part_filled_orders_remaining -= consume
+        swap_input_remaining -= consume
+        if tick.part_filled_orders_remaining == 0:
+            tick.unfilled_ratio_x64 = 0
+        if swap_input_remaining == 0: return
+
+    # 2. 提升活跃队列。
+    if tick.orders_amount > 0:
+        tick.part_filled_orders_remaining = tick.orders_amount
+        tick.orders_amount = 0
+        tick.order_phase += 1
+        tick.unfilled_ratio_x64 = ONE_X64
+        # 用新提升的队列递归。
+        return match_limit_orders_at_tick(tick, swap_input_remaining, sqrt_p)
+
+    return  # tick 没有更多限价单
+```
+
+流向限价单拥有者的输出代币在每个交换时**不**转移。它们虚拟存放在池的输出金库中，直到订单拥有者调用 `SettleLimitOrder`（或 `DecreaseLimitOrder`）。池仅通过 `unfilled_ratio_x64` 跟踪队列现在有多少被填充。每个 `LimitOrderState` 在开设时存储其自己的 `(order_phase, unfilled_ratio_x64)` 快照，因此结算可简化为：
+
+```
+filled_amount  = total_amount × (1 − tick_now.unfilled_ratio_x64 / order.unfilled_ratio_x64)
+                if tick_now.order_phase > order.order_phase
+                else 0
+output_amount  = price_at(tick_index) × filled_amount   # 根据方向调整
+```
+
+这个 O(1) 结算是整个队列设计的意义——一个 tick 可以填充任意数量的订单而不产生每个订单的 gas。
+
+### 与 LP 曲线的交互
+
+在交换步骤中，限价单匹配发生**在** tick（零 `Δsqrt_price`）；LP 曲线消耗发生在 tick **之间**。因此顺序为：
+
+1. 跨越 tick `t_cross`（首先应用 LP `liquidity_net` 变化，因为这是 Uniswap-V3 的做法）。
+2. 填充坐在 `t_cross` 的任何限价单。
+3. 沿 LP 曲线继续到下一个已初始化 tick 或 `swap_input` 耗尽。
+
+因此限价单给交易者在恰好订单 tick 价格处的*更多*有效流动性（一个价格改进效果），代价是 LP 在该部分交换量上不赚取费用——交易的限价单部分对交换者是无费的，因为限价单下单者在充当造市商。动态费用增加（如果启用）仍适用于同一交换的 LP 部分。
+
+## 动态费用派生
+
+`PoolState.dynamic_fee_info` 携带波动率状态。每个交换步骤计算每步费率为：
+
+$$
+\text{fee\_rate}_{\text{total}} = \text{trade\_fee\_rate}_{\text{config}} +
+\underbrace{\frac{\text{dynamic\_fee\_control} \cdot (\text{vol\_acc} \cdot \text{tick\_spacing})^2}
+{D_{\text{ctrl}} \cdot S_{\text{vol}}^2}}_{\text{动态增加}}
+$$
+
+其中：
+
+- $D_{\text{ctrl}} = 100{,}000$ — `DYNAMIC_FEE_CONTROL_DENOMINATOR`
+- $S_{\text{vol}} = 10{,}000$ — `VOLATILITY_ACCUMULATOR_SCALE`
+- `vol_acc` 是更新规则后的每次交换累加器
+- `tick_spacing` 来自 `PoolState.tick_spacing`
+
+结果被限制在 $100{,}000 / 10^6 = 10\%$。
+
+### 累加器更新
+
+两个规则在每次交换中按顺序应用：
+
+**衰减。** 参考底线根据自上次更新以来的时间衰减：
+
+$$
+\text{vol\_ref} = \begin{cases}
+0 & \text{if } \Delta t > \text{decay\_period} \\
+\text{vol\_acc}_{\text{prev}} \cdot \dfrac{\text{reduction\_factor}}{10{,}000} & \text{if } \text{filter\_period} < \Delta t \le \text{decay\_period} \\
+\text{vol\_ref}_{\text{prev}} & \text{if } \Delta t \le \text{filter\_period}
+\end{cases}
+$$
+
+**累积。** 新累加器是参考加上自前一参考索引以来的 tick 距离：
+
+$$
+\text{vol\_acc} = \min\left(
+    \text{vol\_ref} + \left| t_{\text{ref}} - t_{\text{now}} \right| \cdot S_{\text{vol}},
+    \text{max\_vol\_acc}
+\right)
+$$
+
+`tick_spacing_index_reference`（$t_{\text{ref}}$）以 tick 间距单位表示，而非原始 tick：$t_{\text{ref}} = \lfloor \text{tick\_current} / \text{tick\_spacing} \rfloor$。
+
+### 为什么在 tick 距离上是抛物线
+
+对累加器平方意味着费用随价格离其参考点走过距离的**平方**而上升。经验上这与随机游走压力下价格方差缩放相匹配：2× tick 偏移意味着 4× 隐含波动率，因此收费 4× 增加。`dynamic_fee_control` 参数校准绝对水平。
+
+`filter_period` 窗口防止微小的次秒级振荡（例如 MEV 机器人夹击）充气累加器。`decay_period` 窗口防止单个过去的峰值在市场已平静后无限期收费。
+
+## 数值稳健性
+
+- 所有中间乘积通过 `u128` 或 `u256` 形状算术进行。CLMM 直接使用从 Uniswap v3 移植的 `U128Sqrt` 辅助工具和 `FullMath::mulDiv` 模式。
+- 除法舍入按步选择以在本地强制不变量 `k' ≥ k`。`SwapBaseInput` 将输出**向下**舍入；`SwapBaseOutput` 将输入**向上**舍入。
+- Tick 交叉使 `PoolState.liquidity` 变为零被允许（价格可以遍历"流动性洞"）但交换仅推进到下一个已初始化 tick 而不消耗输入，不收费。
+- 溢出防护：`sqrt_price_x64` 保持在包含范围 `[MIN_SQRT_PRICE_X64, MAX_SQRT_PRICE_X64]` 内，对应于 `[MIN_TICK, MAX_TICK]`。会推过任一边界的交换以 `SqrtPriceLimitOverflow` 还原。
+
+## 接下来去哪里
+
+- [`products/clmm/ticks-and-positions`](/zh/products/clmm/ticks-and-positions) 了解 tick 地图如何参与 walk。
+- [`products/clmm/fees`](/zh/products/clmm/fees) 了解数学的费用/奖励方面的细节。
+- [`algorithms/clmm-math`](/zh/algorithms/clmm-math) 了解 `L = sqrt(x · y)` 及范围 vs 流动性公式背后的推导。
+
+资源：
+
+- [`raydium-io/raydium-clmm` — `libraries/swap_math.rs`, `libraries/tick_math.rs`](https://github.com/raydium-io/raydium-clmm)
+- "Uniswap v3 Core" 白皮书，§6–7

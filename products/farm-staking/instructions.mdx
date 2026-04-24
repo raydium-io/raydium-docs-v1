@@ -1,0 +1,261 @@
+---
+title: "Farm / Staking instructions"
+description: "CreateFarm, Deposit, Withdraw, Harvest, AddReward / SetRewards / RestartRewards, WithdrawReward — the full instruction surface across farm v3, v5, and v6."
+---
+
+<Info>
+  Farm instructions are version-specific. A `Deposit` on v6 is not callable on a v5 farm and vice versa. The SDK dispatches by reading the farm's program owner; for on-chain CPI you must choose the right program ID up front.
+</Info>
+
+## Instruction inventory
+
+| Purpose | v3 | v5 | v6 |
+|---------|----|----|----|
+| Create a farm | `CreateFarm` | `CreateFarm` | `CreateFarm` |
+| Add a user ledger (may be implicit) | `CreateUserLedger` | `CreateAssociatedLedger` | Implicit in `Deposit` |
+| Stake | `Deposit` | `Deposit` | `Deposit` |
+| Unstake | `Withdraw` | `Withdraw` | `Withdraw` |
+| Claim rewards only | N/A (use `Deposit 0`) | N/A (use `Deposit 0`) | `Harvest` |
+| Add a reward stream after creation | N/A | `AddReward` | `AddReward` |
+| Edit an existing reward stream | N/A | `SetRewards` | `SetRewards` |
+| Restart a reward after end_time | N/A | `RestartRewards` | `RestartRewards` |
+| Withdraw unclaimed reward budget (admin) | N/A | `WithdrawReward` | `WithdrawReward` |
+
+On v3 and v5, the canonical way to claim rewards without changing stake is to call `Deposit` with `amount = 0`. The program treats this as a pure settlement. v6 introduced an explicit `Harvest` for clarity.
+
+The SDK abstracts all of these behind `raydium.farm.deposit({ ... })` etc. The sections below document the underlying account lists for integrators who need to build instructions manually (aggregators, monitoring tools, SDK extensions).
+
+## `CreateFarm` (v6)
+
+Spin up a new v6 farm.
+
+**Arguments**
+
+```
+reward_info_count: u8               // number of reward streams at creation (1..=5)
+reward_infos: [
+  {
+    open_time:            u64,
+    end_time:             u64,
+    emission_per_second_x64: u128,   // Q64.64
+    mint:                 Pubkey,    // reward mint
+    token_program:        Pubkey,    // SPL or Token-2022
+  }
+]
+```
+
+**Accounts** (abridged, for `reward_info_count = 1`)
+
+| # | Name | W | S | Notes |
+|---|------|---|---|-------|
+| 1 | `creator` | W | S | Pays rent, owns the farm. |
+| 2 | `farm_state` | W |   | New `FarmState` account. |
+| 3 | `farm_authority` |   |   | PDA `[farm_id]`. |
+| 4 | `staking_mint` |   |   | |
+| 5 | `staking_vault` | W |   | Created as the authority's ATA or a PDA vault. |
+| 6 | `staking_token_program` |   |   | |
+| 7 | `reward_mint` |   |   | |
+| 8 | `reward_vault` | W |   | Will receive the initial budget. |
+| 9 | `reward_token_program` |   |   | |
+| 10 | `reward_sender_ata` | W |   | Creator's ATA on the reward mint; drained by this instruction. |
+| 11 | `system_program` |   |   | |
+| 12 | `token_program` |   |   | |
+| 13 | `associated_token_program` |   |   | |
+| 14 | `rent` |   |   | |
+
+**Preconditions**
+
+- `open_time > now`, `end_time > open_time`.
+- `creator` ATAs hold at least `emission_per_second_x64 × (end_time − open_time) / 2^64` of the reward mint.
+- `staking_mint` has no freeze authority, or freeze authority is disabled.
+
+**Postconditions**
+
+- `FarmState` initialized, `total_staked = 0`.
+- Reward vault(s) funded with the full stream budget.
+- The creator's reward ATA is drained by that amount.
+
+## `Deposit` (v6)
+
+Stake `amount` of the staking mint.
+
+**Arguments**
+
+```
+amount: u64
+```
+
+**Accounts**
+
+| # | Name | W | S |
+|---|------|---|---|
+| 1 | `user` | W | S |
+| 2 | `user_ledger` | W |   |
+| 3 | `farm_state` | W |   |
+| 4 | `farm_authority` |   |   |
+| 5 | `staking_vault` | W |   |
+| 6 | `user_staking_ata` | W |   |
+| 7..(7+n) | `reward_vault_{i}` | W |   |
+| ... | `user_reward_ata_{i}` | W |   |
+| last−2 | `system_program` |   |   |
+| last−1 | `token_program` |   |   |
+| last | `associated_token_program` |   |   |
+
+If the `user_ledger` does not exist, the SDK prepends a `CreateAccount`-style ix; the v6 program can also lazily create it given the system program account. Remaining accounts pattern: for each live reward, append `(reward_vault, user_reward_ata)` so the settlement can pay out.
+
+**Effect**
+
+1. Refresh `reward_per_share_x64[i]` for each live reward stream using the lazy update formula.
+2. Compute `pending_i = user_ledger.deposited × reward_per_share_x64[i] / 2^64 − user_ledger.reward_debts[i]`.
+3. Transfer `pending_i` from `reward_vault_{i}` to `user_reward_ata_{i}`.
+4. Transfer `amount` staking mint from `user_staking_ata` to `staking_vault`.
+5. Update `user_ledger.deposited += amount` and re-snapshot `reward_debts[i]`.
+6. Update `farm_state.total_staked += amount`.
+
+**Preconditions**
+
+- `amount > 0` for a true stake (v6 forbids `amount = 0` — use `Harvest` for claim-only).
+- `user_staking_ata` holds at least `amount`.
+- Each live reward vault holds at least the pending owed to this user.
+
+## `Withdraw` (v6)
+
+Unstake `amount`.
+
+**Arguments**
+
+```
+amount: u64
+```
+
+**Accounts** — identical to `Deposit`.
+
+**Effect** — same settlement as `Deposit`, then move staking mint back to the user: `staking_vault → user_staking_ata`. `total_staked` and `user_ledger.deposited` both decrease.
+
+**Preconditions**
+
+- `amount ≤ user_ledger.deposited`.
+- Farm is not paused.
+
+## `Harvest` (v6)
+
+Claim pending rewards without changing stake.
+
+**Arguments** — none.
+
+**Accounts** — same as `Deposit`, no staking-side movement.
+
+**Effect** — refresh `reward_per_share_x64[i]`, pay out `pending_i`, re-snapshot `reward_debts[i]`. No change to `total_staked` or `deposited`.
+
+## `AddReward` (v5/v6)
+
+Add a new reward stream to an existing farm that has an unused slot.
+
+**Arguments**
+
+```
+reward_info: {
+  open_time:            u64,
+  end_time:             u64,
+  emission_per_second_x64: u128,
+  mint:                 Pubkey,
+  token_program:        Pubkey,
+}
+```
+
+**Preconditions**
+
+- A free slot exists (`reward_info_count < 5` on v6, `< 2` on v5).
+- `open_time ≥ now` (may be in the future) or `open_time < now` is allowed only if the program version permits it — v6 does, v5 does not.
+
+**Postconditions**
+
+- The new stream is initialized at index `reward_info_count`, `reward_info_count++`.
+- The reward vault is credited with the full stream budget from the caller's ATA.
+
+**Common error** — `RewardAlreadyExists` if the mint collides with an existing slot.
+
+## `SetRewards` (v5/v6)
+
+Extend or top up an existing reward stream. Cannot change the mint; cannot shorten `end_time`; cannot lower `emission_per_second_x64` once running.
+
+**Arguments**
+
+```
+reward_index:         u8
+new_open_time:        u64,
+new_end_time:         u64,
+new_emission_per_second_x64: u128,
+```
+
+**Preconditions**
+
+- The stream is still running (`reward_state == 1`).
+- `new_end_time ≥ current end_time`.
+- The additional budget required `(new_emission × new_duration − already_emissioned)` is present in the sender's ATA and is transferred to the reward vault by the instruction.
+
+On v5, the equivalent call is `SetRewards` with a smaller argument set (no per-second changes on live streams).
+
+## `RestartRewards` (v5/v6)
+
+Restart a stream after its `end_time` has passed. Conceptually the same as `AddReward` for a mint that already has a slot.
+
+**Arguments** — identical shape to `AddReward` at that index.
+
+**Preconditions**
+
+- `reward_state == 2` (ended).
+- Caller is `reward_sender` of the slot (v6) or farm `owner` (v5).
+
+## `WithdrawReward` (v5/v6)
+
+Admin sweep of unclaimed reward vault balance after a stream has ended and all stakers have had a chance to harvest.
+
+**Arguments**
+
+```
+reward_index: u8
+```
+
+**Preconditions**
+
+- Stream is ended (`reward_state == 2`).
+- `reward_total_emissioned == reward_claimed + vault_balance` (nothing is currently owed).
+
+**Effect** — moves the remainder to `reward_sender_ata`. The program does not prevent withdrawing while stakers still have pending claims; the admin is expected to harvest on behalf of lagging stakers first (or let them harvest). If you sweep early, users lose access to their unclaimed rewards. **Do not call this early.**
+
+## v5 variations
+
+- `Deposit` / `Withdraw` have the same shape as v6 but use up to 2 reward slots and `reward_per_share` is `u128` (fixed-point with a different radix).
+- `CreateAssociatedLedger` is a required separate call before the first `Deposit`; v6 merged it.
+- `AddReward` is available, `Harvest` is not (use `Deposit 0`).
+
+## v3 variations
+
+- Single reward stream. No `AddReward`, no second slot.
+- `Deposit 0` is the only way to claim.
+- `CreateUserLedger` must be called before the first `Deposit`.
+
+## State-change matrix
+
+| Instruction | `total_staked` | `user.deposited` | `reward_per_share` | Reward vaults |
+|-------------|----------------|------------------|---------------------|----------------|
+| `CreateFarm` | 0 | — | 0 | funded by creator |
+| `Deposit(n)` | +n | +n | refreshed | −pending (paid out) |
+| `Withdraw(n)` | −n | −n | refreshed | −pending |
+| `Harvest` | — | — | refreshed | −pending |
+| `AddReward` | — | — | — | +new budget |
+| `SetRewards` | — | — | — | +delta budget |
+| `RestartRewards` | — | — | — | +budget |
+| `WithdrawReward` | — | — | — | −remainder |
+
+## Where to go next
+
+- [`products/farm-staking/code-demos`](/products/farm-staking/code-demos) — TypeScript examples.
+- [`products/farm-staking/accounts`](/products/farm-staking/accounts) — `FarmState` / `UserLedger` / `UserStake` layouts.
+- [`reference/error-codes`](/reference/error-codes) — farm error enum.
+
+Sources:
+
+- [Raydium SDK v2 `Farm` module](https://github.com/raydium-io/raydium-sdk-V2)
+- Raydium farm program source (v3 / v5 / v6)

@@ -1,0 +1,161 @@
+---
+title: "Routing-Mathematik"
+description: "Der Router führt selbst keine Preisberechnung durch; jeder Hop delegiert an das Kurvenmodell seines Pool-Programms. Slippage bei Multi-Hop-Routen kumuliert; CLMM-Hops verwenden limit_prices."
+---
+
+<Info>
+  **Diese Seite wurde mit KI automatisch übersetzt. Maßgeblich ist stets die englische Version.**
+
+  [Englische Version ansehen →](/products/routing/math)
+</Info>
+
+## Der Router führt keine Berechnung durch
+
+Das Routing-Programm **implementiert keinerlei Preislogik**. Es ist ein reiner Orchestrator: Es akzeptiert eine Route, übergiebt Konten an untergeordnete Programme und verkauft Tokenflüsse aneinander.
+
+Jeder Hop berechnet Preise anhand seines eigenen Pool-Programm-Kurvenmodells:
+
+- **AMM v4 Hops:** verwenden die Constant-Product-Formel (`x · y = k`) mit OpenBook-Hybrid-Preisgestaltung. Siehe [`products/amm-v4/math`](/de/products/amm-v4/math).
+- **CPMM Hops:** verwenden die Constant-Product-Formel mit konfigurierbaren Gebührentafeln. Siehe [`products/cpmm/math`](/de/products/cpmm/math).
+- **CLMM Hops:** verwenden Tick-Mathematik für konzentrierte Liquidität. Siehe [`algorithms/clmm-math`](/de/algorithms/clmm-math).
+- **Stable Hops:** verwenden die Stable-Swap-Kurve für ähnliche Assets. Siehe [`products/stable/math`](/de/products/stable/math).
+
+Die einzige Rolle des Routers ist:
+
+1. Den Swap-Befehl jedes Pools über CPI aufrufen.
+2. Den Ausgabebetrag erfassen.
+3. Ihn als Eingabebetrag an den nächsten Hop weitergeben.
+4. Die endgültige Ausgabe gegen das Slippage-Limit des Aufrufers prüfen.
+
+## Slippage-Kumulierung
+
+Bei einer Multi-Hop-Route kumuliert sich die Slippage bei jedem Hop. Eine kleine Slippage beim Hop 1 wird zu einer größeren Slippage beim Hop 2, da das Volumen für Hop 2 bereits reduziert ist.
+
+**Beispiel:**
+
+```
+Route: USDC → SOL → STEP
+
+Pool 1 (USDC / SOL):
+  Eingabe: 1000 USDC
+  Slippage: 1% (Spot würde 0,5 SOL geben, Sie erhalten aber 0,495 SOL)
+  Ausgabe: 0,495 SOL
+
+Pool 2 (SOL / STEP):
+  Eingabe: 0,495 SOL (bereits reduziert)
+  Slippage: 1% (Spot würde 495 STEP geben, Sie erhalten aber 490 STEP)
+  Ausgabe: 490 STEP
+
+Gesamteffektive Slippage auf USDC → STEP: 1,99%, nicht 1% + 1% = 2%.
+```
+
+Wenn Sie `minimum_amount_out` angeben, prüft der Router Ihre endgültige Ausgabe gegen dieses globale Limit. Jeder Hop prüft auch seinen eigenen Swap gegen seine lokale Gebührenstruktur, aber der Router führt keine Neubewertung während der Route durch – Sie müssen die Route vorab berechnen und genug Slippage-Toleranz einkalkulieren.
+
+## CLMM Hops und limit_prices
+
+Für jeden Hop in einen CLMM-Pool prüft der Router, dass die `sqrt_price_x64` des Pools innerhalb einer festgelegten Grenze liegt. Die Grenzen werden als `VecDeque<u128>` namens `limit_prices` übergeben:
+
+- Ein `sqrt_price_x64` pro CLMM-Hop in der Route.
+- `sqrt_price_x64` ist die Tick-basierte Preisdarstellung, die von CLMM verwendet wird. Siehe [`algorithms/clmm-math`](/de/algorithms/clmm-math) für die Definition.
+- Der Router erzwingt:
+
+```
+  sqrt_price_lower <= pool.sqrt_price_x64 <= sqrt_price_upper
+```
+
+für jeden CLMM-Hop und lehnt den Swap ab, wenn der Preis außerhalb der Grenzen liegt.
+
+### Befehlsvarianten und limit_prices
+
+- **`SwapBaseInWithUserAccount`, `SwapBaseOutWithUserAccount` (Legacy, Tags 0 und 1):** die `limit_prices` VecDeque ist **erforderlich**. Eine leere Deque wird mit einem Fehler abgelehnt, falls ein Hop ein CLMM-Pool ist. Sie müssen einen Preis pro CLMM-Hop in der richtigen Reihenfolge angeben.
+
+- **`SwapBaseIn`, `SwapBaseOut` (Aktuell, Tags 8 und 9):** die `limit_prices` VecDeque ist **optional**. Eine leere Deque wird stillschweigend ignoriert; es wird keine Preisüberprüfung durchgeführt. Neuer Code sollte diese verwenden.
+
+### limit_prices erstellen
+
+Für eine Route mit M CLMM-Hops sollte die Deque genau M Einträge enthalten. Ordnen Sie sie nach Hop:
+
+```
+limit_prices = [
+  sqrt_price_for_first_clmm_hop,
+  sqrt_price_for_second_clmm_hop,
+  ...
+]
+```
+
+### Wann limit_prices überprüfen
+
+Der `sqrt_price_x64` ist ein Snapshot des aktuellen Preises des Pools. Er ändert sich kontinuierlich während Swaps ausgeführt werden. Sie sollten:
+
+1. Den aktuellen Zustand des Pools von On-Chain abrufen.
+2. Akzeptable Grenzen berechnen (z. B. ±0,5% des aktuellen Preises).
+3. Diese Grenzen in `limit_prices` kodieren.
+4. Die Grenzen in Ihren Router-Befehl einbeziehen.
+
+Falls der Preis des Pools über Ihre Grenzen hinaus driftet, bevor die Transaktion landet, wird der Router sie ablehnen.
+
+## Gebührenbehandlung
+
+Jeder Pool erhebt seine eigene Gebühr nach seiner Konfiguration:
+
+- **AMM v4:** 0,25% (festgelegt), aufgeteilt zwischen LP, Protokoll und Fonds.
+- **CPMM:** konfigurierbar pro `AmmConfig` (Standard 0,25%, Aufteilung variiert je nach Stufe).
+- **CLMM:** konfigurierbar pro Pool, vom Eingabebetrag abgezogen.
+- **Stable:** wie AMM v4, 0,25% aufgeteilt.
+
+Der Router **erhebt selbst keine Gebühren**. Die gesamte Gebührenbehandlung wird an jeden untergeordneten Pool delegiert. Die Ausgabe von Hop N hat bereits die Gebühr dieses Hops abgezogen.
+
+Siehe die Gebührendokumentation des jeweiligen Pools:
+
+- [`products/amm-v4/fees`](/de/products/amm-v4/fees)
+- [`products/cpmm/fees`](/de/products/cpmm/fees)
+- [`products/clmm/fees`](/de/products/clmm/fees) (falls verfügbar)
+- [`products/stable/fees`](/de/products/stable/fees) (falls verfügbar)
+
+## Beispiel für Multi-Hop-Buchhaltung
+
+Angenommen, Sie führen USDC → SOL → STEP über zwei Constant-Product-Pools durch, die jeweils eine Gebühr von 0,25% erheben:
+
+```
+Eingabe: 1000 USDC
+Pool 1 (USDC/SOL):
+  Eingezogene Gebühr: ceil(1000 * 0,25%) = 2,5 USDC
+  Nettoeingabe zur Kurve: 997,5 USDC
+  Kurvenausgabe (vor Slippage): 0,5 SOL
+  Slippage-Spielraum: Nehmen Sie 1% an, Sie erhalten ~0,495 SOL
+
+Pool 2 (SOL/STEP):
+  Eingabe: 0,495 SOL
+  Eingezogene Gebühr: ceil(0,495 * 0,25%) ≈ 0,001 SOL
+  Nettoeingabe zur Kurve: 0,494 SOL
+  Kurvenausgabe: ~494 STEP
+  Slippage-Spielraum: 1%, Sie erhalten ~489 STEP
+
+Endausgabe: ~489 STEP
+```
+
+Der Router prüft:
+
+```
+489 >= minimum_amount_out  // angegeben vom Aufrufer
+```
+
+Falls falsch, schlägt die gesamte Route atomar fehl.
+
+## Überlegungen zur Präzision
+
+Wie alle Solana-Programme verwendet der Router Integer-Arithmetik:
+
+- Alle Beträge sind `u64` (Lamports oder kleinste Token-Einheiten).
+- Kurvenberechnungen verwenden ggf. `u128`-Zwischenwerte, um Überläufe zu vermeiden.
+- Rundungskonventionen hängen vom untergeordneten Programm ab. Der Router führt kein Neu-Rounding durch.
+
+Wenn ein Hop aufgrund extremer Preisrelationen einen Betrag von Null erzeugt (z. B. Tausch von 1 Lamport in einem 1B:1-Pool), gibt der Router diese Null an den nächsten Hop weiter, der diese möglicherweise als unzureichend ablehnt. Siehe die Fehlercodes des jeweiligen Pools.
+
+## Nächste Schritte
+
+- [`products/amm-v4/math`](/de/products/amm-v4/math) — Constant-Product-Mathematik.
+- [`products/cpmm/math`](/de/products/cpmm/math) — CPMM Constant-Product mit Token-2022.
+- [`algorithms/clmm-math`](/de/algorithms/clmm-math) — Preisgestaltung mit konzentrierter Liquidität.
+- [`products/stable/math`](/de/products/stable/math) — Stable-Swap-Kurve.
+- [`products/routing/code-demos`](/de/products/routing/code-demos) — Beispiele für Angebotserstellung vor Routing.

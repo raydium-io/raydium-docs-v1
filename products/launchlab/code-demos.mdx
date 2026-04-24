@@ -1,0 +1,279 @@
+---
+title: "LaunchLab code demos"
+description: "End-to-end TypeScript: create a LaunchLab launch, buy and sell on the bonding curve, graduate into a CPMM pool, and collect creator fees."
+---
+
+<Info>
+  **Version banner.**
+
+  - SDK: `@raydium-io/raydium-sdk-v2@0.2.42-alpha`
+  - Cluster: Solana `mainnet-beta`
+  - Program ID: see [`reference/program-addresses`](/reference/program-addresses)
+  - Last verified: 2026-04
+
+  Pin the SDK version in your `package.json`. The bonding-curve interface has evolved between minor releases.
+</Info>
+
+## Setup
+
+Demos here mirror files in [`raydium-sdk-V2-demo/src/launchpad`](https://github.com/raydium-io/raydium-sdk-V2-demo/tree/master/src/launchpad). Bootstrap follows the demo repo's [`config.ts.template`](https://github.com/raydium-io/raydium-sdk-V2-demo/blob/master/src/config.ts.template):
+
+```ts
+import { Connection, Keypair, clusterApiUrl, PublicKey } from "@solana/web3.js";
+import { Raydium, TxVersion } from "@raydium-io/raydium-sdk-v2";
+import BN from "bn.js";
+import fs from "node:fs";
+
+const connection = new Connection(process.env.RPC_URL ?? clusterApiUrl("mainnet-beta"));
+const owner = Keypair.fromSecretKey(
+  new Uint8Array(JSON.parse(fs.readFileSync(process.env.KEYPAIR!, "utf8"))),
+);
+const raydium = await Raydium.load({
+  owner,
+  connection,
+  cluster: "mainnet",
+  disableFeatureCheck: true,
+  blockhashCommitment: "finalized",
+});
+export const txVersion = TxVersion.V0;
+```
+
+## Create a launch
+
+Source: [`src/launchpad/createMint.ts`](https://github.com/raydium-io/raydium-sdk-V2-demo/blob/master/src/launchpad/createMint.ts) (and [`createBonkMintApi.ts`](https://github.com/raydium-io/raydium-sdk-V2-demo/blob/master/src/launchpad/createBonkMintApi.ts) for the API-driven Bonk variant)
+
+```ts
+import { NATIVE_MINT } from "@solana/spl-token";
+
+const { execute, extInfo } = await raydium.launchpad.createLaunchpad({
+  programId: /* LaunchLab program ID from reference/program-addresses */,
+  // Token metadata for the new base mint:
+  name:   "Example Token",
+  symbol: "EXMPL",
+  uri:    "https://example.com/metadata.json",
+  decimals: 6,
+
+  // Curve params:
+  curveType: 0,                                      // 0 = quadratic
+  supply:    new BN(1_000_000_000).mul(new BN(10).pow(new BN(6))), // 1B base (6 dec)
+  graduationFractionBps: 8000,                       // 80% → graduation
+  initialK:  new BN("40"),                           // curve shape parameter
+
+  // Quote side:
+  quoteMint: NATIVE_MINT,                            // WSOL
+  openTime:  new BN(Math.floor(Date.now() / 1000) + 60),  // opens in 1min
+
+  // Fee policy:
+  fees: {
+    buyNumerator:   new BN(100),                     // 1.00%
+    buyDenominator: new BN(10_000),
+    sellNumerator:  new BN(100),
+    sellDenominator: new BN(10_000),
+    lpShare:         new BN(60),
+    creatorShare:    new BN(20),
+    protocolShare:   new BN(20),
+    totalShare:      new BN(100),
+  },
+
+  postGraduationLpPolicy: "burn",                    // "burn" | "lock" | "toCreator"
+
+  txVersion: TxVersion.V0,
+});
+
+const { txId } = await execute({ sendAndConfirm: true });
+console.log("Launch:", extInfo.launchState.toBase58());
+console.log("Base mint:", extInfo.baseMint.toBase58());
+console.log("Create tx:", txId);
+```
+
+Notes:
+
+- `initialK` is the scale factor for the quadratic curve. Tune it to target a specific opening CPMM price at graduation. See [`products/launchlab/bonding-curve`](/products/launchlab/bonding-curve) for the derivation.
+- The SDK handles creating the base mint, the metadata PDA, and both vaults in a single transaction. It may exceed 1232 bytes if the metadata URI is long; in that case the SDK splits into two transactions.
+- After `Initialize`, the launch is not tradable until `openTime`. Set `openTime` a minute or two ahead to give front-runners less chance to grab the first buy.
+
+## Fetch launch state
+
+```ts
+const launchId = new PublicKey("<LAUNCH_STATE>");
+
+const launch = await raydium.launchpad.getLaunchById({ launchId });
+console.log("Status:", ["Active","Graduated","Cancelled"][launch.status]);
+console.log("Base sold:", launch.baseSold.toString(),
+            "/", launch.baseSupplyMax.toString());
+console.log("Quote collected:", launch.quoteReserveReal.toString(),
+            "target:", launch.quoteReserveTarget.toString());
+if (launch.status === 1) {
+  console.log("Post-graduation CPMM pool:", launch.cpmmPoolState.toBase58());
+}
+```
+
+`getLaunchById` returns the decoded `LaunchState` plus the computed "progress toward graduation" fraction as a `Decimal`.
+
+## Buy — exact quote in
+
+Source: [`src/launchpad/buy.ts`](https://github.com/raydium-io/raydium-sdk-V2-demo/blob/master/src/launchpad/buy.ts)
+
+```ts
+const quoteIn        = new BN(1).mul(new BN(10).pow(new BN(9)));  // 1 SOL
+const minimumBaseOut = new BN(0);  // accept any; tighten for production
+
+// Preview the quote off-chain so your UI can show expected base_out:
+const preview = raydium.launchpad.computeBuyBase({
+  launchState: launch,
+  quoteIn,
+});
+console.log("Expected base_out:", preview.baseOut.toString(),
+            "price impact:", preview.priceImpact.toString());
+
+const { execute } = await raydium.launchpad.buyExactIn({
+  launchInfo: launch,
+  quoteIn,
+  minimumBaseOut,
+  txVersion: TxVersion.V0,
+});
+
+const { txId } = await execute({ sendAndConfirm: true });
+console.log("Buy tx:", txId);
+```
+
+`computeBuyBase` mirrors the on-chain Newton solver (quadratic curve) or the closed-form CPMM-inverse (curve_type 1). Use it to populate the "You receive" UI field.
+
+## Buy — exact base out
+
+```ts
+const baseOut         = new BN(1_000_000).mul(new BN(10).pow(new BN(6)));  // 1M base
+const maximumQuoteIn  = new BN(2).mul(new BN(10).pow(new BN(9)));          // cap at 2 SOL
+
+const { execute } = await raydium.launchpad.buyExactOut({
+  launchInfo: launch,
+  baseOut,
+  maximumQuoteIn,
+  txVersion: TxVersion.V0,
+});
+
+await execute({ sendAndConfirm: true });
+```
+
+Useful for "buy exactly X tokens" UIs. Rejects with `ExceededSlippage` if the curve has moved enough that the quote requirement now exceeds `maximumQuoteIn`.
+
+## Sell
+
+Source: [`src/launchpad/sell.ts`](https://github.com/raydium-io/raydium-sdk-V2-demo/blob/master/src/launchpad/sell.ts)
+
+```ts
+const baseIn           = new BN(500_000).mul(new BN(10).pow(new BN(6)));  // 0.5M base
+const minimumQuoteOut  = new BN(0);
+
+const { execute } = await raydium.launchpad.sellExactIn({
+  launchInfo: launch,
+  baseIn,
+  minimumQuoteOut,
+  txVersion: TxVersion.V0,
+});
+
+await execute({ sendAndConfirm: true });
+```
+
+The curve's sell path is symmetric to the buy path: reducing `base_sold` by `baseIn` returns `quote_out` equal to the integrated area under the curve between `base_sold − baseIn` and `base_sold`, minus the sell fee.
+
+## Auto-graduate on the threshold-crossing buy
+
+The SDK chains a `Graduate` instruction inside the `buy*` transaction when it detects the post-buy state will cross the threshold:
+
+```ts
+const { execute, willGraduate } = await raydium.launchpad.buyExactIn({
+  launchInfo: launch,
+  quoteIn: new BN(100).mul(new BN(10).pow(new BN(9))),    // large buy
+  minimumBaseOut: new BN(0),
+  txVersion: TxVersion.V0,
+  autoGraduate: true,                                      // default
+});
+
+if (willGraduate) {
+  console.log("This buy will trigger graduation.");
+}
+
+const { txId } = await execute({ sendAndConfirm: true });
+```
+
+Because `Graduate` is permissionless, anyone (including an MEV bot) can race to land the first `Graduate` after the threshold is crossed — typically seconds later, not minutes. The first-lander just pays the rent for the CPMM pool accounts; they get no other benefit.
+
+## Manual `Graduate`
+
+If `autoGraduate` was off or the threshold-crossing transaction failed, you can fire the graduation separately:
+
+```ts
+const { execute } = await raydium.launchpad.graduate({
+  launchInfo: launch,
+  txVersion: TxVersion.V0,
+});
+
+await execute({ sendAndConfirm: true });
+```
+
+Reverts with `NotAtThreshold` if `quote_reserve_real < quote_reserve_target` at submission time. Retry-safe — a second `Graduate` attempt after success reverts with `NotActive`.
+
+## Collect creator fees
+
+Source: [`src/launchpad/claimCreatorFee.ts`](https://github.com/raydium-io/raydium-sdk-V2-demo/blob/master/src/launchpad/claimCreatorFee.ts) (single mint) and [`collectAllCreatorFees.ts`](https://github.com/raydium-io/raydium-sdk-V2-demo/blob/master/src/launchpad/collectAllCreatorFees.ts) (batched)
+
+```ts
+const { execute } = await raydium.launchpad.collectCreatorFees({
+  launchInfo: launch,
+  txVersion: TxVersion.V0,
+});
+
+await execute({ sendAndConfirm: true });
+```
+
+Transfers the accrued creator-fee-counter quote amount to the creator's ATA on the quote mint. Callable pre- or post-graduation; use it periodically rather than waiting for a huge balance to accumulate.
+
+## Track a launch through its lifecycle
+
+Putting it together, a monitoring script might look like:
+
+```ts
+async function watch(launchId: PublicKey) {
+  while (true) {
+    const launch = await raydium.launchpad.getLaunchById({ launchId });
+    const progress =
+      Number(launch.quoteReserveReal) /
+      Number(launch.quoteReserveTarget);
+
+    console.log(
+      `status=${["Active","Graduated","Cancelled"][launch.status]}`,
+      `progress=${(progress * 100).toFixed(2)}%`,
+      `num_buys=${launch.stateData.numBuys}`,
+    );
+
+    if (launch.status === 1) {
+      console.log("Graduated to CPMM pool:", launch.cpmmPoolState.toBase58());
+      break;
+    }
+    await new Promise(r => setTimeout(r, 10_000));
+  }
+}
+```
+
+## Rust CPI
+
+Calling LaunchLab from your own Anchor program is rare (most launch integrations are TS-side only). If you do, the program ships an Anchor crate `raydium_launchlab` with `cpi::accounts::Buy`, `cpi::accounts::Sell`, etc. — pattern mirrors the CPMM / CLMM CPI examples. See [`sdk-api/rust-cpi`](/sdk-api/rust-cpi) for a generalized template once this site is populated.
+
+## Pitfalls
+
+- **Fee-split arithmetic off-by-one.** If `total_share` is not exactly `lp_share + creator_share + protocol_share`, `Initialize` reverts with `InvalidFeeShares`. Set `totalShare` equal to the sum.
+- **Using a non-allowed quote mint.** `launch_config.allowed_quote_mints` is a fixed list; passing any other mint reverts. Check with `raydium.launchpad.getConfig()` first.
+- **Metadata size.** Long `uri` strings push the Metaplex CPI over the budget. Keep `uri` under ~200 chars — most CDN-hosted JSON metadata fits easily.
+- **Graduation race.** Automated bots monitor `quote_reserve_real` and front-run `Graduate` within a slot or two of the threshold crossing. This is benign — it only costs them rent — but it means your UI should treat `status` transitions as fast events.
+
+## Where to go next
+
+- [`products/launchlab/bonding-curve`](/products/launchlab/bonding-curve) — curve math.
+- [`products/cpmm/code-demos`](/products/cpmm/code-demos) — what to do with the resulting pool.
+- [`user-flows/launch-token-launchlab`](/user-flows/launch-token-launchlab) — the end-to-end launch-a-token guide, including off-chain steps.
+
+Sources:
+
+- [Raydium SDK v2](https://github.com/raydium-io/raydium-sdk-V2)
+- Raydium LaunchLab program source

@@ -1,0 +1,251 @@
+---
+title: "Demo kode Stable AMM"
+description: "Cara mengidentifikasi pool Stable AMM dari API, melakukan swap melalui modul Liquidity (menangani pool version=5 secara native), dan menggunakan helper stable-curve off-chain."
+---
+
+<Info>
+  **Halaman ini diterjemahkan secara otomatis oleh AI. Versi bahasa Inggris adalah acuan resmi.**
+
+  [Lihat versi bahasa Inggris →](/products/stable/code-demos)
+</Info>
+
+<Info>
+  **Banner versi.**
+
+  - SDK: `@raydium-io/raydium-sdk-v2@0.2.42-alpha`
+  - Cluster: Solana `mainnet-beta`
+  - ID Program Stable AMM: `5quBtoiQqxF9Jv6KYKctB59NT3gtJD2Y65kdnB1Uev3h` (lihat [`reference/program-addresses`](/id/reference/program-addresses))
+  - Terakhir diverifikasi: 2026-04
+
+  Modul `liquidity` SDK menangani pool Stable AMM secara native. Pool Stable muncul sebagai **`version: 5`** (atau `pooltype: "StablePool"`) pada `ApiV3PoolInfoStandardItem`; helper `addLiquidity` / `removeLiquidity` / swap yang sama bekerja untuk pool ini seperti halnya pool constant-product AMM v4 (`version: 4`) — SDK mendeteksi varian dan mengeluarkan instruksi yang benar secara otomatis. Matematika stable-curve off-chain berada di `src/raydium/liquidity/stable.ts`.
+</Info>
+
+## Setup
+
+```bash
+npm install @raydium-io/raydium-sdk-v2 @solana/web3.js @solana/spl-token
+```
+
+```ts
+import { Raydium, TxVersion } from "@raydium-io/raydium-sdk-v2";
+import { Connection, Keypair, clusterApiUrl } from "@solana/web3.js";
+import BN from "bn.js";
+import bs58 from "bs58";
+
+const connection = new Connection(clusterApiUrl("mainnet-beta"));
+const owner = Keypair.fromSecretKey(bs58.decode(process.env.PRIVATE_KEY!));
+
+const raydium = await Raydium.load({
+  connection,
+  owner,
+  cluster: "mainnet",
+  // Opsional: muat layout model stable curve jika Anda bermaksud memanggil
+  // helper quoting dari `liquidity/stable.ts` secara langsung. Operasi level
+  // pool swap / add / remove melakukan ini secara lazy untuk Anda, jadi sebagian
+  // besar pemanggil dapat melewati langkah ini.
+});
+
+// Sekali: prefetch layout data model on-chain yang digunakan oleh helper
+// stable-curve off-chain. Hanya diperlukan jika Anda memanggil getStablePrice /
+// getDxByDyBaseIn / getDyByDxBaseIn secara langsung. addLiquidity / removeLiquidity /
+// swap tidak memerlukan ini.
+await raydium.liquidity.initLayout();
+```
+
+## Mengidentifikasi pool Stable
+
+Dua sinyal setara pada `ApiV3PoolInfoStandardItem`:
+
+```ts
+const isStable =
+  pool.version === 5 ||
+  pool.pooltype.includes("StablePool"); // SDK menggunakan pemeriksaan string ini secara internal
+
+// Sebagai alternatif, berdasarkan program ID:
+const STABLE_AMM_PROGRAM_ID = "5quBtoiQqxF9Jv6KYKctB59NT3gtJD2Y65kdnB1Uev3h";
+const isStableByProgram = pool.programId === STABLE_AMM_PROGRAM_ID;
+```
+
+Baik AMM v4 (`version: 4`, constant-product) dan Stable AMM (`version: 5`) mengalir melalui API `LiquidityModule` yang sama pada SDK. Secara internal modul mengirimkan ke:
+
+- `InstructionType.AmmV4AddLiquidity` / `AmmV4RemoveLiquidity` untuk pool v4
+- `InstructionType.AmmV5AddLiquidity` / `AmmV5RemoveLiquidity` untuk pool v5 (Stable)
+
+`programId` pool (dikembalikan dengan kunci pool) memberitahu SDK program mana yang akan di-CPI; Anda tidak perlu hardcode.
+
+## Menemukan pool berdasarkan pasangan mint
+
+```ts
+import { PublicKey } from "@solana/web3.js";
+
+// Dua mint umum yang digunakan sebagai contoh
+const mintA = new PublicKey("Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB"); // USDT
+const mintB = new PublicKey("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"); // USDC
+
+const pools = await raydium.api.fetchPoolByMintPair({
+  mint1: mintA.toBase58(),
+  mint2: mintB.toBase58(),
+});
+
+const stablePool = pools.find(
+  (p) => p.version === 5 || p.pooltype.includes("StablePool"),
+);
+
+if (!stablePool) {
+  throw new Error("Tidak ada pool Stable untuk pasangan mint ini");
+}
+
+console.log("ID pool Stable:", stablePool.id);
+console.log("ID program pool Stable:", stablePool.programId);
+console.log("TVL:", stablePool.tvl);
+```
+
+Jika pasangan mint memiliki baik pool v4 (constant-product) maupun pool v5 (stable), respons mencakup keduanya — pilih yang sesuai kebutuhan alur Anda, atau serahkan keduanya ke program [AMM Routing](/id/products/routing) dan biarkan memilih rute terbaik.
+
+## Swap melalui pool Stable
+
+Alur `LiquidityModule.swap` memiliki bentuk yang sama seperti pool v4 — cukup berikan objek pool v5:
+
+```ts
+import { Percent, TokenAmount, toToken } from "@raydium-io/raydium-sdk-v2";
+
+const inputAmount = new TokenAmount(toToken(stablePool.mintA), 1_000_000); // 1 USDT
+const slippage = new Percent(50, 10_000); // 0,5%
+
+// Hitung output yang diharapkan menggunakan helper stable-curve SDK secara internal.
+const { amountOut, minAmountOut } = raydium.liquidity.computeAmountOut({
+  poolInfo: stablePool,
+  amountIn: inputAmount,
+  mintIn:  stablePool.mintA.address,
+  mintOut: stablePool.mintB.address,
+  slippage,
+});
+
+console.log("Output yang diharapkan:", amountOut.toSignificant());
+console.log("Output minimum:", minAmountOut.toSignificant());
+
+// Bangun & tanda tangani transaksi swap.
+const { transaction, execute } = await raydium.liquidity.swap({
+  poolInfo: stablePool,
+  amountIn:    inputAmount.raw,
+  amountOut:   minAmountOut.raw,
+  fixedSide:   "in",
+  txVersion:   TxVersion.V0,
+});
+
+const { txId } = await execute({ sendAndConfirm: true });
+console.log("Tx swap Stable:", txId);
+```
+
+SDK membaca `programId` pool dari kunci pool dan mengirimkan ke program Stable AMM. Tidak ada argumen `programId` khusus yang diperlukan.
+
+## Menambah dan menghapus likuiditas
+
+`addLiquidity` dan `removeLiquidity` bekerja identik di seluruh pool v4 dan v5:
+
+```ts
+import { Percent, TokenAmount, toToken } from "@raydium-io/raydium-sdk-v2";
+
+const amountInA = new TokenAmount(toToken(stablePool.mintA), 100_000_000); // 100 USDT
+const slippage  = new Percent(50, 10_000); // 0,5%
+
+// Hitung jumlah B yang cocok yang diperlukan kurva untuk ukuran A ini.
+const { anotherAmount, minAnotherAmount } = raydium.liquidity.computePairAmount({
+  poolInfo: stablePool,
+  amount:   amountInA.toSignificant(),
+  baseIn:   true,
+  slippage,
+});
+
+const { execute } = await raydium.liquidity.addLiquidity({
+  poolInfo: stablePool,
+  amountInA,
+  amountInB:      anotherAmount,
+  otherAmountMin: minAnotherAmount,
+  fixedSide:      "a",
+  txVersion:      TxVersion.V0,
+});
+
+const { txId } = await execute({ sendAndConfirm: true });
+console.log("Tx menambah likuiditas:", txId);
+```
+
+Secara internal SDK mengeluarkan `InstructionType.AmmV5AddLiquidity` karena `pooltype.includes("StablePool")` adalah true. Alur `removeLiquidity` yang sesuai simetris — masukkan `lpAmount` dan jumlah minimum yang akan Anda terima di setiap sisi.
+
+## Helper quote off-chain (stable.ts)
+
+Untuk quoting server-side atau backtesting, SDK mengekspos matematika stable-curve yang mendasar:
+
+```ts
+import {
+  getStablePrice,
+  getDxByDyBaseIn,
+  getDyByDxBaseIn,
+} from "@raydium-io/raydium-sdk-v2";
+
+// Anda harus memanggil initLayout() sekali sebelum menggunakan ini (memuat
+// PDA on-chain `ModelDataInfo` ke dalam cache StableLayout SDK).
+await raydium.liquidity.initLayout();
+
+const modelData = raydium.liquidity.stableLayout;
+
+// Harga spot pada cadangan pool saat ini.
+const price = getStablePrice(modelData, /* x */, /* y */, /* withFee */);
+console.log("Harga spot:", price);
+
+// Quote: diberikan dx masuk, berapa banyak dy keluar (tidak ada biaya diterapkan di sini)?
+const dyOut = getDyByDxBaseIn(modelData, /* x */, /* y */, /* dx */);
+
+// Quote: diberikan target dy keluar, berapa banyak dx masuk yang diperlukan?
+const dxIn  = getDxByDyBaseIn(modelData, /* x */, /* y */, /* dy */);
+```
+
+Ini adalah fungsi pure — tanpa RPC, tanpa signing. `ModelDataInfo` on-chain diambil sekali oleh `initLayout()` dan di-cache di `raydium.liquidity.stableLayout`. Berikan cadangan saat ini (`x`, `y`) dan helper menghitung dengan binary-searching tabel lookup dan linear interpolating antara dua baris `DataElement` di sekitarnya. Lihat [`products/stable/math`](/id/products/stable/math) untuk algoritma yang mendasar.
+
+## Routing melalui AMM Routing (multi-hop / harga terbaik)
+
+Jika Anda tidak ingin memilih venue sendiri, program [AMM Routing](/id/products/routing) akan mempertimbangkan setiap AMM Raydium (v4 / CPMM / CLMM / Stable) dan routing melalui kombinasi mana pun yang terbaik:
+
+```ts
+const route = await raydium.tradeV2.fetchRoutes({
+  inputMint:  mintA,
+  outputMint: mintB,
+  amount:     new BN(1_000_000),
+  slippage,
+});
+
+// route.routes[0].poolType memberitahu Anda program mana yang digunakan rute terbaik;
+// "Stable" muncul di sini setiap kali pool Stable adalah bagian dari jalur optimal.
+console.log(route.routes[0]);
+
+const { execute } = await raydium.tradeV2.swap({
+  inputMint:    mintA,
+  outputMint:   mintB,
+  inputAmount:  new BN(1_000_000),
+  swapResult:   route.routes[0],
+  slippage,
+  txVersion:    TxVersion.V0,
+});
+
+const { txId } = await execute({ sendAndConfirm: true });
+```
+
+Ini adalah jalur yang direkomendasikan untuk swapper dan agregator produksi — Anda tidak perlu memutuskan secara manual apakah pool Stable ada atau apakah itu adalah venue yang lebih baik hari ini.
+
+## Rekomendasi
+
+1. **Untuk swap pengguna akhir**, lebih suka alur routing [`tradeV2`](/id/products/routing). Ini menangani setiap tipe pool Raydium termasuk Stable.
+2. **Untuk operasi pool-spesifik** (LP add / remove pada pool Stable yang diketahui), gunakan `LiquidityModule` secara langsung — ini auto-detect pool v5.
+3. **Untuk quoting / analytics off-chain**, panggil `getStablePrice` / `getDyByDxBaseIn` / `getDxByDyBaseIn` setelah `initLayout()`. Tidak ada traffic RPC per quote setelah data model di-cache.
+4. **Jangan encode raw instruksi `SwapBaseIn` secara manual.** Program Stable AMM (forked dari AMM v4) mengharapkan 17–19 akun OpenBook untuk entrypoint swap V1, dengan `model_data_account` dislotkan di antara mereka. Helper pre-built SDK menangani setiap akun dan urutan dengan benar; membuat sendiri rawan kesalahan.
+
+## Ke mana selanjutnya
+
+- [Math](/id/products/stable/math) — cara kerja lookup-table interpolation.
+- [Instructions](/id/products/stable/instructions) — referensi instruksi lengkap.
+- [AMM Routing](/id/products/routing) — routing multi-pool di seluruh AMM v4, CPMM, CLMM, Stable.
+
+Sumber:
+
+- [`raydium-sdk-V2/src/raydium/liquidity/liquidity.ts`](https://github.com/raydium-io/raydium-sdk-V2/blob/master/src/raydium/liquidity/liquidity.ts) — titik masuk modul; dispatch v4 / v5.
+- [`raydium-sdk-V2/src/raydium/liquidity/stable.ts`](https://github.com/raydium-io/raydium-sdk-V2/blob/master/src/raydium/liquidity/stable.ts) — `StableLayout`, `getStablePrice`, `getDxByDyBaseIn`, `getDyByDxBaseIn`.

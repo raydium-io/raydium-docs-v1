@@ -1,0 +1,440 @@
+---
+title: "Các ví dụ code Routing"
+description: "Các ví dụ TypeScript: swap đa bước dựa trên SDK thông qua router, và xây dựng instruction thô."
+---
+
+<Info>
+  **Trang này được dịch tự động bằng AI. Phiên bản tiếng Anh là bản chính thức.**
+
+  [Xem bản tiếng Anh →](/products/routing/code-demos)
+</Info>
+
+## Thông tin phiên bản
+
+- **SDK:** `@raydium-io/raydium-sdk-v2@0.2.42-alpha`
+- **Network:** mainnet-beta
+- **Router program ID:** `routeUGWgWzqBWFcrCfv8tritsqukccJPu3q5GPP3xS`
+- **Xác minh:** Tháng 4 năm 2026
+
+## Ví dụ 1: Routing dựa trên SDK
+
+Nguồn: [`src/trade/routeSwap.ts`](https://github.com/raydium-io/raydium-sdk-V2-demo/blob/master/src/trade/routeSwap.ts)
+
+Raydium SDK trừu tượng hóa việc xây dựng route. Sử dụng các hàm trade của SDK để soạn một route đa bước và thực thi nó thông qua router một cách tự động.
+
+### Thiết lập
+
+```typescript
+import {
+  Raydium,
+  Router,
+  Token,
+  TokenAmount,
+  toApiV3Token,
+  toFeeConfig,
+  TxVersion,
+} from "@raydium-io/raydium-sdk-v2";
+import {
+  Connection,
+  Keypair,
+  PublicKey,
+} from "@solana/web3.js";
+import { NATIVE_MINT, TOKEN_2022_PROGRAM_ID } from "@solana/spl-token";
+
+const connection = new Connection("https://api.mainnet-beta.solana.com", "confirmed");
+const wallet = Keypair.fromSecretKey(/* your key bytes */);
+
+const raydium = await Raydium.load({
+  connection,
+  owner: wallet,                 // SDK sẽ ký giao dịch với Keypair này
+  cluster: "mainnet",
+  disableFeatureCheck: true,
+  blockhashCommitment: "finalized",
+});
+
+// Router cần một anchor thời gian chuỗi cho các bước CLMM.
+await raydium.fetchChainTime();
+```
+
+### Xây dựng một swap đa bước
+
+Routing trong `@raydium-io/raydium-sdk-v2` được expose trên `raydium.tradeV2`. Hình dạng toàn diện — tìm nạp dữ liệu pool, tính toán route, xếp hạng theo output, và xây dựng giao dịch swap — được hiển thị dưới đây; điều này phù hợp với ví dụ chính thức trong [`raydium-sdk-V2-demo/src/trade/routeSwap.ts`](https://github.com/raydium-io/raydium-sdk-V2-demo/blob/master/src/trade/routeSwap.ts).
+
+```typescript
+// 1. Chọn các mint input/output và số lượng.
+const inputMint = NATIVE_MINT;                                     // wSOL
+const outputMint = new PublicKey("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"); // USDC
+const inputAmount = "8000000";                                     // 0.008 SOL (lamports)
+
+// 2. Tìm nạp tất cả thông tin cơ bản pool. Lưu trữ đệm điều này một cách tích cực — đó là một RPC fan-out lớn.
+const poolData = await raydium.tradeV2.fetchRoutePoolBasicInfo();
+
+// 3. Liệt kê mọi route khả dụng trong AMM v4, CPMM, CLMM, và Stable AMM.
+const routes = raydium.tradeV2.getAllRoute({
+  inputMint,
+  outputMint,
+  ...poolData,
+});
+
+// 4. Hydrate route với trạng thái RPC trực tiếp (reserves, ticks, mint info).
+const {
+  routePathDict,
+  mintInfos,
+  ammPoolsRpcInfo,
+  ammSimulateCache,
+  clmmPoolsRpcInfo,
+  computeClmmPoolInfo,
+  computePoolTickData,
+  computeCpmmData,
+} = await raydium.tradeV2.fetchSwapRoutesData({
+  routes,
+  inputMint,
+  outputMint,
+});
+
+// 5. Tính toán số lượng output cho mỗi route ứng cử. Kết quả được sắp xếp giảm dần theo output.
+const swapRoutes = raydium.tradeV2.getAllRouteComputeAmountOut({
+  inputTokenAmount: new TokenAmount(
+    new Token({
+      mint: inputMint.toBase58(),
+      decimals: mintInfos[inputMint.toBase58()].decimals,
+      isToken2022: mintInfos[inputMint.toBase58()].programId.equals(TOKEN_2022_PROGRAM_ID),
+    }),
+    inputAmount,
+  ),
+  directPath: routes.directPath.map(
+    (p) =>
+      ammSimulateCache[p.id.toBase58()] ||
+      computeClmmPoolInfo[p.id.toBase58()] ||
+      computeCpmmData[p.id.toBase58()],
+  ),
+  routePathDict,
+  simulateCache: ammSimulateCache,
+  tickCache: computePoolTickData,
+  mintInfos,
+  outputToken: toApiV3Token({
+    ...mintInfos[outputMint.toBase58()],
+    programId: mintInfos[outputMint.toBase58()].programId.toBase58(),
+    address: outputMint.toBase58(),
+    freezeAuthority: undefined,
+    mintAuthority: undefined,
+    extensions: { feeConfig: toFeeConfig(mintInfos[outputMint.toBase58()].feeConfig) },
+  }),
+  chainTime: Math.floor(raydium.chainTimeData?.chainTime ?? Date.now() / 1000),
+  slippage: 0.005, // 0.5%
+  epochInfo: await raydium.connection.getEpochInfo(),
+});
+
+const targetRoute = swapRoutes[0];
+if (!targetRoute) throw new Error("no swap routes were found");
+
+// 6. Giải quyết các pool key cho route đã chọn.
+const poolKeys = await raydium.tradeV2.computePoolToPoolKeys({
+  pools: targetRoute.poolInfoList,
+  ammRpcData: ammPoolsRpcInfo,
+  clmmRpcData: clmmPoolsRpcInfo,
+});
+
+// 7. Xây dựng, ký và thực thi giao dịch swap.
+const { execute, transactions } = await raydium.tradeV2.swap({
+  routeProgram: Router,
+  txVersion: TxVersion.V0,
+  swapInfo: targetRoute,
+  swapPoolKeys: poolKeys,
+  ownerInfo: {
+    associatedOnly: true,
+    checkCreateATAOwner: true,
+  },
+  computeBudgetConfig: {
+    units: 600_000,
+    microLamports: 465_915,
+  },
+});
+
+// `sequentially: true` rất quan trọng — giao dịch đầu tiên có thể cần tạo
+// các ATA trung gian mà các giao dịch tiếp theo phụ thuộc vào.
+const { txIds } = await execute({ sequentially: true });
+console.log("txIds:", txIds);
+```
+
+### Hành vi dự kiến
+
+SDK xử lý:
+
+- Khám phá route trong AMM v4, CPMM, CLMM, và Stable AMM.
+- Derivation tài khoản (trạng thái pool, vault, tài khoản quan sát, tạo trước ATA).
+- Packing instruction cho chương trình router (`Router`) khi route là đa bước, hoặc swap pool trực tiếp khi một pool đơn đã cho kết quả tốt nhất.
+- Thực thi slippage thông qua tham số `slippage` trên `getAllRouteComputeAmountOut`.
+
+`raydium.tradeV2.swap` có thể trả về nhiều hơn một `transaction` — transaction đầu tiên thường khởi tạo các ATA trung gian và transaction thứ hai thực hiện swap. Luôn truyền `sequentially: true` tới `execute()` để chúng xác nhận theo thứ tự.
+
+---
+
+## Ví dụ 2: Xây dựng instruction thô (mã giả kiểu Rust)
+
+Nếu bạn cần kiểm soát tốt hơn hoặc đang xây dựng một chương trình CPI vào router, hãy xây dựng instruction theo cách thủ công. Ví dụ dưới đây sử dụng **tag 8 (`SwapBaseIn`)** — biến thể Current được khuyến nghị — và định tuyến thông qua các ATA do người dùng sở hữu từ đầu đến cuối.
+
+### Kịch bản: USDC → SOL (CPMM) → mSOL (CPMM)
+
+#### Bước 1: Derive các ATA của người dùng
+
+```typescript
+import { getAssociatedTokenAddressSync } from "@solana/spl-token";
+import { PublicKey } from "@solana/web3.js";
+
+const ROUTER_PROGRAM_ID = new PublicKey(
+  "routeUGWgWzqBWFcrCfv8tritsqukccJPu3q5GPP3xS"
+);
+
+const USDC_MINT = new PublicKey(
+  "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+);
+const SOL_MINT = new PublicKey(
+  "So11111111111111111111111111111111111111112"
+);
+const MSOL_MINT = new PublicKey(
+  "mSoL1MK4LCEDcTYVhPnD6DHK4PMGQ8WyXDEMXbnQAaW"
+);
+
+// Input / trung gian / output ATA của người dùng — tất cả đều do người gọi sở hữu.
+const user_usdc_ata = getAssociatedTokenAddressSync(USDC_MINT, wallet.publicKey);
+const user_sol_ata  = getAssociatedTokenAddressSync(SOL_MINT,  wallet.publicKey, true); // wSOL: allowOwnerOffCurve
+const user_msol_ata = getAssociatedTokenAddressSync(MSOL_MINT, wallet.publicKey);
+
+// Nếu các ATA trung gian / output của người dùng chưa tồn tại, hãy tạo chúng
+// trước thông qua chương trình Associated Token Account (hoặc sử dụng CreateSyncNative
+// cho ATA wSOL trên tag 5).
+```
+
+#### Bước 2: Thu thập tài khoản cho mỗi bước
+
+Hop 1 là USDC/SOL trên CPMM. Hop 2 là SOL/mSOL trên CPMM.
+
+```typescript
+// Hop 1: Swap USDC/SOL trên CPMM
+const CPMM_PROGRAM_ID = new PublicKey(
+  "CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C"
+);
+
+// Tìm nạp trạng thái pool cho USDC/SOL
+const usdc_sol_pool = await connection.getParsedAccountInfo(
+  USDC_SOL_POOL_STATE
+);
+
+// Trạng thái pool, authority, vault, mint, chương trình token, v.v.
+// (xem products/cpmm/accounts để danh sách đầy đủ 11 tài khoản)
+const hop1_accounts = [
+  CPMM_PROGRAM_ID,           // Xác định đây là CPMM
+  USDC_SOL_POOL_STATE,
+  CPMM_AUTHORITY,
+  USDC_SOL_VAULT_TOKEN0,
+  USDC_SOL_VAULT_TOKEN1,
+  USDC_MINT,
+  SOL_MINT,
+  LP_MINT,
+  OBSERVATION_STATE,
+  TOKEN_PROGRAM,
+  ASSOCIATED_TOKEN_PROGRAM,
+  SYSTEM_PROGRAM,
+];
+
+// Hop 2: Swap SOL/mSOL trên CPMM
+const sol_msol_pool = await connection.getParsedAccountInfo(
+  SOL_MSOL_POOL_STATE
+);
+
+const hop2_accounts = [
+  CPMM_PROGRAM_ID,           // Xác định đây là CPMM
+  SOL_MSOL_POOL_STATE,
+  CPMM_AUTHORITY,
+  SOL_MSOL_VAULT_TOKEN0,
+  SOL_MSOL_VAULT_TOKEN1,
+  SOL_MINT,
+  MSOL_MINT,
+  LP_MINT_2,
+  OBSERVATION_STATE_2,
+  TOKEN_PROGRAM,
+  ASSOCIATED_TOKEN_PROGRAM,
+  SYSTEM_PROGRAM,
+];
+```
+
+#### Bước 3: Xây dựng instruction
+
+```typescript
+import BN from "bn.js";
+
+// Đối số
+const amount_in = new BN(1_000_000_000); // 1000 USDC (6 decimals)
+const minimum_amount_out = new BN(500_000_000_000); // 500 mSOL (9 decimals)
+
+// Không có bước CLMM, vì vậy limit_prices trống rỗng
+const limit_prices: BN[] = [];
+
+// Pack đối số
+let data = Buffer.alloc(1024);
+let offset = 0;
+
+// Tag 8: SwapBaseIn (biến thể Current; limit_prices rỗng được cho phép)
+data[offset++] = 8;
+
+// amount_in (u64)
+data.writeBigUInt64LE(BigInt(amount_in.toString()), offset);
+offset += 8;
+
+// minimum_amount_out (u64)
+data.writeBigUInt64LE(BigInt(minimum_amount_out.toString()), offset);
+offset += 8;
+
+// limit_prices (VecDeque<u128>) — trống rỗng (không có bước CLMM trong route này).
+// Tag 8 chấp nhận một deque trống mà không có lỗi. Ghi zero entries (không có u128 nào).
+
+data = data.slice(0, offset);
+
+// Xây dựng danh sách tài khoản — mỗi ATA trung gian do người dùng sở hữu.
+const accounts = [
+  { pubkey: user_usdc_ata, isSigner: true,  isWritable: true },
+  { pubkey: user_sol_ata,  isSigner: false, isWritable: true },
+  { pubkey: user_msol_ata, isSigner: false, isWritable: true },
+  ...hop1_accounts.map((pk, i) => ({
+    pubkey: pk,
+    isSigner: false,
+    isWritable: i === 0 ? false : true, // ID chương trình không được ghi
+  })),
+  ...hop2_accounts.map((pk, i) => ({
+    pubkey: pk,
+    isSigner: false,
+    isWritable: i === 0 ? false : true,
+  })),
+];
+
+const instruction = new TransactionInstruction({
+  programId: ROUTER_PROGRAM_ID,
+  keys: accounts,
+  data,
+});
+```
+
+#### Bước 4: Gửi giao dịch
+
+```typescript
+const { blockhash } = await connection.getLatestBlockhash();
+
+const tx = new VersionedTransaction(
+  new TransactionMessage({
+    instructions: [instruction],
+    payerKey: wallet.publicKey,
+    recentBlockhash: blockhash,
+  }).compileToV0Message()
+);
+
+tx.sign([wallet]);
+const sig = await connection.sendTransaction(tx);
+await connection.confirmTransaction(sig);
+```
+
+---
+
+## Ví dụ 3: Xử lý lỗi
+
+Những lỗi phổ biến và cách khôi phục:
+
+### ExceededSlippage
+
+Output nhỏ hơn `minimum_amount_out`. Thử lại với dung sai slippage cao hơn hoặc tái báo giá route.
+
+```typescript
+try {
+  const sig = await connection.sendTransaction(tx);
+} catch (error) {
+  if (error.message.includes("ExceededSlippage")) {
+    console.log(
+      "Giá route đã thay đổi. Tái báo giá và xây dựng lại giao dịch."
+    );
+  }
+}
+```
+
+### SqrtPriceX64 (CLMM)
+
+Giá của một bước CLMM trôi ngoài ranh giới `limit_prices`. Cập nhật ranh giới và thử lại.
+
+### InvalidOwner
+
+Một ATA trung gian hoặc output không do người gọi sở hữu. Router xác thực quyền sở hữu trên mỗi slot; đảm bảo mỗi ATA bạn truyền được derive từ ví của người dùng (không phải từ bất kỳ authority nào khác).
+
+---
+
+## Mẹo và best practices
+
+### Tạo trước các ATA trung gian
+
+Trước khi định tuyến qua một token trung gian mới lần đầu tiên, hãy tạo ATA của người dùng để route không bị lỗi xác thực:
+
+```typescript
+import { createAssociatedTokenAccountInstruction } from "@solana/spl-token";
+
+const createAtaIx = createAssociatedTokenAccountInstruction(
+  wallet.publicKey,  // payer
+  user_sol_ata,      // ATA cần tạo
+  wallet.publicKey,  // owner — luôn là người dùng
+  SOL_MINT,
+);
+
+// Gộp createAtaIx vào cùng giao dịch với route đầu tiên, hoặc gửi nó
+// một lần ở phía trước; tiền thuê (~0.002 SOL) có thể hoàn lại sau thông qua tag 6
+// (CloseTokenAccount) khi ATA trống.
+```
+
+Đối với wSOL cụ thể, ưu tiên [`CreateSyncNative`](/vi/products/routing/instructions#createsyncnative-tag-5) (tag 5) — nó tạo ATA, chuyển SOL, và đồng bộ hóa trong một instruction.
+
+### Báo giá trước khi thực thi
+
+Luôn truy vấn các pool và tính toán output dự kiến trước khi xây dựng instruction:
+
+```typescript
+// Pseudocode: lấy trạng thái pool hiện tại và tính toán giá
+const pool1State = await connection.getAccountInfo(USDC_SOL_POOL_STATE);
+const amount_out_hop1 = computeSwapOutput(
+  amount_in,
+  pool1State,
+  USDC_MINT,
+  SOL_MINT
+);
+
+const pool2State = await connection.getAccountInfo(SOL_MSOL_POOL_STATE);
+const amount_out_hop2 = computeSwapOutput(
+  amount_out_hop1,
+  pool2State,
+  SOL_MINT,
+  MSOL_MINT
+);
+
+const minimum_amount_out = amount_out_hop2 * 0.99; // 1% slippage
+```
+
+### Sử dụng các biến thể instruction mới hơn (8–9)
+
+Tag 8 và 9 (`SwapBaseIn` và `SwapBaseOut`) lịch sự hơn với `limit_prices`. Ưu tiên chúng hơn các biến thể kế thừa nếu bạn không cần xác thực giá CLMM.
+
+```typescript
+// Tag 8: SwapBaseIn với limit_prices tùy chọn
+data[offset++] = 8;
+// ... phần còn lại của packing; deque limit_prices có thể trống
+```
+
+---
+
+## Tiếp theo
+
+- [`products/routing/instructions`](/vi/products/routing/instructions) — tham chiếu instruction đầy đủ.
+- [`products/routing/accounts`](/vi/products/routing/accounts) — chi tiết derivation tài khoản.
+- [`products/cpmm/code-demos`](/vi/products/cpmm/code-demos) — ví dụ swap CPMM để so sánh.
+- [`reference/program-addresses`](/vi/reference/program-addresses) — ID chương trình chính thức và địa chỉ devnet.
+
+Các nguồn:
+
+- [`@raydium-io/raydium-sdk-v2` trên npm](https://www.npmjs.com/package/@raydium-io/raydium-sdk-v2)
+- [`raydium-io/raydium-sdk-V2`](https://github.com/raydium-io/raydium-sdk-V2) (nguồn mở)
+- [`raydium-io/raydium-sdk-V2-demo`](https://github.com/raydium-io/raydium-sdk-V2-demo) — các demo đầu cuối chính thức bao gồm `routeSwap.ts`
+- Mã nguồn chương trình AMM Routing không được công khai; xác minh ID chương trình dựa trên API trực tiếp và bytecode on-chain

@@ -1,0 +1,260 @@
+---
+title: "Rust CPI"
+description: "Invocar programas de Raydium desde otro programa Solana — construcción de listas de cuentas, semillas firmantes, presupuesto de computación y patrones de propagación de errores para CPMM, CLMM, farm v6 y LaunchLab. AMM v4 se cubre por separado ya que no tiene crate de Anchor."
+---
+
+<Info>
+  **Esta página fue traducida automáticamente por IA. La versión en inglés es la fuente autorizada.**
+
+  [Ver versión en inglés →](/sdk-api/rust-cpi)
+</Info>
+
+<Info>
+  CPI («cross-program invocation») es el mecanismo mediante el cual un programa Solana invoca a otro. Los programas Anchor de Raydium incluyen crates contenedores de CPI que hacen que la llamada se vea como una invocación de función tipada — estructuras de cuentas con nombres de campo validados y helpers `cpi::<ix>()`. Esta página documenta el patrón general; para fragmentos específicos del producto consulta la página de demostraciones de código de cada capítulo de producto.
+</Info>
+
+## Dependencias de Cargo
+
+```toml
+[dependencies]
+anchor-lang            = "0.29"
+anchor-spl             = "0.29"
+raydium_cp_swap        = { git = "https://github.com/raydium-io/raydium-cp-swap", features = ["cpi"] }
+raydium_amm_v3         = { git = "https://github.com/raydium-io/raydium-clmm",    features = ["cpi"] }
+# AMM v4 y farm v6: sin crate publicado de Anchor CPI. Ver «AMM v4 / farm v6» más abajo.
+```
+
+La bandera de característica `cpi` hace que los crates se compilen solo en la superficie CPI (estructuras de cuentas + invocadores) en lugar del programa completo, de modo que tu binario se mantiene pequeño.
+
+Para ejemplos funcionales de CPI que cableado las estructuras de cuentas de extremo a extremo, consulta [`raydium-io/raydium-cpi-example`](https://github.com/raydium-io/raydium-cpi-example) (cubre AMM v4, CPMM y CLMM).
+
+## Construcción de listas de cuentas
+
+Cada CPI de Raydium requiere una estructura `Accounts` en el programa llamador. Los campos coinciden con el orden de cuentas de instrucción del programa 1 a 1, con validadores a nivel de campo:
+
+```rust
+use anchor_lang::prelude::*;
+use anchor_spl::token::{Token, TokenAccount, Mint};
+
+#[derive(Accounts)]
+pub struct MyProxySwap<'info> {
+    #[account(mut)]
+    pub user: Signer<'info>,
+
+    /// CHECK: validated by CPMM
+    #[account(mut)]
+    pub pool_state: UncheckedAccount<'info>,
+
+    /// CHECK: ditto
+    pub amm_config: UncheckedAccount<'info>,
+
+    /// CHECK: ditto
+    pub pool_authority: UncheckedAccount<'info>,
+
+    #[account(mut)]
+    pub input_vault: Account<'info, TokenAccount>,
+    #[account(mut)]
+    pub output_vault: Account<'info, TokenAccount>,
+
+    pub input_mint: Account<'info, Mint>,
+    pub output_mint: Account<'info, Mint>,
+
+    #[account(mut)]
+    pub user_input_ata:  Account<'info, TokenAccount>,
+    #[account(mut)]
+    pub user_output_ata: Account<'info, TokenAccount>,
+
+    pub cpmm_program: Program<'info, raydium_cp_swap::program::RaydiumCpSwap>,
+    pub token_program: Program<'info, Token>,
+    pub token_program_2022: Program<'info, anchor_spl::token_2022::Token2022>,
+    /// CHECK: observation PDA
+    #[account(mut)]
+    pub observation_state: UncheckedAccount<'info>,
+}
+```
+
+La mayoría de las cuentas del lado de Raydium son `UncheckedAccount` porque el receptor (Raydium) es responsable de la validación. Tu programa llamador solo valida estrictamente las cuentas que *tú* posees — ATAs de usuario, tus propios PDAs. El comentario de documentación `/// CHECK:` suprime la advertencia de Anchor sobre controles faltantes.
+
+## Construcción de la invocación CPI
+
+Anchor genera un helper por instrucción:
+
+```rust
+use raydium_cp_swap::cpi::{self, accounts::Swap as CpmmSwap};
+
+pub fn my_proxy_swap(
+    ctx: Context<MyProxySwap>,
+    amount_in: u64,
+    minimum_amount_out: u64,
+) -> Result<()> {
+    let cpi_accounts = CpmmSwap {
+        payer:                ctx.accounts.user.to_account_info(),
+        authority:            ctx.accounts.user.to_account_info(),
+        amm_config:           ctx.accounts.amm_config.to_account_info(),
+        pool_state:           ctx.accounts.pool_state.to_account_info(),
+        input_token_account:  ctx.accounts.user_input_ata.to_account_info(),
+        output_token_account: ctx.accounts.user_output_ata.to_account_info(),
+        input_vault:          ctx.accounts.input_vault.to_account_info(),
+        output_vault:         ctx.accounts.output_vault.to_account_info(),
+        input_token_program:  ctx.accounts.token_program.to_account_info(),
+        output_token_program: ctx.accounts.token_program.to_account_info(),
+        input_token_mint:     ctx.accounts.input_mint.to_account_info(),
+        output_token_mint:    ctx.accounts.output_mint.to_account_info(),
+        observation_state:    ctx.accounts.observation_state.to_account_info(),
+    };
+    let cpi_ctx = CpiContext::new(
+        ctx.accounts.cpmm_program.to_account_info(),
+        cpi_accounts,
+    );
+
+    cpi::swap_base_input(cpi_ctx, amount_in, minimum_amount_out)?;
+    Ok(())
+}
+```
+
+`cpi::swap_base_input` se genera a partir del IDL; su lista de argumentos refleja la lista de argumentos de la instrucción Anchor.
+
+## Semillas firmantes (CPI firmada por PDA)
+
+Cuando tu programa firma la CPI en nombre de un PDA (común para bóvedas, depósitos en garantía, etc.), usa `CpiContext::new_with_signer`:
+
+```rust
+let bump         = ctx.accounts.my_authority_bump;
+let signer_seeds: &[&[&[u8]]] = &[&[b"my_authority", &[bump]]];
+
+let cpi_ctx = CpiContext::new_with_signer(
+    ctx.accounts.cpmm_program.to_account_info(),
+    cpi_accounts,
+    signer_seeds,
+);
+
+cpi::swap_base_input(cpi_ctx, amount_in, minimum_amount_out)?;
+```
+
+Las semillas firmantes deben coincidir con la derivación del PDA. Para cualquier cuenta pasada como `authority` (o rol firmante similar), el tiempo de ejecución de Solana verifica que el PDA firme a través de estas semillas.
+
+## Cuentas restantes
+
+Algunas instrucciones de Raydium toman **cuentas restantes** — una lista de longitud variable añadida después de las cuentas fijas. Los ejemplos canónicos:
+
+- **CLMM `SwapV2`**: añade 1–8 cuentas `TickArrayState` correspondientes a los arrays de ticks que el swap podría atravesar.
+- **Farm v6 `Deposit`**: añade pares `(reward_vault, user_reward_ata)` para cada flujo de recompensa activo.
+
+Los helpers CPI de Anchor no verifican el tipo de las cuentas restantes. Pásalas mediante `.with_remaining_accounts(...)`:
+
+```rust
+let cpi_ctx = CpiContext::new(program, accounts)
+    .with_remaining_accounts(ctx.remaining_accounts.to_vec());
+```
+
+El orden importa: el programa receptor itera las cuentas restantes en el orden que las pasas. Para CLMM, los arrays de ticks deben ordenarse direccionalmente (el primer array en la dirección del swap primero). Para farm v6, los slots de recompensa van en orden de índice de slot.
+
+## Propagación de errores
+
+Los programas de Raydium devuelven sus propias enumeraciones de error. Anchor las envuelve; tu programa llamador las ve como `Err(ProgramError::Custom(code))`. Para manejar errores específicos:
+
+```rust
+use raydium_cp_swap::error::ErrorCode as CpmmErr;
+
+match cpi::swap_base_input(cpi_ctx, amount_in, minimum_amount_out) {
+    Ok(_) => Ok(()),
+    Err(e) => {
+        msg!("CPMM swap failed: {:?}", e);
+        // Re-raise, o convierte a tu propio tipo de error.
+        Err(e)
+    }
+}
+```
+
+El número de código de error es estable según la política de IDL ([`sdk-api/anchor-idl`](/es/sdk-api/anchor-idl)). Puedes probar contra códigos específicos comparando con el valor numérico.
+
+## Presupuesto de computación en CPIs compuestas
+
+Cada frame CPI tiene sobrecarga (~1.500 CU para la llamada en sí), y el consumo propio de CU del receptor se suma al tuyo. Una transacción que invoca un swap CPMM desde dentro de tu programa gasta:
+
+```
+your_program_cu
++ ~1_500       (CPI overhead)
++ ~150_000     (CPMM swap, SPL-token variant)
++ ~200_000     (if Token-2022 with transfer fee)
++ ~10_000      (observation update)
+```
+
+Para enrutamiento apilado (tu programa → agregador → CPMM + CLMM + farm harvest), presupuesto ≥500k CU. Siempre establece una instrucción explícita `ComputeBudgetProgram::set_compute_unit_limit(...)` en la transacción — el límite de 200k CU predeterminado se agotará silenciosamente.
+
+## AMM v4 — construcción manual de Instruction
+
+AMM v4 no tiene crate de Anchor. Construye el `Instruction` manualmente:
+
+```rust
+use anchor_lang::solana_program::program::invoke_signed;
+use anchor_lang::solana_program::instruction::{Instruction, AccountMeta};
+
+const AMM_V4_PROGRAM_ID: Pubkey = pubkey!("675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8");
+
+// SwapBaseIn discriminator is 9.
+let mut data = vec![9u8];
+data.extend_from_slice(&amount_in.to_le_bytes());
+data.extend_from_slice(&minimum_amount_out.to_le_bytes());
+
+let ix = Instruction {
+    program_id: AMM_V4_PROGRAM_ID,
+    accounts: vec![
+        AccountMeta::new_readonly(token_program_id, false),
+        AccountMeta::new(amm_id, false),
+        AccountMeta::new_readonly(amm_authority, false),
+        // ... remaining accounts per products/amm-v4/instructions ...
+    ],
+    data,
+};
+invoke_signed(&ix, &account_infos, signer_seeds)?;
+```
+
+Consulta [`products/amm-v4/code-demos`](/es/products/amm-v4/code-demos) para la lista completa de cuentas.
+
+## Farm v6 — cuentas restantes de pares de recompensas
+
+El `Deposit` / `Withdraw` / `Harvest` de Farm v6 utilizan el patrón de pares `(reward_vault_i, user_reward_ata_i)` en cuentas restantes. Secuencia exacta:
+
+```
+remaining_accounts = [
+    reward_vault_0, user_reward_ata_0,
+    reward_vault_1, user_reward_ata_1,
+    ...
+]
+```
+
+Un par por slot de recompensa **activo** (en ejecución o finalizado pero no reclamado). Omite slots no utilizados; el programa despacha según `farm_state.reward_infos[i].reward_state`.
+
+## Prueba de un flujo CPI
+
+El dev local requiere que los programas de Raydium estén disponibles en tu validador de prueba. Opciones:
+
+1. **`anchor test` con clon de programa** — en `Anchor.toml`:
+
+   ```toml
+   [test.validator]
+   clone = [
+     { address = "CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK" },  # CPMM
+     { address = "CLMM...program-id..." },                          # CLMM
+     { address = "farm-v6-program-id..." },                         # farm v6
+   ]
+   ```
+
+   Esto extrae el bytecode desplegado de mainnet hacia tu validador local.
+
+2. **Devnet** — Raydium despliega todos los programas en devnet con los mismos IDs de programa que mainnet. Ejecuta `anchor test --provider.cluster devnet` para alcanzar código activo.
+
+3. **Despliegue local** — clona los repos de Raydium e `anchor deploy` en un validador local. Añade sobrecarga de ciclo de prueba pero te permite modificar el receptor para debugging.
+
+## Referencias
+
+- [`products/cpmm/code-demos`](/es/products/cpmm/code-demos), [`products/clmm/code-demos`](/es/products/clmm/code-demos), [`products/amm-v4/code-demos`](/es/products/amm-v4/code-demos), [`products/farm-staking/code-demos`](/es/products/farm-staking/code-demos) — ejemplos CPI específicos del producto.
+- [`sdk-api/anchor-idl`](/es/sdk-api/anchor-idl) — recuperación de IDL y regeneración de cliente.
+- [`integration-guides/cpi-integration`](/es/integration-guides/cpi-integration) — patrones de nivel superior: depósitos en garantía, bóvedas, composición de agregador.
+
+Fuentes:
+
+- [raydium-cp-swap](https://github.com/raydium-io/raydium-cp-swap)
+- [raydium-clmm](https://github.com/raydium-io/raydium-clmm)
+- [Anchor CPI docs](https://www.anchor-lang.com/docs/cross-program-invocations)

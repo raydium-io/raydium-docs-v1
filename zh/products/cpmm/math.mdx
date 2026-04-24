@@ -1,0 +1,258 @@
+---
+title: "CPMM 数学"
+description: "常数乘积不变量、SwapBaseInput vs SwapBaseOutput、Token-2022 转账费处理以及观察账户的更新规则。"
+---
+
+<Info>
+  **本页内容由 AI 自动翻译，所有内容以英文版本为准。**
+
+  [查看英文版 →](/products/cpmm/math)
+</Info>
+
+## 不变量
+
+CPMM 在其两个金库上维持经典的常数乘积不变量：
+
+$$
+x \cdot y = k
+$$
+
+其中 `x` 是金库0的余额**在接收后扣除**任何 Token-2022 转账费后的值，`y` 同理。每次交换都必须保证 `k' ≥ k`（交易费的计算中已考虑分配给 LP 的费用；协议、基金和创建者的分成*不*计入 `k` —— 它们存在金库中但在曲线计算时被排除，详见下方 [曲线费用](#曲线费用)）。因此，`k` 会随着 LP 费用累积而单调增长。
+
+LP 份额按池的储备而非 `k` 定价：
+
+$$
+\text{LP 在 token0 中的价格} = \frac{x}{\text{lpSupply}}, \qquad \text{LP 在 token1 中的价格} = \frac{y}{\text{lpSupply}}
+$$
+
+销毁 `ΔLP` 个 LP 代币会精确返回 `ΔLP × x / lpSupply` 的 token0 和 `ΔLP × y / lpSupply` 的 token1。存入或提取时曲线和 `k` 都不会移动 —— 只有交换会改变价格。
+
+## 交换路径上的费用模型
+
+CPMM 在每次交换时应用**两个独立评费的费用**：
+
+- **交易费**在输入端收取，费率为 `AmmConfig.trade_fee_rate`。随后分割为 LP、协议和基金份额（LP 份额留在金库中并增加 `k`；协议和基金份额从金库记账中扣除）。
+- **创建者费**（仅当 `enable_creator_fee == true` 时激活）在 `AmmConfig.creator_fee_rate` 费率下收取。根据 `PoolState.creator_fee_on` 和交换方向在**输入**端或**输出**端收取（详见 [`products/cpmm/fees`](/zh/products/cpmm/fees#哪一侧收取费用)）。它有自己的分桶 —— 从不是交易费的一部分。
+
+设定：
+
+- `FEE_RATE_DENOMINATOR = 1_000_000`
+- `trade_fee_rate` —— 来自 `AmmConfig`，例如 `2500` = 相关交易量的 0.25%
+- `creator_fee_rate` —— 来自 `AmmConfig`，例如 `1000` = 相关交易量的 0.10%
+- `protocol_fee_rate`、`fund_fee_rate` —— 以交易费的 `1/FEE_RATE_DENOMINATOR` 单位计，而非交易量
+
+当创建者费在输入端时：
+
+```
+total_input_fee = ceil(amount_in * (trade_fee_rate + creator_fee_rate) / FEE_RATE_DENOMINATOR)
+creator_fee     = floor(total_input_fee * creator_fee_rate / (trade_fee_rate + creator_fee_rate))
+trade_fee       = total_input_fee - creator_fee
+amount_in_after_fees = amount_in - total_input_fee
+```
+
+当创建者费在输出端时：
+
+```
+trade_fee            = ceil(amount_in * trade_fee_rate / FEE_RATE_DENOMINATOR)
+amount_in_after_fees = amount_in - trade_fee
+amount_out_curve     = curve_output(amount_in_after_fees, ...)
+creator_fee          = ceil(amount_out_curve * creator_fee_rate / FEE_RATE_DENOMINATOR)
+amount_out           = amount_out_curve - creator_fee
+```
+
+在两种情况下，交易费的分割方式都相同：
+
+```
+protocol_fee   = floor(trade_fee * protocol_fee_rate / FEE_RATE_DENOMINATOR)
+fund_fee       = floor(trade_fee * fund_fee_rate     / FEE_RATE_DENOMINATOR)
+lp_fee         = trade_fee - protocol_fee - fund_fee     // creator_fee 不在此扣除
+```
+
+`protocol_fee + fund_fee + creator_fee` 的金额保存在金库中，但在池状态上独立跟踪（`protocol_fees_token*`、`fund_fees_token*`、`creator_fees_token*`）。当常数乘积不变量检查 `k' ≥ k` 时，它使用金库余额**减去**全部三个应收但未提取的费用 —— 所以 LP 只获得 `lp_fee`。
+
+详见 [`products/cpmm/fees`](/zh/products/cpmm/fees) 的提取指令和完整数值示例。
+
+## SwapBaseInput（精确输入）
+
+"用户精确给我们 `amount_in` 个输入代币，收到至少 `minimum_amount_out` 个输出代币。"
+
+暂时忽略 Token-2022：
+
+```
+amount_in_after_trade_fee = amount_in - trade_fee
+amount_out                = y − (x * y) / (x + amount_in_after_trade_fee)
+```
+
+代数上：
+
+$$
+\text{amount\_out} = \frac{y \cdot \Delta x_{\text{net}}}{x + \Delta x_{\text{net}}}
+$$
+
+其中 `Δx_net = amount_in_after_trade_fee`。
+
+程序随后更新金库记账，使得交易费中欠协议/基金/创建者的部分存在"应收"分桶（不包括在下次交换的 `x` 中），而 LP 份额加入 `x` 用于下次交换。
+
+### 输入端 Token-2022
+
+如果输入代币有转账费扩展，**代币**会在用户 → 金库的转账时扣除费用。所以金库实际收到 `amount_in − transfer_fee_in(amount_in)`。CPMM 程序因此计算：
+
+```
+amount_actually_received = amount_in − transfer_fee_in(amount_in)
+trade_fee                = ceil(amount_actually_received * trade_fee_rate / FEE_RATE_DENOMINATOR)
+amount_in_after_trade_fee = amount_actually_received − trade_fee
+```
+
+并对 `amount_in_after_trade_fee` 运行曲线。这很重要，因为**曲线价格根据实际进入金库的净金额计算**，而非根据用户的标称金额。
+
+### 输出端 Token-2022
+
+如果输出代币有转账费，池从其金库发送 `amount_out` 给用户。代币的转账费机制会在发出时扣除手续费，所以用户收到 `amount_out − transfer_fee_out(amount_out)`。程序照常从曲线计算 `amount_out`，但集成方负责在报价时将池的"金库发送"数额转换为"用户收到"数额。
+
+### 滑点检查
+
+计算 `amount_out` 后：
+
+```
+require(amount_out >= minimum_amount_out, "AmountSpecifiedLessThanMinimum")
+```
+
+如果输出代币收取转账费，SDK 会在设置 `minimum_amount_out` 之前应用转账费，所以滑点常数以用户实际收到的值而非金库发送的值计。
+
+## SwapBaseOutput（精确输出）
+
+"用户将精确收到 `amount_out` 个输出代币，并愿意为 `maximum_amount_in` 个输入代币支付。"
+
+反演曲线以求 `Δx_net`：
+
+$$
+\Delta x_{\text{net}} = \left\lceil \frac{x \cdot \text{amount\_out}}{y - \text{amount\_out}} \right\rceil
+$$
+
+向上取整非常重要 —— 它保证 `k' ≥ k` 在整数截断后。然后：
+
+```
+// 从净入反推毛入。
+// 费用应用在毛入上，所以：
+//   net = gross − ceil(gross * rate / D)
+//       ≈ gross * (D − rate) / D
+// 在合适的地方用向上取整反演：
+gross_needed = ceil(Δx_net * D / (D − trade_fee_rate))
+```
+
+在 Token-2022 输入上，包装为：
+
+```
+gross_needed_before_mint_fee
+  = inflate_for_transfer_fee(gross_needed, input_mint)
+```
+
+以确保用户支付足够的金额，使得在代币转账费扣除后池仍能接收 `gross_needed`。
+
+### 滑点检查
+
+```
+require(gross_needed_before_mint_fee <= maximum_amount_in, "AmountSpecifiedExceedsMaximum")
+```
+
+## 完整示例
+
+池状态，忽略 Token-2022：
+
+- `x = 1_000_000_000_000`（1,000,000.000000 个 token0，6 位小数）
+- `y = 2_000_000_000_000`（2,000,000.000000 个 token1，6 位小数）
+- `AmmConfig`：`trade_fee_rate = 2500`、`protocol_fee_rate = 120_000`、`fund_fee_rate = 40_000`、`creator_fee_rate = 0`
+
+用户：`SwapBaseInput`，`amount_in = 1_000_000_000`（1,000.000000 个 token0）。创建者费禁用（`enable_creator_fee = false`）。
+
+```
+trade_fee                = ceil(1_000_000_000 * 2500 / 1_000_000)       = 2_500_000
+  protocol_fee           = floor(2_500_000 * 120_000 / 1_000_000)       = 300_000
+  fund_fee               = floor(2_500_000 *  40_000 / 1_000_000)       = 100_000
+  lp_fee                 = 2_500_000 − 300_000 − 100_000                 = 2_100_000
+creator_fee              = 0                                              // 禁用
+
+amount_in_after_trade_fee = 1_000_000_000 − 2_500_000                    = 997_500_000
+
+amount_out = y − (x * y) / (x + Δx_net)
+           = 2_000_000_000_000
+             − (1_000_000_000_000 * 2_000_000_000_000)
+               / (1_000_000_000_000 + 997_500_000)
+           ≈ 1_995_015_009
+
+new_vault0_raw   = x + amount_in                                        = 1_001_000_000_000
+new_vault1       = y − amount_out                                       ≈ 1_998_004_984_991
+
+// 金库0 中收到的 1_000_000_000 中，400_000 是"应收费用"
+//（协议 + 基金），曲线应排除：
+curve_x          = new_vault0_raw − (protocol_fees_token0 + fund_fees_token0)
+                 = 1_001_000_000_000 − 400_000
+                 = 1_000_999_600_000
+
+k' = curve_x * new_vault1 ≈ 2.000_002_501_E24  ≥  k = 2.0E24   ✓
+```
+
+如果相同的池设定 `enable_creator_fee = true`，`creator_fee_rate = 1000`（0.10%）在输入端，程序会收取 `total_input_fee = ceil(1_000_000_000 * 3500 / 1_000_000) = 3_500_000`，然后分割为 `creator_fee = 1_000_000` 和 `trade_fee = 2_500_000`。`trade_fee` 上的协议/基金/LP 计算与上例相同 —— 创建者费有自己的分桶，应收到 `creator_fees_token0`，并像协议和基金分桶一样从 `curve_x` 中排除。
+
+如果输入代币有 1% 的 Token-2022 转账费，金库接收 `990_000_000` 个代币而非 `1_000_000_000`，所有后续计算都使用这个净金额。
+
+## 观察更新规则
+
+在每次交换时，程序评估是否推送新的观察到环形缓冲区：
+
+```
+let since_last = now − observations[head].block_timestamp;
+if since_last >= MIN_OBSERVATION_INTERVAL {
+    let price0 = (vault1 << 32) / vault0;            // Q32.32-ish
+    let price1 = (vault0 << 32) / vault1;
+    let head' = (head + 1) % OBSERVATION_NUM;
+    observations[head'] = Observation {
+        block_timestamp: now,
+        cumulative_token0_price_x32:
+            observations[head].cumulative_token0_price_x32 + price0 * since_last,
+        cumulative_token1_price_x32:
+            observations[head].cumulative_token1_price_x32 + price1 * since_last,
+    };
+    head = head';
+}
+```
+
+两个特性：
+
+- **累积价格，而非现货价格。** 单个观察不是价格。要从时间 `t0` 到 `t1` 获得时间加权平均价格 (TWAP)，读取每端最接近的观察并计算 `(cumulative(t1) − cumulative(t0)) / (t1 − t0)`。
+- **采样频率受限。** 同一槽内连续的交换可能共享一个观察。在交换后立即读取观察可能看起来延迟一个槽 —— 这是正常的。
+
+更多内容见 [`products/clmm/accounts`](/zh/products/clmm/accounts)。
+
+## 曲线费用
+
+这是微妙的部分，值得特别说明。曲线算术针对**净**金库余额运作 —— 即原始 SPL 余额减去应收协议、基金和创建者费（三者都是独立分桶 —— 详见 [`products/cpmm/fees`](/zh/products/cpmm/fees)）。具体图景：
+
+```
+raw_vault_balance   = RPC getTokenAccountBalance 返回的值
+accrued_fees        = protocol_fees_token{0,1} + fund_fees_token{0,1} + creator_fees_token{0,1}
+curve_balance       = raw_vault_balance − accrued_fees
+invariant           = curve_balance0 * curve_balance1
+```
+
+对集成方的影响：
+
+- **不要从原始余额报价。** 先减去应收费字段，或将 `SwapBaseInput` 作为模拟调用并取其返回值。
+- **`CollectProtocolFee` 从金库中移动代币。** 提取后，`raw_vault_balance` 下降但 `curve_balance` 不变；池的价格不动。这是刻意设计的。
+
+## 精度与溢出
+
+- 所有曲线算术都使用 `u128` 中间值以防止 `x * y` 溢出。
+- 除法向零舍入，除了 `SwapBaseOutput` 的 `Δx_net` 向上舍入，以及费用计算向上舍入 `trade_fee` 并向下舍入子分割。这些舍入方向被选择以确保不变量由于整数截断而不会减少。
+- 金库比例极端的池（十亿：1）在小交换时可能触及精度下限；程序在这种情况下返回 `ZeroTradingTokens`。详见 [`reference/error-codes`](/zh/reference/error-codes)。
+
+## 后续去处
+
+- [`products/cpmm/fees`](/zh/products/cpmm/fees) —— 完整的费率层级和提取语义。
+- [`products/cpmm/instructions`](/zh/products/cpmm/instructions) —— 调用这个数学的指令。
+- [`algorithms/constant-product`](/zh/algorithms/constant-product) —— `x · y = k` 的推导与边界情况，在 AMM v4 和 CPMM 间共享。
+
+来源：
+
+- [`raydium-io/raydium-cp-swap` — `states/curve.rs` 中的交换数学](https://github.com/raydium-io/raydium-cp-swap)
+- Raydium 审计报告链接在 [`security/audits`](/zh/security/audits)

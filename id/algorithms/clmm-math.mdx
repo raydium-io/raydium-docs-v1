@@ -1,0 +1,252 @@
+---
+title: "Matematika concentrated-liquidity"
+description: "Representasi sqrt-price, formula likuiditas-ke-jumlah, langkah swap satu-tick dan multi-tick, akuntansi pertumbuhan biaya — matematika di balik Raydium CLMM."
+---
+
+<Info>
+  **Halaman ini diterjemahkan secara otomatis oleh AI. Versi bahasa Inggris adalah acuan resmi.**
+
+  [Lihat versi bahasa Inggris →](/algorithms/clmm-math)
+</Info>
+
+## Mengapa sqrt-price, bukan price
+
+CLMM keluarga Uniswap-v3 merepresentasikan price sebagai akar kuadratnya, disimpan dalam fixed-point `Q64.64`:
+
+```
+sqrt_price_x64 = floor(sqrt(price) · 2^64)
+```
+
+Tiga alasan:
+
+1. **Matematika likuiditas linear.** Jumlah token0 atau token1 dalam kisaran harga ternyata merupakan fungsi linear dari `sqrt_price`, bukan dari `price`. Menyimpan `sqrt_price` memungkinkan langkah swap mengevaluasi formula linear tersebut tanpa menghitung akar kuadrat.
+2. **Kontrol overflow.** `sqrt_price · L` pas di `u256` untuk semua parameter yang masuk akal; `price · L` dapat overflow jauh lebih cepat.
+3. **Matematika tick seragam.** Karena tick didefinisikan sebagai `1.0001^i`, `sqrt(price) = 1.00005^i` juga merupakan pangkat eksak dari tangga 1.00005. Setiap penyeberangan tick diterjemahkan ke perkalian kecil dalam ruang `sqrt_price_x64`.
+
+Price dan sqrt-price berhubungan satu-ke-satu; konversinya adalah `price = (sqrt_price_x64 / 2^64)^2`.
+
+## Kisi tick
+
+Harga didiskritisasi pada grid:
+
+```
+price(tick_i) = 1.0001^i
+```
+
+`tick_i` adalah `i32`. Rentang aktif adalah `[MIN_TICK, MAX_TICK] = [−443636, 443636]`, memberikan rentang harga sekitar `[2^−128, 2^128]`. `tick_spacing` setiap pool diatur oleh tier biayanya: spasi lebih kecil untuk pasangan ketat (misalnya tier stablecoin 0,01% menggunakan spasi 1), spasi lebih besar untuk pasangan volatile (tier 0,25% menggunakan 60, tier 1% menggunakan 120).
+
+Posisi harus memiliki `tick_lower` dan `tick_upper` selaras dengan `tick_spacing`. Tick aktif pool (yang memiliki likuiditas mulai atau berakhir di sana) adalah satu-satunya tick yang peduli untuk langkah swap.
+
+## Likuiditas-ke-jumlah
+
+Untuk posisi dengan likuiditas `L` dan kisaran harga `[sqrt_lo, sqrt_hi]` (semua nilai `sqrt_price`):
+
+| Status Pool | Jumlah token0 | Jumlah token1 |
+|------------|-------------------|-------------------|
+| Harga di atas kisaran (`sqrt_p ≥ sqrt_hi`) | 0 | `L · (sqrt_hi − sqrt_lo)` |
+| Harga dalam kisaran | `L · (sqrt_hi − sqrt_p) / (sqrt_p · sqrt_hi)` | `L · (sqrt_p − sqrt_lo)` |
+| Harga di bawah kisaran (`sqrt_p ≤ sqrt_lo`) | `L · (sqrt_hi − sqrt_lo) / (sqrt_lo · sqrt_hi)` | 0 |
+
+Penurunan: diferensiasi invarian CPMM secara lokal. Dalam kisaran tick tunggal, posisi berperilaku sebagai CPMM dengan cadangan virtual `(x_v, y_v)` yang dipilih sehingga `(sqrt_p, L)` pool saat ini konsisten dengan `L = sqrt(x_v · y_v)`. Integrasi dari `sqrt_p` ke batas kisaran menghasilkan jumlah di atas.
+
+**Formula invers** (digunakan saat minting posisi untuk `amount0` atau `amount1` tertentu):
+
+```
+L_from_amount0(amount0, sqrt_lo, sqrt_hi, sqrt_p) =
+    amount0 · sqrt_p · sqrt_hi / (sqrt_hi − sqrt_p)
+
+L_from_amount1(amount1, sqrt_lo, sqrt_hi, sqrt_p) =
+    amount1 / (sqrt_p − sqrt_lo)
+
+// Untuk deposit simetris ke posisi dalam kisaran, ambil yang minimum.
+L = min(L_from_amount0, L_from_amount1)
+```
+
+## Langkah swap satu-tick
+
+Dalam kisaran tick tunggal, pool berperilaku seperti CPMM. Diberikan `sqrt_p` saat ini dan `sqrt_target` target:
+
+```
+Δamount0_step = L · (sqrt_target − sqrt_p) / (sqrt_p · sqrt_target)     // jika swap untuk token0
+Δamount1_step = L · (sqrt_target − sqrt_p)                              // jika swap untuk token1
+```
+
+### Langkah exact-input
+
+Diberikan `Δin_remaining`:
+
+```
+// Calon sqrt_p baru jika kami mengisi hingga batas tick:
+sqrt_after_full = sqrt_target
+amount_to_full  = Δamount_in_to_reach(sqrt_p → sqrt_target)
+
+if Δin_remaining ≥ amount_to_full:
+    // konsumsi sisa bucket
+    sqrt_p'         = sqrt_target
+    Δin_consumed    = amount_to_full
+    Δout            = amount_out_at_boundary
+else:
+    // kami tidak menyeberang; selesaikan sqrt_p terminal
+    sqrt_p'         = L · sqrt_p / (L + Δin_remaining · sqrt_p)      // untuk swap 0→1
+    Δin_consumed    = Δin_remaining
+    Δout            = L · (sqrt_p − sqrt_p')                          // proporsional dengan Δsqrt
+```
+
+Swap `0→1` menurunkan `sqrt_p` (harga menurun saat kami menjual token0). Swap `1→0` menaikkannya. Formula simetris dengan `sqrt_p` dan `sqrt_target` ditukar.
+
+### Langkah exact-output
+
+Struktur yang sama, menyelesaikan untuk `Δin` sebagai gantinya.
+
+## Loop swap multi-tick
+
+Swap melakukan iterasi di atas tick sampai input habis atau batas harga tercapai:
+
+```
+while Δin_remaining > 0 and sqrt_p != sqrt_price_limit:
+    next_tick = find_next_initialized_tick(pool.tick_current, direction)
+    sqrt_target = min(next_tick.sqrt_price, sqrt_price_limit)       // secara directional
+
+    (Δin, Δout, sqrt_p') = single_step(sqrt_p, sqrt_target, L, Δin_remaining)
+
+    Δin_remaining -= Δin
+    accumulated_out += Δout
+
+    if sqrt_p' == next_tick.sqrt_price:
+        // penyeberangan tick
+        L += next_tick.liquidity_net * direction_sign
+        flip_fee_growth_outside(next_tick)
+        match_limit_orders_at_tick(next_tick, ...)        // lihat products/clmm/math
+        pool.tick_current = next_tick.tick_index
+    sqrt_p = sqrt_p'
+```
+
+Setiap `single_step` menggunakan `L` pool saat ini. `L` berubah **hanya** saat penyeberangan tick yang diinisialisasi. Likuiditas antara tick konstan, yang membuat matematika langkah closed-form.
+
+`liquidity_net` pada tick adalah jumlah signed likuiditas posisi yang dimulai pada tick tersebut dikurangi mereka yang berakhir di sana. Penyeberangan ke atas menambahkan `liquidity_net`; penyeberangan ke bawah menguranginya.
+
+Ketika pool memiliki limit order terbuka pada tick, langkah penyeberangan tick juga secara oportunistik mengonsumsi sebagian input swap untuk mengisi order tersebut (FIFO di seluruh cohort). Algoritma matching dan dynamic-fee surcharge yang mungkin berlaku di atas langkah dasar didokumentasikan dalam [`products/clmm/math`](/id/products/clmm/math); mereka tidak mengubah formula single-step closed-form di atas.
+
+## Akumulator pertumbuhan biaya
+
+CLMM melacak biaya per unit likuiditas aktif, per sisi, secara global dan per tick:
+
+```
+fee_growth_global_0_x64     // Q64.64, monotone
+fee_growth_global_1_x64
+tick.fee_growth_outside_0_x64   // "biaya yang terkumpul saat tick ini berada di luar rentang aktif"
+tick.fee_growth_outside_1_x64
+```
+
+Pada setiap `single_step`:
+
+```
+step_lp_fee = (Δin · fee_rate) · (1 − protocol_fraction − fund_fraction)
+fee_growth_global += step_lp_fee · 2^64 / L     // hanya untuk sisi input
+```
+
+(Sisi lain `fee_growth_global` tidak bergerak pada langkah ini, karena tidak ada token di sisi itu yang dibayarkan sebagai input.)
+
+Saat penyeberangan tick, program **membalik** `fee_growth_outside`:
+
+```
+tick.fee_growth_outside_0_x64 = fee_growth_global_0_x64 − tick.fee_growth_outside_0_x64
+tick.fee_growth_outside_1_x64 = fee_growth_global_1_x64 − tick.fee_growth_outside_1_x64
+```
+
+"Outside" relatif terhadap `tick_current`. Ketika `tick_current` berada di atas tick, outside berarti "di bawah". Ketika `tick_current` berada di bawah, outside berarti "di atas". Pembalikan menukar interpretasi.
+
+### `fee_growth_inside` untuk posisi
+
+Diberikan posisi `[tick_lower, tick_upper]` dan `tick_current` saat ini:
+
+```
+if tick_current >= tick_upper:
+    inside = tick_lower.fee_growth_outside − tick_upper.fee_growth_outside
+else if tick_current < tick_lower:
+    inside = tick_upper.fee_growth_outside − tick_lower.fee_growth_outside
+else:     // posisi dalam kisaran
+    inside = fee_growth_global
+           − tick_lower.fee_growth_outside
+           − tick_upper.fee_growth_outside
+```
+
+Biaya yang belum dikumpulkan posisi untuk sisi token `s` adalah:
+
+```
+tokens_owed_s += L · (fee_growth_inside_s − fee_growth_inside_last_s) / 2^64
+fee_growth_inside_last_s = fee_growth_inside_s
+```
+
+Update ini berjalan pada setiap interaksi dengan posisi (`IncreaseLiquidity`, `DecreaseLiquidity`, `CollectFees`).
+
+## Contoh kerja — penyeberangan satu tick
+
+Pool (disederhanakan):
+
+- `sqrt_p_x64 = 2^64 · 1.0 = 2^64` (harga = 1,0)
+- `L = 1_000_000`
+- `tick_current = 0`
+- Tick terdekat yang diinisialisasi di bawah: `tick = −60`, `sqrt_price = 1.0001^(−30) ≈ 0.99700`, `liquidity_net = −400_000` (tick ini mengakhiri posisi, jadi penyeberangan ke bawah menghilangkan 400k)
+- Tarif biaya: 0,25%
+
+Swap: `Δin = 10_000` token0, arah = 0→1.
+
+**Langkah 1 — hingga `sqrt_target = 0.99700 · 2^64`**:
+
+```
+amount_in_to_target = L · (1/sqrt_target − 1/sqrt_p)
+                    = 1_000_000 · (1/0.99700 − 1/1.0)
+                    ≈ 1_000_000 · 0.003009
+                    ≈ 3_009
+```
+
+3.009 &lt; 10.000, jadi kami mengisi langkah ini sepenuhnya:
+
+```
+Δin_step  = 3_009 / (1 − 0.0025)  = 3_017    // bruto dari biaya
+Δout_step = L · (sqrt_p − sqrt_target) ≈ 1_000_000 · 0.00299 ≈ 2_990
+sqrt_p    = 0.99700 · 2^64
+tick_current = −60
+L         = 1_000_000 + (−400_000)  = 600_000         // menyeberang tick
+fee_growth_outside pada tick −60 dibalik
+Δin_remaining = 10_000 − 3_017 = 6_983
+```
+
+**Langkah 2 — dengan `L = 600_000` baru**:
+
+Tick terdekat yang diinisialisasi (katakan `tick = −120`) berada di `sqrt = 0.99402`. Hitung ulang `amount_in_to_target`:
+
+```
+amount_in_to_target = 600_000 · (1/0.99402 − 1/0.99700)
+                    ≈ 600_000 · 0.003010
+                    ≈ 1_806
+```
+
+Masih kurang dari `Δin_remaining`. Seberang lagi. Lanjutkan hingga `Δin_remaining` mencapai nol.
+
+Urutan lengkap `Δout` terakumulasi ke output swap akhir.
+
+## Inisialisasi dan penjaga overflow
+
+- `MIN_SQRT_PRICE_X64` dan `MAX_SQRT_PRICE_X64` sesuai dengan `tick = ±443636`. Setiap swap yang akan mendorong `sqrt_p` di luar rentang ini dikembalikan.
+- Parameter `sqrt_price_limit` pengguna harus terletak dalam interval yang sama; program memeriksa.
+- Produk `L · Δsqrt` dihitung dalam `u256` kemudian digeser kembali ke `u128` untuk menghindari overflow.
+
+## Perbedaan vs Uniswap v3
+
+- **Oracle.** `ObservationState` Raydium menyimpan ring buffer `(block_timestamp, tick_cumulative, seconds_per_liquidity_cumulative)`; format wire sedikit berbeda dari Uniswap tetapi matematika TWAP sama.
+- **Token-2022.** Raydium CLMM mendukung mint Token-2022; varian transfer-fee memerlukan penyesuaian jumlah pre/post-swap tambahan. Lihat [`algorithms/token-2022-transfer-fees`](/id/algorithms/token-2022-transfer-fees).
+- **Tick bitmap.** Raydium mengemas bitmap tick yang diinisialisasi ke `[u64; 16]` per pool untuk `find_next_initialized_tick` cepat; Uniswap menggunakan pemetaan per-word on-chain. Trade-off adalah rent vs biaya lookup.
+- **Reward slots.** Raydium mendukung 3 aliran reward per-pool dengan counter `reward_growth_global_x64` terpisah; struktur sama dengan akumulator pertumbuhan biaya.
+
+## Pointer
+
+- [`products/clmm/math`](/id/products/clmm/math) — implementasi on-chain dan contoh kerja dengan field struct CLMM aktual.
+- [`products/clmm/ticks-and-positions`](/id/products/clmm/ticks-and-positions) — kisi tick, semantik `liquidity_net`/`gross`, active-range.
+- [`products/clmm/fees`](/id/products/clmm/fees) — akumulator pertumbuhan biaya dalam aksi.
+
+Sumber:
+
+- Whitepaper Uniswap v3 (penurunan kanonik matematika sqrt-price).
+- Sumber program Raydium CLMM.

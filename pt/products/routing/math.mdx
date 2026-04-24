@@ -1,0 +1,161 @@
+---
+title: "Matemática do roteamento"
+description: "O roteador não realiza nenhuma matemática de preço; cada salto delega à curva de seu programa de pool. O slippage em múltiplos saltos se compõe; saltos CLMM usam limit_prices."
+---
+
+<Info>
+  **Esta página foi traduzida automaticamente por IA. A versão em inglês é a fonte oficial.**
+
+  [Ver versão em inglês →](/products/routing/math)
+</Info>
+
+## O roteador não realiza cálculos
+
+O programa de roteamento **não implementa nenhuma lógica de preço**. É um orquestrador puro: aceita uma rota, passa contas para programas filhos e encadeia fluxos de tokens.
+
+Cada salto precifica pela curva do seu próprio programa de pool:
+
+- **Saltos AMM v4:** usam a fórmula de produto constante (`x · y = k`) com preços híbridos do OpenBook. Veja [`products/amm-v4/math`](/pt/products/amm-v4/math).
+- **Saltos CPMM:** usam a fórmula de produto constante com camadas de taxas configuráveis. Veja [`products/cpmm/math`](/pt/products/cpmm/math).
+- **Saltos CLMM:** usam matemática de tick com liquidez concentrada. Veja [`algorithms/clmm-math`](/pt/algorithms/clmm-math).
+- **Saltos estáveis:** usam a curva stable-swap para ativos do mesmo tipo. Veja [`products/stable/math`](/pt/products/stable/math).
+
+O único envolvimento do roteador é:
+
+1. Chamar a instrução de swap de cada pool via CPI.
+2. Coletar o montante de saída.
+3. Passá-lo como o montante de entrada para o próximo salto.
+4. Verificar a saída final contra o limite de slippage do chamador.
+
+## Composição de slippage
+
+Em uma rota com múltiplos saltos, o slippage em cada salto se compõe. Um pequeno slippage no salto 1 se torna um slippage maior no salto 2 porque o volume que entra no salto 2 já está reduzido.
+
+**Exemplo:**
+
+```
+Rota: USDC → SOL → STEP
+
+Pool 1 (USDC / SOL):
+  Entrada: 1000 USDC
+  Slippage: 1% (spot daria 0.5 SOL, mas você recebe 0.495 SOL)
+  Saída: 0.495 SOL
+
+Pool 2 (SOL / STEP):
+  Entrada: 0.495 SOL (já reduzido)
+  Slippage: 1% (spot daria 495 STEP, mas você recebe 490 STEP)
+  Saída: 490 STEP
+
+Slippage efetivo total em USDC → STEP: 1.99%, não 1% + 1% = 2%.
+```
+
+Quando você fornece `minimum_amount_out`, o roteador verifica sua saída final contra este limite global. Cada salto também verifica seu próprio swap contra sua estrutura de taxa local, mas o roteador não faz novas cotações no meio da rota—você deve pré-computar a rota e incluir tolerância de slippage suficiente.
+
+## Saltos CLMM e limit_prices
+
+Para cada salto para um pool CLMM, o roteador verifica se o `sqrt_price_x64` atual do pool está dentro de um limite especificado. Os limites são passados como um `VecDeque<u128>` chamado `limit_prices`:
+
+- Um `sqrt_price_x64` por salto CLMM na rota.
+- `sqrt_price_x64` é a representação de preço baseada em tick usada por CLMM. Veja [`algorithms/clmm-math`](/pt/algorithms/clmm-math) para a definição.
+- O roteador força:
+
+```
+  sqrt_price_lower <= pool.sqrt_price_x64 <= sqrt_price_upper
+```
+
+para cada salto CLMM, rejeitando o swap se o preço estiver fora dos limites.
+
+### Variantes de instrução e limit_prices
+
+- **`SwapBaseInWithUserAccount`, `SwapBaseOutWithUserAccount` (Legado, tags 0 e 1):** o VecDeque `limit_prices` é **obrigatório**. Uma fila vazia é rejeitada com um erro se algum salto for um pool CLMM. Você deve fornecer um preço por salto CLMM, em ordem.
+
+- **`SwapBaseIn`, `SwapBaseOut` (Atual, tags 8 e 9):** o VecDeque `limit_prices` é **opcional**. Uma fila vazia é silenciosamente ignorada; nenhuma verificação de preço é realizada. Novo código deve usar estes.
+
+### Construindo limit_prices
+
+Para uma rota com M saltos CLMM, a fila deve conter exatamente M entradas. Ordene-as por salto:
+
+```
+limit_prices = [
+  sqrt_price_for_first_clmm_hop,
+  sqrt_price_for_second_clmm_hop,
+  ...
+]
+```
+
+### Quando verificar limit_prices
+
+O `sqrt_price_x64` é um instantâneo do preço atual do pool. Muda continuamente conforme os swaps são executados. Você deve:
+
+1. Buscar o estado atual do pool on-chain.
+2. Computar limites aceitáveis (por exemplo, ±0.5% do preço atual).
+3. Codificar esses limites em `limit_prices`.
+4. Incluir os limites em sua instrução de roteador.
+
+Se o preço do pool desviar além dos seus limites antes da transação ser validada, o roteador a rejeitará.
+
+## Tratamento de taxas
+
+Cada pool cobra sua própria taxa de acordo com sua configuração:
+
+- **AMM v4:** 0.25% (fixa) dividida entre LP, protocolo e fundo.
+- **CPMM:** configurável por `AmmConfig` (padrão 0.25%, divisão varia por camada).
+- **CLMM:** configurável por pool, descontado do montante de entrada.
+- **Estável:** como AMM v4, 0.25% dividido.
+
+O roteador **não cobra taxa própria**. Todos os tratamentos de taxa são delegados a cada pool filho. A saída do salto N já tem a taxa daquele salto descontada.
+
+Veja a documentação de taxa do pool individual:
+
+- [`products/amm-v4/fees`](/pt/products/amm-v4/fees)
+- [`products/cpmm/fees`](/pt/products/cpmm/fees)
+- [`products/clmm/fees`](/pt/products/clmm/fees) (se disponível)
+- [`products/stable/fees`](/pt/products/stable/fees) (se disponível)
+
+## Exemplo de contabilização multi-salto
+
+Suponha que você roteie USDC → SOL → STEP através de dois pools de produto constante, cada um com uma taxa de 0.25%:
+
+```
+Entrada: 1000 USDC
+Pool 1 (USDC/SOL):
+  Taxa cobrada: ceil(1000 * 0.25%) = 2.5 USDC
+  Entrada líquida para a curva: 997.5 USDC
+  Saída da curva (antes de slippage): 0.5 SOL
+  Margem de slippage: assuma 1%, então você recebe ~0.495 SOL
+
+Pool 2 (SOL/STEP):
+  Entrada: 0.495 SOL
+  Taxa cobrada: ceil(0.495 * 0.25%) ≈ 0.001 SOL
+  Entrada líquida para a curva: 0.494 SOL
+  Saída da curva: ~494 STEP
+  Margem de slippage: 1%, então você recebe ~489 STEP
+
+Saída final: ~489 STEP
+```
+
+O roteador verifica:
+
+```
+489 >= minimum_amount_out  // especificado pelo chamador
+```
+
+Se for falso, toda a rota falha atomicamente.
+
+## Considerações de precisão
+
+Como todos os programas Solana, o roteador usa aritmética inteira:
+
+- Todos os montantes são `u64` (lamports ou unidades menores de token).
+- Cálculos de curva usam intermediários `u128` quando necessário para evitar overflow.
+- Convenções de arredondamento dependem do programa filho. O roteador não re-arredonda.
+
+Se um salto produz um montante zero devido a proporções de preço extremas (por exemplo, fazer swap de 1 lamport em um pool 1B:1), o roteador propaga esse zero para o próximo salto, que pode rejeitá-lo como insuficiente. Veja os códigos de erro do pool individual.
+
+## Próximas etapas
+
+- [`products/amm-v4/math`](/pt/products/amm-v4/math) — matemática de produto constante.
+- [`products/cpmm/math`](/pt/products/cpmm/math) — CPMM produto constante com Token-2022.
+- [`algorithms/clmm-math`](/pt/algorithms/clmm-math) — preço de liquidez concentrada.
+- [`products/stable/math`](/pt/products/stable/math) — curva stable-swap.
+- [`products/routing/code-demos`](/pt/products/routing/code-demos) — exemplos de cotação antes de roteamento.

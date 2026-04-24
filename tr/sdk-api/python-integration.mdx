@@ -1,0 +1,269 @@
+---
+title: "Python entegrasyonu"
+description: "solders, solana-py ve anchorpy aracılığıyla Raydium'a yönelik bot ve arka uç yazılım geliştirme — ortam kurulumu, havuz durumunu okuma, swap gönderme ve tipik bot mimarisi."
+---
+
+<Info>
+  **Bu sayfa yapay zekâ tarafından otomatik olarak çevrilmiştir. İngilizce sürüm esas alınır.**
+
+  [İngilizce sürümü görüntüle →](/sdk-api/python-integration)
+</Info>
+
+<Info>
+  Raydium, resmi bir Python SDK yayımlamaz. Buradaki desenler iyi bakımı yapılan üç topluluk kütüphanesini birleştiriyor: **`solders`** (Rust bağlantılı Solana ilkelleri), **`solana-py`** (RPC istemcisi) ve **`anchorpy`** (IDL'lerden Anchor tarzı komut oluşturucu). Kombinasyon, TS SDK'nın yaptığı her şeyi kapsıyor; sadece daha az cilalı.
+</Info>
+
+## Ortam
+
+```bash
+python -m venv .venv
+source .venv/bin/activate
+
+pip install solders solana anchorpy construct base58
+```
+
+Bu yazının yazıldığı tarih itibariyle birlikte çalışan sürümler:
+
+```
+solders == 0.21.*
+solana  == 0.34.*
+anchorpy == 0.20.*
+```
+
+`anchorpy` periyodik olarak `anchor-lang` sürümünün gerisinde kalır; yakın zamanda dağıtılan bir Raydium programı için, sabitlenmiş `anchorpy` sürümünüzde IDL'nin derlendiğini taahhüt etmeden önce doğrulayın.
+
+## Bağlantı ve keypair
+
+```python
+from solana.rpc.async_api import AsyncClient
+from solders.keypair import Keypair
+
+client = AsyncClient("https://api.mainnet-beta.solana.com", commitment="confirmed")
+owner  = Keypair.from_bytes(bytes(open("keypair.json", "rb").read()))
+```
+
+`AsyncClient` `async` varyantıdır; senkron `Client` hızlı scriptler için kullanılabilir, ancak birden fazla istek gönderen herhangi bir şey için async tercih edilir.
+
+## Havuz durumunu okuma
+
+Çoğu üretim kullanımı, on-zincir verilerini manuel olarak koddan çözmek yerine Raydium'un REST API'sinden kodlanmış havuz durumunu okur (bkz. [`sdk-api/rest-api`](/tr/sdk-api/rest-api)) — daha basit ve gecikme çoğu kullanım senaryosu için kabul edilebilir.
+
+```python
+import httpx
+
+async def get_pool(pool_id: str) -> dict:
+    async with httpx.AsyncClient() as http:
+        r = await http.get(
+            "https://api-v3.raydium.io/pools/info/ids",
+            params={"ids": pool_id},
+        )
+        r.raise_for_status()
+        data = r.json()
+        if not data["success"]:
+            raise RuntimeError(data["error"]["message"])
+        return data["data"][0]
+
+pool = await get_pool("58oQChx4yWmvKdwLLZzBi4ChoCc2fqCUWBkwMihLYQo2")
+print(pool["price"], pool["day"]["volume"])
+```
+
+En düşük gecikmeye ihtiyaç duyan botlar için on-zincir baytlarını doğrudan koddan çözün:
+
+```python
+from construct import Struct, Int64ul, Int128ul, Bytes, this
+
+# Kısmi CPMM PoolState düzeni (ilk birkaç alan)
+POOL_STATE_LAYOUT = Struct(
+    "discriminator"     / Bytes(8),
+    "amm_config"        / Bytes(32),
+    "pool_creator"      / Bytes(32),
+    "token_0_vault"     / Bytes(32),
+    "token_1_vault"     / Bytes(32),
+    "lp_mint"           / Bytes(32),
+    "token_0_mint"      / Bytes(32),
+    "token_1_mint"      / Bytes(32),
+    # ...
+)
+
+from solders.pubkey import Pubkey
+
+async def decode_pool(pool_id: Pubkey) -> dict:
+    resp = await client.get_account_info(pool_id)
+    data = resp.value.data
+    return POOL_STATE_LAYOUT.parse(data)
+```
+
+Tam düzen `src/raydium/cpmm/layout.ts` dosyasında yer alır (TS kaynağı); gerektiğinde `construct`a taşıyın. `anchorpy` bunu IDL verildiğinde otomatik yapabilir — aşağıya bakın.
+
+## Swap oluşturma ve gönderme
+
+Basitlik için Raydium'un **server-built-transaction** endpoint'ini kullanın. Sunucu, imzaya hazır bir işlem döndürür; yalnızca imzanızı eklemeniz gerekir:
+
+```python
+import httpx
+import base64
+from solders.transaction import VersionedTransaction
+from solana.rpc.types import TxOpts
+
+async def swap(pool_id: str, amount_in: int, slippage_bps: int):
+    async with httpx.AsyncClient() as http:
+        r = await http.get(
+            "https://api-v3.raydium.io/transaction/swap-base-in",
+            params={
+                "poolId":       pool_id,
+                "amount":       amount_in,
+                "inputMint":    "So11111111111111111111111111111111111111112",  # WSOL
+                "outputMint":   "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",  # USDC
+                "slippageBps":  slippage_bps,
+                "wallet":       str(owner.pubkey()),
+                "txVersion":    "V0",
+                "computeUnitPriceMicroLamports": 50_000,
+            },
+        )
+        r.raise_for_status()
+        data = r.json()["data"]
+
+    # Önceden oluşturulmuş işlemi koddan çöz, keypair'imizle imzala, gönder.
+    raw  = base64.b64decode(data["tx"]["transaction"])
+    tx   = VersionedTransaction.from_bytes(raw)
+    tx.sign([owner])
+
+    sig = await client.send_transaction(tx, opts=TxOpts(skip_preflight=False))
+    await client.confirm_transaction(sig.value, commitment="confirmed")
+    return sig.value, data["swapResponse"]
+```
+
+Bu, çalışan bir bota ulaşmanın en hızlı yoludur. Sunucu teklifi hızlı bir şekilde sona erer (≈30 sn); önbelleğe almayın.
+
+## Client tarafından swap oluşturma (`anchorpy` aracılığıyla)
+
+Daha düşük gecikme için veya Raydium API'sine erişemediğinizde (yaptırım altındaki bölgeler, hava boşluğu kurulumları):
+
+```python
+from anchorpy import Program, Provider, Wallet, Context
+from solana.rpc.async_api import AsyncClient
+from solders.pubkey import Pubkey
+import json
+
+idl = json.load(open("cpmm.json"))  # raydium-sdk-v2'den
+provider = Provider(client, Wallet(owner))
+program  = Program(idl, Pubkey.from_string(CPMM_PROGRAM_ID), provider)
+
+# swap_base_input'i çağır:
+tx_sig = await program.rpc["swap_base_input"](
+    amount_in,
+    minimum_amount_out,
+    ctx=Context(
+        accounts={
+            "payer":                owner.pubkey(),
+            "authority":            owner.pubkey(),
+            "amm_config":           amm_config_pk,
+            "pool_state":           pool_state_pk,
+            "input_token_account":  user_input_ata,
+            "output_token_account": user_output_ata,
+            "input_vault":          input_vault_pk,
+            "output_vault":         output_vault_pk,
+            "input_token_program":  TOKEN_PROGRAM_ID,
+            "output_token_program": TOKEN_PROGRAM_ID,
+            "input_token_mint":     input_mint,
+            "output_token_mint":    output_mint,
+            "observation_state":    observation_state_pk,
+        },
+    ),
+)
+```
+
+PDA türetmeleri (gözlem durumu, havuz yetkilisi) CPMM bölümündekiyle aynı formülleri izler. `anchorpy` bunları otomatik olarak türetmez.
+
+## Tipik bot mimarisi
+
+Yaygın bir Python Raydium bot yapısı:
+
+```
+┌──────────────────┐
+│ Zamanlayıcı      │  cron / asyncio / redis kuyruğu
+└──────────┬───────┘
+           │
+           ▼
+┌──────────────────┐
+│ Fiyat yoklayıcı  │  httpx + Raydium REST API
+│  (havuz başına)  │  veya WebSocket RPC abo
+└──────────┬───────┘
+           │ olay
+           ▼
+┌──────────────────┐
+│ Strateji motoru  │  sinyal hesapla, ticaret parametrelerine karar ver
+└──────────┬───────┘
+           │ ticaret parametreleri
+           ▼
+┌──────────────────┐
+│ İşlem oluşturucu │  Raydium REST server-built-tx veya anchorpy
+│ + imzalayıcı     │  solders.Keypair
+└──────────┬───────┘
+           │ VersionedTransaction
+           ▼
+┌──────────────────┐
+│ RPC gönderici    │  solana-py AsyncClient + Jito RPC
+│ (yeniden deneme  │  öncelik ücreti mantığı
+│ + izleme)        │
+└──────────┬───────┘
+           │ imza
+           ▼
+┌──────────────────┐
+│ Ledger deposu    │  Postgres pozisyonlar, bekleyen işlemler, PnL için
+└──────────────────┘
+```
+
+Üretim için önemli kararlar:
+
+- **RPC sağlayıcı.** Genel mainnet RPC'ları agresif bir şekilde hız sınırlandırır. Sürekli trafiği için ayrılmış bir sağlayıcı (Helius, QuickNode, Triton) kullanın.
+- **Havuz durumu için WebSocket.** `client.account_subscribe(pool_id)`, her durum değişikliğinde güncellemeleri iter. Yoklamadan çok sıkı.
+- **Öncelik ücreti sağlayıcı.** Helius'un bir `getPriorityFeeEstimate` endpoint'i vardır; Triton'un kendi sürümü vardır. Hedefteki program üzerindeki son ücretlerin 75. yüzdebiline göre ücretinizi belirleyin.
+- **MEV'ye duyarlı işlemler için paketler.** Sandviç riskini tolere edemiyorsanız Jito'nun blok motorundan geçin. Python kitaplıkları: `jito-sdk-python` (üçüncü taraf, kalite değişken).
+
+## Çiftlik durumunu okuma
+
+```python
+FARM_V6_ID = Pubkey.from_string("...")
+
+async def get_farm_v6(farm_id: Pubkey):
+    resp = await client.get_account_info(farm_id)
+    return farm_v6_idl_program.account["FarmState"].decode(resp.value.data)
+
+farm = await get_farm_v6(farm_id)
+print(farm.total_staked, farm.reward_info_count)
+for r in farm.reward_infos[:farm.reward_info_count]:
+    print(r.reward_mint, r.emission_per_second_x64)
+```
+
+`anchorpy`'nin `.account["X"].decode(bytes)`, IDL yapısıyla eşleşen yerel bir Python nesnesi verir.
+
+## Tuzaklar
+
+### 1. Ondalık işleme
+
+Python'un yerel `float` değeri IEEE-754 çiftdir; 9 ondalık mint'lerdeki tutarlar (1 SOL = 1e9 birim) doğru kalır, ancak oranlar ve ürünler kesinliği kaybeder. Tüm tutar alanları için `int` kullanın (`solders` tüm tutar alanları için `int` döndürür) ve herhangi bir fiyat aritmetiği için `decimal.Decimal` aracılığıyla yönlendirin.
+
+### 2. Slot tabanlı vs timestamp tabanlı akıl yürütme
+
+Bazı çiftlik sürümleri slot sayaçları kullanır; LaunchLab zaman damgaları kullanır. `solana-py` RPC yanıtlarında `slot` döndürür, ancak slot → zaman damgası dönüştürmesi kayıplı (lider planına göre değişir). Duvar saati zamanına ihtiyacınız varsa, açıkça `get_block_time(slot)` çağırın.
+
+### 3. Bağlantı havuzu tükenmesi
+
+`AsyncClient` varsayılan olarak istek başına bir HTTP bağlantısı açar. Yüksek yük altında, `httpx.AsyncClient` oturumlarını yeniden kullanın ve uygun bir `limits=httpx.Limits(max_connections=100)` ayarlayın.
+
+### 4. İşlem boyutu sınırları
+
+Python tarafından oluşturulan işlemler TS tarafından oluşturulan işlemlerden daha küçük değildir — 1232 baytlık sınır eşit şekilde uygulanır. 2'den fazla havuzdan geçen herhangi bir şey için V0 işlemlerini (adres arama tabloları) kullanın.
+
+## İşaretçiler
+
+- [`sdk-api/rest-api`](/tr/sdk-api/rest-api) — yukarıdaki HTTP endpoint'leri.
+- [`sdk-api/anchor-idl`](/tr/sdk-api/anchor-idl) — `anchorpy` için IDL'nin nereden alınacağı.
+- [`integration-guides/routing-and-mev`](/tr/integration-guides/routing-and-mev) — Jito paketi desenleri.
+
+Kaynaklar:
+
+- [solders](https://github.com/kevinheavey/solders)
+- [solana-py](https://github.com/michaelhly/solana-py)
+- [anchorpy](https://github.com/kevinheavey/anchorpy)

@@ -1,0 +1,505 @@
+---
+title: "Comptes CLMM"
+description: "Chaque compte impliqué dans un pool CLMM : PoolState, AmmConfig, TickArrayState, TickArrayBitmapExtension, PersonalPositionState et Observation."
+---
+
+<Info>
+  **Cette page est traduite automatiquement par IA. La version anglaise fait foi.**
+
+  [Voir la version anglaise →](/products/clmm/accounts)
+</Info>
+
+<Info>
+  Cette page décrit la **structure et le rôle** de chaque compte. Les seeds canoniques sont répertoriées dans [`reference/program-addresses`](/fr/reference/program-addresses). Un pool CLMM mobilise davantage de comptes qu'un pool CPMM, car la liquidité est stockée de façon clairsemée sur l'ensemble de la plage de ticks ; comprendre cette dispersion constitue l'essentiel de cette page.
+</Info>
+
+## Inventaire des comptes
+
+Un pool CLMM actif est décrit par les familles de comptes suivantes. Tous appartiennent au programme CLMM, à l'exception des deux mints et de leurs vaults.
+
+| Compte | Rôle | Nombre par pool |
+|---------|---------|----------------|
+| `AmmConfig` | Palier de frais : taux de frais de trading, quote-part protocole, quote-part fund, espacement de ticks par défaut. Partagé par tous les pools de ce palier. | 1 (partagé) |
+| `PoolState` | `sqrt_price_x64` courant, tick courant, liquidité totale, croissance globale des frais, infos de récompense, pointeur d'observation. | 1 |
+| `TickArrayState` | Un bloc de `TICK_ARRAY_SIZE` ticks adjacents. Initialisé uniquement à la demande. | 0 ≤ N ≤ plage |
+| `TickArrayBitmapExtension` | Bitmap de débordement indiquant quels tableaux de ticks existent au-delà du bitmap inline de `PoolState`. | 0 ou 1 |
+| `PersonalPositionState` | Un par position LP. Stocke la plage, la liquidité et la dernière croissance de frais/récompenses observée. Autorité = propriétaire du NFT. | 1 par position |
+| Mint du NFT de position | Mint de supply 1, associé à `PersonalPositionState`. Transférer le NFT transfère la position. | 1 par position |
+| `ObservationState` | Buffer circulaire d'observations de prix pour le TWAP. | 1 |
+| `token_0_vault`, `token_1_vault` | Comptes de tokens détenant les soldes du pool. Détenus par l'autorité du pool. | 2 |
+| `DynamicFeeConfig` | Ensemble de paramètres réutilisables pour le mécanisme de frais dynamiques. Les pools créés via `create_customizable_pool` peuvent y adhérer. Géré par l'administrateur. | partagé (par index) |
+| `LimitOrderState` | Un par ordre limite ouvert. Enregistre le propriétaire, le tick, le sens, le montant total et le snapshot de l'output réglé. | 1 par ordre |
+| `LimitOrderNonce` | Compteur par `(wallet, nonce_index)` qui dérive des PDAs d'ordres uniques. | 1 par (wallet, index) |
+
+## `PoolState`
+
+L'état en temps réel du pool, lu à chaque swap et à chaque modification de position.
+
+```rust
+// programs/amm/src/states/pool.rs
+pub struct PoolState {
+    pub bump:           [u8; 1],
+    pub amm_config:     Pubkey,            // fee tier binding
+    pub owner:          Pubkey,            // admin (multisig)
+    pub token_mint_0:   Pubkey,
+    pub token_mint_1:   Pubkey,
+    pub token_vault_0:  Pubkey,
+    pub token_vault_1:  Pubkey,
+    pub observation_key: Pubkey,
+
+    pub mint_decimals_0: u8,
+    pub mint_decimals_1: u8,
+    pub tick_spacing:   u16,               // inherited from amm_config at init
+
+    pub liquidity:      u128,              // total active (in-range) liquidity
+    pub sqrt_price_x64: u128,              // Q64.64 of sqrt(price)
+    pub tick_current:   i32,               // current tick index
+
+    pub padding3:       u16,
+    pub padding4:       u16,
+
+    // Global fee growth per unit of liquidity, Q64.64.
+    pub fee_growth_global_0_x64: u128,
+    pub fee_growth_global_1_x64: u128,
+
+    // Accrued-but-not-swept protocol fees (per mint).
+    pub protocol_fees_token_0: u64,
+    pub protocol_fees_token_1: u64,
+
+    // Reserved padding for future upgrades.
+    pub padding5: [u128; 4],
+
+    // Status bitmask. Bits 0-5: open-position, decrease-liquidity,
+    // collect-fee, collect-reward, swap, limit-order. A set bit disables
+    // the corresponding operation.
+    pub status:  u8,
+
+    // Fee-collection mode (CollectFeeOn).
+    //   0 = FromInput (deduct fee from the swap input — Uniswap-V3 default)
+    //   1 = Token0Only (always deduct fee from token0 vault)
+    //   2 = Token1Only (always deduct fee from token1 vault)
+    pub fee_on: u8,
+    pub padding: [u8; 6],
+
+    // Live reward streams (up to REWARD_NUM = 3).
+    pub reward_infos: [RewardInfo; 3],
+
+    // Inline bitmap tracking initialized tick-arrays in the primary range.
+    pub tick_array_bitmap: [u64; 16],
+
+    // Reserved padding for future upgrades.
+    pub padding6: [u64; 4],
+
+    pub fund_fees_token_0: u64,
+    pub fund_fees_token_1: u64,
+
+    pub open_time:    u64,                 // currently disabled by the program
+    pub recent_epoch: u64,
+
+    // Per-pool dynamic-fee state. Zero-valued unless the pool was
+    // created with `enable_dynamic_fee = true` via create_customizable_pool.
+    pub dynamic_fee_info: DynamicFeeInfo,
+
+    // Reserved for future upgrades.
+    pub padding1: [u64; 14],
+    pub padding2: [u64; 32],
+}
+```
+
+Champs avec lesquels vous interagirez réellement :
+
+- **`sqrt_price_x64`** et **`tick_current`** représentent l'état de prix du pool. Ils sont mis à jour ensemble à chaque swap. `tick_current` est la partie entière inférieure de `log_{1.0001}(price)`.
+- **`liquidity`** est la liquidité **active** — la somme des valeurs `L` de toutes les positions dont la plage contient `tick_current`. Elle change à chaque fois qu'un swap franchit un tick et à chaque ouverture, fermeture ou redimensionnement de position.
+- **`fee_growth_global_{0,1}_x64`** représentent les frais cumulés par unité de liquidité sur toute l'histoire du pool. Les positions les consultent pour calculer ce qui leur est dû.
+- **`tick_spacing`** est figé à la valeur de `AmmConfig` lors de l'initialisation et ne change jamais. Il détermine quels indices de ticks sont autorisés comme extrémités de position.
+- **`tick_array_bitmap`** est un bitmap **inline** couvrant la plage de ticks communément utilisée autour du prix spot. Pour les pools dont les positions s'étendent loin, le suivi du débordement est délégué au compte séparé `TickArrayBitmapExtension`.
+- **`fee_on`** est fixé à la création du pool. `0` (FromInput) reproduit le comportement classique d'Uniswap-V3. `1` et `2` dirigent les frais de swap vers un seul côté du carnet — voir [`products/clmm/fees`](/fr/products/clmm/fees) pour les compromis associés.
+- **`dynamic_fee_info`** porte l'état de volatilité pour la majoration de frais dynamiques. Lorsqu'il est activé, chaque swap recalcule un `dynamic_fee_component` en plus de `AmmConfig.trade_fee_rate`. La structure est documentée sous `DynamicFeeInfo` ci-dessous ; les pools sans frais dynamiques laissent l'intégralité de cette struct à zéro.
+
+## `AmmConfig`
+
+```rust
+pub struct AmmConfig {
+    pub bump: u8,
+    pub index: u16,                       // uses "amm_config"+u16 seed
+
+    pub owner:             Pubkey,        // admin
+    pub protocol_fee_rate: u32,           // fraction of trade fee to protocol, denom 1e6
+    pub trade_fee_rate:    u32,           // trade fee in 1e6ths of volume
+    pub tick_spacing:      u16,           // default spacing for pools using this config
+    pub fund_fee_rate:     u32,           // fraction of trade fee to fund, denom 1e6
+    pub padding_u32: u32,
+
+    pub fund_owner: Pubkey,
+    pub padding: [u64; 3],
+}
+```
+
+Exemple de paliers de frais CLMM publiés (à vérifier via `GET https://api-v3.raydium.io/main/clmm-config`) :
+
+| Index | `trade_fee_rate` | Espacement de ticks | Usage typique |
+|-------|------------------|--------------|-------------|
+| 0 | `100` (0.01%) | 1 | Paires stables, USDC/USDT |
+| 1 | `500` (0.05%) | 10 | Blue-chips corrélées |
+| 2 | `2_500` (0.25%) | 60 | Paires standard |
+| 3 | `10_000` (1.00%) | 120 | Actifs volatils ou longue traîne |
+
+`protocol_fee_rate` et `fund_fee_rate` sont des fractions du frais de trading ; même convention que pour le CPMM. Voir [`products/clmm/fees`](/fr/products/clmm/fees).
+
+## `TickArrayState`
+
+Le CLMM ne stocke pas un enregistrement par tick — cela représenterait des milliards de comptes. Il regroupe plutôt **`TICK_ARRAY_SIZE` ticks adjacents** (initialisés ou non, typiquement 60 ou 88 selon la version du programme) dans un `TickArrayState` créé paresseusement à la première utilisation.
+
+```rust
+pub const TICK_ARRAY_SIZE: usize = 60;
+pub const TICK_ARRAY_SIZE_USIZE: usize = 60;
+
+pub struct TickArrayState {
+    pub pool_id:                Pubkey,
+    pub start_tick_index:       i32,                            // lowest tick in this array
+    pub ticks:                  [TickState; TICK_ARRAY_SIZE],   // 60 entries
+    pub initialized_tick_count: u8,
+    pub recent_epoch:           u64,
+    pub padding:                [u8; 107],
+}
+
+pub struct TickState {
+    pub tick:                       i32,
+    pub liquidity_net:              i128,                       // ΔL when crossing this tick upward
+    pub liquidity_gross:            u128,                       // total L referencing this tick
+    pub fee_growth_outside_0_x64:   u128,                       // see math.mdx
+    pub fee_growth_outside_1_x64:   u128,
+    pub reward_growths_outside_x64: [u128; 3],
+
+    // Limit-order bookkeeping. All zero for ticks that have never carried
+    // a limit order. See products/clmm/math for the matching algorithm.
+    pub order_phase:                  u64,                      // monotonic FIFO cohort id
+    pub orders_amount:                u64,                      // unfilled tokens in current cohort
+    pub part_filled_orders_remaining: u64,                      // remaining tokens of partially-filled cohort
+    pub unfilled_ratio_x64:           u128,                     // Q64.64; starts at 1.0 and shrinks as fills occur
+
+    pub padding:                    [u32; 3],
+}
+```
+
+Les quatre champs d'ordre limite sont à zéro pour tout tick n'ayant jamais servi à un ordre limite. Lorsque des ordres sont ouverts sur un tick, le programme les suit sous forme de séquence de cohortes :
+
+- `order_phase` est l'identifiant de cohorte. Il s'incrémente à chaque fois qu'une cohorte passe de « entièrement non exécutée » à « partiellement exécutée ».
+- `orders_amount` est le total en token d'entrée de la cohorte courante (la plus récente).
+- `part_filled_orders_remaining` suit la cohorte précédente en cours d'exécution par les swaps en cours.
+- `unfilled_ratio_x64` est un multiplicateur Q64.64 porté par la cohorte : lorsqu'un swap exécute X% de la cohorte, le ratio est multiplié par `(1 − X)`. Chaque ordre ouvert stocke son propre snapshot `(order_phase, unfilled_ratio_x64)` au moment de l'ouverture, ce qui ramène le calcul de règlement à une simple comparaison de snapshots.
+
+Règles :
+
+- Un tick extrémité de position *t* doit satisfaire `t % tick_spacing == 0`. Le programme rejette les positions dont les extrémités ne sont pas alignées sur l'espacement.
+- Le **tableau** du tick est localisé à `floor(t / (TICK_ARRAY_SIZE * tick_spacing)) * (TICK_ARRAY_SIZE * tick_spacing)`.
+- Un tableau de ticks est initialisé paresseusement : la première position ou le premier swap qui touche un tableau non initialisé le crée, en payant le rent.
+- Un tableau de ticks n'est **jamais fermé** par le programme. Une fois alloué, il persiste pour toute la durée de vie du pool, même après que tous les ticks qu'il contient sont revenus à `liquidity_gross == 0`. Les positions et swaps ultérieurs réutilisent le compte existant sans rent supplémentaire. Il n'existe aucun mécanisme de nettoyage des tableaux de ticks déclenché par `ClosePosition`.
+
+### `TickArrayBitmapExtension`
+
+`PoolState.tick_array_bitmap` (inline) couvre la plage « proche du prix spot » — ±1 024 tableaux de ticks. Au-delà de cette plage (pour des valeurs de ticks extrêmes), le programme maintient un compte d'extension :
+
+```rust
+pub struct TickArrayBitmapExtension {
+    pub pool_id: Pubkey,
+    pub positive_tick_array_bitmap: [[u64; 8]; 14],
+    pub negative_tick_array_bitmap: [[u64; 8]; 14],
+}
+```
+
+Si votre plage de position est « normale », vous n'aurez jamais à vous préoccuper du compte d'extension. Les positions pleine plage (par ex. `(MIN_TICK, MAX_TICK)`) en ont besoin ; le SDK le résout pour vous.
+
+## Positions
+
+Une position CLMM est un **ensemble** de trois comptes plus un mint :
+
+### Mint du NFT de position
+
+Un mint SPL Token de supply 1. L'adresse du mint est un PDA déterministe ; le NFT de position dans le wallet du propriétaire n'est qu'un ATA détenant ce token unique. Transférer le NFT est la façon dont une position change de mains — le programme conditionne l'autorisation au **détenteur actuel du solde ATA du NFT**, et non à une Pubkey stockée dans l'état.
+
+### `PersonalPositionState`
+
+Un par position ouverte. Indexé sur le mint du NFT.
+
+```rust
+pub struct PersonalPositionState {
+    pub bump: [u8; 1],
+    pub nft_mint: Pubkey,                 // this position's NFT mint
+    pub pool_id:  Pubkey,
+
+    pub tick_lower_index: i32,
+    pub tick_upper_index: i32,
+
+    pub liquidity: u128,                  // this position's L
+
+    // Fee-growth snapshots at last time the position was touched.
+    pub fee_growth_inside_0_last_x64: u128,
+    pub fee_growth_inside_1_last_x64: u128,
+    pub token_fees_owed_0: u64,           // accrued since last collect
+    pub token_fees_owed_1: u64,
+
+    pub reward_infos: [PositionRewardInfo; 3],
+    pub recent_epoch: u64,
+    pub padding: [u64; 7],
+}
+
+pub struct PositionRewardInfo {
+    pub growth_inside_last_x64: u128,
+    pub reward_amount_owed: u64,
+}
+```
+
+### `ProtocolPositionState` (déprécié)
+
+<Note>
+  Les versions antérieures du CLMM stockaient la comptabilité agrégée par `(pool, tick_lower, tick_upper)` dans un PDA `ProtocolPositionState`. **Les versions récentes ne créent plus ni ne lisent ce compte.** L'emplacement figure toujours dans les listes de comptes des instructions `OpenPosition` / `IncreaseLiquidity` / `DecreaseLiquidity` en tant qu'`UncheckedAccount` pour la compatibilité ABI, mais le programme n'y écrit plus. Les comptes existants on-chain sont des vestiges ; l'administrateur peut appeler `CloseProtocolPosition` pour en récupérer le rent.
+
+  La comptabilité agrégée de plage est désormais dérivée directement des deux ticks extrémités (`liquidity_gross`, `liquidity_net` et les `fee_growth_outside_*` / `reward_growths_outside_x64` par tick) dans `TickArrayState`. La formule de croissance des frais inside `fee_growth_inside = global − outside_lower − outside_upper` continue de fonctionner sans compte de position agrégé.
+</Note>
+
+## Observation
+
+```rust
+pub const OBSERVATION_NUM: usize = 100;
+
+pub struct Observation {
+    pub block_timestamp: u32,
+    pub tick_cumulative: i64,                            // Σ tick_current × Δt
+    pub padding:         [u64; 4],
+}
+
+pub struct ObservationState {
+    pub initialized:       bool,
+    pub recent_epoch:      u64,
+    pub observation_index: u16,
+    pub pool_id:           Pubkey,
+    pub observations:      [Observation; OBSERVATION_NUM], // 100 entries
+    pub padding:           [u64; 4],
+}
+```
+
+Le buffer d'observation du CLMM stocke un **tick cumulatif**, et non un prix cumulatif. Les consommateurs externes calculent le prix moyen géométrique sur un intervalle à partir de `(tick_cumulative[t1] − tick_cumulative[t0]) / (t1 − t0)`, puis appliquent `price = 1.0001 ** tick`. Voir [`algorithms/clmm-math`](/fr/algorithms/clmm-math).
+
+## `DynamicFeeConfig` et `DynamicFeeInfo`
+
+Les paramètres de frais dynamiques se trouvent à deux endroits. Le modèle réutilisable — `DynamicFeeConfig` — est géré par l'administrateur et partagé entre les pools qui y adhèrent. L'état d'exécution par pool — `DynamicFeeInfo` — est intégré dans `PoolState` et mis à jour à chaque swap.
+
+### `DynamicFeeConfig`
+
+```rust
+// programs/amm/src/states/pool_fee.rs
+pub struct DynamicFeeConfig {
+    pub index:                       u16,    // identifier; PDA seed component
+    pub filter_period:               u16,    // seconds — within this window the volatility reference is held
+    pub decay_period:                u16,    // seconds — beyond this window the reference fully decays
+    pub reduction_factor:            u16,    // fixed-point in [1, 10_000); applied at decay
+    pub dynamic_fee_control:         u32,    // fixed-point in (0, 100_000); fee-rate gain
+    pub max_volatility_accumulator:  u32,    // ceiling on the volatility accumulator
+    pub padding:                     [u64; 8],
+}
+```
+
+Seed PDA : `["dynamic_fee_config", index.to_be_bytes()]`. Créé via `create_dynamic_fee_config` (réservé à l'administrateur) et modifié via `update_dynamic_fee_config`. Un pool créé avec `enable_dynamic_fee = true` copie les cinq paramètres de calibration de la config (`filter_period`, `decay_period`, `reduction_factor`, `dynamic_fee_control`, `max_volatility_accumulator`) dans son propre `DynamicFeeInfo` à la création ; les modifications ultérieures de `DynamicFeeConfig` n'affectent pas rétroactivement les pools existants.
+
+### `DynamicFeeInfo` (intégré dans `PoolState`)
+
+```rust
+pub struct DynamicFeeInfo {
+    pub filter_period:                u16,
+    pub decay_period:                 u16,
+    pub reduction_factor:             u16,
+    pub dynamic_fee_control:          u32,
+    pub max_volatility_accumulator:   u32,
+    pub tick_spacing_index_reference: i32,    // tick-spacing-units; reference for next swap
+    pub volatility_reference:         u32,    // running floor for the accumulator
+    pub volatility_accumulator:       u32,    // current cumulative volatility (capped)
+    pub last_update_timestamp:        u64,
+    pub padding:                      [u8; 46],
+}
+```
+
+Les quatre derniers champs sont des données d'état ; les cinq premiers sont des paramètres de calibration copiés depuis `DynamicFeeConfig`. Le calcul des frais et les règles de décroissance sont documentés dans [`products/clmm/math`](/fr/products/clmm/math) et [`products/clmm/fees`](/fr/products/clmm/fees).
+
+Constantes utilisées par la formule :
+
+| Constante | Valeur | Signification |
+|---|---|---|
+| `VOLATILITY_ACCUMULATOR_SCALE` | `10_000` | Granularité de l'accumulateur de volatilité |
+| `REDUCTION_FACTOR_DENOMINATOR` | `10_000` | Dénominateur pour `reduction_factor` |
+| `DYNAMIC_FEE_CONTROL_DENOMINATOR` | `100_000` | Dénominateur pour `dynamic_fee_control` |
+| `MAX_FEE_RATE_NUMERATOR` | `100_000` | Plafond strict de 10% sur le taux de frais résultant |
+
+## `LimitOrderState`
+
+Un compte par ordre limite ouvert.
+
+```rust
+// programs/amm/src/states/limit_order.rs
+pub struct LimitOrderState {
+    pub pool_id:            Pubkey,
+    pub owner:              Pubkey,
+    pub tick_index:         i32,
+    pub zero_for_one:       bool,    // direction: true sells token0 for token1
+    pub order_phase:        u64,     // snapshot of TickState.order_phase at open time
+    pub total_amount:       u64,     // input-token amount placed
+    pub filled_amount:      u64,     // informational; computed precisely on settle
+    pub settle_base:        u64,     // unfilled remainder at last settle/decrease
+    pub settled_output:     u64,     // cumulative output-token paid to owner
+    pub open_time:          u64,
+    pub unfilled_ratio_x64: u128,    // Q64.64 snapshot of TickState.unfilled_ratio_x64 at open
+    pub padding:            [u64; 4],
+}
+```
+
+Cycle de vie :
+
+1. **Ouverture** — l'utilisateur appelle `open_limit_order`, dépose `total_amount` du token d'entrée ; l'ordre est lié à une cohorte `TickState`.
+2. **(optionnel) Augmentation / Diminution** — `increase_limit_order` ajoute au `total_amount` ; `decrease_limit_order` restitue les tokens non exécutés (et tout output réglé jusqu'à ce point).
+3. **Règlement** — lorsque la cohorte est entièrement ou partiellement exécutée, le propriétaire *ou* le keeper opérationnel appelle `settle_limit_order` pour transférer les tokens de sortie vers l'ATA du propriétaire.
+4. **Fermeture** — une fois que `unfilled_amount == 0`, le compte peut être fermé. Le rent est toujours restitué au `owner`.
+
+Seed PDA : `[owner.as_ref(), limit_order_nonce.key().as_ref(), limit_order_nonce.order_nonce.to_be_bytes().as_ref()]`. Le PDA d'ordre est donc unique par `(owner, nonce_index, order_nonce)`.
+
+## `LimitOrderNonce`
+
+Compteur par `(wallet, nonce_index)` permettant à un même utilisateur de gérer plusieurs pipelines parallèles d'ordres limites sans collision de PDAs.
+
+```rust
+pub struct LimitOrderNonce {
+    pub user_wallet: Pubkey,
+    pub nonce_index: u8,             // user-chosen, 0..255
+    pub order_nonce: u64,            // monotonic, incremented every time a new order is opened
+    pub padding:     [u64; 4],
+}
+```
+
+Seed PDA : `[user_wallet.as_ref(), &[nonce_index]]`. La plupart des clients utilisent `nonce_index = 0` et laissent `order_nonce` porter la cardinalité.
+
+## Dériver les comptes clés
+
+```ts
+import { PublicKey } from "@solana/web3.js";
+
+const CLMM_PROGRAM_ID = new PublicKey(
+  "CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK"
+); // see reference/program-addresses
+
+function i32ToBytes(n: number): Buffer {
+  const b = Buffer.alloc(4);
+  b.writeInt32BE(n);
+  return b;
+}
+
+export function deriveClmmAccounts(
+  ammConfig: PublicKey,
+  token0Mint: PublicKey,           // must already be sorted
+  token1Mint: PublicKey,
+) {
+  const [poolState] = PublicKey.findProgramAddressSync(
+    [Buffer.from("pool"), ammConfig.toBuffer(),
+     token0Mint.toBuffer(), token1Mint.toBuffer()],
+    CLMM_PROGRAM_ID,
+  );
+  const [observation] = PublicKey.findProgramAddressSync(
+    [Buffer.from("observation"), poolState.toBuffer()],
+    CLMM_PROGRAM_ID,
+  );
+  const [tickArrayBitmapExtension] = PublicKey.findProgramAddressSync(
+    [Buffer.from("pool_tick_array_bitmap_extension"), poolState.toBuffer()],
+    CLMM_PROGRAM_ID,
+  );
+  return { poolState, observation, tickArrayBitmapExtension };
+}
+
+export function deriveTickArray(
+  pool: PublicKey,
+  startTickIndex: number,
+) {
+  const [tickArray] = PublicKey.findProgramAddressSync(
+    [Buffer.from("tick_array"), pool.toBuffer(), i32ToBytes(startTickIndex)],
+    CLMM_PROGRAM_ID,
+  );
+  return tickArray;
+}
+
+export function deriveDynamicFeeConfig(index: number) {
+  const idx = Buffer.alloc(2);
+  idx.writeUInt16BE(index);
+  const [pda] = PublicKey.findProgramAddressSync(
+    [Buffer.from("dynamic_fee_config"), idx],
+    CLMM_PROGRAM_ID,
+  );
+  return pda;
+}
+
+export function deriveLimitOrderNonce(
+  wallet: PublicKey,
+  nonceIndex: number,
+) {
+  const [pda] = PublicKey.findProgramAddressSync(
+    [wallet.toBuffer(), Buffer.from([nonceIndex & 0xff])],
+    CLMM_PROGRAM_ID,
+  );
+  return pda;
+}
+
+export function deriveLimitOrder(
+  wallet: PublicKey,
+  nonceAccount: PublicKey,
+  orderNonce: bigint,
+) {
+  const nonceBytes = Buffer.alloc(8);
+  nonceBytes.writeBigUInt64BE(orderNonce);
+  const [pda] = PublicKey.findProgramAddressSync(
+    [wallet.toBuffer(), nonceAccount.toBuffer(), nonceBytes],
+    CLMM_PROGRAM_ID,
+  );
+  return pda;
+}
+
+export function derivePersonalPosition(nftMint: PublicKey) {
+  const [personalPosition] = PublicKey.findProgramAddressSync(
+    [Buffer.from("position"), nftMint.toBuffer()],
+    CLMM_PROGRAM_ID,
+  );
+  return personalPosition;
+}
+```
+
+Les chaînes de seeds exactes doivent toujours être vérifiées par rapport à l'IDL on-chain et à [`reference/program-addresses`](/fr/reference/program-addresses).
+
+## Référence rapide du cycle de vie
+
+| Événement | Comptes créés | Comptes détruits |
+|-------|------------------|---------------------|
+| `CreatePool` | `poolState`, `observation`, `token_0_vault`, `token_1_vault` | — |
+| `OpenPosition[WithToken22Nft]` | Mint NFT + ATA, `personalPosition`, éventuellement nouveaux `tickArrayState`(s), `tickArrayBitmapExtension` si inexistant | — |
+| `IncreaseLiquidity` | Éventuellement nouveaux `tickArrayState`(s) | — |
+| `DecreaseLiquidity` | — | Efface éventuellement des entrées de ticks (mais le `tickArrayState` lui-même n'est pas fermé) |
+| `ClosePosition` | — | Mint NFT, `personalPosition` |
+| `SwapV2` | Éventuellement nouveau `tickArrayState` | — |
+| `OpenLimitOrder` | `limitOrderState`, éventuellement `limitOrderNonce` (init-if-needed), éventuellement nouveau `tickArrayState` | — |
+| `IncreaseLimitOrder` | — | — |
+| `DecreaseLimitOrder` | — | Ferme `limitOrderState` si l'ordre est entièrement consommé |
+| `SettleLimitOrder` | — | — |
+| `CloseLimitOrder` | — | `limitOrderState` (rent → `owner`) |
+| `CreateDynamicFeeConfig` | `dynamicFeeConfig` | — |
+| `CreateCustomizablePool` | `poolState`, `observation`, vaults — identique à `CreatePool`. Copie `dynamicFeeConfig` si `enable_dynamic_fee = true`. | — |
+| `CollectRewards` | — | — |
+| `UpdateRewardInfos` | — | — |
+| `CloseProtocolPosition` (admin) | — | `protocolPositionState` vestigial (rent → admin) |
+
+Les comptes `TickArrayState` ne sont **jamais fermés par le programme** — ils persistent pour toute la durée de vie du pool. Une fois initialisé, un tableau de ticks reste on-chain même lorsque tous les ticks qu'il contient reviennent à `liquidity_gross == 0`. La réutilisation d'un tableau existant est gratuite ; seule la première position à toucher un tableau jamais initialisé acquitte son rent.
+
+## Où trouver quoi
+
+- **Calcul des ticks et mécanique des plages** : [`products/clmm/ticks-and-positions`](/fr/products/clmm/ticks-and-positions).
+- **Parcours de swap et calcul de la croissance des frais** : [`products/clmm/math`](/fr/products/clmm/math).
+- **Listes de comptes des instructions** : [`products/clmm/instructions`](/fr/products/clmm/instructions).
+- **Frais et accumulation des récompenses** : [`products/clmm/fees`](/fr/products/clmm/fees).
+- **IDs de programmes et seeds canoniques** : [`reference/program-addresses`](/fr/reference/program-addresses).
+
+Sources :
+
+- [`raydium-io/raydium-clmm` — `programs/amm/src/states`](https://github.com/raydium-io/raydium-clmm)

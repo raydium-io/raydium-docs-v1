@@ -1,0 +1,112 @@
+---
+title: "AMM v4 Gebühren"
+description: "Die 0,25% Handelsgebühr, deren LP/Protokoll-Aufteilung, PnL-Generierung aus OpenBook-Ausführungen und wie der Admin anfallende Protokollgebühren einzieht."
+---
+
+<Info>
+  **Diese Seite wurde mit KI automatisch übersetzt. Maßgeblich ist stets die englische Version.**
+
+  [Englische Version ansehen →](/products/amm-v4/fees)
+</Info>
+
+## Die einzige veröffentlichte Gebührenstufe
+
+Anders als CPMM und CLMM hat AMM v4 **keinen `AmmConfig`-Account**. Gebühren werden direkt in der `AmmInfo.fees`-Struktur jedes Pools gespeichert und sind bei der Pool-Erstellung fest. Die Standardwerte, die praktisch jeden Live-AMM-v4-Pool abdecken:
+
+| On-Chain-Feld | Standard | Bedeutung |
+|---|---|---|
+| `swap_fee_numerator / swap_fee_denominator` | `25 / 10_000` | **Brutto-Handelsgebühr auf AMM-Pfad-Swaps: 0,25% des Eingabevolumens.** |
+| `trade_fee_numerator / trade_fee_denominator` | `25 / 10_000` | Wird durch die OpenBook-Integration zur Berechnung gebühreninklusive Limit-Order-Preisgestaltung verwendet. Standard `0,25%` wie `swap_fee`. |
+| `pnl_numerator / pnl_denominator` | `12 / 100` | **Anteil des Protokolls an der Swap-Gebühr: 12%** — d. h. `0,25% × 12% = 0,03%` des Volumens. Sammelt sich in `need_take_pnl_*`-Zählern an. |
+| `min_separate_numerator / min_separate_denominator` | `5 / 10_000` | Interne Präzisions-Untergrenze, die von der Gebühren-Split-Rundungslogik verwendet wird. |
+
+Beachten Sie, dass `pnl_numerator / pnl_denominator` ein Bruch **der Swap-Gebühr** ist, nicht des Handelsvolumens — eine häufige Fehlinterpretation. Der LP-Anteil ist das Komplement (`88%` der Gebühr = `0,22%` des Volumens) und ist impliziert; es gibt keinen separaten Zähler für den „LP-Anteil".
+
+Eine kleine Anzahl früher erstellter Pools wurden mit unterschiedlichen Zählern erstellt; lesen Sie immer `AmmInfo.fees`, bevor Sie zitieren.
+
+Es gibt **keine Fund-Gebühr** und **keine Creator-Gebühr**: Dies sind CPMM/CLMM-Erfindungen, die es in AMM v4s ursprünglichem Gebührenmodell nicht gab.
+
+## Wie die Aufteilung berechnet wird
+
+Bei jedem Swap erhebt der Pool die Brutto-Handelsgebühr vom Eingabebetrag und verteilt:
+
+```
+gross_fee   = ceil(amount_in * swap_fee_numerator / swap_fee_denominator)        // 0.25% of amount_in
+pnl_portion = gross_fee * pnl_numerator / pnl_denominator                        // 12% of gross_fee
+lp_portion  = gross_fee − pnl_portion                                            // 88% of gross_fee
+```
+
+- `lp_portion` bleibt im Vault und trägt zum nächsten `k` bei. LPs realisieren sie durch später eingelöste LP-Token.
+- `pnl_portion` erhöht `AmmInfo.state_data.need_take_pnl_coin` oder `need_take_pnl_pc` je nachdem, welche Seite die Swap-Eingabe ist.
+
+Das gleiche invarianzerhaltende Verfahren wie CPMM: Der PnL-Betrag sitzt physisch im Vault, wird aber von den bei der Kurve verwendeten Reserven subtrahiert, sodass `TakePnl` Token ohne Preisverschiebung bewegt.
+
+## PnL aus OpenBook (historisch)
+
+<Note>
+  **Wird nicht mehr angesammelt.** Die OpenBook-Integration ist deaktiviert, daher wird der in diesem Abschnitt beschriebene *zweite* PnL-Strom nicht mehr generiert. Die `total_pnl_{coin,pc}`-Zähler auf bestehenden Pools können historische Werte enthalten, aber es werden keine neuen Beträge hinzugefügt. Der 0,03%-Protokollgebühren-Pfad (oben) ist unbeeinträchtigt und noch aktiv.
+</Note>
+
+Historisch hatte AMM v4 einen *zweiten* gebührenähnlichen Einnahmestrom: Wenn seine Limit-Orders auf OpenBook ausgeführt wurden, konnte der Pool auf der Taker-Seite der Ausführung sein und den Maker/Taker-Spread des Marktes verdienen oder zahlen. Diese PnL-Ereignisse wurden während `MonitorStep` in die Pool-Vaults abgewickelt und das Programm gutschrieb sie `state_data.total_pnl_{coin,pc}` als informative Zähler.
+
+- Wenn das gepostete Grid des Pools korrekt um den Kurspreis kalibriert war, tendierten OpenBook-Ausführungen zu **Gebühren-positiv** für den Pool — der AMM war effektiv Market-Making auf OpenBook und verdiente Maker-Rabatte.
+- Wenn OpenBook pausierte oder die Event-Queue voll wurde, konnte der Pool auf veralteten Orders sitzen, die zu ungünstigen Preisen ausgeführt wurden, was negative PnL erzeugte. Diese operative Kopplung war eine der Motivationen für den Wechsel weg vom hybriden Design.
+
+Dieses OpenBook-PnL war **nicht** dasselbe wie die 0,03%-Protokollgebühr. OpenBook-PnL blies die Pool-Reserven direkt auf (LPs + Protokoll begünstigung proportional zur Gebühren-Split), während die 0,03%-Protokollgebühr speziell zum Admin-Sweep gekennzeichnet war. Mit der OpenBook-Seite aus ist die einzige Gebührenakumulation heute die 0,25% auf AMM-Swaps und deren Split.
+
+## Einzug
+
+Der Admin (Raydium Multisig) ruft `WithdrawPnl` / `TakePnl` auf, um `need_take_pnl_*` in die auf dem Program-`AmmConfig` konfigurierten Pool-Ebenen-„PnL-Besitzer"-Accounts zu überweisen (eine andere, programm-umfassende Config — nicht die Pro-Pool CPMM-ähnliche AmmConfig). Einzug:
+
+1. Regelt zuerst alle ausstehenden OpenBook-Ausführungen. *(Keine-Op jetzt, da OpenBook inaktiv ist.)*
+2. Überträgt `need_take_pnl_coin` / `need_take_pnl_pc` aus den Pool-Vaults zum PnL-Ziel.
+3. Setzt die Zähler auf Null.
+
+Die Operation bewegt die Kurve nicht. LPs sollten über einen `TakePnl`-Aufruf hinweg keine Preisänderung sehen.
+
+## LP-Gebührenrückzahlungen
+
+Es gibt keinen dedizierten „LP-Gebühren einziehen"-Befehl. LP-Gebühren sammeln sich in den Vaults an und blasen `k` über Zeit auf; LPs realisieren sie durch Brennen von LP-Token über `Withdraw`. Der Wert eines LP-Token wächst monoton, wenn `(coin_reserve_effective, pc_reserve_effective)` wachsen.
+
+## Visualisierung: Wohin gehen 1.000 USDC an Volumen
+
+Bei einem USDC-lastigen Swap von \$1.000 gegen einen Pool mit Standardparametern:
+
+```
+Brutto-Handelsgebühr (0,25%):   $2,50
+  LP-Anteil   (0,22%):           $2,20   → bleibt im Pool, erhöht k
+  PnL-Anteil  (0,03%):           $0,30   → need_take_pnl_pc, einzog durch TakePnl
+Rest an Benutzer gesendet:      $997,50   (minus kursdynamischer Preisauswirkung)
+```
+
+Vergleichen Sie mit CPMM `AmmConfig[0]` (0,25%-Stufe, keine Creator-Gebühr): LP bekommt \$2,10, Protokoll \$0,30, Fund \$0,10. CPMM führt die Fund-Zeile ein, indem es sie aus dem herausschneidet, was in AMM v4s gleichwertiger Stufe LPs Anteil gewesen wäre.
+
+## Vergleichstabelle
+
+| | AMM v4 | CPMM `index=0` | CLMM `index=2` |
+|---|---|---|---|
+| Handelsgebühr | 0,25% | 0,25% | 0,25% |
+| LP | 0,22% | 0,21% | Variiert nach Emissionen |
+| Protokoll | 0,03% | 0,03% | Pro Stufe |
+| Fund | K. A. | 0,01% | Pro Stufe |
+| Creator (optional) | K. A. | 0 Standard | K. A. |
+| Wo Gebühren sitzen | Pool-Vault + need_take_pnl_* | Pool-Vault + protocol_fees_* + fund_fees_* | Global + Pro-Tick + Pro-Position |
+
+Vollständige Matrix in [`reference/fee-comparison`](/de/reference/fee-comparison).
+
+## Integrator-Hinweise
+
+- **Angebote.** Holen Sie `AmmInfo` über das SDK oder `api-v3.raydium.io/pools/info/ids`. Berechnen Sie **nicht** Ihr eigenes Angebot gegen Raw-Vault-Guthaben — die OpenBook-hinterlegten Beträge und der PnL-Ausschluss ziehen beide die effektiven Reserven weg von dem, was `getTokenAccountBalance` zeigt.
+- **Veraltete Gebührenparameter.** Im Prinzip könnte `SetParams` `swap_fee_numerator` ändern, aber in der Praxis hat der Raydium Multisig Standardwerte für keinen Live-Pool geändert. Dennoch immer von On-Chain-State auslesen, anstatt hartcodiert zu sein.
+- **Keine Rewards.** AMM v4 unterstützt keine On-Pool-Reward-Emissionen. Legacy-Ökosystem-Farmen (Farm v3 / v5 / v6) sind das Staking-Layer-Äquivalent — siehe [`products/farm-staking`](/de/products/farm-staking).
+
+## Nächste Schritte
+
+- [`products/amm-v4/math`](/de/products/amm-v4/math) — die Handelsgebühren-Ableitung innerhalb der Kurve.
+- [`products/amm-v4/instructions`](/de/products/amm-v4/instructions) — `WithdrawPnl` / `SetParams` Account-Listen.
+- [`reference/fee-comparison`](/de/reference/fee-comparison) — Nebeneinander-Matrix.
+
+Quellen:
+
+- [Raydium AMM Program — `raydium-io/raydium-amm`](https://github.com/raydium-io/raydium-amm)
+- On-Chain AMM v4 Gebühren-Zähler/Nenner-Felder (überprüft gegen Mainnet `AmmInfo`-Accounts).

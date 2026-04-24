@@ -1,0 +1,224 @@
+---
+title: "Yönlendirme ve MEV"
+description: "Raydium ürünleri arasında yönlendirmeyi bölme, sandwich saldırılarına karşı dayanıklı yöntemler, Jito paket entegrasyonu ve özel mempool ile halka açık mempool sunumu arasındaki hususlar."
+---
+
+<Info>
+  **Bu sayfa yapay zekâ tarafından otomatik olarak çevrilmiştir. İngilizce sürüm esas alınır.**
+
+  [İngilizce sürümü görüntüle →](/integration-guides/routing-and-mev)
+</Info>
+
+<Info>
+  Solana'da "MEV", Ethereum'un mempool odaklı MEV'siyle aynı değildir. Blok liderler işlemleri sıralı bir mempool olarak değil, gelişte gördüklerinden ön çalıştırma lider tarafındaki yeniden sıralama veya birlikte konumlandırılmış arayıcılar yoluyla gerçekleşir ve sandwich saldırıları havuz durumunu izleyen ve işleminiz ile daha yüksek ücretlerde yarışan botlar tarafından yürütülür. Azaltma yöntemleri buna göre farklılık gösterir.
+</Info>
+
+## Yönlendirmeyi bölme hakkında temel bilgiler
+
+"Yönlendirmeyi bölme", tek bir mantıksal swap'ı birden çok havuz arasında bölmek anlamına gelir, böylece marjinal fiyatlar eşitlenir — her diliş kendi havuzunun fiyatında işlem yapmakla aynı çıktı. İşlem boyutu ilgili herhangi bir havuzun yüzeysel olması durumunda etkili fiyat etkisini azaltır.
+
+Problem tanımı: havuzlar `P_1, ..., P_n` giriş `x`'i çıktıya eşleyen işlevleri `f_i(x)` ile verildiğinde, `x_1 + ... + x_n = X` bölündüğünde `Σ f_i(x_i)` en büyük kılan bölünmeyi bulunuz. Her `f_i` konkav olduğundan, optimum `f'_1(x_1) = f'_2(x_2) = ... = f'_n(x_n)` (eşit marjinal fiyatlar) sağlar.
+
+### Açgözlü uygulama
+
+Uygulamada ~1% optimale kadar yakın olan basit bir yaklaşım:
+
+```
+remaining = X
+routes    = []
+step      = X / 1000     // slice size
+while remaining > 0:
+    best_pool = argmax over i of f'_i(current_x_i + step)
+    x_i += step
+    routes.append((best_pool, step))
+    remaining -= step
+```
+
+Daha ince `step` → optimale daha yakın, daha fazla yineleme. Pratikte 100–500 dilim makul bir dengeleme noktasıdır.
+
+### Dışbükey optimizasyon uygulaması
+
+Üretim sınıfı toplayıcılar için optimizasyonu doğrudan çözün. Her havuzun kapalı-form `f'_i(x)` vardır:
+
+- **Sabit-ürün (CPMM / AMM v4)**: `f'(x) = y * R_y / (R_x + x)^2` burada `R_x, R_y` rezervlerdir ve `y = R_x * R_y / (R_x + x) - R_y` ... (daha basit türetme: marjinal fiyat `R_y / (R_x + x)` olup, marjinal fiyatları eşitlemek için bölme 1D araştırmadır).
+- **CLMM**: parçalı düzgün — bir tick içinde, `f'(x)` `sqrt_price`'ın rasyonel işlevidir; tick arasında ayrık adımlar. Küçük adım çözücü ile bölün veya her bitişik tick'i kendi "havuzunuz" olarak ele alın.
+
+Yönlendirmeyi bölmenin çıktısı, işlem montajı adımınızın swap talimatları dizisine dönüştürdüğü `[(pool_1, x_1), (pool_2, x_2), ...]` vektörüdür.
+
+### Yönlendirmeyi bölme ne zaman yardımcı olur
+
+| İşlem boyutu vs TVL | Bölme yardımcı mı? |
+|-------------------|--------------|
+| `<0.1%` | Hayır — tek havuz baskın |
+| 0.1–1% | Marjinal olarak |
+| 1–5% | Evet, 10–50 bps iyileşme |
+| `>5%` | Evet, büyük iyileşme |
+
+Bir cüzdan içi swap UI'si için derin havuz üzerinde `<$10k` yapan perakende kullanıcılar için çalıştırıyorsanız, bölmeyi kafanıza takmayın — gaz maliyeti iyileşmeyi aşar. Kurumsal akışı alıntılayan toplayıcı için her zaman bölün.
+
+## Çok atlamalı yollar
+
+Doğrudan havuz olmadığında veya doğrudan havuzun etkisi çok büyük olduğunda, bir aracı aracılığıyla atlayın:
+
+```
+tokenA → tokenHub → tokenB
+```
+
+Ortak hub'lar: USDC, SOL, RAY. Her atlamanın özellikleri:
+
+- Kendi slippage sınırı (doğrudan atlama üzerinde daha düşük; çok atlamalı için her atlama başına).
+- Kendi ödenen ücret.
+- Kendi fiyat etkisi.
+
+Toplam etki birleşir: `(1 - impact_1) * (1 - impact_2)`. İki kez %1 etki %2 değil %1.99 toplamıdır.
+
+**Aynı havuzdan iki kez asla atlama yapmayın.** Aynı CLMM aracılığıyla `A → B → A → B` gitmek sadece ücretler ve slippage yakar. Toplayıcılar bu tür yolları oluşturmada filtrelemeli. (Not: bu aynı çiftçi döngüsüdür, çok atlamalı değildir — farklı havuzlar aracılığıyla `A → USDC → B` yönlendirme, yukarıda tasdik edilen standart, yararlı yöntemdir.)
+
+**Her atlama başına vs uçtan uca minimum.** CPI bileşimi ([`integration-guides/cpi-integration`](/tr/integration-guides/cpi-integration)) ile her atlama için `minimum_amount_out`'u 0'a ayarlayabilir ve proxy'nizde tek bir uçtan uca minimum zorunlu kılabilirsiniz. CPI olmadan her atlama kendi minimumunu zorunlu kılar; bu makul ara sınırları hesaplamayı gerektirir — yaygın olarak her atlama için `quote_i * (1 - slippage_bps/10000)`.
+
+## Sandwich saldırıları
+
+### Mekanizm
+
+Bot işlem dedikodu akışını izler. Swap'ınızı gördüğünde:
+
+1. Ön çalıştırma: bot aynı token'ı sizden önce alır ve havuz fiyatını yukarı iter.
+2. Kurban işlem: kötüleşmiş fiyatta swap yaparsınız.
+3. Arka çalıştırma: bot yükseltilmiş fiyata satış yapar ve spreadı yakalar.
+
+Bot her iki işlemine de öncelik ücretleri öder; kar sandwich deltaası eksi iki kez öncelik ücreti olur. Yalnızca havuz fiyatını önemli ölçüde hareket ettiren işlemlerde karlı.
+
+### Azaltmalar
+
+**Sıkı slippage.** Minimum çıktınız alıntının %0.5 altında ise, fiyatı %0.5'ten fazla hareket ettiren sandwich sizi geri döndürür ancak bot'un ön ticareti yine eski fiyatında yürütülür. Para kaybederler. Sandwich botları geniş slippage (%≥1–2%) hedefler; %0.3 altı slippage büyük ölçüde bağışık.
+
+**Özel-mempool sunumu (Jito).** İşleminizi bir Jito paketinin parçası olarak gönderin. Paketler halka açık dedikodu akışında görünmez; botlar işlemi uçuşta göremez ve ön çalıştıramazlar. Değiş-tokuş: paketler doğrulayıcı tarafında ipucu ve her lider Jito etkinli değildir (çoğu olsa da).
+
+**Daha küçük işlem boyutları.** İşlemi birden çok işlem arasında bölün, böylece hiçbir işlem fiyatı karlı sandwich hedefi kadar hareket ettirmeyen bir miktarda hareket ettiremez. Toplam gaz maliyetini artırır.
+
+**Zaman randomizasyonu.** Mümkün olsa düşük hacim dönemlerinde gönderin. İnteraktif kullanıcı swap'ları için kullanılamaz ancak zamanlanmış bot akışı için uygulanabilir.
+
+Raydium'un CLMM havuzları genellikle CPMM'den daha az sandwich aktivitesi görür çünkü tek-tick likidite yapısı, küçük işlemlerin fiyatı hiç hareket ettiremediği (tick içinde kalırlar) anlamına gelir. Derin CLMM havuzları organik olarak en iyi sandwich direnci mekanıdır.
+
+## Jito paketleri
+
+Jito, **paketleri** kabul eden değiştirilmiş bir Solana doğrulayıcısı istemcisidir — atom olarak inen sıralı işlem grupları. Botlar MEV çıkarma için Jito'yu kullanır; düzenli kullanıcılar aynı botlardan koruma için Jito'yu kullanır.
+
+### Paketler nasıl çalışır
+
+- Jito blok motoru uç noktasına bağlanın (ör. `https://mainnet.block-engine.jito.wtf`).
+- 1–5 işlem artı Jito'nun ipucu hesaplarından birine ipucu içeren bir paket gönderin.
+- Mevcut lider Jito çalıştırıyorsa, paketiniz dikkate alınır. Bu slot için müzayede kazananı (en yüksek ipucu başına CU ile paket) iner; diğerleri düşer.
+
+### İpucu boyutlandırması
+
+İpucu boyutları son paket dağılımını takip eder. Jito gerçek-zaman yüzdebirlik yayınlar:
+
+```ts
+const tipRes = await fetch("https://worker.jito.wtf/api/v1/bundles/tip_floor");
+const tips   = await tipRes.json();
+// { ema_landed_tips_25th_percentile, 50th, 75th, 95th, 99th }
+
+// Normal bir gün normal bir kullanıcıya dönük swap — 50. yüzdebirlik iyidir.
+const tipSol = tips.ema_landed_tips_50th_percentile_lamports / 1e9;
+
+// Yoğunluk sırasında zaman duyarlı bot ticareti — 75–95. yüzdebirlik.
+```
+
+Tipik aralıklar: acil olmayan kullanıcı swap'ları için 0.0001–0.001 SOL; yoğunluk sırasında yüksek öncelikli botlar için 0.01–0.1 SOL.
+
+### Paket oluşturma
+
+```ts
+import { SearcherClient } from "jito-ts";
+
+const client = new SearcherClient("https://mainnet.block-engine.jito.wtf");
+
+const tipIx = SystemProgram.transfer({
+  fromPubkey: user.publicKey,
+  toPubkey:   JITO_TIP_ACCOUNTS[Math.floor(Math.random() * 8)],  // 8 tip accts
+  lamports:   tipLamports,
+});
+
+const tx1 = new VersionedTransaction(...);  // the swap
+tx1.sign([user]);
+
+const bundleUuid = await client.sendBundle([tx1], tipLamports);
+// Optionally: await confirmation via client.getBundleStatuses([bundleUuid])
+```
+
+Tuzaklar:
+
+- **İpucu pakette olmalıdır.** Bir Jito ipucu hesabına `SystemProgram.transfer` talimatını paketinizin işlemlerinden birine (genellikle sonuncuya) dahil edin. Pakettin parçası olmayan ayrı bir ipucu işlem yoksayılır.
+- **Lider Jito etkinli değildir.** ~%75 lider Jito çalıştırır; ~%25 değildir. Non-Jito lider slot tuttuğunda gönderilen paketler düşer. İstemci otomatik olarak yeniden dener.
+- **Sona erme.** Paketler düzenli işlemlerle aynı blockhash sona erme modelini kullanır. Hızlı bir şekilde derle ve gönder; ~60 saniye pencere.
+
+### Paketler vs öncelik ücretleri
+
+Öncelik ücretleri lideri işleminizi daha erken dahil etmeye rüşvet verir. Jito paketleri ayrıca işlemi halka açık mempool'dan gizler. Aciliyet için öncelik ücretlerini kullanın; sandwich koruması için paketleri kullanın. Yüksek değerli kullanıcı swap'larında her ikisini de kullanın.
+
+Öncelik ücretlerini boyutlandırma konusunda [`integration-guides/priority-fee-tuning`](/tr/integration-guides/priority-fee-tuning) bölümüne bakın.
+
+## MEV-pay / geri dönüş korumalı RPC
+
+Bazı RPC sağlayıcılar, işleminizi dahili olarak Jito paketleri veya eşdeğer özel yollar aracılığıyla yönlendirecek "MEV-pay" veya "geri dönüş korumalı" uç noktalar sunar:
+
+- **Helius** — paket desteği olan canlı bağlantılar.
+- **QuickNode** — "Geri Dönüş Koru" uç noktası; gönderilen işlemler etrafında otomatik olarak paketler oluşturur.
+- **Triton** — özel akış katmanı.
+
+Bunlardan birini kullanmak, paket mantığını kendileri yönetmek istemeyen projeler için en basit yoldur. Değiş-tokuş: opak iç mekanizması; sağlayıcının paket yapısına güvenirsiniz.
+
+## Yoğunluk ele alma
+
+Yüksek hacim pencerelerinde (mainnet başlatma, ana listeleme, süregelen rali), lider paket sıraları dolar. Belirtiler:
+
+- İşlemler 60+ saniye boyunca onaylanmamış olarak kalır, sonra "blockhash bulunamadı" ile sona erer.
+- Dün çalışan öncelik ücretleri bugün yetersiz.
+- Simülasyon başarılı ancak yürütme asla inmez.
+
+Stratejiler:
+
+1. **Sona erişte agresif yeniden deneme.** `TransactionExpiredBlockheightExceeded` üzerinde yeni blockhash ile yeniden oluşturun ve yeniden gönderin. Geri dönüş üzerinde yeniden deneme *yapmayın* — geri dönüşler deterministiktir.
+2. **Çok-RPC yayını.** Aynı işlemi birden çok RPC'ye paralel olarak gönderin; lider'e ilk ulaşan kazanır.
+3. **Öncelik ücreti rampa.** 50. yüzdebirlik ile başlayın; ilk denemesi sona erse, 75. sonra 95. üzerinde yeniden deneyin.
+4. **Jito paketleri yedek olarak.** Jito liderleri, blok motoru paketleri ipucu başına CU ile sıraladığı için daha az tıkanmış olma eğilimindedir; yüksek ipuçlu paketler öncelik alır.
+5. **Daha az simülasyon.** Yoğunluk altında, ilk olarak bir kez simüle edin; havuz durumu yine de kaymış olacağından yeniden denemede yeniden simülasyon yapmayın. Yoğunluk sırasında yeniden simülasyon sık sık sahte şekilde başarısız olur.
+
+## Ürün başına MEV hususları
+
+**CPMM.** Düşük TVL havuzlarında yüksek sandwich'e açık. Sabit-ürün eğrisi hatta küçük bot ön işaretlerini de amplifikasyon yapar. Herhangi bir CPMM işlem >havuz TVL'nin 0.5% için Jito paketleri önerilir.
+
+**CLMM.** Derin havuzlarda daha az sandwich'e açık çünkü tick içi işlemler fiyatı hareket ettirmez. Ancak çapraz-tick işlemleri kesinlikle yapar; tick geçişlerini hedefleyen sandwich'ler bilinen desendir. Sıkı slippage (`<0.3%`) en iyi savunmadır.
+
+**AMM v4 + OpenBook.** OpenBook sipariş kitabı doldurmaları aynı işlem aracılığıyla çalıştığından, sipariş kitabı durumunu bilmeyen sandwich botları fiyat etkisini az tahmin eder ve sık başarısız olur. Bu nedenle organik düşük-MEV mekanı.
+
+**LaunchLab.** Erken bağlama eğrisi aşaması sırasında, heyecan yapan başlatmalarda ön çalıştırma yaygındır. Eğriler hızlı hareket eder ve slippage geniş. Jito paketleri güçlü bir şekilde önerilir. Mezuniyet sonrası, ortaya çıkan CPMM normal CPMM dinamiklerini takip eder.
+
+**Çiftlikleri.** Hasat ve stake işlemleri swap'lar değildir ve sandwich'e açık değildir. Özel ele alma gerekmez.
+
+## Kontrol listesi
+
+Bir üretim toplayıcısı / cüzdan swap UI'si için:
+
+- [ ] Slippage normal çiftlerde ≤%0.5 olur; kullanıcı geçersiz kılabilir.
+- [ ] >\$1k USD değerin swap'ları için Jito paket sunumu varsayılan olarak etkin.
+- [ ] Öncelik ücreti canlı tahminden kaynak; sabit kodlanmamış.
+- [ ] Yeniden deneme mantığı geri dönüş (yeniden deneme yok) ile sona erişi (yeni blockhash ile yeniden dene) ayırt eder.
+- [ ] Çok atlamalı yollar uçtan uca minimumları değil per-atlama minimumlarını ayarla.
+- [ ] Herhangi bir tek havuz TVL'nin >1% işlemleri için split routing etkin.
+- [ ] Havuz tazeliği: sunumdan hemen önce durumu yeniden getir; eski ise yeniden alıntı.
+- [ ] Sığ havuzlarda sandwich dirençli: Jito-sadece veya slippage >%1 ise reddet.
+
+## İşaretçiler
+
+- [`integration-guides/aggregator`](/tr/integration-guides/aggregator) — havuz keşfi, alıntılama, işlem montajı.
+- [`integration-guides/priority-fee-tuning`](/tr/integration-guides/priority-fee-tuning) — CU ve öncelik ücreti boyutlandırması.
+- [`integration-guides/cpi-integration`](/tr/integration-guides/cpi-integration) — tek slippage kapısı çok-atlama bileşimi.
+- [`algorithms/slippage-and-price-impact`](/tr/algorithms/slippage-and-price-impact) — resmi tanımlar.
+
+Kaynaklar:
+
+- [Jito belgeleri](https://docs.jito.wtf)
+- [Solana doğrulayıcı belgeleri öncelik ücretleri](https://docs.solana.com/transaction_fees)
+- [jito-ts](https://github.com/jito-labs/jito-ts) — TypeScript paket istemcisi.

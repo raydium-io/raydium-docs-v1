@@ -1,0 +1,415 @@
+---
+title: "從自訂程式呼叫 CPI"
+description: "链上程式呼叫 Raydium 的組合模式 — 託管帳戶、匯總代理、自動複合金庫 — 包含完整的實作範例，涵蓋帳戶構造、PDA 簽署人、剩餘帳戶和計算預算編制。"
+---
+
+<Info>
+  **本頁內容由 AI 自動翻譯，所有內容以英文版本為準。**
+
+  [查看英文版 →](/integration-guides/cpi-integration)
+</Info>
+
+<Info>
+  [`sdk-api/rust-cpi`](/zh-Hant/sdk-api/rust-cpi) 涵蓋了呼叫各個 Raydium 程式的低階機制。本頁是更高階的補充：*為什麼*你會將 Raydium 組合到自己的程式中、*哪種*模式適合你的用例，以及端到端需要的完整膠合程式碼。
+</Info>
+
+## CPI 適用的時機
+
+當交易需要與只有你的程式才能進行的其他鏈上狀態變更原子性地發生時，自訂程式就很有用。常見的情況包括：
+
+- **託管帳戶／限價單程式** — 使用者將鑄幣存入你的託管帳戶，你的程式監視價格條件，當觸發時，你的程式原子性地透過 Raydium 進行交換並將結果記入使用者的帳戶。
+- **匯總代理** — 單一指令可以將交換路由通過 Raydium 加上一個或多個其他 DEX，所有跳躍都在由你的程式擁有的單一滑點檢查下進行。
+- **自動複合金庫** — 將 LP 或農場質押存入你的金庫，金庫按計劃收集獎勵、重新供應流動性、發行份額代幣。
+- **策略金庫** — 槓桿 LP 頭寸，透過 CLMM 交換進行再平衡；清算人在一次交易中關閉頭寸並交換抵押品。
+- **具有自訂解鎖的代幣發行平台** — 你的程式持有解鎖代幣並按計劃發放到 Raydium 池中。
+
+如果你只想從鏈下程式碼發送交換，CPI 就太過度了 — 改用 SDK。只有當原子性與你自己的狀態相關時，CPI 的複雜性才值得投入。
+
+## 組合模式
+
+### 模式 1：薄代理
+
+你的程式公開一個單一指令，驗證某些政策（例如白名單鑄幣對、經過驗證的使用者的費用折扣），然後轉發到 Raydium。
+
+```
+┌──────────────┐   user tx    ┌────────────────┐  CPI  ┌──────────┐
+│ user         │─────────────▶│ your program   │──────▶│ Raydium  │
+└──────────────┘              │  (validate)    │       │  (CPMM)  │
+                              └────────────────┘       └──────────┘
+```
+
+狀態存在於使用者的 ATA 中。你的程式不擁有任何代幣。信任占用面積最小。
+
+### 模式 2：託管帳戶
+
+你的程式擁有一個持有使用者輸入鑄幣的 PDA。在觸發時，PDA 簽署對 Raydium 進行交換的 CPI。
+
+```
+           deposit                   trigger
+   user ───────────▶  PDA vault  ───────────────▶  Raydium swap
+                     (your prog)                    (signed by PDA)
+                                                            │
+                                                            ▼
+                                                    PDA vault (output mint)
+                                                            │
+                                                     withdraw ▼
+                                                         user
+```
+
+關鍵細節：PDA 透過 `CpiContext::new_with_signer` 簽署。詳見 [PDA 簽署人種子](#pda-signer-seeds)。
+
+### 模式 3：複合多跳
+
+你的程式在一個指令中發出多個 CPI，在所有 CPI 中強制執行單一滑點界限。Raydium 交換指令各自具有自己的 `minimum_amount_out`，但你將它們設為 0（或非常鬆散的下限），並在最後一跳之後自己強制執行嚴格的最終最小值。
+
+```
+instruction:
+  CPI swap: tokenA → tokenB   (raydium, loose min)
+  CPI swap: tokenB → tokenC   (raydium / third-party, loose min)
+  CPI swap: tokenC → tokenD   (raydium, loose min)
+  require(user.tokenD_ata.amount - pre_balance >= user_min_out)
+```
+
+這為整個路由提供了單一還原門。只有在你信任每個跳躍都滑點安全時才使用此模式；否則，讓每個跳躍強制執行自己的最小值。
+
+### 模式 4：金庫／策略
+
+你的程式在 PDA 中持有 LP 代幣或農場質押。保管人（或使用者）呼叫 `compound()`，該函式會：
+
+1. 從農場收集獎勵。
+2. 將獎勵交換為池代幣（透過 CPI 進入 CPMM 或 CLMM）。
+3. 將所得存入 LP（另一個 CPI）。
+4. 質押新的 LP（又一個 CPI）。
+
+全部在一個交易中進行，因此金庫的 NAV 原子性地移動。計算預算通常為 600k–1M CU；地址查找表是必需的。
+
+## 帳戶列表構造
+
+呼叫程式的 `Accounts` 結構鏡像 Raydium 程式的帳戶順序，但大多數 Raydium 端帳戶是 `UncheckedAccount`，因為 Raydium 會自己驗證它們。你只會在*你*擁有的帳戶上添加約束條件：
+
+```rust
+use anchor_lang::prelude::*;
+use anchor_spl::token::{Token, TokenAccount};
+
+#[derive(Accounts)]
+pub struct EscrowSwap<'info> {
+    /// The escrow PDA; holds input mint and signs the CPI.
+    #[account(
+        mut,
+        seeds = [b"escrow", user.key().as_ref()],
+        bump = escrow.bump,
+    )]
+    pub escrow: Account<'info, Escrow>,
+
+    #[account(mut)]
+    pub user: Signer<'info>,
+
+    // ----- Raydium-side accounts, mostly unchecked -----
+
+    /// CHECK: validated by CPMM
+    #[account(mut)] pub pool_state: UncheckedAccount<'info>,
+    /// CHECK: validated by CPMM
+    pub amm_config: UncheckedAccount<'info>,
+    /// CHECK: validated by CPMM
+    pub pool_authority: UncheckedAccount<'info>,
+    #[account(mut)] pub input_vault:  Account<'info, TokenAccount>,
+    #[account(mut)] pub output_vault: Account<'info, TokenAccount>,
+    /// CHECK: validated by CPMM
+    #[account(mut)] pub observation_state: UncheckedAccount<'info>,
+
+    /// Escrow's input ATA — owned by the escrow PDA.
+    #[account(
+        mut,
+        associated_token::mint = input_mint,
+        associated_token::authority = escrow,
+    )]
+    pub escrow_input_ata: Account<'info, TokenAccount>,
+
+    /// Escrow's output ATA.
+    #[account(
+        mut,
+        associated_token::mint = output_mint,
+        associated_token::authority = escrow,
+    )]
+    pub escrow_output_ata: Account<'info, TokenAccount>,
+
+    pub input_mint:  Account<'info, anchor_spl::token::Mint>,
+    pub output_mint: Account<'info, anchor_spl::token::Mint>,
+
+    pub cpmm_program:       Program<'info, raydium_cp_swap::program::RaydiumCpSwap>,
+    pub token_program:      Program<'info, Token>,
+    pub token_program_2022: Program<'info, anchor_spl::token_2022::Token2022>,
+}
+```
+
+不對稱性 — 對你的帳戶進行嚴格驗證，對 Raydium 的帳戶進行 `UncheckedAccount` — 不是懶惰。接收器驗證自己的；在呼叫程式處進行雙重驗證只會燃燒 CU 並在 Raydium 發佈新的結構布局欄位時冒著不同步的風險。
+
+## CPI 呼叫本身
+
+```rust
+use raydium_cp_swap::cpi::{self, accounts::Swap as CpmmSwap};
+
+pub fn escrow_swap(
+    ctx: Context<EscrowSwap>,
+    amount_in: u64,
+    minimum_amount_out: u64,
+) -> Result<()> {
+    let user_key = ctx.accounts.user.key();
+    let bump     = ctx.accounts.escrow.bump;
+    let seeds: &[&[u8]] = &[b"escrow", user_key.as_ref(), &[bump]];
+    let signer: &[&[&[u8]]] = &[seeds];
+
+    let cpi_accounts = CpmmSwap {
+        payer:                ctx.accounts.user.to_account_info(),
+        authority:            ctx.accounts.escrow.to_account_info(),
+        amm_config:           ctx.accounts.amm_config.to_account_info(),
+        pool_state:           ctx.accounts.pool_state.to_account_info(),
+        input_token_account:  ctx.accounts.escrow_input_ata.to_account_info(),
+        output_token_account: ctx.accounts.escrow_output_ata.to_account_info(),
+        input_vault:          ctx.accounts.input_vault.to_account_info(),
+        output_vault:         ctx.accounts.output_vault.to_account_info(),
+        input_token_program:  ctx.accounts.token_program.to_account_info(),
+        output_token_program: ctx.accounts.token_program.to_account_info(),
+        input_token_mint:     ctx.accounts.input_mint.to_account_info(),
+        output_token_mint:    ctx.accounts.output_mint.to_account_info(),
+        observation_state:    ctx.accounts.observation_state.to_account_info(),
+    };
+
+    let cpi_ctx = CpiContext::new_with_signer(
+        ctx.accounts.cpmm_program.to_account_info(),
+        cpi_accounts,
+        signer,
+    );
+
+    cpi::swap_base_input(cpi_ctx, amount_in, minimum_amount_out)?;
+    Ok(())
+}
+```
+
+### PDA 簽署人種子
+
+CPI 只有在作為 `authority` 傳遞的 PDA 與呼叫程式聲稱的推導相匹配時才會成功。兩者必須同意：
+
+1. 種子位元組序列（此處 `[b"escrow", user.key().as_ref()]`）。
+2. bump。
+3. 呼叫程式 ID（你的程式，而不是 Raydium 的）。
+
+Raydium 不在乎 authority 是誰 — 它只在乎作為 `authority` 傳遞的簽名涵蓋交易且輸入 ATA 由該 authority 擁有。驗證發生在 `anchor_spl::token::transfer` 中：ATA 的 `authority` 欄位必須等於簽署人。
+
+常見的錯誤：將 `user` 作為 authority 傳遞（並從由託管帳戶 PDA 擁有的 `escrow_input_ata` 轉賬）。SPL Token 程式會以 `owner mismatch` 拒絕。務必使 `authority` 欄位與 ATA 擁有者相符。
+
+## 剩餘帳戶
+
+幾個 Raydium 指令採用可變長度帳戶列表，附加在固定帳戶之後 — **剩餘帳戶**。
+
+- **CLMM `SwapV2`**：1–8 個 `TickArrayState` 帳戶，用於交換可能遍歷的刻度陣列，按交換方向。
+- **Farm v6 `Deposit` / `Harvest` / `Withdraw`**：`(reward_vault, user_reward_ata)` 對，每個活躍獎勵槽位一對。
+- **Token-2022 轉移鉤點鑄幣**：轉移鉤點程式加上鉤點需要的任何帳戶。
+
+Anchor CPI 幫助程式不對剩餘帳戶進行型別檢查。將它們直接傳遞：
+
+```rust
+let cpi_ctx = CpiContext::new_with_signer(program, accounts, signer)
+    .with_remaining_accounts(ctx.remaining_accounts.to_vec());
+```
+
+**順序很重要。** 對於 CLMM：
+
+```
+remaining = [
+    tick_array_in_direction_0,    // first one crossed
+    tick_array_in_direction_1,
+    ...,
+]
+```
+
+對於農場 v6 收集：
+
+```
+remaining = [
+    reward_vault_0, user_reward_ata_0,
+    reward_vault_1, user_reward_ata_1,
+    // omit any slot whose reward_state is Uninitialized
+]
+```
+
+你的呼叫程式必須將從用戶端接收的剩餘帳戶直接傳遞。不要試圖篩選或重新排列它們。
+
+## 複合呼叫的計算預算
+
+CPI 本身的呼叫框架耗費約 1,500 CU；被呼叫者的自身 CU 用量堆疊在其上。每個 Raydium CPI 的粗略預算：
+
+| 呼叫 | CU (SPL Token) | CU (Token-2022) |
+|------|----------------|-----------------|
+| CPMM swap_base_input | ~150,000 | ~200,000 |
+| CLMM swap_v2 (單個刻度陣列) | ~180,000 | ~230,000 |
+| CLMM swap_v2 (跨越 2 個刻度) | ~220,000 | ~270,000 |
+| Farm v6 deposit | ~120,000 | ~150,000 |
+| Farm v6 harvest (每個獎勵槽位) | +30,000 | +40,000 |
+| AMM v4 swap_base_in | ~140,000 | n/a |
+
+為每個 CPI 框架添加約 1,500，為你自己程式的開銷添加約 20,000。執行 `harvest → swap A → swap B → deposit LP → stake LP` 的自動複合程式輕鬆達到 700k CU。
+
+始終設定明確的 `ComputeBudgetProgram::set_compute_unit_limit`：
+
+```ts
+import { ComputeBudgetProgram } from "@solana/web3.js";
+
+const tx = new Transaction().add(
+  ComputeBudgetProgram.setComputeUnitLimit({ units: 900_000 }),
+  ComputeBudgetProgram.setComputeUnitPrice({ microLamports: priorityFeeMicroLamports }),
+  yourInstruction,
+);
+```
+
+預設 200k CU 上限會在複合呼叫完成之前很久就無聲地耗盡。
+
+## 錯誤傳播
+
+Raydium 的程式回傳具有穩定錯誤代碼的 Anchor 錯誤。你的呼叫程式會將它們視為 `Err(ProgramError::Custom(code))`。預設冒泡：
+
+```rust
+cpi::swap_base_input(cpi_ctx, amount_in, minimum_amount_out)?;
+```
+
+或攔截特定代碼：
+
+```rust
+use raydium_cp_swap::error::ErrorCode as CpmmErr;
+
+match cpi::swap_base_input(cpi_ctx, amount_in, minimum_amount_out) {
+    Ok(_) => {},
+    Err(err) if is_err(err, CpmmErr::ExceededSlippage) => {
+        // Your program might want to retry at a larger slippage, or unwind state.
+        return err!(YourErr::PoolTooVolatile);
+    }
+    Err(err) => return Err(err),
+}
+```
+
+錯誤代碼對應關係根據 IDL 政策（[`sdk-api/anchor-idl`](/zh-Hant/sdk-api/anchor-idl)）對每個版本是穩定的；新代碼附加在末尾，現有代碼的含義永遠不會改變。
+
+## 完整的實作範例：限價單託管帳戶
+
+流程：
+
+1. **`open_order`** — 使用者將 `amount_in` 個 `input_mint` 存入託管帳戶 PDA；記錄目標 `min_amount_out` 和到期時間。
+2. **`execute_order`** — 任何人（保管人）使用目前的池帳戶進行呼叫。程式檢查目前的報價 ≥ `min_amount_out`，然後 CPI Raydium 交換並將輸出保留在託管帳戶中。
+3. **`claim`** — 使用者從託管帳戶提取輸出鑄幣。
+
+```rust
+#[account]
+pub struct LimitOrder {
+    pub user:          Pubkey,
+    pub input_mint:    Pubkey,
+    pub output_mint:   Pubkey,
+    pub amount_in:     u64,
+    pub min_out:       u64,
+    pub expiry_unix:   i64,
+    pub state:         u8,    // 0 open, 1 filled, 2 cancelled, 3 expired
+    pub bump:          u8,
+}
+
+#[program]
+pub mod limit_orders {
+    use super::*;
+
+    pub fn execute_order(
+        ctx: Context<ExecuteOrder>,
+    ) -> Result<()> {
+        let order = &ctx.accounts.order;
+        require!(order.state == 0, OrderErr::NotOpen);
+        require!(Clock::get()?.unix_timestamp < order.expiry_unix, OrderErr::Expired);
+
+        let user_key = order.user;
+        let seeds: &[&[u8]] = &[b"order", user_key.as_ref(), &[order.bump]];
+        let signer: &[&[&[u8]]] = &[seeds];
+
+        let pre_out_balance = ctx.accounts.escrow_output_ata.amount;
+
+        let cpi_accounts = CpmmSwap {
+            payer:                ctx.accounts.keeper.to_account_info(),
+            authority:            ctx.accounts.order.to_account_info(),
+            amm_config:           ctx.accounts.amm_config.to_account_info(),
+            pool_state:           ctx.accounts.pool_state.to_account_info(),
+            input_token_account:  ctx.accounts.escrow_input_ata.to_account_info(),
+            output_token_account: ctx.accounts.escrow_output_ata.to_account_info(),
+            input_vault:          ctx.accounts.input_vault.to_account_info(),
+            output_vault:         ctx.accounts.output_vault.to_account_info(),
+            input_token_program:  ctx.accounts.token_program.to_account_info(),
+            output_token_program: ctx.accounts.token_program.to_account_info(),
+            input_token_mint:     ctx.accounts.input_mint.to_account_info(),
+            output_token_mint:    ctx.accounts.output_mint.to_account_info(),
+            observation_state:    ctx.accounts.observation_state.to_account_info(),
+        };
+
+        let cpi_ctx = CpiContext::new_with_signer(
+            ctx.accounts.cpmm_program.to_account_info(),
+            cpi_accounts,
+            signer,
+        );
+
+        // Let the escrow enforce the minimum — we trust Raydium's slippage, but we
+        // also re-check our own post-swap delta in case a future change ever relaxes it.
+        cpi::swap_base_input(cpi_ctx, order.amount_in, order.min_out)?;
+
+        ctx.accounts.escrow_output_ata.reload()?;
+        let delta = ctx.accounts.escrow_output_ata.amount
+            .checked_sub(pre_out_balance)
+            .ok_or(error!(OrderErr::AccountingError))?;
+        require!(delta >= order.min_out, OrderErr::InsufficientOutput);
+
+        let order = &mut ctx.accounts.order;
+        order.state = 1;
+        Ok(())
+    }
+}
+```
+
+保管人支付交易費用（他們在別處獲得保管人費用 — 未顯示）。託管帳戶 PDA 簽署 CPI。Raydium 端滑點檢查*和*託管帳戶自己的增量檢查都強制執行下限 — 雙保險。
+
+## 測試
+
+將 Raydium 程式拉入本地驗證器進行整合測試（來自 `Anchor.toml`）：
+
+```toml
+[test.validator]
+clone = [
+  { address = "CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK" }, # CPMM
+  { address = "CLMM...." },                                     # CLMM
+  { address = "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8" }, # AMM v4
+  { address = "FarmqiPv5eAj3j1GMdMCMUGXqPUvmquZtMy86QH6rzhG" }, # Farm v6
+]
+```
+
+也複製池狀態帳戶，以便你的測試可以實際執行交換；`anchor test` 在啟動時從主網取得它們。詳見 [`sdk-api/rust-cpi`](/zh-Hant/sdk-api/rust-cpi#testing-a-cpi-flow)。
+
+## 組合特有的陷阱
+
+### 可重入性
+
+Solana 沒有真正的可重入性 — CPI 無法在同一呼叫中呼叫回原始程式。但你仍然可以構建自己進入邏輯可重入性：CPI 讀取你的狀態，然後你的程式再次讀取它，假設 CPI 沒有改變它。對於 Raydium，CPI 不會碰你的狀態，所以這不如例如閃貸環境那樣令人擔憂。但如果你將 Raydium 與借貸協議組合，要注意。
+
+### 帳戶可變性漂移
+
+如果你的程式將帳戶作為 `mut` 傳遞，但 Raydium 期望它為唯讀（或反之），執行時會以 `InvalidAccountData` 拒絕呼叫。始終檢查 Raydium 的指令在 IDL 中的預期可變性；`anchor_cp_swap::cpi::accounts::Swap` 透過其欄位類型強制執行它。
+
+### Token-2022 程式欄位
+
+輸入和輸出鑄幣可能在不同的代幣程式下 — 一個 SPL Token，一個 Token-2022。CPI 有分開的 `input_token_program` 和 `output_token_program` 欄位，原因就在這裡。始終檢查每個鑄幣的 `owner` 欄位並將正確的程式路由到每個槽位。
+
+### 版本化交易
+
+包含 2+ 個 Raydium CPI 加上 ATA 建立的複合 tx 很少能放入傳統（v0-無-LUT）交易。使用 V0 和地址查找表；透過 `raydium.getRaydiumLutAddresses()` 拉取 Raydium 的公共 LUT。
+
+## 指標
+
+- [`sdk-api/rust-cpi`](/zh-Hant/sdk-api/rust-cpi) — 低階 CPI 機制。
+- [`integration-guides/priority-fee-tuning`](/zh-Hant/integration-guides/priority-fee-tuning) — 計算預算調整大小。
+- [`products/cpmm/code-demos`](/zh-Hant/products/cpmm/code-demos)、[`products/clmm/code-demos`](/zh-Hant/products/clmm/code-demos)、[`products/farm-staking/code-demos`](/zh-Hant/products/farm-staking/code-demos) — 按產品的 CPI 程式碼片段。
+
+來源：
+
+- [raydium-cp-swap CPI crate](https://github.com/raydium-io/raydium-cp-swap)
+- [raydium-clmm CPI crate](https://github.com/raydium-io/raydium-clmm)
+- [Anchor CPI docs](https://www.anchor-lang.com/docs/cross-program-invocations)

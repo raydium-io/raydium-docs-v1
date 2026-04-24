@@ -1,0 +1,369 @@
+---
+title: "CLMM数学"
+description: "スクエアルート価格表現、流動性 ↔ トークン量、シングルティックスワップステップ、マルチティック反復、手数料成長アカウンティング。"
+---
+
+<Info>
+  **このページは AI による自動翻訳です。すべての内容は英語版を正とします。**
+
+  [英語版を表示 →](/products/clmm/math)
+</Info>
+
+## スクエアルート価格表現
+
+CLMMは価格を `sqrt_price_x64` として保存します。これはトークン1あたりのトークン0の価格のスクエアルートを、Q64.64固定小数点数で表したものです。
+
+$$
+\text{sqrt\_price\_x64} = \lfloor \sqrt{p} \cdot 2^{64} \rfloor
+$$
+
+ここで `p = token1_amount / token0_amount` です。`sqrt` を使用することで、スワップ数学が線形化されます（トークン量のデルタは `Δsqrt_price` について線形になります）。また、`x64` 固定小数点により、多数のティックを跨ぐスワップでも精度が保たれます。
+
+ティック ↔ スクエアルート価格の変換は、`bit-by-bit` ログ近似により事前計算されます。
+
+$$
+\text{sqrt\_price\_x64}(t) \approx 2^{64} \cdot (1.0001)^{t/2}
+$$
+
+これは `tick_math::get_sqrt_price_at_tick` のルックアップベースの指数関数として実装されています。
+
+## 正規単位としての流動性
+
+範囲 `[sqrt_a, sqrt_b]`（`sqrt_a < sqrt_b`）内の**流動性 `L`** を持つポジションは、以下のようにトークン量にマップされます。ここで `sqrt_c = sqrt_price_x64` はプールの現在の価格です。
+
+| ケース | `amount0` | `amount1` |
+|------|-----------|-----------|
+| `sqrt_c <= sqrt_a`（プール価格が範囲以下） | `L · (sqrt_b - sqrt_a) / (sqrt_a · sqrt_b)` | `0` |
+| `sqrt_a < sqrt_c < sqrt_b`（範囲内） | `L · (sqrt_b - sqrt_c) / (sqrt_c · sqrt_b)` | `L · (sqrt_c - sqrt_a)` |
+| `sqrt_c >= sqrt_b`（プール価格が範囲以上） | `0` | `L · (sqrt_b - sqrt_a)` |
+
+これら3つの恒等式はすべて、集約流動性が範囲内で満たす不変式 `x = L / sqrt_p`、`y = L · sqrt_p` から導出されます。
+
+インテグレーターは通常、逆の計算を望みます。`amount0` / `amount1` のデポジットが与えられたとき、範囲内に収まる最大の `L` を計算することです。SDKの `LiquidityMath.getLiquidityFromTokenAmounts` がこれを行います。範囲内のケースの公式は以下の通りです。
+
+$$
+L_0 = \text{amount0} \cdot \frac{\text{sqrt\_c} \cdot \text{sqrt\_b}}{\text{sqrt\_b} - \text{sqrt\_c}},
+\qquad
+L_1 = \frac{\text{amount1}}{\text{sqrt\_c} - \text{sqrt\_a}},
+\qquad
+L = \min(L_0, L_1)
+$$
+
+どちらのサイドが制約になるかによって、実際に消費される比率が決まります。もう一方のサイドには残金が残る場合があります。
+
+## シングルティックスワップステップ
+
+スワップは**ステップ**で進みます。各ステップは、（a）現在のティック範囲内で利用可能なすべてのインプットを消費しティックを越えずに進む、または（b）価格を次の初期化されたティックに正確に移動させるかのいずれかです。
+
+現在の状態 `(sqrt_c, L)` と**上向きの** スワップ（トークン0イン、トークン1アウト、`sqrt_price` が増加）が与えられたとき、次の初期化されたティックまでの距離を `sqrt_t` とします。このマイクロ区間内で、インプットと価格の関係は以下の通りです。
+
+$$
+\Delta\text{amount0} = L \cdot \left( \frac{1}{\text{sqrt\_c}} - \frac{1}{\text{sqrt\_t}} \right)
+= \frac{L \cdot (\text{sqrt\_t} - \text{sqrt\_c})}{\text{sqrt\_c} \cdot \text{sqrt\_t}}
+$$
+
+および
+
+$$
+\Delta\text{amount1} = L \cdot (\text{sqrt\_t} - \text{sqrt\_c})
+$$
+
+プログラムは以下の2つの処理のいずれかを実行します。
+
+- **全インプットがフィットする？** 手数料差引後の残りインプットが `sqrt_t` に到達するための `Δamount0` より少ない場合、新しい `sqrt_c'` を正確に解きます。
+
+  $$
+  \text{sqrt\_c}' = \frac{L \cdot \text{sqrt\_c}}{L + \Delta\text{input} \cdot \text{sqrt\_c}}
+  $$
+
+  （正確入力 `token0 → token1` スワップの場合）。スワップはこのステップで完了し、ティックを越えることはありません。
+
+- **インプットが `Δamount0` を超える？** `sqrt_c' = sqrt_t` を設定し、ティックを越えます（`liquidity_net` を適用）。残りインプットを `Δamount0` だけ減らし、アウトプットを `Δamount1` だけ増やして、繰り返します。
+
+逆方向（`token1 → token0`、価格が下がる）の場合、公式で `sqrt_c` と `sqrt_t` が入れ替わり、反転が別のスロットで起こります。
+
+完全なRust実装は `raydium-clmm/programs/amm/src/libraries/swap_math.rs` にあります。そこのロジックはUniswap v3の `SwapMath.computeSwapStep` と一致しています。
+
+## 各ステップの手数料
+
+取引手数料は**インプット**量から各ステップで差し引かれます。これはCPMMと同じ規約です。
+
+```
+step_fee_amount  = ceil(step_input * trade_fee_rate / 1_000_000)
+step_net_input   = step_input - step_fee_amount
+protocol_portion = floor(step_fee_amount * protocol_fee_rate / 1_000_000)
+fund_portion     = floor(step_fee_amount * fund_fee_rate     / 1_000_000)
+lp_portion       = step_fee_amount - protocol_portion - fund_portion
+```
+
+LP部分は、グローバル手数料成長アキュムレーターを更新することで、現在範囲内にある流動性全体に分割されます。
+
+$$
+\text{fee\_growth\_global}_{\text{in}} \mathrel{+}= \text{lp\_portion} \cdot \frac{2^{64}}{L}
+$$
+
+つまり、*流動性単位あたりの手数料* として表示され、Q64.64です。そのため、このスワップ全体で範囲内に留まったサイズ `L_i` のポジションは、後で `L_i · Δfee_growth_global / 2^{64}` の返却トークンを読み取ることができます。
+
+プロトコル部分とファンド部分は、それぞれ `PoolState.protocol_fees_token_{0,1}` と `PoolState.fund_fees_token_{0,1}` に蓄積され、CPMMと同じです。これらは `CollectProtocolFee` / `CollectFundFee` によってクリアされます。
+
+## 範囲外および範囲内の手数料成長
+
+CLMM手数料アカウンティングの難しい部分は、ポジションが**範囲内に** あるときのみ手数料を得るという点です。プールはグローバルな累積手数料を追跡しますが、ポジションはその特定の範囲*内の*累積手数料を知る必要があります。
+
+解決策は**ティックベース**アキュムレーターです。各ティックは以下を保存します。
+
+```
+fee_growth_outside_0_x64
+fee_growth_outside_1_x64
+```
+
+ティック初期化の時点で：
+
+- プールの価格がこのティック**上に** ある場合（`tick_current >= this_tick`）、`fee_growth_outside = fee_growth_global`。（これまで稼いだすべてが「外側」、つまり現在の価格に対してこのティック「下」にあります）
+- それ以外の場合 `fee_growth_outside = 0`。
+
+価格がティックを越えるとき、プログラムはそのティックの `fee_growth_outside` を**フリップ**します。
+
+$$
+\text{fee\_growth\_outside} \gets \text{fee\_growth\_global} - \text{fee\_growth\_outside}
+$$
+
+この不変式が保証するもの：任意のティック `t` について、`fee_growth_outside(t)` は `tick_current` が `t` の反対側にあったときに蓄積した手数料と等しいです。
+
+**範囲 `[tick_lower, tick_upper]` 内の手数料成長**は、以下のように導出されます。
+
+```
+if tick_current >= tick_upper:
+    fee_growth_below = fee_growth_outside(tick_lower)
+    fee_growth_above = fee_growth_global - fee_growth_outside(tick_upper)
+elif tick_current >= tick_lower:
+    fee_growth_below = fee_growth_outside(tick_lower)
+    fee_growth_above = fee_growth_outside(tick_upper)
+else:
+    fee_growth_below = fee_growth_global - fee_growth_outside(tick_lower)
+    fee_growth_above = fee_growth_outside(tick_upper)
+
+fee_growth_inside = fee_growth_global - fee_growth_below - fee_growth_above
+```
+
+これはUniswap-v3の手数料成長公式で、変更されていません。
+
+## ポジションが保存するもの、読み取るもの
+
+`PersonalPositionState` は `fee_growth_inside_0_last_x64` と `fee_growth_inside_1_last_x64` を保存します。これらはポジションが最後にタッチされたときの `fee_growth_inside` 値です。
+
+その後のタッチ（増加、減少、収集）では、プログラムは以下を行います。
+
+1. 上記の公式を使用して、現在の `fee_growth_inside_{0,1}_x64` を計算します。
+2. `Δ = fee_growth_inside_now − fee_growth_inside_last`（u128上のモジュラ減算）を計算します。
+3. `Δ × position.liquidity / 2^{64}` を `tokens_fees_owed_{0,1}` に追加します。
+4. `fee_growth_inside_last` を新しい値に更新します。
+
+トークンが実際にボルトから移動するのは、`CollectFees` / `DecreaseLiquidity` 時で、`tokens_fees_owed` に対してのみです。
+
+## リワード
+
+プールの最大3つのリワードストリームのそれぞれは、独自の `reward_growth_global_x64` アキュムレーターで同じ成長内機構を使用します。排出時に：
+
+$$
+\text{reward\_growth\_global} \mathrel{+}= \text{emission\_per\_second} \cdot \Delta t \cdot \frac{2^{64}}{L}
+$$
+
+—排出はアクティブ流動性に反比例するスケーリングされるため、より密なプールは各ポジションに1秒あたりより少ないリワードを支払いますが、全体では複数のポジションにまたがります。ポジションあたりの返却リワードは
+
+$$
+\text{reward\_owed} = (\text{reward\_growth\_inside}_{\text{now}} - \text{reward\_growth\_inside}_{\text{last}}) \cdot L / 2^{64}
+$$
+
+で、`CollectReward` 経由で請求されます。[`products/clmm/fees`](/ja/products/clmm/fees) を参照してください。
+
+## 実例：正確入力スワップ
+
+仮定：
+
+- `tick_spacing = 60`
+- `sqrt_price_x64 = 1 × 2^{64}` —価格 = 1.0、つまり `tick_current = 0`。
+- アクティブ流動性 `L = 1_000_000 × 2^{64}`。
+- 上の次の初期化ティック：`t = 60`（sqrt_price_b ≈ `1.003004 × 2^{64}`）。
+- 取引手数料率：500（0.05%）。
+
+ユーザー：正確入力1,000トークン0の `SwapBaseInput`。
+
+ステップ1 —手数料：
+
+```
+trade_fee       = ceil(1000 * 500 / 1_000_000)  = 1
+step_net_input  = 999
+```
+
+ステップ2 —999は現在のティック範囲内に収まるか？
+
+```
+Δ to next tick (amount0):
+  L · (sqrt_t - sqrt_c) / (sqrt_c * sqrt_t)
+  ≈ 1_000_000 · (1.003004 − 1) / (1 · 1.003004)
+  ≈ 2995.5 token0
+```
+
+`999 < 2995.5` なので、全インプットはティックを越えずに収まります。
+
+ステップ3 —新しい価格：
+
+```
+sqrt_c' = L · sqrt_c / (L + Δin · sqrt_c)
+        = 1_000_000 · 1 / (1_000_000 + 999 · 1)
+        ≈ 0.999001
+```
+
+つまり、`sqrt_c'` は `sqrt_c` よりやや下。ここで上記の公式は `token1 → token0` スワップ用です。ここの例は `token0 → token1` で、価格は**上向き**ではなく下向きに駆動されます。そのため、`token0 in` に対応するフォームを使用します。
+
+```
+sqrt_c' = sqrt_c + Δin / L
+        = 1 + 999 / 1_000_000
+        = 1.000999
+```
+
+（これは `token0 → token1` の予想されるスワップ方向と一致します。`sqrt_c` は価格とともに上昇します）
+
+ステップ4 —アウト量：
+
+```
+Δout token1 = L · (sqrt_c' − sqrt_c)
+            = 1_000_000 · 0.000999
+            = 999.00
+```
+
+丸め処理を考慮した後、ユーザーはおよそ999トークン1を受け取ります。手数料（1トークン0）は、LP、プロトコル、およびファンドの間で `trade_fee_rate × protocol_fee_rate / 1e6`（ファンドについても同様）で分割されます。LP部分は `fee_growth_global_0_x64` にフローします。
+
+## スワップ中のリミットオーダーマッチング
+
+スワップステップがオープンなリミットオーダーを保有するティックを越えるとき、これらのオーダーはティックの正確な価格で、LP曲線**前に** スワップインプットを消費します。マッチングはティック内で `order_phase` コホート別のFIFOです。
+
+### `TickState` のコホートごとの状態
+
+```
+order_phase                  : u64    単調なコホートid
+orders_amount                : u64    現在の（最新の）コホート内の入力トークン合計
+part_filled_orders_remaining : u64    スワップが現在フィリング中のコホートの残入力
+unfilled_ratio_x64           : u128   Q64.64 部分フィルコホートのフィル比
+```
+
+2コホートレイアウトが存在するのは、ティックがオープンしている古いコホートがまだフィリング中にあるときに新しいオーダーが開かれる可能性があるからです。新しくオープンされたオーダーは `orders_amount` に参加し、次の `order_phase` を継承します。前のコホートが完全に消費されるまで、フィルできません。
+
+### マッチングステップ
+
+スワップ中の各ティック交差で発生するマッチングの疑似コード：
+
+```
+fn match_limit_orders_at_tick(tick, swap_input_remaining, sqrt_p):
+    # 1. 部分フィルコホートを最初にフィルしようとします。
+    if tick.part_filled_orders_remaining > 0:
+        consume = min(tick.part_filled_orders_remaining, swap_input_remaining)
+        # そのコホートの未フィル比を更新します。
+        tick.unfilled_ratio_x64 *= (1 - consume / tick.part_filled_orders_remaining)
+        tick.part_filled_orders_remaining -= consume
+        swap_input_remaining -= consume
+        if tick.part_filled_orders_remaining == 0:
+            tick.unfilled_ratio_x64 = 0
+        if swap_input_remaining == 0: return
+
+    # 2. アクティブコホートをプロモートします。
+    if tick.orders_amount > 0:
+        tick.part_filled_orders_remaining = tick.orders_amount
+        tick.orders_amount = 0
+        tick.order_phase += 1
+        tick.unfilled_ratio_x64 = ONE_X64
+        # 新しくプロモートされたコホートで再帰します。
+        return match_limit_orders_at_tick(tick, swap_input_remaining, sqrt_p)
+
+    return  # tickにリミットオーダーはありません
+```
+
+リミットオーダーオーナーに向かうアウトプットトークンは、スワップごとに転送**されません**。オーダーオーナーが `SettleLimitOrder`（または `DecreaseLimitOrder`）を呼び出すまで、プールのアウトプットボルト内に仮想的に座っています。プールは `unfilled_ratio_x64` 経由でコホートのフィル量だけを追跡します。各 `LimitOrderState` はオープン時に独自の `(order_phase, unfilled_ratio_x64)` スナップショットを保存するため、セットルメントは以下に減少します。
+
+```
+filled_amount  = total_amount × (1 − tick_now.unfilled_ratio_x64 / order.unfilled_ratio_x64)
+                if tick_now.order_phase > order.order_phase
+                else 0
+output_amount  = price_at(tick_index) × filled_amount   # 方向に調整
+```
+
+このO(1)セットルメントがコホート設計全体のポイントです。ティックは任意の数のオーダーをフィルでき、ガスはオーダーあたりです。
+
+### LP曲線との相互作用
+
+スワップステップで、リミットオーダーマッチングはティック**で**起こります（ゼロ `Δsqrt_price`）。LP曲線消費はティック**間で**起こります。したがって順序は：
+
+1. ティック `t_cross` を越えます（LP `liquidity_net` 変更を最初に適用します。これはUniswap-V3がする方法です）。
+2. `t_cross` に座っているリミットオーダーをフィルします。
+3. LP曲線に沿って次の初期化ティックまたは `swap_input` 枯渇まで続行します。
+
+リミットオーダーはしたがって、トレーダーに正確にオーダーのティック価格で*より*効果的な流動性を与えます（価格改善効果）。LP手数料を獲得しないコストで—リミットオーダー部分は、リミットオーダー作成者がメーカーとして機能するため、スワッパーにとって手数料がありません。動的手数料サージ（有効な場合）は、同じスワップのLP部分に適用されます。
+
+## 動的手数料導出
+
+`PoolState.dynamic_fee_info` はボラティリティ状態を保持します。各スワップステップは、ステップ単位の手数料率を以下のように計算します。
+
+$$
+\text{fee\_rate}_{\text{total}} = \text{trade\_fee\_rate}_{\text{config}} +
+\underbrace{\frac{\text{dynamic\_fee\_control} \cdot (\text{vol\_acc} \cdot \text{tick\_spacing})^2}
+{D_{\text{ctrl}} \cdot S_{\text{vol}}^2}}_{\text{動的サージ}}
+$$
+
+ここで：
+
+- $D_{\text{ctrl}} = 100{,}000$ — `DYNAMIC_FEE_CONTROL_DENOMINATOR`
+- $S_{\text{vol}} = 10{,}000$ — `VOLATILITY_ACCUMULATOR_SCALE`
+- `vol_acc` は以下の更新ルール後のステップあたりアキュムレーター
+- `tick_spacing` は `PoolState.tick_spacing` から
+
+結果は $100{,}000 / 10^6 = 10\%$ でクランプされます。
+
+### アキュムレーター更新
+
+2つのルールが各スワップで順番に適用されます。
+
+**減衰。** リファレンスフロアは最後の更新以降の時間に基づいて減衰します。
+
+$$
+\text{vol\_ref} = \begin{cases}
+0 & \text{if } \Delta t > \text{decay\_period} \\
+\text{vol\_acc}_{\text{prev}} \cdot \dfrac{\text{reduction\_factor}}{10{,}000} & \text{if } \text{filter\_period} < \Delta t \le \text{decay\_period} \\
+\text{vol\_ref}_{\text{prev}} & \text{if } \Delta t \le \text{filter\_period}
+\end{cases}
+$$
+
+**蓄積。** 新しいアキュムレーターはリファレンスプラス前のリファレンスインデックス以来のティック距離です。
+
+$$
+\text{vol\_acc} = \min\left(
+    \text{vol\_ref} + \left| t_{\text{ref}} - t_{\text{now}} \right| \cdot S_{\text{vol}},
+    \text{max\_vol\_acc}
+\right)
+$$
+
+`tick_spacing_index_reference`（$t_{\text{ref}}$）はティック単位で、生ティックではありません。$t_{\text{ref}} = \lfloor \text{tick\_current} / \text{tick\_spacing} \rfloor$。
+
+### ティック距離で放物線である理由
+
+アキュムレーターを二乗することは、手数料が価格がリファレンスポイントから歩んできた距離の*二乗*に応じて上昇することを意味します。経験的にこれはランダムウォーク圧力下での価格の分散スケーリングと一致します。2×ティック遠隔は4×暗黙のボラティリティを意味するため、4×サージを請求します。`dynamic_fee_control` パラメーターは絶対レベルを調整します。
+
+`filter_period` ウィンドウは、小さなサブセカンド振動（例えば、MEVボット サンドイッチング）がアキュムレーターを膨らませることを防ぎます。`decay_period` ウィンドウは、単一の過去スパイクが市場が静まった後に無期限に手数料を請求することを防ぎます。
+
+## 数値堅牢性
+
+- すべての中間生成物は `u128` または `u256` 形状の算術を通過します。CLMMは `U128Sqrt` ヘルパーと `FullMath::mulDiv` パターンを直接Uniswap v3から移植しています。
+- 除算丸めは、不変式 `k' ≥ k` をローカルに強制するためにステップごとに選択されます。`SwapBaseInput` はアウトプットを**下**にラウンドします。`SwapBaseOutput` はインプットを**上**にラウンドします。
+- `PoolState.liquidity` をゼロに落とすティック交差は許可されます（価格は「流動性ホール」を走行できます）が、スワップは単に次の初期化ティックに進んで入力を消費せず、手数料を請求しません。
+- オーバーフローガード：`sqrt_price_x64` は `[MIN_TICK, MAX_TICK]` に対応する `[MIN_SQRT_PRICE_X64, MAX_SQRT_PRICE_X64]` の包括的範囲内に保たれます。どちらかのバウンドを超えて押されるスワップは `SqrtPriceLimitOverflow` で差し戻されます。
+
+## 次に進むべきこと
+
+- [`products/clmm/ticks-and-positions`](/ja/products/clmm/ticks-and-positions) ティックマップがウォークにどのように参加するかについて。
+- [`products/clmm/fees`](/ja/products/clmm/fees) 数学の手数料/リワード側の詳細について。
+- [`algorithms/clmm-math`](/ja/algorithms/clmm-math) `L = sqrt(x · y)` 及び範囲対流動性公式の背後にある導出について。
+
+ソース：
+
+- [`raydium-io/raydium-clmm` — `libraries/swap_math.rs`, `libraries/tick_math.rs`](https://github.com/raydium-io/raydium-clmm)
+- "Uniswap v3 Core" ホワイトペーパー、§6–7

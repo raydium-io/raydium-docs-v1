@@ -1,0 +1,158 @@
+---
+title: "滑点和价格影响"
+description: "滑点与价格影响的精确定义、Raydium SDK 如何计算 minAmountOut 和 maxAmountIn、不同 AMM 类型的差异，以及生产环境路由的 MEV 考虑。"
+---
+
+<Info>
+  **本页内容由 AI 自动翻译，所有内容以英文版本为准。**
+
+  [查看英文版 →](/algorithms/slippage-and-price-impact)
+</Info>
+
+## 两个不同的概念
+
+**价格影响**和**滑点**经常在用户界面中被混淆，但它们指的是不同的东西。
+
+- **价格影响**是针对特定池状态的交易的确定性属性。给定 `(Δin, reserves)`，价格影响在交易提交前完全可计算。
+
+- **滑点**是你在报价时*预期*的价格和执行时*实际获得*的价格之间的实际差异。它是延迟、并发交易和区块纳入顺序的函数——而不是池数学的函数。
+
+对一个其他方面处于闲置状态的池的 1% 报价，如果它在下一个区块中成交，滑点为 0%；那 1% 是价格影响。如果另一笔交易先命中池，那同样的报价会差 0.2%——额外的 0.2% 就是滑点。
+
+## 正式定义
+
+### 价格影响
+
+```
+p_before = pool.spot_price()
+p_after  = pool.spot_price_if_trade(Δin) applied
+impact   = (p_before − p_after) / p_before       // 可以是有符号的
+```
+
+对于 CPMM：小额交易时 `impact ≈ 2 · Δin / reserve_in`。对于 CLMM：取决于交易跨越多少个 tick；通常在当前 tick 范围内保持平稳，在每个 tick 跨越处跳跃。
+
+### 实现滑点
+
+```
+quoted_out = 报价时计算的输出金额
+actual_out = 链上观察到的输出金额
+slippage   = (quoted_out − actual_out) / quoted_out
+```
+
+滑点总是非负的（或为零），假设报价是诚实的。负值意味着你获得的*比*报价的多——如果池状态在报价和执行之间朝对你有利的方向移动，这是可能的。
+
+## 计算 `minAmountOut` 和 `maxAmountIn`
+
+每个 Raydium 交换都需要一个滑点保护界限：
+
+- `SwapBaseInput(amount_in, min_amount_out)` — 精确输入，下限输出。
+- `SwapBaseOutput(max_amount_in, amount_out)` — 精确输出，上限输入。
+
+SDK 的计算如下：
+
+```ts
+const computed = raydium.<pool_type>.computeAmountOut({
+  poolInfo,
+  amountIn,
+  mintIn,
+  mintOut,
+  slippage: 0.005,     // 0.5% 容差
+});
+
+// computed.amountOut         — "预期"报价
+// computed.minAmountOut      — amountOut × (1 − slippage)，作为链上界限使用
+// computed.priceImpact       — 确定性的，仅依赖池状态
+// computed.fee               — 总费用（所有成分之和）
+```
+
+滑点容差是**围绕价格影响的缓冲区**，而不是价格影响本身。0.5% 的容差意味着"接受比报价最多差 0.5%"——与价格影响是 0.01%（小额交易）还是 2%（大额交易）无关。对于有 2% 价格影响、0.5% 容差的交易，`minAmountOut` 是交易前现货的 2.5% 以下——本质上是影响和容差的总和。
+
+## 推荐滑点容差
+
+没有单一的正确数字；正确的界限取决于：
+
+1. **交易对稳定性。** 稳定币对稳定币的池可以安全地使用 0.1%。波动的模因币对通常需要 3–5% 才能可靠地成交。
+2. **交易规模。** 较大的交易具有较大的价格影响，因此容差需要与之相应调整以避免回滚。SDK 的自动滑点默认值大约为 `max(0.5%, 2 × price_impact)` 就是因为这个原因。
+3. **区块纳入延迟。** 在内存池中停留多个区块的交易会面临更多并发交易的暴露。Jito 捆绑和优先费用可以减少这种情况。
+
+经验法则（Raydium UI 默认值）：
+
+| 交易对类型 | 默认容差 |
+|-----------|---------|
+| 稳定币对稳定币（USDC-USDT、USDC-USDS） | 0.1% |
+| 稳定币对主流（USDC-SOL、USDC-BTC） | 0.5% |
+| 主流对主流（SOL-BTC、SOL-ETH） | 1% |
+| 波动性（模因币、流动性差的长尾） | 3–5% |
+
+## 不同 AMM 类型的差异
+
+### CPMM
+
+价格影响平滑连续（闭式解 `2 · Δin / reserve_in`）。滑点容差随交易规模线性扩展。
+
+### AMM v4
+
+与 CPMM 相同的曲线数学，但"有效准备金"包括池的 OpenBook 发布的限价单。实际上这意味着：
+
+- 从原始金库余额报价*低估*了准备金，因此*高估*了影响。
+- SDK 获取 `AmmInfo` 并求和 `vault + on_book.free + on_book.locked` 以获得正确的数字。
+- 陈旧的 OpenBook 状态（crank 被阻止）会导致报价影响与链上现实出现偏差。聚合器例行在大型 AMM-v4 交易前进行预处理（无许可 `MonitorStep`）。
+
+### CLMM
+
+价格影响是**分段的**。在当前 tick 范围内，影响大约与 `Δin / L` 成线性关系。跨越 tick 边界可以离散地改变 `L`，导致边际价格突然跳跃。跨越几个稀疏 tick 的交易的影响可能远高于 `2 · Δin / reserve` 经验法则。
+
+SDK 的 CLMM 报价确定性地迭代交换步骤，返回精确的预期 `amountOut`，所以 `minAmountOut = amountOut · (1 − slippage)` 是正确的。但**priceImpact** 返回值应该理解为"交易前现货和交易后现货之间的点差"，在 CLMM 上，这对于仅关心 `amount_out` 的用户来说，可能远高于交换的实际滑点。
+
+### LaunchLab 曲线
+
+与 CPMM 相似，但曲线不对称（二次或虚拟准备金）。随着曲线在毕业前变陡峭，后期买家的影响增长更快。预买家 UI 应在买入预期在一个交易中推动曲线超过约 5% 的 `quote_reserve_target` 时发出警告。
+
+## MEV 考虑
+
+在 Solana 上，针对交换的 MEV 提取主要采取**三明治攻击**的形式：机器人在你之后放置一个反向运行交易，加上在你之前进行的前置运行，两者都在同一时段。你的交易以比没有三明治时更糟糕的价格成交；反向运行捕获了差异。
+
+防缓解：
+
+1. **紧 `minAmountOut`。** 激进的滑点界限会导致被三明治后的受害者交易回滚，保护资金（但浪费 gas）。在 Solana 上这是标准做法——拒绝很便宜。
+2. **Jito 捆绑。** 通过 Jito 提交捆绑小费可以将中间人从重新排序你的交易中排除。捆绑作为原子块成交。
+3. **优先费用。** 高优先费用增加了你的交易在当前领导者区块中成交的机会，在三明治机器人反应之前。不如捆绑稳健，更标准。
+4. **私有 RPC。** 通过私有 RPC 提交（或通过验证器的直接端点）减少了内存池三明治机器人可以观察到你的交易的时间窗口。
+
+Raydium SDK 不进行捆绑；集成商通常在上层使用 Jito。参见 [`integration-guides/routing-and-mev`](/zh/integration-guides/routing-and-mev) 了解模式。
+
+## 多跳路由的滑点
+
+当交换通过多个池路由时（例如 `USDC → SOL → RAY`），滑点容差应该按每跳应用，而不仅仅是端到端：
+
+```ts
+// 不好：0.5% 仅在末尾应用，因此任何中间跳跃滑动都会导致第二跳失败。
+const finalMin = finalAmount * (1 - 0.005);
+
+// 更好：每跳执行自己的界限。
+const hop1Min  = hop1Amount * (1 - 0.005);
+const hop2Min  = hop2Amount * (1 - 0.005);
+// 端到端这更紧（复合），但原子性——如果任一跳降级，tx 会尽早回滚。
+```
+
+SDK 的路由器在你调用 `raydium.trade.swap` 时自动应用按跳界限。对于自定义路由器，复制这个模式。
+
+## 向用户报告
+
+良好交换 UI 的经验法则：
+
+- 分别显示**预期价格影响和滑点容差两者**。
+- 当价格影响超过约 2% 时高亮——"高影响"警告。
+- 当价格影响超过容差时高亮——交易几乎肯定会回滚。
+- 对于波动对，提供"高滑点模式"来放松界限并显示更强的警告。
+
+## 指针
+
+- [`products/cpmm/math`](/zh/products/cpmm/math)、[`products/amm-v4/math`](/zh/products/amm-v4/math)、[`products/clmm/math`](/zh/products/clmm/math) — 每个池类型的影响推导。
+- [`integration-guides/routing-and-mev`](/zh/integration-guides/routing-and-mev) — 多跳路由 + MEV 防护。
+- [`integration-guides/priority-fee-tuning`](/zh/integration-guides/priority-fee-tuning) — 调整优先费用以降低滑点。
+
+来源：
+
+- Raydium SDK v2 滑点/影响实现。
+- Flashbots / Jito on Solana MEV。

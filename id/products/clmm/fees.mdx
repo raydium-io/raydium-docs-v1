@@ -1,0 +1,266 @@
+---
+title: "Biaya dan reward CLMM"
+description: "Cara CLMM membagi biaya transaksi ke LP, protokol, dan fund; cara sistem reward tiga slot memancarkan ke posisi yang aktif; serta cara keduanya diselesaikan menjadi saldo per-posisi."
+---
+
+<Info>
+  **Halaman ini diterjemahkan secara otomatis oleh AI. Versi bahasa Inggris adalah acuan resmi.**
+
+  [Lihat versi bahasa Inggris →](/products/clmm/fees)
+</Info>
+
+## Tingkatan biaya
+
+Pool CLMM terikat pada `AmmConfig` saat pembuatan; config tersebut menentukan tarif biaya transaksi, bagian protokol dan fund, serta **tick spacing** (lihat [`products/clmm/ticks-and-positions`](/id/products/clmm/ticks-and-positions)). Tingkatan yang umum dipublikasikan (konfirmasi live melalui `GET https://api-v3.raydium.io/main/clmm-config`):
+
+| Indeks `AmmConfig` | `trade_fee_rate` | Tick spacing | Penggunaan umum |
+|---|---|---|---|
+| 0 | `100` (0,01%) | 1 | Pasangan stabil |
+| 1 | `500` (0,05%) | 10 | Blue-chip berkorelasi |
+| 2 | `2_500` (0,25%) | 60 | Pasangan standar |
+| 3 | `10_000` (1,00%) | 120 | Aset volatil atau long-tail |
+
+Tarif biaya transaksi menggunakan satuan `1/FEE_RATE_DENOMINATOR = 1/1_000_000` dari volume. Tarif protokol dan fund menggunakan penyebut yang sama tetapi diterapkan pada **biaya transaksi**, bukan pada volume — konvensi ini sama seperti pada CPMM.
+
+## Pembagian biaya per swap
+
+Pada setiap langkah swap (lihat [`products/clmm/math`](/id/products/clmm/math)):
+
+```
+step_trade_fee   = ceil(step_input * trade_fee_rate / 1_000_000)
+step_protocol    = floor(step_trade_fee * protocol_fee_rate / 1_000_000)
+step_fund        = floor(step_trade_fee * fund_fee_rate     / 1_000_000)
+step_lp          = step_trade_fee - step_protocol - step_fund
+```
+
+- `step_lp` mengalir ke `fee_growth_global_{input_side}_x64` yang diskalakan oleh likuiditas aktif saat ini: `fee_growth_global += step_lp × 2^64 / pool.liquidity`.
+- `step_protocol` terakumulasi ke `PoolState.protocol_fees_token_{input_side}` — disapu dengan `CollectProtocolFee`.
+- `step_fund` terakumulasi ke `PoolState.fund_fees_token_{input_side}` — disapu dengan `CollectFundFee`.
+
+Sama seperti CPMM, porsi protokol dan fund berada di dalam vault tetapi **dikecualikan dari tampilan likuiditas kurva**: matematika swap membaca `pool.liquidity` yang tidak menggelembung akibat biaya yang menunggu untuk disapu.
+
+## Mengapa biaya bersifat per-sisi
+
+Berbeda dengan CPMM (di mana biaya swap selalu dikenakan pada token input dan sisi lain pool tidak pernah melihat akrual protokol/fund dari swap tersebut), pada CLMM aturan yang sama berlaku di setiap langkah: **biaya terakumulasi pada token mana pun yang menjadi input untuk langkah tersebut**. Karena swap multi-tick memiliki arah yang konsisten, semua langkah mengenakan biaya dalam token yang sama — sehingga dalam praktiknya biaya pada swap tertentu masuk ke *satu* sisi saja.
+
+Jika pengguna melakukan swap token0 → token1, `fee_growth_global_0_x64` naik; `fee_growth_global_1_x64` tidak berubah. Posisi mendapatkan biaya dalam token0 pada swap tersebut. Swap berikutnya mungkin berjalan ke arah sebaliknya dan mengkredit `fee_growth_global_1_x64`. Seiring waktu, pool yang seimbang mengakumulasi biaya pada kedua sisi.
+
+## Biaya satu sisi (`CollectFeeOn`)
+
+Pool yang dibuat melalui [`CreateCustomizablePool`](/id/products/clmm/instructions) dapat menggunakan mode pengumpulan biaya non-default. Mode ini ditetapkan saat pembuatan pool dan disimpan di `PoolState.fee_on`.
+
+| Nilai `CollectFeeOn` | Byte `fee_on` | Perilaku |
+|---|---|---|
+| `FromInput` (default) | `0` | Klasik Uniswap-V3 — biaya selalu dipotong dari token input di setiap langkah swap. Token input berganti sesuai arah swap. |
+| `Token0Only` | `1` | Biaya selalu didenominasikan dalam token0. Untuk swap 0→1, biaya adalah token input (sama dengan `FromInput`). Untuk swap 1→0, biaya diambil dari output swap (token0). |
+| `Token1Only` | `2` | Simetris dengan `Token0Only` — biaya selalu dalam token1. |
+
+**Mengapa pool memilih `Token0Only` atau `Token1Only`** — untuk memberi LP satu mata uang akrual yang mudah diprediksi. Pasangan seperti `MEMECOIN / USDC` di mana LP berdenominasi dolar diuntungkan oleh `Token1Only` (biaya selalu diselesaikan ke USDC); P&L LP pun tidak terpengaruh oleh sisi mana yang mendominasi perdagangan. Pertimbangannya adalah bahwa pada arah di mana biaya keluar dari output swap, pengguna menerima `out − fee` alih-alih `out − ε` dari sisi input, sehingga logika kuotasi harus mengurangi biaya dari sisi output. `computeAmountOut` pada SDK menangani percabangan ini dari `fee_on`; kode klien yang membaca `pool.fee_on` secara langsung sebaiknya mencerminkan fungsi pembantu pada `PoolState`:
+
+```rust
+pool.is_fee_on_input(zero_for_one: bool) -> bool   // true → fee is deducted from input
+pool.is_fee_on_token0(zero_for_one: bool) -> bool  // for telemetry / accounting
+```
+
+**Efek pada level LP** — biaya tetap dirutekan melalui akumulator standar `fee_growth_global_{0,1}_x64` per langkah swap, sehingga posisi masih menyelesaikan biaya dengan formula `fee_growth_inside` yang sama. Asimetrinya hanya pada *arah* akrual sisi, bukan pada matematikanya.
+
+`fee_on` **tidak** dapat diubah setelah pembuatan. Pool yang dibuat melalui `CreatePool` lama secara permanen bersifat `FromInput`.
+
+## Biaya dinamis
+
+Pool yang dibuat dengan `enable_dynamic_fee = true` menerapkan surcharge berbasis volatilitas di atas `AmmConfig.trade_fee_rate`. Mekanisme ini merupakan port yang disederhanakan dari desain biaya dinamis Trader Joe / Meteora.
+
+### State
+
+`PoolState.dynamic_fee_info` membawa lima parameter kalibrasi (snapshot dari `DynamicFeeConfig` saat pembuatan pool) ditambah empat field state yang diperbarui oleh setiap swap. Lihat [`products/clmm/accounts`](/id/products/clmm/accounts#dynamicfeeconfig-and-dynamicfeeinfo) untuk tata letak byte-nya.
+
+### Pembaruan per swap
+
+Pada setiap langkah swap, program menjalankan tiga sub-langkah:
+
+1. **Decay reference**. Jika `now - last_update_timestamp > filter_period`, referensi volatilitas meluruh:
+
+    ```
+    if elapsed > decay_period:
+        volatility_reference = 0
+    elif elapsed > filter_period:
+        volatility_reference = volatility_accumulator * reduction_factor / 10_000
+    # else: hold the previous reference
+    ```
+
+2. **Update accumulator**. Akumulator baru adalah referensi ditambah jarak absolut yang ditempuh (dalam satuan `tick_spacing`), dikalikan dengan skala granularitas, dibatasi pada maksimum yang dikonfigurasi:
+
+    ```
+    delta_idx     = abs(tick_spacing_index_reference - current_tick_spacing_index)
+    accumulator   = volatility_reference + delta_idx * 10_000   // VOLATILITY_ACCUMULATOR_SCALE
+    accumulator   = min(accumulator, max_volatility_accumulator)
+    ```
+
+3. **Compute surcharge**. Surcharge bersifat parabolik terhadap akumulator (karena "jarak tick" swap dikuadratkan dalam formula kanonik), dikali gain yang diskalakan oleh `dynamic_fee_control`:
+
+    ```
+    fee_increment_rate = dynamic_fee_control * (accumulator * tick_spacing)^2
+                       / (100_000 * 10_000^2)
+    fee_rate           = AmmConfig.trade_fee_rate + fee_increment_rate
+    fee_rate           = min(fee_rate, 100_000)              // 10% cap
+    ```
+
+Batas 10% (`MAX_FEE_RATE_NUMERATOR = 100_000` dalam satuan `1e6`) dikodekan secara keras sebagai pembatas keamanan; dalam praktiknya, config yang sudah dikalibrasi dengan baik berada jauh di bawah batas ini.
+
+### Memilih parameter
+
+Rentang default yang telah berhasil digunakan pada pool pilot:
+
+| Parameter | Rentang umum | Catatan |
+|---|---|---|
+| `filter_period` | 30 – 60 s | Menahan referensi dari volatilitas mikro; lebih rendah = lebih reaktif |
+| `decay_period` | 300 – 1800 s | Setelah jendela tenang ini, biaya kembali ke dasar |
+| `reduction_factor` | 4_000 – 8_000 | Dari `10_000`. Lebih tinggi = biaya tinggi lebih persisten |
+| `dynamic_fee_control` | 1_000 – 50_000 | Dari `100_000`. Gain pada kurva |
+| `max_volatility_accumulator` | 100_000 – 10_000_000 | Membatasi seberapa tinggi surcharge dapat naik |
+
+Lakukan kalibrasi dengan memutar ulang swap historis secara offline terhadap formula tersebut, lalu sesuaikan `dynamic_fee_control` agar rata-rata biaya yang dihasilkan sesuai target (misalnya, 1,5× dasar pada hari volatilitas 1σ, 5× pada hari 3σ).
+
+### Apa yang dilihat LP
+
+Pendapatan biaya dinamis mengalir melalui akumulator yang sama dengan biaya dasar — `fee_growth_global_{0,1}_x64`. Tidak ada field "dynamic fee growth" yang terpisah. LP di pool volatil cukup mendapatkan biaya lebih tinggi selama periode volatil, tanpa instruksi klaim atau penyelesaian tambahan.
+
+### Yang perlu diketahui integrator
+
+- Biaya yang dikembalikan oleh kuotasi dapat berubah antara blok N dan blok N+1 meskipun cadangan pool belum bergerak — setiap swap menggeser akumulator volatilitas. Kuotasi Trade API valid pada blok saat kuotasi dibuat dan bisa berbeda beberapa bps jika pool reaktif dipicu antara kuotasi dan eksekusi.
+- `volatility_accumulator` dan `last_update_timestamp` bersifat publik on-chain — klien dapat mereplikasi formula ini di sisi klien untuk simulasi offline.
+
+## Akuntansi biaya per posisi
+
+Setiap posisi menyimpan, pada waktu terakhir kali disentuh:
+
+- `fee_growth_inside_0_last_x64` dan `fee_growth_inside_1_last_x64` — pertumbuhan biaya spesifik rentang pada snapshot tersebut.
+
+Pada setiap sentuhan berikutnya (`IncreaseLiquidity`, `DecreaseLiquidity`, dan secara implisit setiap transisi state yang memperbarui pertumbuhan biaya tick-bound):
+
+1. Program menghitung ulang `fee_growth_inside_{0,1}_x64` dari pertumbuhan biaya **global** dan snapshot `fee_growth_outside_*` dari dua tick endpoint.
+2. Δ ditambahkan ke `tokens_fees_owed_{0,1}` yang dibobot oleh likuiditas posisi:
+
+   ```
+   Δ_fee_growth_inside_0 = fee_growth_inside_now_0 - fee_growth_inside_last_0
+   tokens_fees_owed_0  += Δ_fee_growth_inside_0 * position.liquidity / 2^64
+   ```
+
+3. `fee_growth_inside_{0,1}_last_x64` diperbarui.
+
+Token berpindah secara fisik hanya pada `DecreaseLiquidity` atau jalur `CollectFees` khusus (dalam set instruksi Raydium saat ini, biaya disapu sebagai bagian dari `DecreaseLiquidity`). Menetapkan `liquidity = 0` dalam panggilan `DecreaseLiquidity` adalah idiom kanonik "hanya kumpulkan biaya".
+
+### Posisi di luar rentang tidak mendapatkan apa-apa
+
+Jika rentang suatu posisi tidak mengandung `tick_current`, `fee_growth_inside` yang dihitung untuknya **dibatasi dari atas** dan tidak bergerak selama harga berada di luar rentang tersebut. Posisi berhenti mengakumulasi biaya hingga harga kembali ke rentangnya. Ini adalah fitur, bukan bug — inilah cara concentrated liquidity mengkonsentrasikan *imbal hasil biaya* sekaligus modal.
+
+## Aliran reward
+
+Pool CLMM dapat memiliki hingga **tiga** aliran reward yang aktif secara bersamaan. Setiap aliran adalah tuple (reward mint, emission rate, waktu mulai, waktu selesai) yang disimpan di `PoolState.reward_infos[i]`.
+
+```rust
+pub struct RewardInfo {
+    pub reward_state: u8,               // Uninitialized | Initialized | Open | Ended
+    pub open_time: u64,
+    pub end_time: u64,
+    pub last_update_time: u64,
+    pub emissions_per_second_x64: u128, // Q64.64 reward tokens per second
+    pub reward_total_emissioned: u64,
+    pub reward_claimed: u64,
+    pub token_mint:    Pubkey,
+    pub token_vault:   Pubkey,
+    pub authority:     Pubkey,           // who can SetRewardParams / fund
+    pub reward_growth_global_x64: u128,  // accumulator, Q64.64
+}
+```
+
+### Loop penyelesaian
+
+Setiap instruksi yang menyentuh likuiditas (dan `UpdateRewardInfos` sebagai instruksi tersendiri) memajukan semua aliran aktif ke `now`:
+
+```
+for each reward_info with state in {Open, Ended within grace}:
+    elapsed         = min(now, end_time) − last_update_time
+    if elapsed > 0 && pool.liquidity > 0:
+        reward_growth_global_x64 += emissions_per_second_x64 × elapsed × 2^64 / pool.liquidity
+        reward_total_emissioned  += emissions_per_second × elapsed
+    last_update_time = min(now, end_time)
+```
+
+Jika `pool.liquidity == 0` selama suatu interval, emisi untuk interval tersebut **tidak** didistribusikan (memang tidak bisa; tidak ada likuiditas aktif yang dapat menerimanya). Anggaran yang tersisa tetap berada di reward vault. Protokol yang menerbitkan reward dan tidak memantaunya dapat mengisi ulang atau mengakhiri aliran melalui `SetRewardParams`.
+
+### Akrual reward per posisi
+
+Sama persis seperti biaya, dengan dimensi tambahan per aliran:
+
+```
+for each stream i:
+    reward_growth_inside_now_i   = compute_inside_i(pool, tick_lower, tick_upper)
+    Δ_i = reward_growth_inside_now_i - personal_position.reward_infos[i].growth_inside_last_x64
+    personal_position.reward_infos[i].reward_amount_owed += Δ_i * personal_position.liquidity / 2^64
+    personal_position.reward_infos[i].growth_inside_last_x64 = reward_growth_inside_now_i
+```
+
+Pengguna mengklaim melalui `CollectReward`, yang mentransfer `reward_amount_owed` dari vault aliran ke pengguna dan mereset counter ke nol.
+
+### Hanya posisi aktif yang mendapatkan reward
+
+`reward_growth_inside` menggunakan formula yang sama dengan `fee_growth_inside` — melalui akumulator tick-outside — sehingga posisi di luar rentang harga saat ini tidak mengakumulasi reward. Ini mencerminkan pilihan desain Uniswap v3 "insentif diberikan kepada likuiditas aktif" dan menyelaraskan kepentingan LP dengan cakupan harga spot.
+
+### Pendanaan dan pengakhiran aliran
+
+Aliran dibuat melalui `InitializeReward`, yang menyetor total anggaran (`emissions_per_second × (end_time − open_time)`) ke dalam reward vault aliran di muka. Program menolak `InitializeReward` jika saldo pendana tidak mencukupi. `SetRewardParams` dapat memperpanjang `end_time` atau menaikkan emission rate; pengurangan keduanya diblokir untuk menghindari penarikan emisi yang sudah dijanjikan kepada LP.
+
+Ketika `now > end_time`, aliran beralih ke status `Ended` tetapi `reward_growth_global_x64`-nya terus dapat dibaca — LP masih dapat melakukan `CollectReward` untuk jumlah yang diperoleh secara historis lama setelah emisi berhenti.
+
+## Pengumpulan biaya oleh admin
+
+| Penanda tangan | Instruksi | Efek |
+|--------|-------------|--------|
+| `amm_config.owner` | `CollectProtocolFee` | Sapu `protocol_fees_token_{0,1}` ke penerima. |
+| `amm_config.fund_owner` | `CollectFundFee` | Sapu `fund_fees_token_{0,1}` ke penerima. |
+
+Keduanya tidak menggerakkan kurva — jumlah yang terakumulasi sudah berada di luar `pool.liquidity`. Lihat [`security/admin-and-multisig`](/id/security/admin-and-multisig) untuk informasi tentang siapa yang memegang penanda tangan ini di mainnet.
+
+## Interaksi dengan Token-2022
+
+Biaya dan reward semuanya didenominasikan dalam salah satu token pool atau aliran. Ekstensi Token-2022 berperilaku sama seperti pada CPMM:
+
+- **Biaya transfer pada mint input swap.** Pool menerima `amount_in − mint_transfer_fee`. Input langkah program CLMM dihitung terhadap jumlah bersih, sehingga akumulator biaya pool mencerminkan token yang benar-benar ada di vault.
+- **Biaya transfer pada mint output.** Pool mengirim `amount_out`; pengguna menerima `amount_out − mint_transfer_fee`. Pemeriksaan slippage harus dilakukan terhadap jumlah yang diterima pengguna.
+- **Biaya transfer pada mint reward.** Emisi didenominasikan dalam satuan "ke dalam vault" saat `InitializeReward` (pendana membayar biaya transfer mint ke dalam vault). Penarikan saat `CollectReward` kemudian dikenakan biaya transfer mint lagi; LP harus memperkirakan sedikit pemotongan pada token reward berbiaya transfer.
+- **Mint non-transferable / confidential / group-member.** Ditolak saat `CreatePool` / `InitializeReward`.
+
+Efek gabungan pada swap multi-hop dengan biaya transfer dapat sangat signifikan. Quoter yang mengabaikannya akan memberikan kuotasi yang terlalu optimis; lihat [`algorithms/token-2022-transfer-fees`](/id/algorithms/token-2022-transfer-fees) untuk perhitungan referensi.
+
+## Membaca biaya dan reward dari off-chain
+
+```ts
+const pool = await raydium.clmm.getPoolInfoFromRpc(poolId);
+const position = await raydium.clmm.getOwnerPositionInfo({
+  wallet: owner.publicKey,
+});
+
+for (const p of position) {
+  console.log("Position", p.nftMint.toBase58(),
+              "range", p.tickLower, "→", p.tickUpper,
+              "L", p.liquidity.toString(),
+              "fees owed:", p.tokenFeesOwed0.toString(),
+              p.tokenFeesOwed1.toString(),
+              "rewards owed:", p.rewardInfos.map(r => r.rewardAmountOwed.toString()));
+}
+```
+
+`tokenFeesOwed*` dan `rewardAmountOwed` adalah snapshot dari terakhir kali posisi disentuh. Untuk melihat nilai **saat ini** (yang mencerminkan pertumbuhan sejak saat itu), panggil `IncreaseLiquidity` dengan likuiditas nol dalam simulasi, atau hitung ulang secara manual menggunakan `fee_growth_*` global dan dua snapshot tick-outside.
+
+## Langkah selanjutnya
+
+- [`products/clmm/math`](/id/products/clmm/math) — derivasi lengkap dari `fee_growth_inside`.
+- [`products/clmm/instructions`](/id/products/clmm/instructions) — daftar akun untuk `CollectReward`, `InitializeReward`, `SetRewardParams`.
+- [`algorithms/token-2022-transfer-fees`](/id/algorithms/token-2022-transfer-fees) — kuotasi dengan mint berbiaya transfer.
+- [`reference/fee-comparison`](/id/reference/fee-comparison) — matriks biaya CLMM/CPMM/AMM-v4 berdampingan.
+
+Sumber:
+
+- [`raydium-io/raydium-clmm` — `states/pool.rs`, `libraries/fixed_point_64.rs`](https://github.com/raydium-io/raydium-clmm)
+- Whitepaper "Uniswap v3 Core", §7 (fee growth)

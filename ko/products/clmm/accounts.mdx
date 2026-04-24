@@ -1,0 +1,505 @@
+---
+title: "CLMM 계정"
+description: "CLMM 풀이 사용하는 모든 계정: PoolState, AmmConfig, TickArrayState, TickArrayBitmapExtension, PersonalPositionState, Observation."
+---
+
+<Info>
+  **이 페이지는 AI 자동 번역입니다. 모든 내용은 영문판을 기준으로 합니다.**
+
+  [영문판 보기 →](/products/clmm/accounts)
+</Info>
+
+<Info>
+  이 페이지는 각 계정의 **레이아웃과 역할**을 설명합니다. 시드(seed)는 표준값이며 [`reference/program-addresses`](/ko/reference/program-addresses)에 정리되어 있습니다. CLMM 풀은 CPMM 풀보다 계정 수가 많은데, 이는 유동성이 틱 범위 전체에 희소하게 저장되기 때문입니다. 이 희소성을 이해하는 것이 이 페이지의 핵심입니다.
+</Info>
+
+## 계정 목록
+
+활성 CLMM 풀은 아래의 계정 패밀리로 구성됩니다. 두 개의 민트와 해당 볼트를 제외한 모든 계정은 CLMM 프로그램이 소유합니다.
+
+| 계정 | 역할 | 풀당 개수 |
+|---------|---------|----------------|
+| `AmmConfig` | 수수료 티어: 거래 수수료율, 프로토콜 배분, 펀드 배분, 기본 틱 간격. 해당 티어의 모든 풀이 공유합니다. | 1 (공유) |
+| `PoolState` | 현재 `sqrt_price_x64`, 현재 틱, 총 유동성, 수수료 성장 글로벌 값, 리워드 정보, 관찰 포인터. | 1 |
+| `TickArrayState` | `TICK_ARRAY_SIZE`개의 연속 틱 블록. 필요 시에만 초기화됩니다. | 0 ≤ N ≤ range |
+| `TickArrayBitmapExtension` | `PoolState`의 인라인 비트맵 범위를 벗어난 틱 배열 존재 여부를 추적하는 오버플로 비트맵. | 0 또는 1 |
+| `PersonalPositionState` | LP 포지션 하나당 하나. 범위, 유동성, 마지막으로 확인된 수수료/리워드 성장을 저장합니다. 권한 = NFT 소유자. | 포지션당 1 |
+| Position NFT 민트 | 공급량 1의 민트로, `PersonalPositionState`와 연결됩니다. NFT를 전송하면 포지션도 이전됩니다. | 포지션당 1 |
+| `ObservationState` | TWAP용 가격 관찰값의 링 버퍼. | 1 |
+| `token_0_vault`, `token_1_vault` | 풀 잔액을 보유하는 토큰 계정. 풀 권한이 소유합니다. | 2 |
+| `DynamicFeeConfig` | 동적 수수료 메커니즘의 재사용 가능한 파라미터 세트. `create_customizable_pool`로 생성된 풀이 선택적으로 활성화할 수 있습니다. 관리자가 관리합니다. | 공유 (인덱스별) |
+| `LimitOrderState` | 열린 지정가 주문 하나당 하나. 소유자, 틱, 방향, 총 수량, 결제 출력 스냅샷을 기록합니다. | 주문당 1 |
+| `LimitOrderNonce` | `(wallet, nonce_index)` 쌍별 카운터로, 고유한 주문 PDA를 유도합니다. | (wallet, index)당 1 |
+
+## `PoolState`
+
+풀의 라이브 상태로, 모든 스왑과 포지션 변경 시 읽힙니다.
+
+```rust
+// programs/amm/src/states/pool.rs
+pub struct PoolState {
+    pub bump:           [u8; 1],
+    pub amm_config:     Pubkey,            // fee tier binding
+    pub owner:          Pubkey,            // admin (multisig)
+    pub token_mint_0:   Pubkey,
+    pub token_mint_1:   Pubkey,
+    pub token_vault_0:  Pubkey,
+    pub token_vault_1:  Pubkey,
+    pub observation_key: Pubkey,
+
+    pub mint_decimals_0: u8,
+    pub mint_decimals_1: u8,
+    pub tick_spacing:   u16,               // inherited from amm_config at init
+
+    pub liquidity:      u128,              // total active (in-range) liquidity
+    pub sqrt_price_x64: u128,              // Q64.64 of sqrt(price)
+    pub tick_current:   i32,               // current tick index
+
+    pub padding3:       u16,
+    pub padding4:       u16,
+
+    // Global fee growth per unit of liquidity, Q64.64.
+    pub fee_growth_global_0_x64: u128,
+    pub fee_growth_global_1_x64: u128,
+
+    // Accrued-but-not-swept protocol fees (per mint).
+    pub protocol_fees_token_0: u64,
+    pub protocol_fees_token_1: u64,
+
+    // Reserved padding for future upgrades.
+    pub padding5: [u128; 4],
+
+    // Status bitmask. Bits 0-5: open-position, decrease-liquidity,
+    // collect-fee, collect-reward, swap, limit-order. A set bit disables
+    // the corresponding operation.
+    pub status:  u8,
+
+    // Fee-collection mode (CollectFeeOn).
+    //   0 = FromInput (deduct fee from the swap input — Uniswap-V3 default)
+    //   1 = Token0Only (always deduct fee from token0 vault)
+    //   2 = Token1Only (always deduct fee from token1 vault)
+    pub fee_on: u8,
+    pub padding: [u8; 6],
+
+    // Live reward streams (up to REWARD_NUM = 3).
+    pub reward_infos: [RewardInfo; 3],
+
+    // Inline bitmap tracking initialized tick-arrays in the primary range.
+    pub tick_array_bitmap: [u64; 16],
+
+    // Reserved padding for future upgrades.
+    pub padding6: [u64; 4],
+
+    pub fund_fees_token_0: u64,
+    pub fund_fees_token_1: u64,
+
+    pub open_time:    u64,                 // currently disabled by the program
+    pub recent_epoch: u64,
+
+    // Per-pool dynamic-fee state. Zero-valued unless the pool was
+    // created with `enable_dynamic_fee = true` via create_customizable_pool.
+    pub dynamic_fee_info: DynamicFeeInfo,
+
+    // Reserved for future upgrades.
+    pub padding1: [u64; 14],
+    pub padding2: [u64; 32],
+}
+```
+
+실제로 다루게 될 필드:
+
+- **`sqrt_price_x64`** 와 **`tick_current`** 는 풀의 가격 상태입니다. 모든 스왑 시 함께 업데이트됩니다. `tick_current`는 `log_{1.0001}(price)`의 내림값입니다.
+- **`liquidity`** 는 **활성** 유동성으로, `tick_current`를 포함하는 범위를 가진 모든 포지션의 `L` 값 합계입니다. 스왑이 틱을 넘을 때마다, 그리고 포지션이 열리거나 닫히거나 크기가 변경될 때마다 변경됩니다.
+- **`fee_growth_global_{0,1}_x64`** 는 풀 전체 역사에 걸쳐 유동성 단위당 누적된 수수료입니다. 포지션은 이 값을 읽어 자신에게 귀속된 수수료를 계산합니다.
+- **`tick_spacing`** 은 초기화 시 `AmmConfig`에 고정되며 이후 변경되지 않습니다. 포지션 엔드포인트로 허용되는 틱 인덱스를 결정합니다.
+- **`tick_array_bitmap`** 은 현재 가격 주변의 일반적인 틱 범위를 커버하는 **인라인** 비트맵입니다. 포지션이 이 범위를 벗어나는 경우 오버플로 추적은 별도의 `TickArrayBitmapExtension`에서 관리됩니다.
+- **`fee_on`** 은 풀 생성 시 고정됩니다. `0` (FromInput)은 기존 Uniswap-V3 동작을 재현합니다. `1`과 `2`는 스왑 수수료를 단일 측면으로 라우팅합니다 — 트레이드오프는 [`products/clmm/fees`](/ko/products/clmm/fees)를 참고하세요.
+- **`dynamic_fee_info`** 는 동적 수수료 서차지의 변동성 상태를 보유합니다. 활성화된 경우, 모든 스왑은 `AmmConfig.trade_fee_rate` 위에 `dynamic_fee_component`를 재계산합니다. 레이아웃은 아래 `DynamicFeeInfo` 섹션에 문서화되어 있으며, 동적 수수료를 사용하지 않는 풀은 전체 구조체가 0입니다.
+
+## `AmmConfig`
+
+```rust
+pub struct AmmConfig {
+    pub bump: u8,
+    pub index: u16,                       // uses "amm_config"+u16 seed
+
+    pub owner:             Pubkey,        // admin
+    pub protocol_fee_rate: u32,           // fraction of trade fee to protocol, denom 1e6
+    pub trade_fee_rate:    u32,           // trade fee in 1e6ths of volume
+    pub tick_spacing:      u16,           // default spacing for pools using this config
+    pub fund_fee_rate:     u32,           // fraction of trade fee to fund, denom 1e6
+    pub padding_u32: u32,
+
+    pub fund_owner: Pubkey,
+    pub padding: [u64; 3],
+}
+```
+
+공개된 CLMM 수수료 티어의 일반적인 구성 (`GET https://api-v3.raydium.io/main/clmm-config`에서 확인하세요):
+
+| 인덱스 | `trade_fee_rate` | 틱 간격 | 주요 용도 |
+|-------|------------------|--------------|-------------|
+| 0 | `100` (0.01%) | 1 | 스테이블 페어, USDC/USDT |
+| 1 | `500` (0.05%) | 10 | 상관관계 높은 블루칩 |
+| 2 | `2_500` (0.25%) | 60 | 일반 페어 |
+| 3 | `10_000` (1.00%) | 120 | 변동성 높은 또는 롱테일 자산 |
+
+`protocol_fee_rate`과 `fund_fee_rate`는 거래 수수료의 일부로, CPMM과 동일한 방식을 따릅니다. [`products/clmm/fees`](/ko/products/clmm/fees)를 참고하세요.
+
+## `TickArrayState`
+
+CLMM은 틱 하나당 단일 레코드를 저장하지 않습니다. 그렇게 하면 수십억 개의 계정이 필요하기 때문입니다. 대신 **`TICK_ARRAY_SIZE`개의 연속 틱**(프로그램 버전에 따라 일반적으로 60 또는 88개)을 하나의 `TickArrayState`로 묶어 첫 사용 시 지연 생성합니다.
+
+```rust
+pub const TICK_ARRAY_SIZE: usize = 60;
+pub const TICK_ARRAY_SIZE_USIZE: usize = 60;
+
+pub struct TickArrayState {
+    pub pool_id:                Pubkey,
+    pub start_tick_index:       i32,                            // lowest tick in this array
+    pub ticks:                  [TickState; TICK_ARRAY_SIZE],   // 60 entries
+    pub initialized_tick_count: u8,
+    pub recent_epoch:           u64,
+    pub padding:                [u8; 107],
+}
+
+pub struct TickState {
+    pub tick:                       i32,
+    pub liquidity_net:              i128,                       // ΔL when crossing this tick upward
+    pub liquidity_gross:            u128,                       // total L referencing this tick
+    pub fee_growth_outside_0_x64:   u128,                       // see math.mdx
+    pub fee_growth_outside_1_x64:   u128,
+    pub reward_growths_outside_x64: [u128; 3],
+
+    // Limit-order bookkeeping. All zero for ticks that have never carried
+    // a limit order. See products/clmm/math for the matching algorithm.
+    pub order_phase:                  u64,                      // monotonic FIFO cohort id
+    pub orders_amount:                u64,                      // unfilled tokens in current cohort
+    pub part_filled_orders_remaining: u64,                      // remaining tokens of partially-filled cohort
+    pub unfilled_ratio_x64:           u128,                     // Q64.64; starts at 1.0 and shrinks as fills occur
+
+    pub padding:                    [u32; 3],
+}
+```
+
+지정가 주문 관련 4개 필드는 해당 틱에서 지정가 주문이 한 번도 사용되지 않은 경우 모두 0입니다. 틱에 주문이 열리면 프로그램은 이를 코호트 시퀀스로 추적합니다:
+
+- `order_phase`는 코호트 ID입니다. 코호트가 "전량 미체결"에서 "부분 체결"로 전환될 때마다 증가합니다.
+- `orders_amount`는 현재(최신) 코호트의 입력 토큰 합계입니다.
+- `part_filled_orders_remaining`은 진행 중인 스왑에 의해 현재 체결되고 있는 이전 코호트를 추적합니다.
+- `unfilled_ratio_x64`는 코호트에 적용되는 Q64.64 배수입니다. 스왑이 코호트의 X%를 체결하면 비율은 `(1 − X)`를 곱합니다. 각 열린 주문은 열린 시점의 자체 `(order_phase, unfilled_ratio_x64)` 스냅샷을 저장하므로, 정산 수학은 스냅샷 비교로 단순화됩니다.
+
+규칙:
+
+- 포지션 엔드포인트 틱 *t*는 `t % tick_spacing == 0`을 만족해야 합니다. 프로그램은 간격에 맞지 않는 포지션을 거부합니다.
+- 틱의 **배열**은 `floor(t / (TICK_ARRAY_SIZE * tick_spacing)) * (TICK_ARRAY_SIZE * tick_spacing)`에 위치합니다.
+- 틱 배열은 지연 초기화됩니다: 초기화되지 않은 배열에 처음 닿는 포지션 또는 스왑이 이를 생성하며 임대료를 납부합니다.
+- 틱 배열은 **프로그램에 의해 절대 닫히지 않습니다**. 한번 할당되면 내부의 모든 틱이 `liquidity_gross == 0`으로 돌아가도 풀의 수명 동안 유지됩니다. 이후 포지션과 스왑은 추가 임대료 없이 기존 계정을 재사용합니다. `ClosePosition` 기반의 틱 배열 정리 경로는 존재하지 않습니다.
+
+### `TickArrayBitmapExtension`
+
+`PoolState.tick_array_bitmap`(인라인)은 "현재 가격 근처" 범위인 ±1,024개의 틱 배열을 커버합니다. 극단적인 틱 값 등 이 범위를 벗어나는 경우 프로그램은 확장 계정을 별도로 관리합니다:
+
+```rust
+pub struct TickArrayBitmapExtension {
+    pub pool_id: Pubkey,
+    pub positive_tick_array_bitmap: [[u64; 8]; 14],
+    pub negative_tick_array_bitmap: [[u64; 8]; 14],
+}
+```
+
+포지션 범위가 "일반적"이라면 확장 계정을 신경 쓸 필요가 없습니다. 풀 범위 포지션(예: `(MIN_TICK, MAX_TICK)`)은 이 계정이 필요하며, SDK가 자동으로 처리합니다.
+
+## 포지션
+
+CLMM 포지션은 세 개의 계정과 민트로 구성된 **번들**입니다:
+
+### Position NFT 민트
+
+공급량 1의 SPL Token 민트입니다. 민트 주소는 결정론적 PDA이며, 소유자 지갑의 Position NFT는 해당 단일 토큰을 보유하는 ATA입니다. NFT를 전송하는 것이 포지션을 이전하는 방법입니다 — 프로그램은 상태에 저장된 Pubkey가 아닌 **NFT ATA 잔액의 현재 보유자**에게 권한을 부여합니다.
+
+### `PersonalPositionState`
+
+열린 포지션 하나당 하나. NFT 민트를 키로 사용합니다.
+
+```rust
+pub struct PersonalPositionState {
+    pub bump: [u8; 1],
+    pub nft_mint: Pubkey,                 // this position's NFT mint
+    pub pool_id:  Pubkey,
+
+    pub tick_lower_index: i32,
+    pub tick_upper_index: i32,
+
+    pub liquidity: u128,                  // this position's L
+
+    // Fee-growth snapshots at last time the position was touched.
+    pub fee_growth_inside_0_last_x64: u128,
+    pub fee_growth_inside_1_last_x64: u128,
+    pub token_fees_owed_0: u64,           // accrued since last collect
+    pub token_fees_owed_1: u64,
+
+    pub reward_infos: [PositionRewardInfo; 3],
+    pub recent_epoch: u64,
+    pub padding: [u64; 7],
+}
+
+pub struct PositionRewardInfo {
+    pub growth_inside_last_x64: u128,
+    pub reward_amount_owed: u64,
+}
+```
+
+### `ProtocolPositionState` (deprecated)
+
+<Note>
+  이전 CLMM 버전은 `(pool, tick_lower, tick_upper)` 조합별 집계 정보를 `ProtocolPositionState` PDA에 저장했습니다. **최신 버전에서는 이 계정을 생성하거나 읽지 않습니다.** 해당 슬롯은 ABI 호환성을 위해 `OpenPosition` / `IncreaseLiquidity` / `DecreaseLiquidity` 계정 목록에 `UncheckedAccount`로 남아 있지만, 프로그램이 기록하지 않습니다. 온체인에 남아 있는 기존 계정은 잔재이며, 관리자는 `CloseProtocolPosition`을 호출해 임대료를 회수할 수 있습니다.
+
+  집계 범위 정보는 이제 `TickArrayState`의 두 엔드포인트 틱(`liquidity_gross`, `liquidity_net`, 그리고 틱별 `fee_growth_outside_*` / `reward_growths_outside_x64`)에서 직접 유도됩니다. `fee_growth_inside = global − outside_lower − outside_upper` 공식은 집계 포지션 계정 없이도 계속 작동합니다.
+</Note>
+
+## Observation
+
+```rust
+pub const OBSERVATION_NUM: usize = 100;
+
+pub struct Observation {
+    pub block_timestamp: u32,
+    pub tick_cumulative: i64,                            // Σ tick_current × Δt
+    pub padding:         [u64; 4],
+}
+
+pub struct ObservationState {
+    pub initialized:       bool,
+    pub recent_epoch:      u64,
+    pub observation_index: u16,
+    pub pool_id:           Pubkey,
+    pub observations:      [Observation; OBSERVATION_NUM], // 100 entries
+    pub padding:           [u64; 4],
+}
+```
+
+CLMM의 관찰 버퍼는 누적 가격이 아닌 **누적 틱**을 저장합니다. 외부 소비자는 `(tick_cumulative[t1] − tick_cumulative[t0]) / (t1 − t0)`에서 구간의 기하 평균 가격을 계산한 후 `price = 1.0001 ** tick`을 적용합니다. [`algorithms/clmm-math`](/ko/algorithms/clmm-math)를 참고하세요.
+
+## `DynamicFeeConfig`와 `DynamicFeeInfo`
+
+동적 수수료 파라미터는 두 곳에 저장됩니다. 재사용 가능한 템플릿인 `DynamicFeeConfig`는 관리자가 관리하며 옵트인한 풀들이 공유합니다. 풀별 런타임 상태인 `DynamicFeeInfo`는 `PoolState`에 내장되어 모든 스왑 시 업데이트됩니다.
+
+### `DynamicFeeConfig`
+
+```rust
+// programs/amm/src/states/pool_fee.rs
+pub struct DynamicFeeConfig {
+    pub index:                       u16,    // identifier; PDA seed component
+    pub filter_period:               u16,    // seconds — within this window the volatility reference is held
+    pub decay_period:                u16,    // seconds — beyond this window the reference fully decays
+    pub reduction_factor:            u16,    // fixed-point in [1, 10_000); applied at decay
+    pub dynamic_fee_control:         u32,    // fixed-point in (0, 100_000); fee-rate gain
+    pub max_volatility_accumulator:  u32,    // ceiling on the volatility accumulator
+    pub padding:                     [u64; 8],
+}
+```
+
+PDA 시드: `["dynamic_fee_config", index.to_be_bytes()]`. `create_dynamic_fee_config`(관리자 전용)로 생성하고 `update_dynamic_fee_config`로 수정합니다. `enable_dynamic_fee = true`로 생성된 풀은 생성 시점에 5개의 캘리브레이션 파라미터(`filter_period`, `decay_period`, `reduction_factor`, `dynamic_fee_control`, `max_volatility_accumulator`)를 자체 `DynamicFeeInfo`에 스냅샷으로 저장합니다. 이후 `DynamicFeeConfig`를 수정해도 기존 풀에는 소급 적용되지 않습니다.
+
+### `DynamicFeeInfo` (`PoolState`에 내장)
+
+```rust
+pub struct DynamicFeeInfo {
+    pub filter_period:                u16,
+    pub decay_period:                 u16,
+    pub reduction_factor:             u16,
+    pub dynamic_fee_control:          u32,
+    pub max_volatility_accumulator:   u32,
+    pub tick_spacing_index_reference: i32,    // tick-spacing-units; reference for next swap
+    pub volatility_reference:         u32,    // running floor for the accumulator
+    pub volatility_accumulator:       u32,    // current cumulative volatility (capped)
+    pub last_update_timestamp:        u64,
+    pub padding:                      [u8; 46],
+}
+```
+
+하위 4개 필드는 상태이고, 상위 5개는 `DynamicFeeConfig`에서 복사된 캘리브레이션 값입니다. 수수료 수학과 감쇠 규칙은 [`products/clmm/math`](/ko/products/clmm/math)와 [`products/clmm/fees`](/ko/products/clmm/fees)에 문서화되어 있습니다.
+
+공식에서 사용되는 상수:
+
+| 상수 | 값 | 의미 |
+|---|---|---|
+| `VOLATILITY_ACCUMULATOR_SCALE` | `10_000` | 변동성 누산기의 세밀도 |
+| `REDUCTION_FACTOR_DENOMINATOR` | `10_000` | `reduction_factor`의 분모 |
+| `DYNAMIC_FEE_CONTROL_DENOMINATOR` | `100_000` | `dynamic_fee_control`의 분모 |
+| `MAX_FEE_RATE_NUMERATOR` | `100_000` | 결과 수수료율의 하드 캡 10% |
+
+## `LimitOrderState`
+
+열린 지정가 주문 하나당 하나의 계정.
+
+```rust
+// programs/amm/src/states/limit_order.rs
+pub struct LimitOrderState {
+    pub pool_id:            Pubkey,
+    pub owner:              Pubkey,
+    pub tick_index:         i32,
+    pub zero_for_one:       bool,    // direction: true sells token0 for token1
+    pub order_phase:        u64,     // snapshot of TickState.order_phase at open time
+    pub total_amount:       u64,     // input-token amount placed
+    pub filled_amount:      u64,     // informational; computed precisely on settle
+    pub settle_base:        u64,     // unfilled remainder at last settle/decrease
+    pub settled_output:     u64,     // cumulative output-token paid to owner
+    pub open_time:          u64,
+    pub unfilled_ratio_x64: u128,    // Q64.64 snapshot of TickState.unfilled_ratio_x64 at open
+    pub padding:            [u64; 4],
+}
+```
+
+라이프사이클:
+
+1. **Open** — 사용자가 `open_limit_order`를 호출하여 입력 토큰의 `total_amount`를 예치하면, 주문이 `TickState` 코호트에 바인딩됩니다.
+2. **(선택사항) Increase / Decrease** — `increase_limit_order`는 `total_amount`에 추가하고, `decrease_limit_order`는 미체결 토큰(및 해당 시점까지 정산된 출력)을 반환합니다.
+3. **Settle** — 코호트가 전체 또는 부분적으로 체결되면, 소유자 *또는* 운영 키퍼가 `settle_limit_order`를 호출하여 출력 토큰을 소유자의 ATA로 전송합니다.
+4. **Close** — `unfilled_amount == 0`이 되면 계정을 닫을 수 있습니다. 임대료는 항상 `owner`에게 반환됩니다.
+
+PDA 시드: `[owner.as_ref(), limit_order_nonce.key().as_ref(), limit_order_nonce.order_nonce.to_be_bytes().as_ref()]`. 주문 PDA는 따라서 `(owner, nonce_index, order_nonce)` 조합마다 고유합니다.
+
+## `LimitOrderNonce`
+
+`(wallet, nonce_index)` 쌍별 카운터로, 단일 사용자가 PDA 충돌 없이 여러 지정가 주문 파이프라인을 병렬로 운영할 수 있게 합니다.
+
+```rust
+pub struct LimitOrderNonce {
+    pub user_wallet: Pubkey,
+    pub nonce_index: u8,             // user-chosen, 0..255
+    pub order_nonce: u64,            // monotonic, incremented every time a new order is opened
+    pub padding:     [u64; 4],
+}
+```
+
+PDA 시드: `[user_wallet.as_ref(), &[nonce_index]]`. 대부분의 클라이언트는 `nonce_index = 0`을 사용하고 `order_nonce`로 카디널리티를 관리합니다.
+
+## 핵심 계정 유도
+
+```ts
+import { PublicKey } from "@solana/web3.js";
+
+const CLMM_PROGRAM_ID = new PublicKey(
+  "CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK"
+); // see reference/program-addresses
+
+function i32ToBytes(n: number): Buffer {
+  const b = Buffer.alloc(4);
+  b.writeInt32BE(n);
+  return b;
+}
+
+export function deriveClmmAccounts(
+  ammConfig: PublicKey,
+  token0Mint: PublicKey,           // must already be sorted
+  token1Mint: PublicKey,
+) {
+  const [poolState] = PublicKey.findProgramAddressSync(
+    [Buffer.from("pool"), ammConfig.toBuffer(),
+     token0Mint.toBuffer(), token1Mint.toBuffer()],
+    CLMM_PROGRAM_ID,
+  );
+  const [observation] = PublicKey.findProgramAddressSync(
+    [Buffer.from("observation"), poolState.toBuffer()],
+    CLMM_PROGRAM_ID,
+  );
+  const [tickArrayBitmapExtension] = PublicKey.findProgramAddressSync(
+    [Buffer.from("pool_tick_array_bitmap_extension"), poolState.toBuffer()],
+    CLMM_PROGRAM_ID,
+  );
+  return { poolState, observation, tickArrayBitmapExtension };
+}
+
+export function deriveTickArray(
+  pool: PublicKey,
+  startTickIndex: number,
+) {
+  const [tickArray] = PublicKey.findProgramAddressSync(
+    [Buffer.from("tick_array"), pool.toBuffer(), i32ToBytes(startTickIndex)],
+    CLMM_PROGRAM_ID,
+  );
+  return tickArray;
+}
+
+export function deriveDynamicFeeConfig(index: number) {
+  const idx = Buffer.alloc(2);
+  idx.writeUInt16BE(index);
+  const [pda] = PublicKey.findProgramAddressSync(
+    [Buffer.from("dynamic_fee_config"), idx],
+    CLMM_PROGRAM_ID,
+  );
+  return pda;
+}
+
+export function deriveLimitOrderNonce(
+  wallet: PublicKey,
+  nonceIndex: number,
+) {
+  const [pda] = PublicKey.findProgramAddressSync(
+    [wallet.toBuffer(), Buffer.from([nonceIndex & 0xff])],
+    CLMM_PROGRAM_ID,
+  );
+  return pda;
+}
+
+export function deriveLimitOrder(
+  wallet: PublicKey,
+  nonceAccount: PublicKey,
+  orderNonce: bigint,
+) {
+  const nonceBytes = Buffer.alloc(8);
+  nonceBytes.writeBigUInt64BE(orderNonce);
+  const [pda] = PublicKey.findProgramAddressSync(
+    [wallet.toBuffer(), nonceAccount.toBuffer(), nonceBytes],
+    CLMM_PROGRAM_ID,
+  );
+  return pda;
+}
+
+export function derivePersonalPosition(nftMint: PublicKey) {
+  const [personalPosition] = PublicKey.findProgramAddressSync(
+    [Buffer.from("position"), nftMint.toBuffer()],
+    CLMM_PROGRAM_ID,
+  );
+  return personalPosition;
+}
+```
+
+시드 문자열은 항상 온체인 IDL과 [`reference/program-addresses`](/ko/reference/program-addresses)를 통해 이중으로 확인하세요.
+
+## 라이프사이클 빠른 참조
+
+| 이벤트 | 생성되는 계정 | 삭제되는 계정 |
+|-------|------------------|---------------------|
+| `CreatePool` | `poolState`, `observation`, `token_0_vault`, `token_1_vault` | — |
+| `OpenPosition[WithToken22Nft]` | NFT 민트 + ATA, `personalPosition`, 필요 시 새 `tickArrayState`(들), 아직 없는 경우 `tickArrayBitmapExtension` | — |
+| `IncreaseLiquidity` | 필요 시 새 `tickArrayState`(들) | — |
+| `DecreaseLiquidity` | — | 틱 항목이 지워질 수 있음 (단, `tickArrayState` 자체는 닫히지 않음) |
+| `ClosePosition` | — | NFT 민트, `personalPosition` |
+| `SwapV2` | 필요 시 새 `tickArrayState` | — |
+| `OpenLimitOrder` | `limitOrderState`, 필요 시 `limitOrderNonce` (init-if-needed), 필요 시 새 `tickArrayState` | — |
+| `IncreaseLimitOrder` | — | — |
+| `DecreaseLimitOrder` | — | 주문이 완전히 소진된 경우 `limitOrderState` 닫힘 |
+| `SettleLimitOrder` | — | — |
+| `CloseLimitOrder` | — | `limitOrderState` (임대료 → `owner`) |
+| `CreateDynamicFeeConfig` | `dynamicFeeConfig` | — |
+| `CreateCustomizablePool` | `poolState`, `observation`, 볼트 — `CreatePool`과 동일. `enable_dynamic_fee = true`인 경우 `dynamicFeeConfig` 스냅샷. | — |
+| `CollectRewards` | — | — |
+| `UpdateRewardInfos` | — | — |
+| `CloseProtocolPosition` (관리자) | — | 잔재 `protocolPositionState` (임대료 → 관리자) |
+
+`TickArrayState` 계정은 **프로그램에 의해 절대 닫히지 않습니다** — 풀의 수명 동안 유지됩니다. 틱 배열이 한번 초기화되면 내부의 모든 틱이 `liquidity_gross == 0`으로 돌아가도 온체인에 남아 있습니다. 기존 틱 배열을 재사용하는 것은 무료이며, 한번도 초기화되지 않은 배열에 처음 접근하는 포지션만 임대료를 납부합니다.
+
+## 관련 문서 안내
+
+- **틱 수학과 범위 메커니즘**: [`products/clmm/ticks-and-positions`](/ko/products/clmm/ticks-and-positions).
+- **스왑 워크와 수수료 성장 수학**: [`products/clmm/math`](/ko/products/clmm/math).
+- **인스트럭션 계정 목록**: [`products/clmm/instructions`](/ko/products/clmm/instructions).
+- **수수료 및 리워드 발생**: [`products/clmm/fees`](/ko/products/clmm/fees).
+- **표준 프로그램 ID와 시드**: [`reference/program-addresses`](/ko/reference/program-addresses).
+
+소스:
+
+- [`raydium-io/raydium-clmm` — `programs/amm/src/states`](https://github.com/raydium-io/raydium-clmm)

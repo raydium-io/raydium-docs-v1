@@ -1,0 +1,254 @@
+---
+title: "Vecteurs d'attaque"
+description: "Motifs d'attaque connus contre les AMM et les expositions spécifiques de Raydium — sandwich/MEV, manipulation de prix, attaques de donation, abus de hooks Token-2022, bugs de composabilité — incluant comment Raydium se défend contre chacun."
+---
+
+<Info>
+  **Cette page est traduite automatiquement par IA. La version anglaise fait foi.**
+
+  [Voir la version anglaise →](/security/attack-vectors)
+</Info>
+
+Un AMM est une cible attrayante pour du code malveillant : les fonds des LP sont dans des pools entièrement visibles ; chaque swap change le prix de manière déterministe. Cette page énumère les classes d'attaque qui ont été démontrées contre les AMM, comment elles s'appliquent à Raydium spécifiquement, et ce que Raydium (et les intégrateurs) font pour se défendre.
+
+## 1. Attaques sandwich / MEV
+
+### Attaque
+
+Un bot surveille le mempool / flux de gossip, voit un swap d'un utilisateur, le front-run avec un achat dans la même direction (poussant le prix), laisse le tx de l'utilisateur s'exécuter à un prix plus mauvais, puis back-run avec une vente opposée. Le bot profite du spread.
+
+### Exposition
+
+- **Très exposé** : les pools CPMM et AMM v4 à faible TVL — même les petits trades déplacent le prix de manière significative.
+- **Moins exposé** : les pools CLMM profonds — les trades intra-tick ne déplacent pas le prix.
+- **Non exposé** : récoltes de ferme, dépôts de LP (ratio appliqué, non sensible au prix de la même manière).
+
+### Défenses
+
+- **Bundles Jito** ([`integration-guides/routing-and-mev`](/fr/integration-guides/routing-and-mev)) masquent le tx du mempool public.
+- **Slippage serré** — un minimum-out plus proche de l'attendu rend les sandwichs non rentables. En dessous de ~0,3 %, la plupart des sandwichs perdent de l'argent.
+- **Tailles de trade plus petites** — divisez un swap de 100 k\$ en 10× 10 k\$ ; chacun déplace le prix moins.
+
+### Posture de Raydium
+
+Les programmes principaux de Raydium n'appliquent pas de protections anti-MEV — ils sont neutres au niveau du programme. La protection se produit au niveau de la soumission (Jito, protections intégrées des portefeuilles). L'interface graphique fixe le slippage par défaut à 0,5 %, ce qui est raisonnable pour la plupart des pools.
+
+## 2. Manipulation de prix
+
+### Attaque
+
+Un grand trader déplace temporairement le prix d'un pool (via un flash loan ou un auto-financement), déclenche une action en aval qui dépend du prix (une liquidation, un emprunt dérivé d'un oracle, un paiement de dérivé), puis ramène le prix à la normale.
+
+### Exposition
+
+- **Opérations Raydium natives** : non exposée. Un swap spot aller-retour ne subit que les frais d'allers-retours ; le trader perd de l'argent.
+- **Programmes intégrés** : exposés s'ils lisent naïvement le prix du pool Raydium.
+
+### Défenses
+
+- **Utilisez les TWAP**, pas les prix spot, pour la composabilité (voir [`security/oracle-and-token-risks`](/fr/security/oracle-and-token-risks)).
+- **CLMM ObservationState** fournit un TWAP à court terme qui n'est pas manipulable sans engagement de capital soutenu.
+- **Consensus multi-oracle** : si votre programme lit Raydium, Pyth, Jupiter et agit uniquement quand ils s'accordent à 1 %, la manipulation par flash loan d'une seule source ne suffit pas.
+
+### Posture de Raydium
+
+CLMM expédie le support ObservationState TWAP ; les intégrateurs qui l'ignorent et utilisent les prix spot sont livrés à eux-mêmes. L'interface graphique frontale de Raydium utilise plusieurs sources de prix pour l'affichage USD.
+
+## 3. Attaques de donation / inflation
+
+### Attaque
+
+Le premier LP dans un nouveau pool dépose une quantité infime (p. ex., 1 jeton chacun de 6 mints décimaux → 1 unité de LP émise). Puis l'attaquant « donne » 1 000 000 de jetons directement au coffre du pool via un transfert SPL Token. Maintenant, 1 unité de LP représente 500 000 de chaque mint. Tout LP ultérieur déposant moins que cela est arrondi à 0 unité de LP et perd son dépôt.
+
+### Exposition
+
+- **CPMM / AMM v4** : potentiellement exposé sur les pools nouvellement créés et à faible liquidité.
+- **CLMM** : non exposé (pas de mint LP partagé ; chaque position est son propre NFT avec une valeur de liquidité explicite).
+
+### Défenses
+
+L'instruction `initialize` de CPMM verrouille un montant minimum de LP au pool (inspiré par le modèle `MINIMUM_LIQUIDITY` d'Uniswap V2). Cela signifie que le premier LP reçoit `sqrt(x × y) - MINIMUM_LIQUIDITY`, avec `MINIMUM_LIQUIDITY` (1000 unités) brûlé à null. Une attaque de donation nécessite que l'attaquant donne >> le dépôt initial, ce qui devient antiéconomique.
+
+De plus, le SDK de Raydium avertit bruyamment quand le dépôt initial est minuscule et guide les utilisateurs vers des montants sensés.
+
+### Posture de Raydium
+
+Le verrouillage `MINIMUM_LIQUIDITY` est expédié dans CPMM ; AMM v4 a un mécanisme similaire. Les utilisateurs créant des pools doivent amorcer avec au moins `10 000+` unités de chaque mint pour rendre les attaques de donation antiéconomiques de toute façon.
+
+## 4. Abus de transfer-hook Token-2022
+
+### Attaque
+
+Le hook de transfert d'un mint est modifiable. L'attaquant déploie un hook innocent au lancement du mint, obtient une liste sur Raydium, accumule du LP des utilisateurs. Plus tard, met à niveau le hook pour bloquer tous les transferts (effectivement un soft-rug — les utilisateurs ne peuvent pas se retirer). L'attaquant rend le pool échangeable dans une seule direction, achète du LP bon marché, déverrouille les hooks, gagne.
+
+### Exposition
+
+Les pools qui incluent un mint avec transfer-hook.
+
+### Défenses
+
+- **Niveau du programme** : les programmes Raydium appellent le hook pendant les swaps ; si le hook bloque, le swap revient. Cela ne prévient pas l'attaque de manière mécanique.
+- **Niveau de l'interface graphique** : Raydium signale les pools avec des mints transfer-hook.
+- **Niveau intégrateur** : les agrégateurs doivent ignorer les mints transfer-hook par défaut et ne lister que les hooks vérifiés.
+
+### Posture de Raydium
+
+Raydium ne bannit pas les pools transfer-hook (les hooks légitimes existent), mais les marque clairement. Les agrégateurs filtrant sur `tags.includes("TRANSFER_HOOK")` peuvent exclure si souhaité.
+
+## 5. Exploits de composabilité / CPI
+
+### Attaque
+
+Un programme compose Raydium via CPI et introduit un bug : p. ex., il passe le mauvais `observation_state`, les mauvais tick arrays pour un swap CLMM, ou double-dépense un compte. L'attaquant identifie la composition bugguée et l'exploite.
+
+### Exposition
+
+- **L'intégrateur buggué** — généralement la source du bug.
+- **Raydium** — uniquement si le bug déclenche un comportement involontaire dans les programmes Raydium eux-mêmes.
+
+### Exemples historiques
+
+Aucun des programmes de Raydium n'a été exploité via CPI — les validateurs de compte de Raydium attrapent les comptes mal formés et revenaient. Les exploits dans l'écosystème plus large se sont produits via des bugs de programme personnalisé qui *composaient* avec un AMM mais ne venaient pas de l'AMM.
+
+### Défenses
+
+- Les programmes appelants doivent utiliser les aides CPI d'Anchor (pas les instructions construites à la main) quand possible — la sécurité des types capture la plupart des abus.
+- Les tests d'intégration contre l'état forké mainnet couvrent les cas de composition.
+
+## 6. Compromission d'admin / clé
+
+### Attaque
+
+Une clé d'admin (autorité de mise à niveau, admin AmmConfig, réclamation de frais de protocole) est compromise. L'attaquant déploie une mise à niveau malveillante qui draine les pools, ou modifie les AmmConfigs pour router les frais vers un portefeuille attaquant, ou draine les frais de protocole.
+
+### Exposition
+
+Tous les rôles documentés dans [`security/admin-and-multisig`](/fr/security/admin-and-multisig).
+
+### Défenses
+
+- **Multisig 3/4** sur l'autorité de mise à niveau nécessite de compromettre 4 signataires indépendants.
+- **Timelock 24 heures** sur les mises à niveau donne aux utilisateurs le temps de se retirer avant qu'une mise à niveau malveillante s'active.
+- **Surveillance opérationnelle** — alertes sur toute activité multisig via la file d'attente publique de Squads.
+
+### Incident historique
+
+La clé d'autorité du pool AMM v4 a été compromise en décembre 2022 (pré-multisig). Correctif : toute l'autorité déplacée vers le multisig Squads. Post-correction, aucun incident.
+
+## 7. Attaques économiques sur la mathématique des ticks CLMM
+
+### Attaque
+
+Un attaquant sophistiqué exploite l'arrondi ou les cas limites de comptabilité des frais dans la mathématique des ticks CLMM. Des exemples qui ont été trouvés dans *d'autres* implémentations CLMM (pas Raydium) :
+
+- La comptabilité de la croissance des frais qui arrondit contre l'utilisateur, accumulant de la poussière.
+- Le franchissement de tick qui crédite/débite le mauvais delta fee_growth.
+- Débordement d'entier dans les produits `sqrtPrice * liquidity`.
+
+### Exposition
+
+Mathématique complexe et sur mesure. Les audits et la fuzzing sont la défense principale.
+
+### Posture de Raydium
+
+CLMM a eu deux audits indépendants (OtterSec + MadShield) plus la fuzzing continue basée sur les propriétés. Aucun bug impactant la production trouvé à ce jour. L'arithmétique `sqrt_price_x64` Q64.64 utilise des mathématiques 128 bits saturantes avec des tests unitaires couvrant les ticks limites.
+
+## 8. Confusion de position-NFT
+
+### Attaque
+
+Un utilisateur est trompé en signant une transaction qui transfère son NFT de position CLMM à un attaquant. L'attaquant est maintenant propriétaire de la liquidité de la position.
+
+### Exposition
+
+Tout détenteur de position NFT.
+
+### Défenses
+
+- Les interfaces graphiques du portefeuille doivent reconnaître les NFT de position Raydium et les afficher distinctement (pas en tant que NFT génériques à « envoyer »).
+- Les utilisateurs doivent être prudents en signant des transactions qui transfèrent des NFT.
+
+### Posture de Raydium
+
+Les NFT de position implémentent la norme de métadonnées de Metaplex ; les applications de portefeuille qui comprennent les positions CLMM les affichent en tant que positions de liquidité plutôt que des NFT échangeables. La plupart des portefeuilles Solana majeurs les font apparaître spécialement dès 2026.
+
+## 9. Manipulation du flux de récompenses de ferme
+
+### Attaque
+
+Un créateur de ferme finance le coffre de récompense, attire les jalonneurs, puis appelle `restartRewards` avec des paramètres qui rendent le calcul des récompenses en attente étrange, volant la valeur de la moisson.
+
+### Exposition
+
+Les fermes avec des créateurs malveillants. Farm v6 limite étroitement les pouvoirs du créateur ; cette attaque ne fonctionne pas.
+
+### Défenses
+
+Les instructions d'admin de Farm v6 (`setRewards`, `restartRewards`, `addReward`) préservent les droits au prorata — le reward_per_share est ajusté au moment du changement, de sorte qu'aucune accumulation pré-changement n'est rétroactivement corrompue.
+
+### Posture de Raydium
+
+L'audit de ferme d'OtterSec a spécifiquement testé les scénarios de redémarrage de récompenses ; aucun exploit trouvé.
+
+## 10. Divergence simulation-vs-exécution
+
+### Attaque
+
+Un attaquant construit une transaction qui simule avec succès mais revient à l'exécution (ou vice versa). Utilisé pour harceler les portefeuilles qui s'appuient sur la simulation pour l'affichage.
+
+### Exposition
+
+Les portefeuilles affichant « vous recevrez X » basé sur la simulation.
+
+### Défenses
+
+- Utilisez `simulateTransaction` avec le même blockhash que la soumission réelle.
+- Affichage du résultat attendu comme « ≈ » (approximativement) pas exacte.
+- Re-simulez immédiatement avant la soumission.
+
+### Posture de Raydium
+
+La simulation CLMM est déterministe compte tenu de l'état actuel du pool ; la divergence se produit uniquement si l'état change entre la simulation et l'exécution (cas normal, traité via les bornes de slippage).
+
+## Tableau de synthèse
+
+| Vecteur | Spécifique à Raydium | Défendu au | Risque résiduel pour les utilisateurs |
+|---------|----------------------|-----------|---------------------------------------|
+| Sandwich / MEV | Oui | Couche de soumission (Jito, slippage) | Faible si Jito utilisé |
+| Manipulation de prix | Composabilité uniquement | Utiliser TWAP | Faible si TWAP consommé |
+| Attaque de donation | CPMM | MINIMUM_LIQUIDITY | Faible |
+| Abus de transfer-hook | Pools Token-2022 | Drapeaux d'interface graphique | Moyen pour les hooks non vérifiés |
+| Exploits CPI | Bugs des intégrateurs | Les validateurs de Raydium revenaient | Faible (bug reste chez l'intégrateur) |
+| Compromission d'admin | Tous les programmes | Multisig + timelock | Faible (24h pour réagir) |
+| Mathématique des ticks CLMM | CLMM | Audits + fuzzing | Faible |
+| Confusion de position NFT | CLMM | UX du portefeuille | Faible avec les portefeuilles modernes |
+| Manipulation de ferme | Farm v6 | Pouvoirs créateurs bornés | Faible |
+| Divergence de simulation | N'importe lequel | UX du portefeuille | Faible |
+
+## Ce que les utilisateurs peuvent faire
+
+- Par défaut, un slippage serré ; augmentez uniquement si nécessaire.
+- Utilisez les portefeuilles / flux de swap activés Jito.
+- Vérifiez les extensions de mint avant LP.
+- Surveillez le multisig Squads pour les mises à niveau en attente.
+- Diversifiez entre les pools ; ne concentrez pas tout votre LP dans un pool de lancement.
+
+## Ce que les intégrateurs peuvent faire
+
+- Utilisez les TWAP ObservationState pour la tarification des dérivés.
+- Validez les contraintes de compte lors de la composition via CPI.
+- Filtrez les pools par champ `tags` (ignorez `scam`, `honeypot`, transfer-hook non vérifiés).
+- Définissez des bornes de slippage raisonnables ; n'acceptez pas un slippage de 0 à partir de l'entrée de l'utilisateur.
+- Utilisez `simulateTransaction` avec prudence — documentez que c'est une estimation.
+
+## Pointeurs
+
+- [`security/oracle-and-token-risks`](/fr/security/oracle-and-token-risks) — Risques Token-2022 en profondeur.
+- [`security/admin-and-multisig`](/fr/security/admin-and-multisig) — Structure d'autorité.
+- [`security/disclosure`](/fr/security/disclosure) — Programme de primes aux bugs.
+- [`integration-guides/routing-and-mev`](/fr/integration-guides/routing-and-mev) — Atténuations du MEV.
+
+Sources :
+
+- [Rekt News](https://rekt.news) — Post-mortems DeFi informant cette liste.
+- Rapports d'audit liés dans [`security/audits`](/fr/security/audits).

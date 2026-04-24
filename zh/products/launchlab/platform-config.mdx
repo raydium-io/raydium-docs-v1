@@ -1,0 +1,237 @@
+---
+title: "LaunchLab PlatformConfig"
+description: "针对每个平台的配置，用于自定义品牌、费用分配、NFT 迁移份额、锁仓分配，以及该平台允许的曲线形状白名单。"
+---
+
+<Info>
+  **本页内容由 AI 自动翻译，所有内容以英文版本为准。**
+
+  [查看英文版 →](/products/launchlab/platform-config)
+</Info>
+
+<Info>
+  `PlatformConfig` 是**平台层级**的配置，构建在 [`GlobalConfig`](/zh/products/launchlab/global-config) 之上。`GlobalConfig` 定义的是协议范围的规则（「交易费 1%，初始供应量至少 1000 万，只有这个钱包可以毕业」），而 `PlatformConfig` 则是各启动平台（pump.fun、Raydium 自有 UI、第三方启动板）用来添加自己的费用、声明毕业后流动性的分配比例、限制允许的曲线形状，以及在链上展示品牌信息（名称、网站、图像）的工具。
+</Info>
+
+## 概述
+
+每个 `PlatformConfig` 账户为一个平台管理四项跨层的配置：
+
+1. **品牌信息**——名称、网站、图像链接，全部内存中存储，便于任何区块浏览器或聚合器展示该代币的启动平台。
+2. **平台费用**——除了协议 `trade_fee_rate` 外额外的交易费（`fee_rate`）。累积到平台的 `platform_fee_wallet`。由 `GlobalConfig.max_share_fee_rate` 限制最高 100 bps。
+3. **NFT 迁移分配**——三个整数（`platform_scale`、`creator_scale`、`burn_scale`），总和为 `RATE_DENOMINATOR_VALUE = 1_000_000`，用于将毕业后的流动性代币分为三部分：铸造给平台 NFT 钱包的部分、铸造给创建者 NFT 钱包的部分，以及销毁的部分（Burn & Earn）。仅在毕业目标为 CPMM（`migrate_type = 1`）时有意义。
+4. **曲线参数白名单**——一个 `Vec<PlatformCurveParam>`，列出该平台允许的 `(supply, total_base_sell, total_quote_fund_raising, migrate_type, migrate_cpmm_fee_on, vesting_params...)` 的精确组合。如果向量为空或所有条目都无效，则允许**任何**组合；否则启动必须与其中某个条目完全匹配。
+
+PDA 推导：
+
+```ts
+const [platformConfigPda] = PublicKey.findProgramAddressSync(
+  [
+    Buffer.from("platform_config"),
+    platformAdmin.toBuffer(),       // platform's owning pubkey
+  ],
+  LAUNCHLAB_PROGRAM_ID,
+);
+```
+
+（参见源代码中的 `create_platform_config` 了解规范的 seed 列表。）
+
+## 账户结构
+
+```rust
+// states/platform_config.rs
+pub const PLATFORM_CONFIG_SEED: &str = "platform_config";
+pub const NAME_SIZE: usize = 64;
+pub const WEB_SIZE:  usize = 256;
+pub const IMG_SIZE:  usize = 256;
+pub const MAX_CREATOR_FEE_RATE: u64 = 5000;       // 50 bps (denominator 1_000_000)
+pub const MAX_TRANSFER_FEE_RATE: u16 = 500;       // 5%   (denominator 10_000)
+pub const MAX_CURVE_PARAMS: usize = 10;
+
+#[account]
+pub struct PlatformConfig {
+    pub epoch:                       u64,
+    pub platform_fee_wallet:         Pubkey,            // signs ClaimPlatformFee
+    pub platform_nft_wallet:         Pubkey,            // receives the platform NFT slice at CPMM graduation
+    pub platform_scale:              u64,               // share of LP minted to platform NFT
+    pub creator_scale:               u64,               // share of LP minted to creator NFT
+    pub burn_scale:                  u64,               // share of LP burned via Burn & Earn
+    pub fee_rate:                    u64,               // platform's trade fee (1/1_000_000)
+    pub name:                        [u8; 64],          // utf-8 padded with zeros
+    pub web:                         [u8; 256],
+    pub img:                         [u8; 256],
+    pub cpswap_config:               Pubkey,            // CPMM AmmConfig that the post-grad pool will bind to
+    pub creator_fee_rate:            u64,               // creator-side fee taken pre-graduation
+    pub transfer_fee_extension_auth: Pubkey,            // for Token-2022 launches: who inherits transfer-fee authorities post-graduation
+    pub platform_vesting_wallet:     Pubkey,
+    pub platform_vesting_scale:      u64,               // platform's slice of total_locked_amount
+    pub platform_cp_creator:         Pubkey,            // optional creator-of-record on the post-graduation CPMM pool
+    pub padding:                     [u8; 108],
+    pub curve_params:                Vec<PlatformCurveParam>, // whitelist of permitted curve shapes
+}
+```
+
+`platform_scale + creator_scale + burn_scale` 必须等于 `1_000_000`（由 `MigrateNftInfo::check` 校验）。线上常见的分配方案：
+
+- `(0, 100_000, 900_000)` — 90% 流动性销毁，10% 给创建者。标准 pump 风格的公平启动。
+- `(50_000, 100_000, 850_000)` — 小额平台分配（5%），10% 创建者，85% 销毁。
+- `(0, 0, 1_000_000)` — 全部销毁，无 NFT 铸造。严格的「无内部人士」启动。
+
+## 品牌字段
+
+`name`、`web` 和 `img` 是内联字节数组，用零填充至其大小常数。要将它们读作字符串，需要截取到第一个 `\0`：
+
+```ts
+function readString(bytes: Uint8Array): string {
+  const end = bytes.indexOf(0);
+  return Buffer.from(end === -1 ? bytes : bytes.subarray(0, end)).toString("utf-8");
+}
+```
+
+这些常数（`name: 64`、`web: 256`、`img: 256`）特意设置得很宽松，以便平台能为区块浏览器和聚合器提供足够的元数据，而无需依赖链下存储。超过这些大小的任何内容在 `CreatePlatformConfig` 时会以 `InvalidInput` 报错。
+
+## 费用机制
+
+在绑定到某个 `PlatformConfig` 的曲线上进行交换时，需要支付三层累积费用：
+
+```
+trade_fee     = amount_in × global_config.trade_fee_rate    / 1_000_000
+platform_fee  = amount_in × platform_config.fee_rate        / 1_000_000
+creator_fee   = amount_in × platform_config.creator_fee_rate / 1_000_000
+
+amount_after_fee = amount_in − trade_fee − platform_fee − creator_fee
+```
+
+- `trade_fee` 累积到协议的 `protocol_fee_owner`（通过 `CollectFee` 领取）。
+- `platform_fee` 累积到每个平台的金库（通过 `ClaimPlatformFee` 或 `ClaimPlatformFeeFromVault` 领取；见 [`instructions`](/zh/products/launchlab/instructions)）。
+- `creator_fee` 累积到按创建者公钥 + 报价币种密钥的每个创建者金库（通过 `ClaimCreatorFee` 领取）。
+
+`creator_fee_rate` 由 `MAX_CREATOR_FEE_RATE = 5000`（50 bps）限制。`fee_rate`（平台费）由 `GlobalConfig.max_share_fee_rate` 限制最高 `10000`（100 bps）。
+
+## NFT 迁移分配（仅限 CPMM）
+
+当启动毕业到 CPMM（`migrate_type = 1`，由 `migrate_to_cpswap_wallet` 签署）时，迁移指令将由 `CPMM::InitializeWithPermission` 铸造的流动性代币分为三部分：
+
+```
+lp_to_platform = lp_total × platform_scale / 1_000_000   → platform_nft_wallet
+lp_to_creator  = lp_total × creator_scale  / 1_000_000   → creator NFT (Fee Key)
+lp_to_burn     = lp_total × burn_scale     / 1_000_000   → Burn & Earn lock program
+```
+
+平台和创建者的份额被流动性锁定程序（`LockrWmn6K5twhz3y9w1dQERbmgSaRkfnTeTKbpofwE`）包装为 **NFT**——该 NFT 的持有者有权无限期地领取累积的 CPMM 费用，但不能提取底层流动性。参见 [`products/launchlab/creator-fees`](/zh/products/launchlab/creator-fees) 了解毕业后的 Fee Key 流程。
+
+销毁份额发送给锁定程序且 `is_burn = true`，使得流动性代币永久无法访问——它们保证了池的价格底线，但不会向任何人返还费用。
+
+当 `migrate_type = 0`（毕业到 AMM v4）时，NFT 分配字段被忽略，整个流动性根据 AMM v4 端的单独流程进行锁定/销毁。
+
+## 曲线参数白名单
+
+`curve_params: Vec<PlatformCurveParam>` 是平台用来限制其启动可以选择哪些曲线形状的机制。如果向量非空且至少有一个条目有效，程序在 `Initialize` 时会强制要求启动的参数至少与某一个条目完全匹配。
+
+```rust
+#[derive(AnchorSerialize, AnchorDeserialize, Clone)]
+pub struct PlatformCurveParam {
+    pub epoch:                u64,
+    pub index:                u8,           // ordinal within this platform's whitelist
+    pub global_config:        Pubkey,       // which GlobalConfig this entry applies to
+    pub bonding_curve_param:  BondingCurveParam,
+    pub padding:              [u64; 50],
+}
+
+#[derive(AnchorSerialize, AnchorDeserialize, Clone)]
+pub struct BondingCurveParam {
+    pub migrate_type:               u8,    // 0 = AMM v4, 1 = CPMM. u8::MAX = wildcard
+    pub migrate_cpmm_fee_on:        u8,    // 0 = quote-only, 1 = both. u8::MAX = wildcard
+    pub supply:                     u64,   // 0 = wildcard
+    pub total_base_sell:            u64,   // 0 = wildcard
+    pub total_quote_fund_raising:   u64,   // 0 = wildcard
+    pub total_locked_amount:        u64,   // u64::MAX = wildcard
+    pub cliff_period:               u64,   // u64::MAX = wildcard
+    pub unlock_period:              u64,   // u64::MAX = wildcard
+}
+```
+
+每个字段都有一个哨兵值，表示**通配符**（任何值都匹配）：`u64` 字段为 `u64::MAX`，`u8` 字段为 `u8::MAX`，供应量/销售/募资字段为 `0`。所有字段都是哨兵值的 `BondingCurveParam` 是「允许任何」——相当于空白名单的行为。
+
+`Initialize` 时的匹配算法：
+
+1. 过滤 `curve_params` 中 `global_config` 与启动选择的 `GlobalConfig` 匹配的条目。
+2. 如果过滤后的列表为空，允许任何参数（该平台没有为此 `GlobalConfig` 设置白名单）。
+3. 如果过滤后的列表中每个条目的 `all_is_invalid()`（每个字段都是通配符），允许任何参数。
+4. 否则遍历条目；对于每个条目，检查启动的参数是否与所有非通配符字段匹配。如果所有非通配符字段都匹配，接受并返回。
+5. 如果没有条目匹配，以 `InvalidInput` 报错。
+
+这让一个平台可以声称「我们只允许标准的 10 亿供应量 / 8 亿销售 / 3 万 USDC 募资 / 无锁仓的形状」，通过写一个单一条目，为这四个字段设置具体值，其他地方使用通配符。或更严格的平台可能列举三四种离散的形状，每种对应一个支持的启动层级。
+
+`MAX_CURVE_PARAMS = 10` 限制白名单大小。
+
+## `PlatformGlobalAccess` — 平台授权
+
+当某个 `GlobalConfig` 有 `requires_platform_auth = 1` 时，针对它的每个 `Initialize` 都必须包含一个 `PlatformGlobalAccess` PDA，证明该平台已被预授权：
+
+```rust
+// states/platform_global_access.rs
+pub const PLATFORM_GLOBAL_ACCESS_SEED: &str = "platform_global_access";
+
+#[account]
+pub struct PlatformGlobalAccess {
+    pub bump:            u8,
+    pub global_config:   Pubkey,
+    pub platform_config: Pubkey,
+    pub padding:         [u64; 8],
+}
+```
+
+PDA seed 为：`[b"platform_global_access", global_config, platform_config]`。
+
+协议管理员通过 `CreatePlatformGlobalAccess` 为每个 `(GlobalConfig, PlatformConfig)` 对创建一个这样的账户，通过 `ClosePlatformGlobalAccess` 撤销。没有这个账户，启动无法从受限制的平台绑定到那个 `GlobalConfig`。
+
+## 读取方式
+
+```ts
+const platformConfig = await raydium.launchpad.getPlatformConfig(platformConfigPda);
+
+console.log("Platform:", readString(platformConfig.name));
+console.log("Fee rate:", platformConfig.feeRate, "(/1M)");
+console.log("NFT split:",
+  platformConfig.platformScale,
+  platformConfig.creatorScale,
+  platformConfig.burnScale,
+);
+console.log("Curve whitelist size:", platformConfig.curveParams.length);
+```
+
+对于显示「这个代币是从哪里启动的」的 UI，`PoolState.platform_config` 直接指向源 `PlatformConfig`——获取一次并缓存品牌信息。
+
+## 更新方式
+
+| 指令 | 签署者 | 变更内容 |
+|---|---|---|
+| `CreatePlatformConfig` | 平台管理员（一次性）| 用 `PlatformParams` 初始化账户。|
+| `UpdatePlatformConfig` | 平台管理员 | 通过参数 `param: u8` 分派的通用指令；每次调用修改一个字段。品牌字段、费率、锁仓钱包和各类钱包都可通过此修改。|
+| `UpdatePlatformCurveParam` | 平台管理员 | 按 `(global_config, index)` 添加或替换一个 `PlatformCurveParam` 条目。|
+| `RemovePlatformCurveParam` | 平台管理员 | 清除一个条目（设为全哨兵 = 通配符）。|
+| `ClaimPlatformFee` | `platform_fee_wallet` | 从 `PoolState.quote_vault` 扫出每个池的平台费。|
+| `ClaimPlatformFeeFromVault` | `platform_fee_wallet` | 扫出每平台费用金库（PDA 在 `[platform_config, quote_mint]`）。|
+
+钱包轮换（`platform_fee_wallet`、`platform_nft_wallet`、`platform_vesting_wallet`、`platform_cp_creator`、`transfer_fee_extension_auth`、`cpswap_config`）全部通过 `UpdatePlatformConfig` 进行。查阅源代码的 `update_platform_config` 分派表以了解准确的 `param` 代码。
+
+## 常见陷阱
+
+- **白名单哨兵设置错误。** `BondingCurveParam` 的 `total_locked_amount = 0` *不是*通配符——它匹配明确选择不使用锁仓的启动。该字段的通配符是 `u64::MAX`。`cliff_period` 和 `unlock_period` 也存在同样的陷阱。使用 `clear()`（程序公开了）来正确设置哨兵。
+- **NFT 分配四舍五入错误。** 三个份额必须精确求和至 `1_000_000`。在 `CreatePlatformConfig` 处的差一错误会报错；运行时的差一错误会多铸造或多销毁一个流动性单位，这正是严格等值检查防止的情况。
+- **平台锁仓双重分配。** 如果 `platform_vesting_scale > 0`，平台必须在启动募资结束后调用一次 `CreatePlatformVestingAccount`；如果忘记了，该份额保持未分配和休眠（启动的 `total_locked_amount` 预算已消耗但平台永远无法领取）。
+- **`platform_cp_creator` 模糊性。** 设为 `Pubkey::default()` 时，启动创建者被记录为毕业后 CPMM 池的 `pool_creator`；设为真实密钥时，那个密钥被记录为代替。这影响后来谁可以调用 `CPMM::CollectCreatorFee`。在平台配置创建时决定你想要哪种模式。
+
+## 相关文档
+
+- [`products/launchlab/global-config`](/zh/products/launchlab/global-config) — 协议层规则，启动必须满足。
+- [`products/launchlab/vesting`](/zh/products/launchlab/vesting) — `platform_vesting_scale` 机制。
+- [`products/launchlab/creator-fees`](/zh/products/launchlab/creator-fees) — Fee Key NFT、Burn & Earn。
+- [`products/launchlab/platforms`](/zh/products/launchlab/platforms) — 平台集成者的操作指南。
+
+源代码：
+
+- `raydium-launch/programs/launchpad/src/states/platform_config.rs` — `PlatformConfig`、`PlatformParams`、`MigrateNftInfo`、`PlatformCurveParam`、`BondingCurveParam`、`is_valid_curve_param`。
+- `raydium-launch/programs/launchpad/src/states/platform_global_access.rs` — `PlatformGlobalAccess`。
+- `raydium-launch/programs/launchpad/src/lib.rs` — `create_platform_config`、`update_platform_config`、`update_platform_curve_param`、`remove_platform_curve_param`、`create_platform_global_access`、`close_platform_global_access`、`claim_platform_fee`、`claim_platform_fee_from_vault`。

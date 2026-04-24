@@ -1,0 +1,415 @@
+---
+title: "사용자 정의 프로그램에서의 CPI"
+description: "Raydium을 호출하는 온체인 프로그램의 구성 패턴 — 에스크로, 애그리게이터 프록시, 자동 복리 금고 — 계정 생성, PDA 서명자, 남은 계정, 컴퓨팅 예산 등 완전한 작업 예제 포함."
+---
+
+<Info>
+  **이 페이지는 AI 자동 번역입니다. 모든 내용은 영문판을 기준으로 합니다.**
+
+  [영문판 보기 →](/integration-guides/cpi-integration)
+</Info>
+
+<Info>
+  [`sdk-api/rust-cpi`](/ko/sdk-api/rust-cpi)에서는 각 Raydium 프로그램을 호출하는 저수준 메커니즘을 다룹니다. 이 페이지는 고수준 가이드입니다: Raydium을 자신의 프로그램에 구성하는 *이유*, 어떤 패턴이 사용 사례에 맞는지, 그리고 처음부터 끝까지 필요한 전체 연결 코드를 설명합니다.
+</Info>
+
+## CPI가 적합한 경우
+
+사용자 정의 프로그램은 스왑이 다른 온체인 상태 변경과 원자적으로 발생해야 하고, 그 상태 변경을 오직 프로그램만 수행할 수 있을 때 유용합니다. 일반적인 경우:
+
+- **에스크로 / 리밋 오더 프로그램** — 사용자가 민트를 에스크로에 입금하고, 프로그램이 가격 조건을 감시하다가 조건이 트리거되면 프로그램이 Raydium을 통해 원자적으로 스왑을 수행하고 사용자의 계정에 크레딧을 줍니다.
+- **애그리게이터 프록시** — Raydium과 다른 DEX 하나 이상을 통해 스왑을 라우팅하는 단일 인스트럭션으로, 모든 홉이 프로그램이 소유한 단일 슬리피지 체크 아래에 있습니다.
+- **자동 복리 금고** — LP 또는 팜 스테이크를 금고에 입금하면, 금고가 일정에 따라 보상을 수확하고, 유동성을 재공급하고, 주식 토큰을 발행합니다.
+- **전략 금고** — CLMM을 통한 스왑으로 리밸런싱하는 레버리지 LP 포지션; 포지션을 종료하고 담보를 한 트랜잭션으로 스왑하는 청산자.
+- **사용자 정의 베스팅이 있는 토큰 출시 플랫폼** — 프로그램이 베스팅 토큰을 보유하고 일정에 따라 Raydium 풀에 출시합니다.
+
+단순히 오프체인 코드에서 스왑을 보내려면 CPI는 과도합니다 — SDK를 사용하세요. CPI는 자신의 상태와의 원자성이 요구사항일 때만 복잡성이 정당합니다.
+
+## 구성 패턴
+
+### 패턴 1: 씬 프록시
+
+프로그램은 어떤 정책 (예: 화이트리스트된 민트 쌍, 인증된 사용자에 대한 수수료 할인)을 검증하는 단일 인스트럭션을 노출하고 Raydium으로 포워드합니다.
+
+```
+┌──────────────┐   user tx    ┌────────────────┐  CPI  ┌──────────┐
+│ user         │─────────────▶│ your program   │──────▶│ Raydium  │
+└──────────────┘              │  (validate)    │       │  (CPMM)  │
+                              └────────────────┘       └──────────┘
+```
+
+상태는 사용자의 ATA에 있습니다. 프로그램은 토큰을 소유하지 않습니다. 최소한의 신뢰 영역.
+
+### 패턴 2: 에스크로
+
+프로그램은 사용자의 입력 민트를 보유하는 PDA를 소유합니다. 트리거 시, PDA가 자신의 잔액을 Raydium으로 스왑하도록 CPI를 서명합니다.
+
+```
+           deposit                   trigger
+   user ───────────▶  PDA vault  ───────────────▶  Raydium swap
+                     (your prog)                    (signed by PDA)
+                                                            │
+                                                            ▼
+                                                    PDA vault (output mint)
+                                                            │
+                                                     withdraw ▼
+                                                         user
+```
+
+중요한 세부사항: PDA는 `CpiContext::new_with_signer`를 통해 서명합니다. [서명자 시드](#pda-서명자-시드)를 참조하세요.
+
+### 패턴 3: 구성된 다중 홉
+
+프로그램은 한 인스트럭션에서 여러 CPI를 발행하고, 모든 CPI에 걸쳐 단일 슬리피지 한계를 강제합니다. Raydium 스왑 인스트럭션 각각은 자신의 `minimum_amount_out`을 가지지만, 0 (또는 매우 느슨한 하한)으로 설정하고 마지막 홉 후에 엄격한 최종 최소값을 직접 강제합니다.
+
+```
+instruction:
+  CPI swap: tokenA → tokenB   (raydium, loose min)
+  CPI swap: tokenB → tokenC   (raydium / third-party, loose min)
+  CPI swap: tokenC → tokenD   (raydium, loose min)
+  require(user.tokenD_ata.amount - pre_balance >= user_min_out)
+```
+
+이것은 전체 라우트에 대한 단일 되돌리기 게이트를 제공합니다. 모든 홉이 슬리피지에 안전하다고 신뢰할 때만 이 패턴을 사용하세요; 그렇지 않으면 각 홉이 자신의 최소값을 강제하도록 하세요.
+
+### 패턴 4: 금고 / 전략
+
+프로그램은 LP 토큰 또는 팜 스테이크를 PDA에 보유합니다. 키퍼 (또는 사용자)가 `compound()`를 호출하면:
+
+1. 팜에서 보상을 수확합니다.
+2. 보상을 풀 토큰으로 스왑합니다 (CPMM 또는 CLMM으로의 CPI).
+3. 수익금을 LP에 다시 입금합니다 (다른 CPI).
+4. 새 LP를 스테이킹합니다 (또 다른 CPI).
+
+모두 한 트랜잭션에서 금고의 NAV가 원자적으로 움직입니다. 컴퓨팅 예산은 보통 600k–1M CU입니다; 주소 조회 테이블은 필수입니다.
+
+## 계정 목록 구성
+
+호출 프로그램의 `Accounts` 구조는 Raydium 프로그램의 계정 순서를 반영하지만, 대부분의 Raydium 쪽 계정은 Raydium이 자체적으로 검증하기 때문에 `UncheckedAccount`입니다. *자신이* 소유한 계정에만 제약 조건을 추가합니다:
+
+```rust
+use anchor_lang::prelude::*;
+use anchor_spl::token::{Token, TokenAccount};
+
+#[derive(Accounts)]
+pub struct EscrowSwap<'info> {
+    /// 에스크로 PDA; 입력 민트를 보유하고 CPI에 서명합니다.
+    #[account(
+        mut,
+        seeds = [b"escrow", user.key().as_ref()],
+        bump = escrow.bump,
+    )]
+    pub escrow: Account<'info, Escrow>,
+
+    #[account(mut)]
+    pub user: Signer<'info>,
+
+    // ----- Raydium 쪽 계정, 대부분 미검증 -----
+
+    /// CHECK: CPMM에서 검증됨
+    #[account(mut)] pub pool_state: UncheckedAccount<'info>,
+    /// CHECK: CPMM에서 검증됨
+    pub amm_config: UncheckedAccount<'info>,
+    /// CHECK: CPMM에서 검증됨
+    pub pool_authority: UncheckedAccount<'info>,
+    #[account(mut)] pub input_vault:  Account<'info, TokenAccount>,
+    #[account(mut)] pub output_vault: Account<'info, TokenAccount>,
+    /// CHECK: CPMM에서 검증됨
+    #[account(mut)] pub observation_state: UncheckedAccount<'info>,
+
+    /// 에스크로의 입력 ATA — 에스크로 PDA가 소유합니다.
+    #[account(
+        mut,
+        associated_token::mint = input_mint,
+        associated_token::authority = escrow,
+    )]
+    pub escrow_input_ata: Account<'info, TokenAccount>,
+
+    /// 에스크로의 출력 ATA.
+    #[account(
+        mut,
+        associated_token::mint = output_mint,
+        associated_token::authority = escrow,
+    )]
+    pub escrow_output_ata: Account<'info, TokenAccount>,
+
+    pub input_mint:  Account<'info, anchor_spl::token::Mint>,
+    pub output_mint: Account<'info, anchor_spl::token::Mint>,
+
+    pub cpmm_program:       Program<'info, raydium_cp_swap::program::RaydiumCpSwap>,
+    pub token_program:      Program<'info, Token>,
+    pub token_program_2022: Program<'info, anchor_spl::token_2022::Token2022>,
+}
+```
+
+비대칭성 — 자신의 계정에는 엄격한 검증, Raydium의 계정에는 `UncheckedAccount` — 는 게으름이 아닙니다. 수신자가 자신의 것을 검증합니다; 호출자에서 다시 검증하면 CU를 낭비하고 Raydium이 새로운 구조 레이아웃 필드를 출시할 때 동기화되지 않을 위험이 있습니다.
+
+## CPI 호출 자체
+
+```rust
+use raydium_cp_swap::cpi::{self, accounts::Swap as CpmmSwap};
+
+pub fn escrow_swap(
+    ctx: Context<EscrowSwap>,
+    amount_in: u64,
+    minimum_amount_out: u64,
+) -> Result<()> {
+    let user_key = ctx.accounts.user.key();
+    let bump     = ctx.accounts.escrow.bump;
+    let seeds: &[&[u8]] = &[b"escrow", user_key.as_ref(), &[bump]];
+    let signer: &[&[&[u8]]] = &[seeds];
+
+    let cpi_accounts = CpmmSwap {
+        payer:                ctx.accounts.user.to_account_info(),
+        authority:            ctx.accounts.escrow.to_account_info(),
+        amm_config:           ctx.accounts.amm_config.to_account_info(),
+        pool_state:           ctx.accounts.pool_state.to_account_info(),
+        input_token_account:  ctx.accounts.escrow_input_ata.to_account_info(),
+        output_token_account: ctx.accounts.escrow_output_ata.to_account_info(),
+        input_vault:          ctx.accounts.input_vault.to_account_info(),
+        output_vault:         ctx.accounts.output_vault.to_account_info(),
+        input_token_program:  ctx.accounts.token_program.to_account_info(),
+        output_token_program: ctx.accounts.token_program.to_account_info(),
+        input_token_mint:     ctx.accounts.input_mint.to_account_info(),
+        output_token_mint:    ctx.accounts.output_mint.to_account_info(),
+        observation_state:    ctx.accounts.observation_state.to_account_info(),
+    };
+
+    let cpi_ctx = CpiContext::new_with_signer(
+        ctx.accounts.cpmm_program.to_account_info(),
+        cpi_accounts,
+        signer,
+    );
+
+    cpi::swap_base_input(cpi_ctx, amount_in, minimum_amount_out)?;
+    Ok(())
+}
+```
+
+### PDA 서명자 시드
+
+CPI는 `authority`로 전달된 PDA가 호출자가 주장하는 파생과 일치할 때만 성공합니다. 둘 다 다음에 동의해야 합니다:
+
+1. 시드 바이트 수열 (여기서 `[b"escrow", user.key().as_ref()]`).
+2. 범프.
+3. 호출 프로그램 ID (Raydium이 아닌 자신의 프로그램).
+
+Raydium은 권한이 누구인지 신경 쓰지 않습니다 — 오직 `authority` 서명이 트랜잭션을 커버하고 입력 ATA가 그 권한으로 소유되었다는 것만 신경 씁니다. 검증은 `anchor_spl::token::transfer`에서 발생합니다: ATA의 `authority` 필드는 서명자와 같아야 합니다.
+
+일반적인 버그: `user`를 권한으로 전달하기 (그리고 에스크로 PDA가 소유한 `escrow_input_ata`에서 전송). SPL Token 프로그램이 `owner mismatch`로 거부합니다. 항상 `authority` 필드를 ATA 소유자와 일치시키세요.
+
+## 남은 계정
+
+여러 Raydium 인스트럭션은 고정된 것 후에 추가된 가변 길이 계정 목록을 취합니다 — **남은 계정**.
+
+- **CLMM `SwapV2`**: 스왑이 순회할 수 있는 틱 배열에 대한 1–8개의 `TickArrayState` 계정 (스왑 방향으로).
+- **Farm v6 `Deposit` / `Harvest` / `Withdraw`**: `(reward_vault, user_reward_ata)` 쌍 (활성 보상 슬롯당 하나의 쌍).
+- **Token-2022 전송 훅 민트**: 전송 훅 프로그램과 훅이 필요한 모든 계정.
+
+Anchor CPI 헬퍼는 남은 계정을 타입 체크하지 않습니다. 그대로 전달하세요:
+
+```rust
+let cpi_ctx = CpiContext::new_with_signer(program, accounts, signer)
+    .with_remaining_accounts(ctx.remaining_accounts.to_vec());
+```
+
+**순서가 중요합니다.** CLMM의 경우:
+
+```
+remaining = [
+    tick_array_in_direction_0,    // 처음 지난 것
+    tick_array_in_direction_1,
+    ...,
+]
+```
+
+팜 v6 수확의 경우:
+
+```
+remaining = [
+    reward_vault_0, user_reward_ata_0,
+    reward_vault_1, user_reward_ata_1,
+    // reward_state가 Uninitialized인 슬롯은 생략
+]
+```
+
+호출 프로그램은 클라이언트에서 받는 남은 계정을 변경 없이 전달해야 합니다. 필터링하거나 재정렬하려고 하지 마세요.
+
+## 구성된 호출의 컴퓨팅 예산
+
+CPI는 호출 프레임 자체에 ~1,500 CU를 소비합니다; 호출자의 고유 CU 사용이 그 위에 쌓입니다. Raydium CPI당 대략 예산:
+
+| 호출 | CU (SPL Token) | CU (Token-2022) |
+|------|----------------|-----------------|
+| CPMM swap_base_input | ~150,000 | ~200,000 |
+| CLMM swap_v2 (single tick array) | ~180,000 | ~230,000 |
+| CLMM swap_v2 (crosses 2 ticks) | ~220,000 | ~270,000 |
+| Farm v6 deposit | ~120,000 | ~150,000 |
+| Farm v6 harvest (per reward slot) | +30,000 | +40,000 |
+| AMM v4 swap_base_in | ~140,000 | n/a |
+
+각 CPI 프레임에 ~1,500을, 자신의 프로그램 오버헤드에 ~20,000을 추가하세요. `harvest → swap A → swap B → deposit LP → stake LP`를 수행하는 자동 복리기는 쉽게 700k CU에 도달합니다.
+
+항상 명시적인 `ComputeBudgetProgram::set_compute_unit_limit`을 설정하세요:
+
+```ts
+import { ComputeBudgetProgram } from "@solana/web3.js";
+
+const tx = new Transaction().add(
+  ComputeBudgetProgram.setComputeUnitLimit({ units: 900_000 }),
+  ComputeBudgetProgram.setComputeUnitPrice({ microLamports: priorityFeeMicroLamports }),
+  yourInstruction,
+);
+```
+
+기본 200k CU 한계는 구성된 호출이 완료되기 훨씬 전에 조용히 고갈됩니다.
+
+## 에러 전파
+
+Raydium의 프로그램은 안정적인 에러 코드가 있는 Anchor 에러를 반환합니다. 호출 프로그램은 이를 `Err(ProgramError::Custom(code))`로 봅니다. 기본적으로 버블링하세요:
+
+```rust
+cpi::swap_base_input(cpi_ctx, amount_in, minimum_amount_out)?;
+```
+
+또는 특정 코드에 대해 인터셉트하세요:
+
+```rust
+use raydium_cp_swap::error::ErrorCode as CpmmErr;
+
+match cpi::swap_base_input(cpi_ctx, amount_in, minimum_amount_out) {
+    Ok(_) => {},
+    Err(err) if is_err(err, CpmmErr::ExceededSlippage) => {
+        // 프로그램이 더 큰 슬리피지에서 재시도하거나 상태를 되돌릴 수 있습니다.
+        return err!(YourErr::PoolTooVolatile);
+    }
+    Err(err) => return Err(err),
+}
+```
+
+에러 코드-의미 매핑은 IDL 정책([`sdk-api/anchor-idl`](/ko/sdk-api/anchor-idl))에 따라 프로토콜당 안정적입니다; 새 코드는 끝에 추가되고, 기존 코드는 절대 의미가 변하지 않습니다.
+
+## 전체 작업 예제: 리밋 오더 에스크로
+
+흐름:
+
+1. **`open_order`** — 사용자가 `amount_in`의 `input_mint`를 에스크로 PDA에 입금합니다; 목표 `min_amount_out`과 만료를 기록합니다.
+2. **`execute_order`** — 누구나 (키퍼)가 현재 풀 계정과 함께 호출합니다. 프로그램이 현재 견적이 `min_amount_out` ≥ 인지 확인하고, Raydium 스왑으로 CPI하고, 에스크로에 출력을 유지합니다.
+3. **`claim`** — 사용자가 에스크로에서 출력 민트를 인출합니다.
+
+```rust
+#[account]
+pub struct LimitOrder {
+    pub user:          Pubkey,
+    pub input_mint:    Pubkey,
+    pub output_mint:   Pubkey,
+    pub amount_in:     u64,
+    pub min_out:       u64,
+    pub expiry_unix:   i64,
+    pub state:         u8,    // 0 open, 1 filled, 2 cancelled, 3 expired
+    pub bump:          u8,
+}
+
+#[program]
+pub mod limit_orders {
+    use super::*;
+
+    pub fn execute_order(
+        ctx: Context<ExecuteOrder>,
+    ) -> Result<()> {
+        let order = &ctx.accounts.order;
+        require!(order.state == 0, OrderErr::NotOpen);
+        require!(Clock::get()?.unix_timestamp < order.expiry_unix, OrderErr::Expired);
+
+        let user_key = order.user;
+        let seeds: &[&[u8]] = &[b"order", user_key.as_ref(), &[order.bump]];
+        let signer: &[&[&[u8]]] = &[seeds];
+
+        let pre_out_balance = ctx.accounts.escrow_output_ata.amount;
+
+        let cpi_accounts = CpmmSwap {
+            payer:                ctx.accounts.keeper.to_account_info(),
+            authority:            ctx.accounts.order.to_account_info(),
+            amm_config:           ctx.accounts.amm_config.to_account_info(),
+            pool_state:           ctx.accounts.pool_state.to_account_info(),
+            input_token_account:  ctx.accounts.escrow_input_ata.to_account_info(),
+            output_token_account: ctx.accounts.escrow_output_ata.to_account_info(),
+            input_vault:          ctx.accounts.input_vault.to_account_info(),
+            output_vault:         ctx.accounts.output_vault.to_account_info(),
+            input_token_program:  ctx.accounts.token_program.to_account_info(),
+            output_token_program: ctx.accounts.token_program.to_account_info(),
+            input_token_mint:     ctx.accounts.input_mint.to_account_info(),
+            output_token_mint:    ctx.accounts.output_mint.to_account_info(),
+            observation_state:    ctx.accounts.observation_state.to_account_info(),
+        };
+
+        let cpi_ctx = CpiContext::new_with_signer(
+            ctx.accounts.cpmm_program.to_account_info(),
+            cpi_accounts,
+            signer,
+        );
+
+        // 에스크로가 최소값을 강제하게 합시다 — Raydium의 슬리피지를 신뢰하지만,
+        // 향후 변경이 완화될 경우를 대비해 스왑 후 우리 자신의 델타를 다시 확인합니다.
+        cpi::swap_base_input(cpi_ctx, order.amount_in, order.min_out)?;
+
+        ctx.accounts.escrow_output_ata.reload()?;
+        let delta = ctx.accounts.escrow_output_ata.amount
+            .checked_sub(pre_out_balance)
+            .ok_or(error!(OrderErr::AccountingError))?;
+        require!(delta >= order.min_out, OrderErr::InsufficientOutput);
+
+        let order = &mut ctx.accounts.order;
+        order.state = 1;
+        Ok(())
+    }
+}
+```
+
+키퍼가 트랜잭션 수수료를 지급합니다 (다른 곳에서 키퍼 수수료를 받습니다 — 표시되지 않음). 에스크로 PDA가 CPI에 서명합니다. Raydium 쪽 슬리피지 체크 *and* 에스크로 자신의 델타 체크 모두 하한을 강제합니다 — 이중 안전.
+
+## 테스트
+
+Raydium 프로그램을 로컬 밸리데이터에 통합 테스트용으로 끌어올리기 (`Anchor.toml`에서):
+
+```toml
+[test.validator]
+clone = [
+  { address = "CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK" }, # CPMM
+  { address = "CLMM...." },                                     # CLMM
+  { address = "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8" }, # AMM v4
+  { address = "FarmqiPv5eAj3j1GMdMCMUGXqPUvmquZtMy86QH6rzhG" }, # Farm v6
+]
+```
+
+풀 상태 계정도 클론해서 테스트가 실제로 스왑을 실행할 수 있도록 하세요; `anchor test`는 시작 시 메인넷에서 가져옵니다. [`sdk-api/rust-cpi`](/ko/sdk-api/rust-cpi#testing-a-cpi-flow)를 참조하세요.
+
+## 구성에 특화된 함정
+
+### 재진입성
+
+솔라나는 진정한 재진입성이 없습니다 — CPI는 같은 호출 내에서 발생 프로그램으로 다시 호출할 수 없습니다. 하지만 논리적 재진입성으로 스스로를 빌드할 수 있습니다: CPI가 상태를 읽은 후 코드가 CPI가 변경하지 않았다고 가정하고 다시 읽는 경우. Raydium의 경우 CPI가 상태를 건드리지 않으므로, 예를 들어 플래시 대출 컨텍스트만큼 우려의 대상이 아닙니다. 하지만 Raydium을 대출 프로토콜과 구성하면 주의하세요.
+
+### 계정 변경 가능성 드리프트
+
+프로그램이 계정을 `mut`로 전달하지만 Raydium이 읽기 전용으로 예상하거나 그 반대 경우, 런타임이 `InvalidAccountData`로 호출을 거부합니다. Raydium의 인스트럭션의 예상 변경 가능성을 항상 IDL에서 확인하세요; `anchor_cp_swap::cpi::accounts::Swap`은 필드 타입으로 강제합니다.
+
+### Token-2022 프로그램 필드
+
+입력 및 출력 민트는 다른 토큰 프로그램 아래에 있을 수 있습니다 — 하나는 SPL Token, 하나는 Token-2022. CPI는 이 이유로 별도의 `input_token_program`과 `output_token_program` 필드를 가집니다. 각 민트의 `owner` 필드를 항상 확인하고 올바른 프로그램을 각 슬롯으로 라우팅하세요.
+
+### 버전 관리되는 트랜잭션
+
+2개 이상의 Raydium CPI와 ATA 생성을 수행하는 구성된 TX는 레거시 (v0-without-LUT) 트랜잭션에 거의 맞지 않습니다. V0을 주소 조회 테이블과 함께 사용하세요; `raydium.getRaydiumLutAddresses()`를 통해 Raydium의 공개 LUT를 끌어오세요.
+
+## 포인터
+
+- [`sdk-api/rust-cpi`](/ko/sdk-api/rust-cpi) — 저수준 CPI 메커니즘.
+- [`integration-guides/priority-fee-tuning`](/ko/integration-guides/priority-fee-tuning) — 컴퓨팅 예산 크기 조정.
+- [`products/cpmm/code-demos`](/ko/products/cpmm/code-demos), [`products/clmm/code-demos`](/ko/products/clmm/code-demos), [`products/farm-staking/code-demos`](/ko/products/farm-staking/code-demos) — 상품별 CPI 스니펫.
+
+출처:
+
+- [raydium-cp-swap CPI crate](https://github.com/raydium-io/raydium-cp-swap)
+- [raydium-clmm CPI crate](https://github.com/raydium-io/raydium-clmm)
+- [Anchor CPI docs](https://www.anchor-lang.com/docs/cross-program-invocations)

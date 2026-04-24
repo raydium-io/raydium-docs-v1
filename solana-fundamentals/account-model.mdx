@@ -1,0 +1,210 @@
+---
+title: "Account model"
+description: "Solana's account-centric architecture — accounts hold state, programs are stateless code that operates on accounts. Rent, ownership, program accounts vs data accounts, and what it all means when you're reading Raydium's pool state."
+---
+
+<Info>
+  Solana's account model is the single most important thing to understand before reading Raydium's code. Unlike Ethereum where state lives alongside contract code, Solana programs are completely stateless: all state lives in separate "accounts" that programs operate on. Every Raydium pool, position, and vault is an account — understanding how those accounts work makes the rest of the documentation make sense.
+</Info>
+
+## The fundamental split: programs vs accounts
+
+### Programs
+
+A **program** on Solana is executable code — a compiled binary loaded from a file, deployed to a `Pubkey`, and invokable via transactions. Programs have no associated state; they contain only logic.
+
+Raydium's programs:
+
+- CPMM: `CPMMoo8L3F4NbTegBCKVNunggL7H1Zpdmwpwh8KMoZ0F`
+- CLMM: `CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK`
+- AMM v4: `675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8`
+
+Each is a fixed binary. The program doesn't "remember" anything between invocations.
+
+### Accounts
+
+An **account** is a row of data on-chain. Every account has:
+
+- `pubkey` — its address.
+- `owner` — the program that owns it (controls writes).
+- `data` — the raw bytes.
+- `lamports` — SOL balance (1 SOL = 1,000,000,000 lamports).
+- `rent_epoch` — legacy rent-collection field (ignored since rent-exemption became mandatory).
+
+When you query a Raydium pool, you're reading one or more accounts. When a swap runs, the CPMM program reads/writes several accounts — the pool state, the vaults, the observation state, and the user's token accounts.
+
+## Ownership
+
+Every account is owned by exactly one program. Only that program's code can modify the account's `data` field. A user can modify `lamports` (send/receive SOL) on an account they can sign for, but modifying `data` requires the owner program to do it on their behalf.
+
+Examples:
+
+- Your user wallet: owned by the System Program. Lamports live here; you sign to transfer.
+- Your USDC token account: owned by the SPL Token Program. The token program's `transfer` instruction updates the balance.
+- A Raydium pool state account: owned by the CPMM program. Only CPMM's instructions can modify the reserves, fees, etc.
+- A Raydium position NFT's `PersonalPositionState`: owned by the CLMM program.
+
+"Owned by" is strict: if program A writes to an account owned by program B, the Solana runtime rejects the transaction.
+
+## Rent and rent-exemption
+
+Creating an account consumes storage space. Solana charges rent for that space, but as of 2020 all new accounts must be **rent-exempt** — meaning they hold enough lamports that the rent they'd owe over 2 years is pre-paid. In practice:
+
+- Rent-exempt account lives forever.
+- Closing the account returns the lamports to the closing signer.
+
+For a 165-byte account (e.g., SPL Token account), rent-exemption is ~0.00204 SOL. For a 1,440-byte Raydium CPMM pool state, it's ~0.011 SOL.
+
+### Raydium rent costs
+
+| Account | Size | Rent |
+|---------|------|------|
+| CPMM PoolState | ~1,440 B | ~0.011 SOL |
+| CLMM PoolState | ~1,500 B | ~0.012 SOL |
+| CLMM TickArray | ~9,000 B | ~0.063 SOL |
+| CLMM PersonalPositionState | ~280 B | ~0.003 SOL |
+| ATA | 165 B | ~0.002 SOL |
+| Vault (Token Account) | 165 B | ~0.002 SOL |
+
+Pool creation requires rent for several accounts at once — which is why CPMM pool creation costs ~0.15 SOL total.
+
+## Data vs executable accounts
+
+Accounts come in two flavors:
+
+### Data accounts
+
+Hold state (pool reserves, token balances, user positions). `executable = false`. This is the vast majority.
+
+### Executable accounts
+
+Hold program bytecode. `executable = true`. These are programs (CPMM, CLMM, etc.). Programs don't have data beyond their bytecode.
+
+### Program-derived accounts (PDAs)
+
+A PDA is a data account whose address is *derived deterministically* from a program and some seeds — no private key exists for this address. Only the derivation program can sign on behalf of a PDA via `invoke_signed`.
+
+Raydium uses PDAs extensively:
+
+- Pool state PDAs: derived from `[poolTypeDiscriminator, mintA, mintB, ammConfig]`.
+- Vault PDAs: derived from `[pool, mint]`.
+- Observation state PDA: derived from `[observationSeed, pool]`.
+
+PDAs let Raydium create accounts at predictable addresses without managing keys. Anyone can compute the PDA address for a known pool given the seeds.
+
+See [`solana-fundamentals/pdas-and-cpis`](/solana-fundamentals/pdas-and-cpis).
+
+## Transactions and account references
+
+Every Solana transaction carries an explicit list of accounts it will read/write. The runtime enforces:
+
+- Listed accounts can be read or written (per their `is_writable` flag).
+- Unlisted accounts cannot be touched.
+
+For a Raydium swap, the transaction's account list includes:
+
+```
+[readonly] CPMM program
+[writable] pool state
+[readonly] amm config
+[readonly] pool authority (PDA)
+[writable] input vault
+[writable] output vault
+[writable] user input ATA
+[writable] user output ATA
+[readonly] input mint
+[readonly] output mint
+[readonly] input token program
+[readonly] output token program
+[writable] observation state
+[signer,writable] user
+```
+
+This explicit enumeration is why Solana transactions are fast and parallelizable — the runtime can determine non-conflicting txs up front.
+
+## Account size and data layout
+
+Every Raydium account has a fixed or bounded size. Layout is defined in code (Rust structs with `#[repr(C)]`) and documented in [`sdk-api/anchor-idl`](/sdk-api/anchor-idl).
+
+Anchor programs prepend an 8-byte **discriminator** to every account they create, derived from `hash("account:<StructName>")[0..8]`. This lets clients identify the type of an account just by reading the first 8 bytes — crucial for `getProgramAccounts` scans that enumerate all accounts of a type.
+
+### Reading a Raydium pool state
+
+Via the SDK:
+
+```ts
+const pool = await raydium.cpmm.getPoolInfoFromRpc({ poolId });
+console.log(pool.poolInfo);
+```
+
+Via raw RPC + layout:
+
+```ts
+const accountInfo = await connection.getAccountInfo(poolId);
+const data = accountInfo.data;
+// Skip first 8 bytes (discriminator), then parse according to struct layout.
+const poolState = CpmmPoolStateLayout.decode(data.slice(8));
+```
+
+The layout is in `src/raydium/cpmm/layout.ts` in the SDK source.
+
+## Worked example: reading a token account
+
+Let's read a user's USDC balance.
+
+```ts
+import { Connection, PublicKey } from "@solana/web3.js";
+import { getAssociatedTokenAddressSync, AccountLayout } from "@solana/spl-token";
+
+const connection = new Connection("https://api.mainnet-beta.solana.com");
+const user       = new PublicKey("YourUserWallet...");
+const usdcMint   = new PublicKey("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v");
+
+// 1. Compute the ATA address (PDA-style derivation).
+const ata = getAssociatedTokenAddressSync(usdcMint, user);
+
+// 2. Read the account.
+const accountInfo = await connection.getAccountInfo(ata);
+if (!accountInfo) {
+  console.log("ATA doesn't exist yet (user has never held USDC).");
+  return;
+}
+
+// 3. Verify owner is SPL Token program.
+console.assert(accountInfo.owner.toBase58() === "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA");
+
+// 4. Decode the data.
+const parsed = AccountLayout.decode(accountInfo.data);
+console.log("Balance (smallest units):", parsed.amount.toString());
+console.log("Mint:",                     new PublicKey(parsed.mint).toBase58());
+console.log("Owner:",                    new PublicKey(parsed.owner).toBase58());
+```
+
+This pattern — derive address, fetch account, verify owner, decode — applies to every on-chain read, including Raydium pools.
+
+## Why this matters for Raydium
+
+The account model shapes Raydium's design:
+
+- **Pool state is a single account** — everything about a pool (mints, reserves, fees, admin) lives in one account owned by the pool program.
+- **LP tokens are standard SPL token accounts** — Raydium delegates tokenization to the SPL Token program.
+- **Tick arrays are chunked** — CLMM can't have a single growable array of ticks because accounts have fixed allocated size; instead, it uses chunked `TickArray` PDAs.
+- **Position NFTs are Metaplex NFTs** — CLMM positions are standard NFTs per Metaplex; position state is a separate PDA.
+
+Understanding this lets you answer "where does X live?" questions correctly:
+
+- "Where are the pool reserves?" → two vault accounts (token accounts) owned by the SPL Token program, with authority delegated to a PDA of the pool program.
+- "Where is the tick data for CLMM?" → a series of TickArray PDAs, each covering 60 consecutive ticks.
+- "Where is my farm stake?" → a `UserLedger` PDA derived from `[user, farmId]`, owned by the farm program.
+
+## Pointers
+
+- [`solana-fundamentals/programs-and-anchor`](/solana-fundamentals/programs-and-anchor) — how programs process accounts.
+- [`solana-fundamentals/pdas-and-cpis`](/solana-fundamentals/pdas-and-cpis) — PDA derivation and CPI.
+- [`solana-fundamentals/transactions-and-fees`](/solana-fundamentals/transactions-and-fees) — how accounts are referenced in transactions.
+- [`sdk-api/anchor-idl`](/sdk-api/anchor-idl) — account layouts for Raydium's programs.
+
+Sources:
+
+- [Solana Account docs](https://docs.solana.com/developing/programming-model/accounts).
+- [SPL Token program](https://spl.solana.com/token) — where token accounts live.

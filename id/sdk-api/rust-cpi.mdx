@@ -1,0 +1,260 @@
+---
+title: "Rust CPI"
+description: "Memanggil program Raydium dari program Solana lain — konstruksi daftar akun, seed penandatangan, anggaran komputasi, dan pola propagasi kesalahan untuk CPMM, CLMM, farm v6, dan LaunchLab. AMM v4 dibahas terpisah karena tidak memiliki crate Anchor."
+---
+
+<Info>
+  **Halaman ini diterjemahkan secara otomatis oleh AI. Versi bahasa Inggris adalah acuan resmi.**
+
+  [Lihat versi bahasa Inggris →](/sdk-api/rust-cpi)
+</Info>
+
+<Info>
+  CPI ("cross-program invocation") adalah mekanisme yang memungkinkan satu program Solana memanggil program lain. Program Anchor milik Raydium dilengkapi dengan crate pembungkus CPI yang membuat situs pemanggilan terlihat seperti pemanggilan fungsi yang diketik — struct akun dengan nama bidang tervalidasi dan helper `cpi::<ix>()`. Halaman ini mendokumentasikan pola umum; untuk potongan kode spesifik produk, lihat halaman code-demos dari bab produk masing-masing.
+</Info>
+
+## Dependensi Cargo
+
+```toml
+[dependencies]
+anchor-lang            = "0.29"
+anchor-spl             = "0.29"
+raydium_cp_swap        = { git = "https://github.com/raydium-io/raydium-cp-swap", features = ["cpi"] }
+raydium_amm_v3         = { git = "https://github.com/raydium-io/raydium-clmm",    features = ["cpi"] }
+# AMM v4 dan farm v6: tidak ada crate CPI Anchor yang dipublikasikan. Lihat "AMM v4 / farm v6" di bawah.
+```
+
+Flag fitur `cpi` membuat crate dikompilasi hanya ke permukaan CPI (struct akun + invoker) daripada program lengkap, sehingga biner Anda tetap kecil.
+
+Untuk contoh CPI yang berfungsi dan menghubungkan struct akun end-to-end, lihat [`raydium-io/raydium-cpi-example`](https://github.com/raydium-io/raydium-cpi-example) (mencakup AMM v4, CPMM, dan CLMM).
+
+## Konstruksi daftar akun
+
+Setiap CPI Raydium memerlukan struct `Accounts` dalam program pemanggil. Bidang cocok dengan urutan akun instruksi program 1-untuk-1, dengan validator tingkat bidang:
+
+```rust
+use anchor_lang::prelude::*;
+use anchor_spl::token::{Token, TokenAccount, Mint};
+
+#[derive(Accounts)]
+pub struct MyProxySwap<'info> {
+    #[account(mut)]
+    pub user: Signer<'info>,
+
+    /// CHECK: validated by CPMM
+    #[account(mut)]
+    pub pool_state: UncheckedAccount<'info>,
+
+    /// CHECK: ditto
+    pub amm_config: UncheckedAccount<'info>,
+
+    /// CHECK: ditto
+    pub pool_authority: UncheckedAccount<'info>,
+
+    #[account(mut)]
+    pub input_vault: Account<'info, TokenAccount>,
+    #[account(mut)]
+    pub output_vault: Account<'info, TokenAccount>,
+
+    pub input_mint: Account<'info, Mint>,
+    pub output_mint: Account<'info, Mint>,
+
+    #[account(mut)]
+    pub user_input_ata:  Account<'info, TokenAccount>,
+    #[account(mut)]
+    pub user_output_ata: Account<'info, TokenAccount>,
+
+    pub cpmm_program: Program<'info, raydium_cp_swap::program::RaydiumCpSwap>,
+    pub token_program: Program<'info, Token>,
+    pub token_program_2022: Program<'info, anchor_spl::token_2022::Token2022>,
+    /// CHECK: observation PDA
+    #[account(mut)]
+    pub observation_state: UncheckedAccount<'info>,
+}
+```
+
+Sebagian besar akun sisi Raydium adalah `UncheckedAccount` karena penerima (Raydium) memiliki validasi. Program pemanggil Anda hanya secara ketat memvalidasi akun yang *Anda* miliki — user ATA, PDA Anda sendiri. Komentar doc `/// CHECK:` menekan peringatan Anchor tentang kontrol yang hilang.
+
+## Membangun panggilan CPI
+
+Anchor menghasilkan satu helper per instruksi:
+
+```rust
+use raydium_cp_swap::cpi::{self, accounts::Swap as CpmmSwap};
+
+pub fn my_proxy_swap(
+    ctx: Context<MyProxySwap>,
+    amount_in: u64,
+    minimum_amount_out: u64,
+) -> Result<()> {
+    let cpi_accounts = CpmmSwap {
+        payer:                ctx.accounts.user.to_account_info(),
+        authority:            ctx.accounts.user.to_account_info(),
+        amm_config:           ctx.accounts.amm_config.to_account_info(),
+        pool_state:           ctx.accounts.pool_state.to_account_info(),
+        input_token_account:  ctx.accounts.user_input_ata.to_account_info(),
+        output_token_account: ctx.accounts.user_output_ata.to_account_info(),
+        input_vault:          ctx.accounts.input_vault.to_account_info(),
+        output_vault:         ctx.accounts.output_vault.to_account_info(),
+        input_token_program:  ctx.accounts.token_program.to_account_info(),
+        output_token_program: ctx.accounts.token_program.to_account_info(),
+        input_token_mint:     ctx.accounts.input_mint.to_account_info(),
+        output_token_mint:    ctx.accounts.output_mint.to_account_info(),
+        observation_state:    ctx.accounts.observation_state.to_account_info(),
+    };
+    let cpi_ctx = CpiContext::new(
+        ctx.accounts.cpmm_program.to_account_info(),
+        cpi_accounts,
+    );
+
+    cpi::swap_base_input(cpi_ctx, amount_in, minimum_amount_out)?;
+    Ok(())
+}
+```
+
+`cpi::swap_base_input` dihasilkan dari IDL; daftar argumennya mencerminkan daftar argumen instruksi Anchor.
+
+## Seed penandatangan (CPI bertanda PDA)
+
+Ketika program Anda menandatangani CPI atas nama PDA (umum untuk vault, escrow, dll.), gunakan `CpiContext::new_with_signer`:
+
+```rust
+let bump         = ctx.accounts.my_authority_bump;
+let signer_seeds: &[&[&[u8]]] = &[&[b"my_authority", &[bump]]];
+
+let cpi_ctx = CpiContext::new_with_signer(
+    ctx.accounts.cpmm_program.to_account_info(),
+    cpi_accounts,
+    signer_seeds,
+);
+
+cpi::swap_base_input(cpi_ctx, amount_in, minimum_amount_out)?;
+```
+
+Seed penandatangan harus cocok dengan derivasi PDA. Untuk akun apa pun yang dilewatkan sebagai `authority` (atau peran penandatangan serupa), runtime Solana memeriksa bahwa PDA menandatangani melalui seed ini.
+
+## Akun yang tersisa
+
+Beberapa instruksi Raydium mengambil **remaining accounts** — daftar panjang variabel yang ditambahkan setelah akun tetap. Contoh kanonis:
+
+- **CLMM `SwapV2`**: menambahkan 1–8 akun `TickArrayState` yang sesuai dengan array tick yang mungkin dilewati swap.
+- **Farm v6 `Deposit`**: menambahkan pasangan `(reward_vault, user_reward_ata)` untuk setiap aliran reward aktif.
+
+Helper CPI Anchor tidak melakukan type-check remaining accounts. Lewatkan melalui `.with_remaining_accounts(...)`:
+
+```rust
+let cpi_ctx = CpiContext::new(program, accounts)
+    .with_remaining_accounts(ctx.remaining_accounts.to_vec());
+```
+
+Urutan penting: program penerima mengulangi remaining accounts dalam urutan yang Anda berikan. Untuk CLMM, array tick harus dipesan secara arah (array pertama dalam arah swap terlebih dahulu). Untuk farm v6, slot reward berjalan dalam urutan indeks slot.
+
+## Propagasi kesalahan
+
+Program Raydium mengembalikan enum kesalahan mereka sendiri. Anchor membungkusnya; program pemanggil Anda melihatnya sebagai `Err(ProgramError::Custom(code))`. Untuk menangani kesalahan spesifik:
+
+```rust
+use raydium_cp_swap::error::ErrorCode as CpmmErr;
+
+match cpi::swap_base_input(cpi_ctx, amount_in, minimum_amount_out) {
+    Ok(_) => Ok(()),
+    Err(e) => {
+        msg!("CPMM swap failed: {:?}", e);
+        // Re-raise, atau konversi ke tipe kesalahan Anda sendiri.
+        Err(e)
+    }
+}
+```
+
+Nomor kode kesalahan stabil menurut kebijakan IDL ([`sdk-api/anchor-idl`](/id/sdk-api/anchor-idl)). Anda dapat menguji terhadap kode spesifik dengan membandingkan nilai numerik.
+
+## Anggaran komputasi dalam CPI yang disusun
+
+Setiap bingkai CPI memiliki overhead (~1.500 CU untuk panggilan itu sendiri), dan konsumsi CU penerima sendiri ditumpuk di atas milik Anda. Transaksi yang memanggil swap CPMM dari dalam program Anda menghabiskan:
+
+```
+your_program_cu
++ ~1_500       (CPI overhead)
++ ~150_000     (CPMM swap, SPL-token variant)
++ ~200_000     (if Token-2022 with transfer fee)
++ ~10_000      (observation update)
+```
+
+Untuk perutean bersusun (program Anda → aggregator → CPMM + CLMM + farm harvest), anggaran ≥500k CU. Selalu atur instruksi `ComputeBudgetProgram::set_compute_unit_limit(...)` eksplisit dalam transaksi — batas default 200k CU akan diam-diam habis.
+
+## AMM v4 — konstruksi Instruction manual
+
+AMM v4 tidak memiliki crate Anchor. Bangun `Instruction` dengan tangan:
+
+```rust
+use anchor_lang::solana_program::program::invoke_signed;
+use anchor_lang::solana_program::instruction::{Instruction, AccountMeta};
+
+const AMM_V4_PROGRAM_ID: Pubkey = pubkey!("675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8");
+
+// Diskriminator SwapBaseIn adalah 9.
+let mut data = vec![9u8];
+data.extend_from_slice(&amount_in.to_le_bytes());
+data.extend_from_slice(&minimum_amount_out.to_le_bytes());
+
+let ix = Instruction {
+    program_id: AMM_V4_PROGRAM_ID,
+    accounts: vec![
+        AccountMeta::new_readonly(token_program_id, false),
+        AccountMeta::new(amm_id, false),
+        AccountMeta::new_readonly(amm_authority, false),
+        // ... akun yang tersisa per products/amm-v4/instructions ...
+    ],
+    data,
+};
+invoke_signed(&ix, &account_infos, signer_seeds)?;
+```
+
+Lihat [`products/amm-v4/code-demos`](/id/products/amm-v4/code-demos) untuk daftar akun lengkap.
+
+## Farm v6 — remaining accounts pasangan reward
+
+Farm v6's `Deposit` / `Withdraw` / `Harvest` menggunakan pola pasangan `(reward_vault_i, user_reward_ata_i)` dalam remaining accounts. Urutan yang tepat:
+
+```
+remaining_accounts = [
+    reward_vault_0, user_reward_ata_0,
+    reward_vault_1, user_reward_ata_1,
+    ...
+]
+```
+
+Satu pasangan per slot reward **aktif** (berjalan atau berakhir-tetapi-belum-diklaim). Lewatkan slot yang tidak digunakan; program mengirim `farm_state.reward_infos[i].reward_state`.
+
+## Menguji alur CPI
+
+Dev lokal memerlukan program Raydium tersedia di validator pengujian Anda. Pilihan:
+
+1. **`anchor test` dengan program clone** — dalam `Anchor.toml`:
+
+   ```toml
+   [test.validator]
+   clone = [
+     { address = "CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK" },  # CPMM
+     { address = "CLMM...program-id..." },                          # CLMM
+     { address = "farm-v6-program-id..." },                         # farm v6
+   ]
+   ```
+
+   Ini menarik bytecode yang di-deploy dari mainnet ke validator lokal Anda.
+
+2. **Devnet** — Raydium menerapkan semua program ke devnet dengan ID program yang sama dengan mainnet. Jalankan `anchor test --provider.cluster devnet` untuk menekan kode aktif.
+
+3. **Deploy lokal** — clone repo Raydium dan `anchor deploy` ke validator lokal. Menambah overhead siklus pengujian tetapi memungkinkan Anda memodifikasi penerima untuk debugging.
+
+## Penunjuk
+
+- [`products/cpmm/code-demos`](/id/products/cpmm/code-demos), [`products/clmm/code-demos`](/id/products/clmm/code-demos), [`products/amm-v4/code-demos`](/id/products/amm-v4/code-demos), [`products/farm-staking/code-demos`](/id/products/farm-staking/code-demos) — contoh CPI spesifik produk.
+- [`sdk-api/anchor-idl`](/id/sdk-api/anchor-idl) — pengambilan IDL dan regenerasi klien.
+- [`integration-guides/cpi-integration`](/id/integration-guides/cpi-integration) — pola tingkat lebih tinggi: escrow, vault, komposisi aggregator.
+
+Sumber:
+
+- [raydium-cp-swap](https://github.com/raydium-io/raydium-cp-swap)
+- [raydium-clmm](https://github.com/raydium-io/raydium-clmm)
+- [Anchor CPI docs](https://www.anchor-lang.com/docs/cross-program-invocations)

@@ -1,0 +1,202 @@
+---
+title: "어그리게이터 통합"
+description: "Raydium 풀을 발견하고, CPMM / CLMM / AMM v4에서 시세를 조회하며, 올바른 프로그램 세트를 통해 원자적 스왑을 라우팅하는 방법. DEX 어그리게이터 및 지갑 스왑 UI를 위해 작성되었습니다."
+---
+
+<Info>
+  **이 페이지는 AI 자동 번역입니다. 모든 내용은 영문판을 기준으로 합니다.**
+
+  [영문판 보기 →](/integration-guides/aggregator)
+</Info>
+
+<Info>
+  어그리게이터의 역할은 많은 풀에서 사용자에게 최고의 가능한 가격을 제공하고, 단일 입력을 여러 풀 경로로 분할할 수 있으며, 이를 원자적으로 실행하는 것입니다. 이 페이지는 해당 작업의 Raydium 특화 부분인 발견, 시세 조회, 트랜잭션 조립을 다룹니다.
+</Info>
+
+## 발견
+
+### 풀 인벤토리
+
+각 상품별로 활성 Raydium 풀의 전체 목록이 필요합니다. 세 가지 옵션이 있습니다:
+
+1. **REST API** (가장 간단함): `GET https://api-v3.raydium.io/pools/info/list?poolType=all&pageSize=1000&page=1`은 1000개 단위로 풀을 반환합니다. 모든 풀을 얻을 때까지 페이지를 넘깁니다. 1–5분 동안 캐시합니다.
+2. **온체인 스캔**: CPMM, CLMM, AMM v4 프로그램 ID에서 `getProgramAccounts`를 실행하고 상태 계정 판별자로 필터링합니다. ~10초의 RPC 시간으로 거의 모든 활성 풀을 산출합니다. API가 다운되었거나 속도 제한이 걸렸을 때 유용합니다.
+3. **하이브리드**: API를 기본 소스로 사용하고, 일일 온체인 스캔을 검증으로 실행합니다. 팀은 API를 포괄적으로 유지하기로 약속하지만, 직접 CPI(프론트엔드 없음)를 통해 생성된 풀은 가끔 지연될 수 있습니다.
+
+### 민트 쌍 조회
+
+특정 `(mintA, mintB)` 쌍에 대해 `GET /pools/info/mint?mint1=...&mint2=...&poolType=all&sort=liquidity`를 사용합니다. 모든 수수료 계층과 상품 유형의 모든 풀을 반환합니다. 거래량이 많은 민트에서는 쌍당 ~10개 결과가 일반적입니다. TVL별로 정렬하고 라우팅을 위해 상위 몇 개를 선택합니다.
+
+## 시세 조회
+
+시세 계산 로직은 상품별로 다릅니다. SDK의 순수 수학 함수를 사용하여 재구현을 피하세요:
+
+```ts
+// CPMM
+const cpmmQuote = raydium.cpmm.computeAmountOut({
+  poolInfo: cpmmPool,
+  amountIn,
+  mintIn,
+  mintOut,
+  slippage: 0,        // compute exact expected; layer slippage at route level
+});
+
+// CLMM — crosses ticks; deterministic but more expensive.
+// `computeAmountOutFormat` is the canonical helper exposed via `PoolUtils` in
+// raydium-sdk-v2: the `*Format` suffix signals that it returns the output
+// pre-shaped for transaction building (including `remainingAccounts` for tick arrays).
+const { output: clmmOut, remainingAccounts } = PoolUtils.computeAmountOutFormat({
+  poolInfo:  clmmPool,
+  poolState: clmmPoolState,
+  tickArrayCache,
+  amountIn,
+  tokenIn:   mintIn,
+  slippage:  0,
+});
+
+// AMM v4
+const ammV4Quote = raydium.liquidity.computeAmountOut({
+  poolInfo: ammV4Pool,
+  amountIn,
+  mintIn: mintIn,
+  mintOut: mintOut,
+  slippage: 0,
+});
+```
+
+세 가지 모두 반환 값: `{ amountOut, fee, priceImpact, minAmountOut }`. 어그리게이터 비교를 위해 `amountOut`을 사용합니다(슬리피지 전).
+
+### 캐시 신선도
+
+풀 상태는 빠르게 낡습니다. 권장되는 신선도 목표:
+
+| 풀 유형 | 재조회 빈도 | 이유 |
+|-----------|---------------------|-----|
+| `<$100k` TVL인 CPMM | `<10s` | 리저브가 모든 거래마다 움직입니다. |
+| `>$10M` TVL인 CPMM | 30–60s | 리저브가 지배적이고, 소규모 거래는 잡음입니다. |
+| CLMM | `<30s` | 틱 경계; 단일 대규모 거래가 유동성을 재설정할 수 있습니다. |
+| AMM v4 | `<30s` | OpenBook 측의 움직임이 금고에 캡처되지 않습니다. |
+
+대화형 지연 시간에서 시세를 받는 어그리게이터의 경우, 각 관련 풀 상태에 대한 WebSocket 계정 업데이트(`accountSubscribe`)를 구독합니다. 이는 모델을 폴링에서 푸시로 전환합니다.
+
+### Token-2022 조정
+
+라우트의 모든 민트에 Token-2022 전송 수수료가 있으면, 시세 계산이 [`algorithms/token-2022-transfer-fees`](/ko/algorithms/token-2022-transfer-fees)에 따라 입력 및 출력을 조정해야 합니다. SDK는 `poolInfo.mintA.extensions.transferFeeConfig`이 채워져 있으면 이를 처리합니다. 시세를 신뢰하기 전에 `.extensions` 필드를 확인하세요.
+
+## 라우팅
+
+### 단일 풀 라우트
+
+대부분의 라우트는 단일 풀입니다. `amountOut`이 가장 높은 풀을 선택합니다. 여러 풀이 가깝다면, 수수료 계층(낮을수록 좋음)으로 기울이고, TVL(높을수록 안전함)로 기울입니다.
+
+### 분할 라우팅
+
+단일 풀의 가격 영향이 >5%인 대규모 거래의 경우, 풀 전체에 분할합니다. 간단한 탐욕 알고리즘:
+
+```
+remaining = amountIn
+routes    = []
+while remaining > 0:
+    best_pool, best_size = argmax over pools of:
+        marginal_out_per_in(pool, current_size_toward_pool + epsilon)
+    size = min(remaining, best_pool.max_size_at_target_impact)
+    routes.append((best_pool, size))
+    remaining -= size
+```
+
+이는 집계 영향을 최소화하는 라우팅 벡터 `[(pool_A, 0.6), (pool_B, 0.3), (pool_C, 0.1)]`를 산출합니다. 적절한 볼록 최적화 솔루션(예: 풀 전체에서 한계 가격 동등화)은 실제로 탐욕 결과의 ~1% 이내입니다.
+
+### 다중 홉 라우트
+
+직접 `USDC-SOL` 풀이 좋은 시세를 제공하지 않을 때(드물게) `USDC → RAY → SOL` 두 개의 개별 풀을 통한 것이 일반적입니다. 홉별 슬리피지 경계를 적용합니다. 각 홉은 자체 `minAmountOut`을 적용합니다. [`algorithms/slippage-and-price-impact`](/ko/algorithms/slippage-and-price-impact)를 참조하세요.
+
+같은 풀 위의 다중 홉(예: `SOL-USDC`에서 두 개의 CLMM 홉)은 단일 홉과 비교할 때 항상 차선입니다 — 그러한 라우트를 생성하지 마세요.
+
+## 트랜잭션 조립
+
+### 단일 홉, 단일 풀
+
+SDK의 `raydium.trade.swap`을 직접 사용합니다:
+
+```ts
+const { execute } = await raydium.trade.swap({
+  poolKeys:        poolInfo,
+  amountIn,
+  amountOut:       quote.minAmountOut,
+  fixedSide:       "in",
+  inputMint:       mintIn,
+  txVersion:       TxVersion.V0,
+  computeBudgetConfig: {
+    units:         250_000,
+    microLamports: priorityFee,
+  },
+});
+```
+
+### 분할 및 다중 홉
+
+ATA + 지시사항을 수동으로 구성합니다. 패턴:
+
+```
+[1] ComputeBudget set_compute_unit_limit
+[2] ComputeBudget set_compute_unit_price
+[3] createATA (if needed, once per mint the user doesn't hold)
+[4..N] SwapInstruction for each (pool, size) in routes
+[N+1] CloseAccount (if you wrap/unwrap SOL)
+```
+
+원자성을 위해 모두 하나의 트랜잭션 내에 있습니다. 주소 조회 테이블이 있는 V0에서 3풀 분할의 경우, 이는 일반적으로 ~1100바이트에 맞습니다. 4개 이상의 풀의 경우, 트랜잭션 크기 상한선은 다중 트랜잭션 또는 허브 민트에서의 통합을 강제합니다.
+
+### 원자성
+
+어그리게이터는 원자성을 보장해야 합니다: 전체 라우트가 성공하거나 아무것도 성공하지 않습니다. Raydium의 스왑 지시사항은 `ExceededSlippage`에서 되돌리므로, 하나의 홉이 실패하는 다중 풀 라우트는 전체 트랜잭션을 되돌립니다. 무료입니다.
+
+한 가지 예외: 라우트가 Raydium + 제3자 DEX를 통하면, DEX도 슬리피지 되돌림 모델을 가져야 합니다. 일부 프로그램은 슬리피지 경계를 무시합니다(드물게).
+
+## 함정
+
+### 1. 낡은 시세
+
+사용자가 "You receive 125.43 RAY"를 본 후 트랜잭션이 착지할 때까지, 리저브가 이동할 수 있습니다. 제출 직전에 풀 상태를 재조회합니다. 재시세; 새 시세가 >1% 더 나쁘면 일시 중지하고 사용자에게 재확인합니다.
+
+### 2. 풀 블랙리스트
+
+일부 Raydium 풀은 전송 수수료가 99%로 설정되었거나 양도 불가능한 확장이 있는 사기 토큰입니다. REST API는 이를 태그 처리합니다(`tags` 필드 참조); `scam` 또는 `honeypot`으로 태그된 모든 풀을 건너뜁니다. Raydium의 태그 위에서 자체 안전 검사를 실행하는 것이 신중합니다.
+
+### 3. CLMM의 관찰 상태 요구
+
+CLMM `SwapV2`는 `observation_state` 계정을 취합니다. SDK는 이를 채웁니다. 수동으로 작성된 지시사항은 종종 잊어버리는데, 이는 프로그램이 `AccountNotFound`로 되돌리도록 합니다. 항상 포함하세요.
+
+### 4. 주소 조회 테이블
+
+Raydium은 가장 많이 사용되는 계정(주요 민트, 프로그램 ID, AmmConfigs)에 대한 공개 조회 테이블을 유지합니다. 어그리게이터는 이를 사용해야 합니다 — 트랜잭션당 ~100바이트를 절약하고 더 큰 라우트를 V0에 맞출 수 있게 합니다. LUT 주소 풀기:
+
+```ts
+const raydiumLUTs = await raydium.getRaydiumLutAddresses();
+```
+
+### 5. 혼잡 처리
+
+고용량 창 동안, 트랜잭션은 여러 블록에 대해 멤풀에 머물 수 있습니다. TX 만료(되돌림이 아님 — 되돌림은 결정론적)에 대한 공격적 재시도가 권장됩니다. SDK의 `sendAndConfirm` 옵션은 기본 재시도를 수행합니다. 프로덕션 어그리게이터는 자체 로직(Jito 번들, 다중 RPC 브로드캐스트)을 상단에 계층화합니다.
+
+## 체크리스트
+
+라이브하기 전에 다음을 확인하세요:
+
+- [ ] 풀 발견이 CPMM + CLMM + AMM v4를 포괄적으로 다룹니다.
+- [ ] 시세가 소수의 테스트 거래에서 1 기저점 내로 Raydium 자체 UI 시세와 일치합니다.
+- [ ] 분할 라우팅은 단일 풀에서 >5% 영향의 거래를 시작합니다.
+- [ ] 우선 수수료는 최근 풀 프로그램 수수료를 상대로 크기 조정됩니다([`integration-guides/priority-fee-tuning`](/ko/integration-guides/priority-fee-tuning) 참조).
+- [ ] Token-2022 전송 수수료가 계산되고 사용자에게 표시됩니다.
+- [ ] 트랜잭션은 슬리피지가 초과될 때 깔끔하게 되돌립니다.
+- [ ] 재시도 로직은 tx 만료(재시도)를 되돌림(재시도 금지)과 구분합니다.
+
+## 포인터
+
+- [`integration-guides/routing-and-mev`](/ko/integration-guides/routing-and-mev) — 샌드위치 저항, 번들.
+- [`integration-guides/priority-fee-tuning`](/ko/integration-guides/priority-fee-tuning) — 컴퓨트 예산 지시사항 크기 조정.
+- [`sdk-api/rest-api`](/ko/sdk-api/rest-api) — 풀 목록 엔드포인트.
+
+출처:
+
+- [Raydium SDK v2 `trade` module](https://github.com/raydium-io/raydium-sdk-V2)

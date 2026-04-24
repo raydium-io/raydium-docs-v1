@@ -1,0 +1,231 @@
+---
+title: "LaunchLab PlatformConfig"
+description: "Per-platform configuration that customizes branding, fee splits, NFT migration shares, vesting allocation, and the whitelist of permitted curve shapes for any launch routed through that platform."
+---
+
+<Info>
+  `PlatformConfig` is the **platform-level** overlay that sits on top of [`GlobalConfig`](/products/launchlab/global-config). Where `GlobalConfig` defines the protocol-wide rules ("trade fee is 1%, supply must be at least 10M, only this wallet can graduate"), `PlatformConfig` is what each launch platform — pump.fun, Raydium's own UI, third-party launchpads — uses to add their fee, claim their slice of post-graduation LP, restrict which curve shapes their launches can pick, and surface their branding (name, website, image) on-chain.
+</Info>
+
+## What it is
+
+A `PlatformConfig` account owns four cross-cutting concerns for a platform:
+
+1. **Branding** — name, website, image link, all stored inline so any explorer or aggregator can display the platform that launched a token.
+2. **Platform fee** — an extra trade fee (`fee_rate`) on top of the protocol's `trade_fee_rate`. Accrues to the platform's `platform_fee_wallet`. Capped at 100 bps by `GlobalConfig.max_share_fee_rate`.
+3. **NFT migration split** — three integers (`platform_scale`, `creator_scale`, `burn_scale`) that sum to `RATE_DENOMINATOR_VALUE = 1_000_000` and partition the post-graduation LP into a piece minted to the platform NFT wallet, a piece to the creator NFT wallet, and a piece burned (Burn & Earn). Only meaningful when graduation targets CPMM (`migrate_type = 1`).
+4. **Curve-parameter whitelist** — a `Vec<PlatformCurveParam>` listing exactly which `(supply, total_base_sell, total_quote_fund_raising, migrate_type, migrate_cpmm_fee_on, vesting_params...)` combinations are permitted on this platform. If the vector is empty or all entries are invalid, **any** combination is allowed; otherwise launches must match one of the entries exactly.
+
+PDA derivation:
+
+```ts
+const [platformConfigPda] = PublicKey.findProgramAddressSync(
+  [
+    Buffer.from("platform_config"),
+    platformAdmin.toBuffer(),       // platform's owning pubkey
+  ],
+  LAUNCHLAB_PROGRAM_ID,
+);
+```
+
+(See `create_platform_config` in the source for the canonical seed list.)
+
+## Layout
+
+```rust
+// states/platform_config.rs
+pub const PLATFORM_CONFIG_SEED: &str = "platform_config";
+pub const NAME_SIZE: usize = 64;
+pub const WEB_SIZE:  usize = 256;
+pub const IMG_SIZE:  usize = 256;
+pub const MAX_CREATOR_FEE_RATE: u64 = 5000;       // 50 bps (denominator 1_000_000)
+pub const MAX_TRANSFER_FEE_RATE: u16 = 500;       // 5%   (denominator 10_000)
+pub const MAX_CURVE_PARAMS: usize = 10;
+
+#[account]
+pub struct PlatformConfig {
+    pub epoch:                       u64,
+    pub platform_fee_wallet:         Pubkey,            // signs ClaimPlatformFee
+    pub platform_nft_wallet:         Pubkey,            // receives the platform NFT slice at CPMM graduation
+    pub platform_scale:              u64,               // share of LP minted to platform NFT
+    pub creator_scale:               u64,               // share of LP minted to creator NFT
+    pub burn_scale:                  u64,               // share of LP burned via Burn & Earn
+    pub fee_rate:                    u64,               // platform's trade fee (1/1_000_000)
+    pub name:                        [u8; 64],          // utf-8 padded with zeros
+    pub web:                         [u8; 256],
+    pub img:                         [u8; 256],
+    pub cpswap_config:               Pubkey,            // CPMM AmmConfig that the post-grad pool will bind to
+    pub creator_fee_rate:            u64,               // creator-side fee taken pre-graduation
+    pub transfer_fee_extension_auth: Pubkey,            // for Token-2022 launches: who inherits transfer-fee authorities post-graduation
+    pub platform_vesting_wallet:     Pubkey,
+    pub platform_vesting_scale:      u64,               // platform's slice of total_locked_amount
+    pub platform_cp_creator:         Pubkey,            // optional creator-of-record on the post-graduation CPMM pool
+    pub padding:                     [u8; 108],
+    pub curve_params:                Vec<PlatformCurveParam>, // whitelist of permitted curve shapes
+}
+```
+
+`platform_scale + creator_scale + burn_scale` must equal `1_000_000` (validated by `MigrateNftInfo::check`). Common splits seen in production:
+
+- `(0, 100_000, 900_000)` — 90% LP burned, 10% to creator. Standard pump-style fair launch.
+- `(50_000, 100_000, 850_000)` — small platform slice (5%), 10% creator, 85% burn.
+- `(0, 0, 1_000_000)` — full burn, no NFT mints. Strict "no insiders" launches.
+
+## Branding fields
+
+`name`, `web`, and `img` are inline byte arrays padded with zeros up to their size constants. To read them as strings, slice up to the first `\0`:
+
+```ts
+function readString(bytes: Uint8Array): string {
+  const end = bytes.indexOf(0);
+  return Buffer.from(end === -1 ? bytes : bytes.subarray(0, end)).toString("utf-8");
+}
+```
+
+The constants are deliberately generous (`name: 64`, `web: 256`, `img: 256`) so platforms can include enough metadata for explorers and aggregators without touching off-chain storage. Anything that exceeds these sizes reverts at `CreatePlatformConfig` with `InvalidInput`.
+
+## Fee mechanics
+
+A swap on a curve bound to a `PlatformConfig` charges three layered fees:
+
+```
+trade_fee     = amount_in × global_config.trade_fee_rate    / 1_000_000
+platform_fee  = amount_in × platform_config.fee_rate        / 1_000_000
+creator_fee   = amount_in × platform_config.creator_fee_rate / 1_000_000
+
+amount_after_fee = amount_in − trade_fee − platform_fee − creator_fee
+```
+
+- `trade_fee` accrues to the protocol's `protocol_fee_owner` (claimed via `CollectFee`).
+- `platform_fee` accrues to a per-platform vault (claimed via `ClaimPlatformFee` or `ClaimPlatformFeeFromVault`; see [`instructions`](/products/launchlab/instructions)).
+- `creator_fee` accrues to a per-creator vault keyed by the creator's pubkey + quote mint (claimed via `ClaimCreatorFee`).
+
+`creator_fee_rate` is capped by `MAX_CREATOR_FEE_RATE = 5000` (50 bps). `fee_rate` (the platform fee) is capped at `10000` (100 bps) by `GlobalConfig.max_share_fee_rate`.
+
+## NFT migration split (CPMM-only)
+
+When a launch graduates to CPMM (`migrate_type = 1`, signed by `migrate_to_cpswap_wallet`), the migration instruction splits the LP tokens minted by `CPMM::InitializeWithPermission` three ways:
+
+```
+lp_to_platform = lp_total × platform_scale / 1_000_000   → platform_nft_wallet
+lp_to_creator  = lp_total × creator_scale  / 1_000_000   → creator NFT (Fee Key)
+lp_to_burn     = lp_total × burn_scale     / 1_000_000   → Burn & Earn lock program
+```
+
+The platform and creator slices are wrapped as **NFTs** by the LP-Lock program (`LockrWmn6K5twhz3y9w1dQERbmgSaRkfnTeTKbpofwE`) — the holder of the NFT is entitled to claim accrued CPMM fees indefinitely without being able to withdraw the underlying liquidity. See [`products/launchlab/creator-fees`](/products/launchlab/creator-fees) for the post-graduation Fee Key flow.
+
+The burn slice is sent to the Lock program with `is_burn = true` so the LP tokens are permanently inaccessible — they secure the pool's price floor without ever paying fees back to anyone.
+
+When `migrate_type = 0` (graduate to AMM v4), the NFT split fields are ignored and the entire LP is locked / burned according to a separate AMM v4-side flow.
+
+## Curve-parameter whitelist
+
+`curve_params: Vec<PlatformCurveParam>` is the platform's mechanism for restricting which curve shapes its launches can pick. If the vector is non-empty and at least one entry is valid, the program enforces at `Initialize` that the launch's parameters match at least one entry exactly.
+
+```rust
+#[derive(AnchorSerialize, AnchorDeserialize, Clone)]
+pub struct PlatformCurveParam {
+    pub epoch:                u64,
+    pub index:                u8,           // ordinal within this platform's whitelist
+    pub global_config:        Pubkey,       // which GlobalConfig this entry applies to
+    pub bonding_curve_param:  BondingCurveParam,
+    pub padding:              [u64; 50],
+}
+
+#[derive(AnchorSerialize, AnchorDeserialize, Clone)]
+pub struct BondingCurveParam {
+    pub migrate_type:               u8,    // 0 = AMM v4, 1 = CPMM. u8::MAX = wildcard
+    pub migrate_cpmm_fee_on:        u8,    // 0 = quote-only, 1 = both. u8::MAX = wildcard
+    pub supply:                     u64,   // 0 = wildcard
+    pub total_base_sell:            u64,   // 0 = wildcard
+    pub total_quote_fund_raising:   u64,   // 0 = wildcard
+    pub total_locked_amount:        u64,   // u64::MAX = wildcard
+    pub cliff_period:               u64,   // u64::MAX = wildcard
+    pub unlock_period:              u64,   // u64::MAX = wildcard
+}
+```
+
+Each field has a sentinel value that means **wildcard** (any value matches): `u64::MAX` for the `u64` fields, `u8::MAX` for the `u8` fields, `0` for the supply / sell / fund-raising fields. A `BondingCurveParam` with all sentinels is "allow anything" — equivalent to the empty-whitelist behaviour.
+
+The matching algorithm at `Initialize`:
+
+1. Filter `curve_params` to entries whose `global_config` matches the launch's chosen `GlobalConfig`.
+2. If the filtered list is empty, allow any params (the platform did not whitelist anything for this `GlobalConfig`).
+3. If every entry in the filtered list has `all_is_invalid()` (every field is the wildcard), allow any params.
+4. Otherwise iterate entries; for each entry, check the launch's params against every non-wildcard field. If all non-wildcard fields match, accept and return.
+5. If no entry matched, revert with `InvalidInput`.
+
+This lets a platform say "we only allow the standard 1B-supply / 800M-sold / 30k-USDC-raise / no-vesting shape" by writing a single entry with concrete values for those four fields and wildcards everywhere else. Or a stricter platform might enumerate three or four discrete shapes, one per supported launch tier.
+
+`MAX_CURVE_PARAMS = 10` caps the whitelist size.
+
+## `PlatformGlobalAccess` — authorizing a platform
+
+When a `GlobalConfig` has `requires_platform_auth = 1`, every `Initialize` against it must include a `PlatformGlobalAccess` PDA proving the platform has been pre-authorized:
+
+```rust
+// states/platform_global_access.rs
+pub const PLATFORM_GLOBAL_ACCESS_SEED: &str = "platform_global_access";
+
+#[account]
+pub struct PlatformGlobalAccess {
+    pub bump:            u8,
+    pub global_config:   Pubkey,
+    pub platform_config: Pubkey,
+    pub padding:         [u64; 8],
+}
+```
+
+PDA seeds: `[b"platform_global_access", global_config, platform_config]`.
+
+The protocol admin creates one of these per `(GlobalConfig, PlatformConfig)` pair via `CreatePlatformGlobalAccess` and revokes it via `ClosePlatformGlobalAccess`. Without this account, a launch cannot bind to that `GlobalConfig` from the gated platform.
+
+## Read path
+
+```ts
+const platformConfig = await raydium.launchpad.getPlatformConfig(platformConfigPda);
+
+console.log("Platform:", readString(platformConfig.name));
+console.log("Fee rate:", platformConfig.feeRate, "(/1M)");
+console.log("NFT split:",
+  platformConfig.platformScale,
+  platformConfig.creatorScale,
+  platformConfig.burnScale,
+);
+console.log("Curve whitelist size:", platformConfig.curveParams.length);
+```
+
+For a UI showing "where did this token launch from", `PoolState.platform_config` points at the originating `PlatformConfig` directly — fetch it once and cache the branding.
+
+## Update path
+
+| Instruction | Who signs | What changes |
+|-------------|-----------|--------------|
+| `CreatePlatformConfig` | platform admin (one-time) | Initializes the account with `PlatformParams`. |
+| `UpdatePlatformConfig` | platform admin | Generic dispatch keyed by a `param: u8`; mutates one field per call. Branding fields, fee rates, vesting wallet, and the various wallets are all settable through this. |
+| `UpdatePlatformCurveParam` | platform admin | Add or replace one `PlatformCurveParam` entry by `(global_config, index)`. |
+| `RemovePlatformCurveParam` | platform admin | Clear one entry (sets it to all-sentinel = wildcard). |
+| `ClaimPlatformFee` | `platform_fee_wallet` | Sweep the per-pool platform fee from `PoolState.quote_vault`. |
+| `ClaimPlatformFeeFromVault` | `platform_fee_wallet` | Sweep the per-platform fee vault (PDA at `[platform_config, quote_mint]`). |
+
+Wallet rotations (`platform_fee_wallet`, `platform_nft_wallet`, `platform_vesting_wallet`, `platform_cp_creator`, `transfer_fee_extension_auth`, `cpswap_config`) all go through `UpdatePlatformConfig`. Read the source's `update_platform_config` dispatch table for the exact `param` codes.
+
+## Common pitfalls
+
+- **Whitelist sentinels mis-set.** A `BondingCurveParam` with `total_locked_amount = 0` *is not* a wildcard — it matches launches that explicitly opt out of vesting. The wildcard for that field is `u64::MAX`. The same trap exists for `cliff_period` and `unlock_period`. Use `clear()` (which the program exposes) to set sentinels correctly.
+- **NFT-split rounding.** The three scales must sum to exactly `1_000_000`. Off-by-one errors at `CreatePlatformConfig` revert; off-by-one at runtime would mint or burn one extra LP unit, which is what the strict-equality check is there to prevent.
+- **Platform vesting double-allocation.** If `platform_vesting_scale > 0`, the platform must call `CreatePlatformVestingAccount` once after the launch's fundraising ends; if it forgets, that share remains unallocated and dormant forever (the launch's `total_locked_amount` budget is consumed but the platform never claims).
+- **`platform_cp_creator` ambiguity.** When set to `Pubkey::default()`, the launch creator is recorded as the post-graduation CPMM pool's `pool_creator`; when set to a real key, that key is recorded instead. This affects who can call `CPMM::CollectCreatorFee` later. Decide at platform-config creation time which model you want.
+
+## Pointers
+
+- [`products/launchlab/global-config`](/products/launchlab/global-config) — protocol-side rules a launch must satisfy.
+- [`products/launchlab/vesting`](/products/launchlab/vesting) — `platform_vesting_scale` mechanics.
+- [`products/launchlab/creator-fees`](/products/launchlab/creator-fees) — Fee Key NFT, Burn & Earn.
+- [`products/launchlab/platforms`](/products/launchlab/platforms) — platform integrator's how-to.
+
+Sources:
+
+- `raydium-launch/programs/launchpad/src/states/platform_config.rs` — `PlatformConfig`, `PlatformParams`, `MigrateNftInfo`, `PlatformCurveParam`, `BondingCurveParam`, `is_valid_curve_param`.
+- `raydium-launch/programs/launchpad/src/states/platform_global_access.rs` — `PlatformGlobalAccess`.
+- `raydium-launch/programs/launchpad/src/lib.rs` — `create_platform_config`, `update_platform_config`, `update_platform_curve_param`, `remove_platform_curve_param`, `create_platform_global_access`, `close_platform_global_access`, `claim_platform_fee`, `claim_platform_fee_from_vault`.

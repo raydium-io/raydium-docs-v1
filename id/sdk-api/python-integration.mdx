@@ -1,0 +1,264 @@
+---
+title: "Integrasi Python"
+description: "Membangun bot dan backend yang menggunakan Raydium di Python melalui solders, solana-py, dan anchorpy — setup lingkungan, membaca state pool, mengirim swap, dan arsitektur bot tipikal."
+---
+
+<Info>
+  **Halaman ini diterjemahkan secara otomatis oleh AI. Versi bahasa Inggris adalah acuan resmi.**
+
+  [Lihat versi bahasa Inggris →](/sdk-api/python-integration)
+</Info>
+
+## Lingkungan
+
+```bash
+python -m venv .venv
+source .venv/bin/activate
+
+pip install solders solana anchorpy construct base58
+```
+
+Versi yang kompatibel saat dokumen ini ditulis:
+
+```
+solders == 0.21.*
+solana  == 0.34.*
+anchorpy == 0.20.*
+```
+
+`anchorpy` terkadang tertinggal dari versi `anchor-lang`; untuk program Raydium yang baru di-deploy, pastikan IDL dapat dikompilasi dengan `anchorpy` yang Anda gunakan sebelum commit.
+
+## Koneksi dan keypair
+
+```python
+from solana.rpc.async_api import AsyncClient
+from solders.keypair import Keypair
+
+client = AsyncClient("https://api.mainnet-beta.solana.com", commitment="confirmed")
+owner  = Keypair.from_bytes(bytes(open("keypair.json", "rb").read()))
+```
+
+`AsyncClient` adalah varian async; `Client` sinkron tersedia untuk skrip cepat, tetapi async lebih disarankan untuk aplikasi yang mengirim beberapa request.
+
+## Membaca state pool
+
+Kebanyakan penggunaan produksi membaca state pool yang sudah didekode dari Raydium REST API (lihat [`sdk-api/rest-api`](/id/sdk-api/rest-api)) daripada mendekode data on-chain secara manual — ini lebih sederhana dan latensinya dapat diterima untuk sebagian besar kasus.
+
+```python
+import httpx
+
+async def get_pool(pool_id: str) -> dict:
+    async with httpx.AsyncClient() as http:
+        r = await http.get(
+            "https://api-v3.raydium.io/pools/info/ids",
+            params={"ids": pool_id},
+        )
+        r.raise_for_status()
+        data = r.json()
+        if not data["success"]:
+            raise RuntimeError(data["error"]["message"])
+        return data["data"][0]
+
+pool = await get_pool("58oQChx4yWmvKdwLLZzBi4ChoCc2fqCUWBkwMihLYQo2")
+print(pool["price"], pool["day"]["volume"])
+```
+
+Untuk bot yang memerlukan latensi serendah mungkin, dekode byte on-chain secara langsung:
+
+```python
+from construct import Struct, Int64ul, Int128ul, Bytes, this
+
+# Layout PoolState CPMM parsial (beberapa field awal)
+POOL_STATE_LAYOUT = Struct(
+    "discriminator"     / Bytes(8),
+    "amm_config"        / Bytes(32),
+    "pool_creator"      / Bytes(32),
+    "token_0_vault"     / Bytes(32),
+    "token_1_vault"     / Bytes(32),
+    "lp_mint"           / Bytes(32),
+    "token_0_mint"      / Bytes(32),
+    "token_1_mint"      / Bytes(32),
+    # ...
+)
+
+from solders.pubkey import Pubkey
+
+async def decode_pool(pool_id: Pubkey) -> dict:
+    resp = await client.get_account_info(pool_id)
+    data = resp.value.data
+    return POOL_STATE_LAYOUT.parse(data)
+```
+
+Layout lengkapnya ada di `src/raydium/cpmm/layout.ts` (sumber TS); sesuaikan ke `construct` sesuai kebutuhan. `anchorpy` dapat melakukan ini secara otomatis berdasarkan IDL — lihat di bawah.
+
+## Membangun dan mengirim swap
+
+Untuk kesederhanaan, gunakan endpoint **server-built-transaction** Raydium. Server mengembalikan transaksi yang siap ditandatangani; Anda hanya perlu menambahkan signature Anda:
+
+```python
+import httpx
+import base64
+from solders.transaction import VersionedTransaction
+from solana.rpc.types import TxOpts
+
+async def swap(pool_id: str, amount_in: int, slippage_bps: int):
+    async with httpx.AsyncClient() as http:
+        r = await http.get(
+            "https://api-v3.raydium.io/transaction/swap-base-in",
+            params={
+                "poolId":       pool_id,
+                "amount":       amount_in,
+                "inputMint":    "So11111111111111111111111111111111111111112",  # WSOL
+                "outputMint":   "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",  # USDC
+                "slippageBps":  slippage_bps,
+                "wallet":       str(owner.pubkey()),
+                "txVersion":    "V0",
+                "computeUnitPriceMicroLamports": 50_000,
+            },
+        )
+        r.raise_for_status()
+        data = r.json()["data"]
+
+    # Dekode tx yang sudah dibangun, tandatangani dengan keypair kami, kirim.
+    raw  = base64.b64decode(data["tx"]["transaction"])
+    tx   = VersionedTransaction.from_bytes(raw)
+    tx.sign([owner])
+
+    sig = await client.send_transaction(tx, opts=TxOpts(skip_preflight=False))
+    await client.confirm_transaction(sig.value, commitment="confirmed")
+    return sig.value, data["swapResponse"]
+```
+
+Ini adalah jalur tercepat menuju bot yang berfungsi. Quote server kedaluwarsa dengan cepat (≈30 detik); jangan cache.
+
+## Membangun swap client-side (via `anchorpy`)
+
+Untuk latensi lebih rendah atau ketika Anda tidak dapat menjangkau API Raydium (wilayah yang disanksi, setup air-gapped):
+
+```python
+from anchorpy import Program, Provider, Wallet, Context
+from solana.rpc.async_api import AsyncClient
+from solders.pubkey import Pubkey
+import json
+
+idl = json.load(open("cpmm.json"))  # dari raydium-sdk-v2
+provider = Provider(client, Wallet(owner))
+program  = Program(idl, Pubkey.from_string(CPMM_PROGRAM_ID), provider)
+
+# Panggil swap_base_input:
+tx_sig = await program.rpc["swap_base_input"](
+    amount_in,
+    minimum_amount_out,
+    ctx=Context(
+        accounts={
+            "payer":                owner.pubkey(),
+            "authority":            owner.pubkey(),
+            "amm_config":           amm_config_pk,
+            "pool_state":           pool_state_pk,
+            "input_token_account":  user_input_ata,
+            "output_token_account": user_output_ata,
+            "input_vault":          input_vault_pk,
+            "output_vault":         output_vault_pk,
+            "input_token_program":  TOKEN_PROGRAM_ID,
+            "output_token_program": TOKEN_PROGRAM_ID,
+            "input_token_mint":     input_mint,
+            "output_token_mint":    output_mint,
+            "observation_state":    observation_state_pk,
+        },
+    ),
+)
+```
+
+Derivasi PDA (observation state, pool authority) mengikuti formula yang sama seperti di bab CPMM. `anchorpy` tidak menderivasi mereka secara otomatis.
+
+## Arsitektur bot tipikal
+
+Struktur bot Raydium Python yang umum:
+
+```
+┌──────────────────┐
+│ Scheduler        │  cron / asyncio / redis queue
+└──────────┬───────┘
+           │
+           ▼
+┌──────────────────┐
+│ Price poller     │  httpx + Raydium REST API
+│  (per pool)      │  atau WebSocket RPC sub
+└──────────┬───────┘
+           │ event
+           ▼
+┌──────────────────┐
+│ Strategy engine  │  hitung signal, tentukan parameter trade
+└──────────┬───────┘
+           │ trade params
+           ▼
+┌──────────────────┐
+│ TX builder       │  server-built-tx Raydium atau anchorpy
+│ + signer         │  solders.Keypair
+└──────────┬───────┘
+           │ VersionedTransaction
+           ▼
+┌──────────────────┐
+│ RPC sender       │  solana-py AsyncClient + Jito RPC
+│ (retry + monitor)│  logika priority fee
+└──────────┬───────┘
+           │ sig
+           ▼
+┌──────────────────┐
+│ Ledger store     │  Postgres untuk posisi, pending tx, PnL
+└──────────────────┘
+```
+
+Keputusan kunci untuk produksi:
+
+- **RPC provider.** Public mainnet RPC membatasi rate secara agresif. Gunakan provider dedicated (Helius, QuickNode, Triton) untuk lalu lintas berkelanjutan.
+- **WebSocket untuk state pool.** `client.account_subscribe(pool_id)` mengirim update pada setiap perubahan state. Jauh lebih ketat daripada polling.
+- **Priority fee provider.** Helius memiliki endpoint `getPriorityFeeEstimate`; Triton punya milik mereka sendiri. Ukur fee Anda berdasarkan persentil 75 dari fee terbaru di program target.
+- **Bundle untuk trade sensitif MEV.** Rute melalui block engine Jito jika Anda tidak dapat mentoleransi risiko sandwich. Library Python: `jito-sdk-python` (pihak ketiga, kualitas bervariasi).
+
+## Membaca state farm
+
+```python
+FARM_V6_ID = Pubkey.from_string("...")
+
+async def get_farm_v6(farm_id: Pubkey):
+    resp = await client.get_account_info(farm_id)
+    return farm_v6_idl_program.account["FarmState"].decode(resp.value.data)
+
+farm = await get_farm_v6(farm_id)
+print(farm.total_staked, farm.reward_info_count)
+for r in farm.reward_infos[:farm.reward_info_count]:
+    print(r.reward_mint, r.emission_per_second_x64)
+```
+
+`.account["X"].decode(bytes)` `anchorpy` memberikan objek Python native yang cocok dengan struct IDL.
+
+## Jebakan umum
+
+### 1. Penanganan desimal
+
+`float` native Python adalah IEEE-754 double; jumlah di mint 9-desimal (1 SOL = 1e9 unit) tetap akurat tetapi rasio dan produk kehilangan presisi. Gunakan `int` (`solders` mengembalikan `int` untuk semua amount field) dan rute melalui `decimal.Decimal` untuk aritmetika harga apa pun.
+
+### 2. Penalaran berbasis slot vs berbasis timestamp
+
+Beberapa versi farm menggunakan counter slot; LaunchLab menggunakan timestamp. `solana-py` mengembalikan `slot` dalam respons RPC, tetapi mengonversi slot → timestamp itu lossy (bervariasi berdasarkan leader schedule). Jika Anda memerlukan waktu wall-clock, panggil `get_block_time(slot)` secara eksplisit.
+
+### 3. Kelelahan pool koneksi
+
+`AsyncClient` membuka satu koneksi HTTP per request secara default. Di bawah beban tinggi, gunakan kembali session `httpx.AsyncClient` dan atur `limits=httpx.Limits(max_connections=100)` yang sesuai.
+
+### 4. Batas ukuran transaksi
+
+Transaksi yang dibangun Python tidak lebih kecil daripada yang dibangun TS — batas 1232 byte berlaku sama. Gunakan V0 transaction (address lookup table) untuk apa pun yang melewati lebih dari ~2 pool.
+
+## Rujukan
+
+- [`sdk-api/rest-api`](/id/sdk-api/rest-api) — endpoint HTTP yang digunakan di atas.
+- [`sdk-api/anchor-idl`](/id/sdk-api/anchor-idl) — tempat mendapatkan IDL untuk `anchorpy`.
+- [`integration-guides/routing-and-mev`](/id/integration-guides/routing-and-mev) — pola bundle Jito.
+
+Sumber:
+
+- [solders](https://github.com/kevinheavey/solders)
+- [solana-py](https://github.com/michaelhly/solana-py)
+- [anchorpy](https://github.com/kevinheavey/anchorpy)

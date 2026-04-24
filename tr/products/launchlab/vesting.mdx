@@ -1,0 +1,241 @@
+---
+title: "LaunchLab hak kazanım (vesting)"
+description: "Kilitli tokolar, cliff ve doğrusal açılış takvimi, benefisiyerin başına düşen VestingRecord hesabı, ve yaratıcılar ve platformların mezuniyet sonrası ayrılmış arzı dağıtmak için kullandıkları create / claim komutları."
+---
+
+<Info>
+  **Bu sayfa yapay zekâ tarafından otomatik olarak çevrilmiştir. İngilizce sürüm esas alınır.**
+
+  [İngilizce sürümü görüntüle →](/products/launchlab/vesting)
+</Info>
+
+<Info>
+  Hak kazanım (vesting) bir LaunchLab başlatmasında **isteğe bağlıdır**. `Initialize` sırasında `vesting_param.total_locked_amount = 0` ayarlayın ve aşağıdaki bölüm geçerli olmaz. Etkinleştirildikten sonra, takvim başlatmanın ömrü boyunca sabittir; cliff ve açılış dönemleri geriye dönük olarak değiştirilemez.
+</Info>
+
+## Neden hak kazanım
+
+Bonding curve, fundraising sırasında `base_supply_graduation` tokolar satar ve kalanını mezuniyet sonrası havuza katar. Hak kazanım, arzdan ek bir pay ayırır, bunu yapılandırılabilir bir cliff için kilitler ve ardından bunu doğrusal olarak bir veya daha fazla benefisiyere serbest bırakır — genellikle yaratıcının ekibi, danışmanları veya platform ortakları.
+
+Pratik kullanım durumları:
+
+- **Takım ayırması.** Bir yaratıcı, örneğin, arzın %5'ini kurucu ekip için ayrılır, 6 ay boyunca kilitlenir ve takip eden 12 ay boyunca doğrusal olarak açılır.
+- **Platform ayırması.** Bir başlatma platformu, listelediği her tokenin bir dilimini aynı takvim üzerinde `CreatePlatformVestingAccount` aracılığıyla alır.
+- **Danışman / katkıda bulunan hibe verileri.** Kendi `VestingRecord` hesaplarına sahip birden fazla benefisiyeri, her biri talep edilen miktarını bağımsız olarak takip eder.
+
+Kilitli tokolar asla curve'e girmez ve mezuniyet LP'sinin bir parçası değildir. Her benefisiyeri `ClaimVestedToken` çağrırana kadar havuzun `base_vault`'unda uyur durmda kalırlar.
+
+## Takvim şekli
+
+Bir başlatma için hak kazanım, `Initialize` zamanında kaydedilen üç sayı tarafından tanımlanır:
+
+| Alan | Tür | Anlam |
+|------|-----|-------|
+| `total_locked_amount` | `u64` | Tüm benefisiyenler genelinde kilitli tüm temel tokolar toplamı (yaratıcı + platform). Bağlayıcı `GlobalConfig`'ten `total_locked_amount <= supply * max_lock_rate / 1_000_000` koşulunu sağlamalıdır. |
+| `cliff_period` | `u64` (saniye) | Fundraising bitip herhangi bir token açılmadan önce bekleme süresi. |
+| `unlock_period` | `u64` (saniye) | Cliff sonrasında doğrusal açılış penceresinin süresi. `0` cliff'in sonunda her şeyin anında açılması anlamına gelir. |
+
+Bu üç değer `PoolState.vesting_schedule` üzerinde (`VestingSchedule` yapısı) ve zincir üstü `start_time` ile birlikte yaşar; program bunu fundraising başarıyla bittiğinde (mezuniyet koşulları ilk karşılandığında) `block_time + cliff_period` olarak kaydeder.
+
+```rust
+// states/pool.rs
+pub struct VestingSchedule {
+    pub total_locked_amount:     u64,
+    pub cliff_period:            u64,
+    pub unlock_period:           u64,
+    pub start_time:              u64,   // fundraising sonunda program tarafından ayarlanır
+    pub allocated_share_amount:  u64,   // hak kazanım kayıtlarına yapılan ayırmaların çalışan toplamı
+}
+```
+
+`allocated_share_amount`, `CreateVestingAccount` / `CreatePlatformVestingAccount` aracılığıyla `VestingRecord` hesaplarına zaten atanan toplam tutardır. Asla `total_locked_amount`'ı aşmamalıdır. Bir yaratıcı aşırı tahsis ederse, sonraki `CreateVestingAccount` çağrısı `InvalidTotalLockedAmount` ile geri döner.
+
+## Doğrusal açılış formülü
+
+Fundraising bittikten sonra, program her `VestingRecord` için kümülatif açılan tutarı şu şekilde hesaplar:
+
+```
+elapsed         = min(now, start_time + unlock_period) − start_time
+unlocked_amount = token_share_amount × elapsed / unlock_period
+```
+
+`unlock_period == 0` ise, tüm `token_share_amount` `start_time` de tek adımda talep edilebilir hale gelir. Aksi takdirde curve, `start_time` de 0'dan `start_time + unlock_period` de `token_share_amount`'a kadar düz bir çizgidir ve bundan sonra `token_share_amount` ile sınırlandırılır.
+
+Her `ClaimVestedToken` çağrısında aktarılan tutar, yeni hesaplanan kümülatif açılan tutar ile kayıttaki çalışan `claimed_amount` alanı arasındaki deltadır.
+
+```
+delta_amount    = unlocked_amount − vesting_record.claimed_amount
+vesting_record.claimed_amount = unlocked_amount
+```
+
+`start_time` öncesinde bir talep `VestingNotStarted` ile geri döner. `start_time + unlock_period` sonrasında bir talep tam kalanını kapatır.
+
+## Hesap düzenleri
+
+### `VestingSchedule`
+
+`PoolState` üzerinde satır içi yaşar. Bkz. [`accounts`](/tr/products/launchlab/accounts).
+
+### `VestingRecord`
+
+Benefisiyerin başına düşen kayıt. PDA şu şekilde türetilir:
+
+```
+seeds = [
+  b"pool_vesting",
+  pool_state.key(),
+  beneficiary.key(),
+]
+program = LaunchLab program
+```
+
+```rust
+// states/vesting.rs
+#[account]
+pub struct VestingRecord {
+    pub epoch:               u64,         // recent_epoch izleyicisi
+    pub pool:                Pubkey,      // PoolState'e geri işaretçi
+    pub beneficiary:         Pubkey,      // ClaimVestedToken çağırabilen kişi
+    pub claimed_amount:      u64,         // kümülatif talep edilen
+    pub token_share_amount:  u64,         // bu benefisiyere tahsis edilen toplam
+    pub padding:             [u64; 8],
+}
+```
+
+Bir benefisiyeri başlatma başına yalnızca **bir** `VestingRecord`'si olabilir. Aynı benefisiyeye aynı başlatmada tekrar tahsis etmek, PDA zaten var olduğu için geri döner.
+
+## Komutlar
+
+### `CreateVestingAccount`
+
+Yalnızca yaratıcı. Havuzun `total_locked_amount`'ının bir dilimini yeni bir benefisiyeye tahsis eder, yeni bir `VestingRecord` PDA'sı başlatarak.
+
+**Argümanlar**
+
+```
+share_amount: u64    // bu benefisiyeye tahsis edilen tokolar
+```
+
+**Hesaplar**
+
+| # | Ad | W | S | Notlar |
+|---|----|----|---|--------|
+| 1 | `creator` | W | S | `pool_state.creator`'a eşit olmalıdır; yeni hesap için kirayı öder. |
+| 2 | `beneficiary` | W |   | Daha sonra açılan tokolar alır. Pubkey burada kilitlenir — değiştirilemez. |
+| 3 | `pool_state` | W |   | `vesting_schedule.allocated_share_amount`'ı artırmak için mutate edilir. |
+| 4 | `vesting_record` | W |   | `init`; PDA `[b"pool_vesting", pool_state, beneficiary]`. |
+| 5 | `system_program` |   |   | Hesap oluşturma için gereklidir. |
+
+**Ön koşullar**
+
+- `share_amount > 0`.
+- `pool_state.vesting_schedule.allocated_share_amount + share_amount <= total_locked_amount`.
+- `beneficiary` pubkey'i bu havuz için mevcut `VestingRecord`'si yok.
+
+**Sonkoşullar**
+
+- `vesting_record` `token_share_amount = share_amount`, `claimed_amount = 0` ile başlatılır.
+- `pool_state.vesting_schedule.allocated_share_amount += share_amount`.
+
+**Yaygın hatalar** — `InvalidTotalLockedAmount`, `InvalidInput`.
+
+### `CreatePlatformVestingAccount`
+
+`CreateVestingAccount`'un platform-yöneticisi varyantı. Platformun hak kazanım cüzdanı (`PlatformConfig.platform_vesting_wallet`'da depolanır) benefisiyeridir ve pay `PlatformConfig.platform_vesting_scale` ile sınırlandırılır.
+
+İmzalayan `platform_config.platform_vesting_wallet` eşit olmalıdır. Diğer hesaplar `CreateVestingAccount` aynıdır. Platform, listelediği her başlatmada sabit bir hak kazanım payı almak için sözleşme yaptığında bunu kullanın.
+
+### `ClaimVestedToken`
+
+Yalnızca benefisiyeri. Havuzun `base_vault`'ından benefisiyerin ATA'sına yeni açılan tokolar aktarır.
+
+**Argümanlar**
+
+Hiçbiri (program talep tutarını tablosundan hesaplar).
+
+**Hesaplar**
+
+| # | Ad | W | S | Notlar |
+|---|----|----|---|--------|
+| 1 | `beneficiary` | W | S | `vesting_record.beneficiary`'e eşit olmalıdır. |
+| 2 | `authority` |   |   | PDA `[b"vault_auth_seed"]`; kasaiyetini imzalar. |
+| 3 | `pool_state` | W |   | Yalnızca takvim yeniden doğrulanması gerekiyorsa mutate edilir. |
+| 4 | `vesting_record` | W |   | `claimed_amount` güncellenir. |
+| 5 | `base_vault` | W |   | Havuzun temel-token kasası; borçlandırılır. |
+| 6 | `beneficiary_ata` | W |   | Açılan tokolar alır; `init_if_needed`. |
+| 7 | `base_mint` |   |   | Havuzun temel madeni. |
+| 8 | `token_program` |   |   | SPL Token veya Token-2022 programı. |
+| 9 | `associated_token_program` |   |   | Gerekirse ATA oluşturma için. |
+| 10 | `system_program` |   |   | Hesap oluşturma için gereklidir. |
+
+**Ön koşullar**
+
+- `block_time >= pool_state.vesting_schedule.start_time` (aksi takdirde `VestingNotStarted`).
+- `pool_state.status == PoolStatus::Migrated` — mezuniyet zaten yapılmış olmalıdır. Mezuniyetten önce çağrı yapmak geri döner.
+- Açılan tutar deltası sıfırdan büyüktür. No-op çağrısı (hesaplanan delta 0) geri döner.
+
+**Sonkoşullar**
+
+- `vesting_record.claimed_amount` yeni kümülatif açılan tutara ilerler.
+- Temel tokenın `delta_amount`'ı `beneficiary_ata`'ya aktarılır.
+
+**Yaygın hatalar** — `VestingNotStarted`, `NoAssetsToCollect`, `MathOverflow`.
+
+## Çalışılan örnek
+
+Bir başlatma ayarları:
+
+- `supply = 1_000_000_000`
+- `total_locked_amount = 100_000_000` (arzın %10'u)
+- `cliff_period = 180 * 86400` (180 gün)
+- `unlock_period = 365 * 86400` (cliff'ten sonra 1 yıl doğrusal)
+
+Yaratıcı `Initialize` sonrası hemen iki `VestingRecord` hesabını ayırır:
+
+- Benefisiyeri A (takım): `share_amount = 70_000_000`
+- Benefisiyeri B (danışman): `share_amount = 30_000_000`
+
+`allocated_share_amount = 100_000_000`, `total_locked_amount`'a eşit — başka tahsisler mümkün değil.
+
+Fundraising `2027-01-01T00:00Z` de tamamlanır. Program `start_time = 2027-01-01 + 180 gün = 2027-06-30` ayarlar.
+
+`2027-09-30` de (`start_time` sonrası 90 gün), Benefisiyeri A `ClaimVestedToken` çağırır:
+
+```
+elapsed         = min(now, start_time + 365·86400) − start_time
+                = 90 · 86400
+unlocked_amount = 70_000_000 × (90 / 365) ≈ 17_260_274
+delta_amount    = 17_260_274 − 0 = 17_260_274
+```
+
+A'nın cüzdanı 17.26M temel token alır. `vesting_record.claimed_amount` 17_260_274'e ilerler.
+
+Altı ay sonra (`2028-03-31`, `start_time` sonrası 270 gün), A tekrar talep eder:
+
+```
+unlocked_amount = 70_000_000 × (270 / 365) ≈ 51_780_822
+delta_amount    = 51_780_822 − 17_260_274 = 34_520_548
+```
+
+A başka 34.52M token alır. `2028-06-30` sonrasında (`unlock_period` sonu), sonraki talep kalan ~18.22M'ı aktarır ve `claimed_amount == token_share_amount` bırakır.
+
+## Uç durumlar
+
+- **Benefisiyeri anahtarını kaybeder.** `VestingRecord.beneficiary`'deki pubkey, `ClaimVestedToken` çağırabilen tek imzalayıcıdır. Kurtarma yolu yoktur. Kurtarma önemliyse benefisiyeri multisig'e ayarlayın.
+- **Token-2022 aktarım ücretleri.** Temel madeni bir transfer-fee uzantısına sahip Token-2022 madeni ise, benefisiyeri tam delta değil `delta_amount − transfer_fee` alır. Havuzun kasası, aktarılan tutarı brüt olarak kaydeder — fark madeni'nin alıkoyulan-ücret hesabına tahakkuk eder.
+- **Havuz mezuniyet almadı.** Mezuniyet öncesi `ClaimVestedToken` çağrısı yapmak geri döner. Hak kazanım saati yalnızca fundraising gerçekten tamamlandığında başlar; durdurulan başlatma (`start_time`'ı asla ayarlamaz) kilitli tokolar kasada ulaşılamaz bırakır.
+- **Aşırı tahsis denemesi.** Program `allocated_share_amount <= total_locked_amount` öğesini her `CreateVestingAccount`'da uygular. `total_locked_amount`'ın kalan kısmı (varsa) tahsis edilmemiş **kaybolur** — başlatma mezuniyete ulaştıktan sonra bu tokolar kasada sonsuza kadar kalır. Tam tutarı tahsis edin, böyle bir niyetiniz yoksa.
+
+## İşaretçiler
+
+- [`products/launchlab/accounts`](/tr/products/launchlab/accounts) — `VestingSchedule` dahil tam `PoolState` düzeni.
+- [`products/launchlab/instructions`](/tr/products/launchlab/instructions) — mezuniyet yaşam döngüsü.
+- [`products/launchlab/platform-config`](/tr/products/launchlab/platform-config) — platform tahsisleri için `platform_vesting_scale` anlamı.
+- [`products/launchlab/global-config`](/tr/products/launchlab/global-config) — `total_locked_amount`'ı sınırlandıran `max_lock_rate` tavanı.
+
+Kaynaklar:
+
+- `raydium-launch/programs/launchpad/src/states/vesting.rs` — `VestingRecord`.
+- `raydium-launch/programs/launchpad/src/states/pool.rs` — `VestingSchedule`, `VestingParams`, `is_vesting_started`, `vesting_end_time`.
+- `raydium-launch/programs/launchpad/src/instructions/create_vesting_account.rs`.
+- `raydium-launch/programs/launchpad/src/instructions/claim_vested_token.rs`.

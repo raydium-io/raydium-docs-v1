@@ -1,0 +1,278 @@
+---
+title: "Farm / Staking kod örnekleri"
+description: "Raydium'un farm v6 programına karşı farm oluşturma, LP stake etme, ödül toplama ve ödül bütçesi artırma işlemleri için TypeScript örnekleri."
+---
+
+<Info>
+  **Bu sayfa yapay zekâ tarafından otomatik olarak çevrilmiştir. İngilizce sürüm esas alınır.**
+
+  [İngilizce sürümü görüntüle →](/products/farm-staking/code-demos)
+</Info>
+
+## Kurulum
+
+Buradaki örnekler [`raydium-sdk-V2-demo/src/farm`](https://github.com/raydium-io/raydium-sdk-V2-demo/tree/master/src/farm) klasöründeki dosyaları yansıtır. Bootstrap, demo repo'sunun [`config.ts.template`](https://github.com/raydium-io/raydium-sdk-V2-demo/blob/master/src/config.ts.template) dosyasını takip eder:
+
+```ts
+import { Connection, Keypair, clusterApiUrl, PublicKey } from "@solana/web3.js";
+import { Raydium, TxVersion } from "@raydium-io/raydium-sdk-v2";
+import BN from "bn.js";
+import fs from "node:fs";
+
+const connection = new Connection(process.env.RPC_URL ?? clusterApiUrl("mainnet-beta"));
+const owner = Keypair.fromSecretKey(
+  new Uint8Array(JSON.parse(fs.readFileSync(process.env.KEYPAIR!, "utf8"))),
+);
+const raydium = await Raydium.load({
+  owner,
+  connection,
+  cluster: "mainnet",
+  disableFeatureCheck: true,
+  blockhashCommitment: "finalized",
+});
+export const txVersion = TxVersion.V0;
+```
+
+## Farm'ı ID'ye göre getir
+
+```ts
+const farmId = new PublicKey("<FARM_ID>");
+
+const farm = await raydium.farm.getFarmById({ farmId });
+console.log("Staking mint:", farm.symbolMint.toBase58());
+console.log("Total staked:", farm.totalStaked.toString());
+console.log("Rewards:");
+for (const r of farm.rewardInfos) {
+  console.log(
+    "  -", r.mint.toBase58(),
+    "rate(1e-" + r.decimals + "/s):", r.perSecond.toString(),
+    "open:", new Date(r.openTime * 1000).toISOString(),
+    "end: ", new Date(r.endTime * 1000).toISOString(),
+  );
+}
+```
+
+`getFarmById`, `FarmState`'i zincir dışından alır, program sürümüne göre kodunu çözer ve sabit nokta emisyon hızını saniyede düz bir `Decimal` değerine normalleştirir.
+
+## LP token'larını stake et
+
+Kaynak: [`src/farm/stake.ts`](https://github.com/raydium-io/raydium-sdk-V2-demo/blob/master/src/farm/stake.ts)
+
+```ts
+const amount = new BN(1_000_000_000);   // 1 LP (assuming 9 decimals)
+
+const { execute } = await raydium.farm.deposit({
+  farmInfo: farm,
+  amount,
+  txVersion: TxVersion.V0,
+});
+
+const { txId } = await execute({ sendAndConfirm: true });
+console.log("Deposit tx:", txId);
+```
+
+SDK, bekleyen herhangi bir ödülün ön mutabakatını yapar, dolayısıyla bu cüzdan zaten bu farmda stake sahibiyse, talimatlı aynı işlemde birikmiş ödülleri kullanıcının ATA'larına ödeyecektir.
+
+## Sadece talep (harvest)
+
+Kaynak: [`src/farm/harvest.ts`](https://github.com/raydium-io/raydium-sdk-V2-demo/blob/master/src/farm/harvest.ts)
+
+```ts
+const { execute } = await raydium.farm.harvestAllRewards({
+  farmInfoList: [farm],
+  txVersion: TxVersion.V0,
+});
+
+await execute({ sendAndConfirm: true });
+```
+
+`harvestAllRewards`, bir liste kabul eder — portföy görünümü gösteren kullanıcı arayüzleri için çağrıyı toplu hale getirin. Her farm, bir işlem içinde ayrı bir talimat olarak talep edilir (1232 baytlık boyut sınırına tabi; >~6 farm için birden fazla işleme bölün).
+
+v6 üzerinde tek bir farm için açık `Harvest` yolunu da kullanabilirsiniz:
+
+```ts
+const { execute } = await raydium.farm.withdraw({
+  farmInfo: farm,
+  amount: new BN(0),        // 0 = harvest-only path, even on v6
+  txVersion: TxVersion.V0,
+});
+await execute({ sendAndConfirm: true });
+```
+
+v3 ve v5'te `amount: 0` deyimi gereklidir; SDK bunu doğru şekilde gönderir.
+
+## Unstake et
+
+Kaynak: [`src/farm/unstake.ts`](https://github.com/raydium-io/raydium-sdk-V2-demo/blob/master/src/farm/unstake.ts)
+
+```ts
+const amount = new BN(500_000_000);   // 0.5 LP
+
+const { execute } = await raydium.farm.withdraw({
+  farmInfo: farm,
+  amount,
+  txVersion: TxVersion.V0,
+});
+
+await execute({ sendAndConfirm: true });
+```
+
+## v6 farm oluştur
+
+Kaynak: [`src/farm/createAmmFarm.ts`](https://github.com/raydium-io/raydium-sdk-V2-demo/blob/master/src/farm/createAmmFarm.ts) ve [`editAmmFarm.ts`](https://github.com/raydium-io/raydium-sdk-V2-demo/blob/master/src/farm/editAmmFarm.ts)
+
+```ts
+import { CurveCalculator } from "@raydium-io/raydium-sdk-v2"; // optional, for APR planning
+
+const stakingMint = new PublicKey("<LP_MINT>");       // e.g. a CPMM LP mint
+const rewardMint  = new PublicKey("<REWARD_MINT>");   // e.g. your project's token
+
+const now      = Math.floor(Date.now() / 1000);
+const openTime = now + 60 * 60;                       // start in 1h
+const duration = 60 * 60 * 24 * 30;                   // 30 days
+const endTime  = openTime + duration;
+
+const totalBudget = new BN(1_000_000).mul(new BN(10).pow(new BN(9))); // 1M reward tokens (9 dec)
+const perSecond   = totalBudget.div(new BN(duration));                // integer, SDK lifts to Q64.64
+
+const { execute, extInfo } = await raydium.farm.create({
+  programId: /* v6 program ID, from reference/program-addresses */,
+  poolInfo: { lpMint: { address: stakingMint, decimals: 9, programId: /* SPL Token */ } as any },
+  rewardInfos: [
+    {
+      mint:           rewardMint,
+      openTime:       new BN(openTime),
+      endTime:        new BN(endTime),
+      perSecond,
+      rewardSender:   owner.publicKey,    // who pays the initial budget
+      mintProgramId:  /* SPL Token or Token-2022 */,
+    },
+  ],
+  txVersion: TxVersion.V0,
+});
+
+const { txId } = await execute({ sendAndConfirm: true });
+console.log("Farm:", extInfo.farmId.toBase58(), "createTx:", txId);
+```
+
+Önemli noktalar:
+
+- `perSecond`, saniyede tamsayı emisyon hızıdır. SDK, göndermeden önce bunu Q64.64'e pakler. Kesirli bir oran için, ölçeği ayarlayın ve süreyi değiştirin.
+- Tam bütçe (`perSecond × duration`), ödül ATA'nızda bulunmalıdır — `create`, bunu ödül kasasına atomik olarak taşır.
+- Bir `create` çağrısında 5'e kadar ödülü tohumlandırabilirsiniz. Hesap listesi, her ek akış için `(reward_mint, reward_vault, sender_ata, token_program)` kadar büyür; 1232 baytlık işlem boyutu sınırından haberdar olun. 4+ ödül için, 1-2 ile oluşturun ve sonraki işlemlerde `AddReward`'ı kullanın.
+
+## Mevcut bir ödül akışını artır
+
+```ts
+const additionalDays = 30;
+const extraSeconds   = 60 * 60 * 24 * additionalDays;
+const extraBudget    = perSecond.mul(new BN(extraSeconds));
+
+const { execute } = await raydium.farm.setRewards({
+  farmInfo: farm,
+  rewardInfos: [
+    {
+      rewardMint:  rewardMint,
+      newEndTime:  new BN(farm.rewardInfos[0].endTime + extraSeconds),
+      newPerSecond: perSecond,                   // keep same rate
+      payer:        owner.publicKey,
+    },
+  ],
+  txVersion: TxVersion.V0,
+});
+
+await execute({ sendAndConfirm: true });
+```
+
+`setRewards`, `end_time`'ı uzatır ve delta bütçesini aktarır. Talimatlı bir akışı kısaltamaz, canlı bir akış üzerinde `per_second`'yi düşüremez ve ödül mint'ini değiştiremez. Mint'leri takas etmek için `end_time`'ı bekleyin ve boş bir yuva varsa `AddReward`'ı kullanın veya yeni bir farm oluşturun.
+
+## Biten bir akışı yeniden başlat
+
+```ts
+const { execute } = await raydium.farm.restartRewards({
+  farmInfo: farm,
+  newRewardInfo: {
+    rewardMint:   rewardMint,
+    openTime:     new BN(Math.floor(Date.now() / 1000) + 60 * 60),
+    endTime:      new BN(Math.floor(Date.now() / 1000) + 60 * 60 + 60 * 60 * 24 * 14),
+    perSecond:    new BN("1000000000"),
+    payer:        owner.publicKey,
+  },
+  txVersion: TxVersion.V0,
+});
+
+await execute({ sendAndConfirm: true });
+```
+
+Sadece hedef yuvanın `reward_state == 2` (bitti) olduğu durumda geçerlidir. Arayan, yuvanın `reward_sender`'ı (v6) veya farm sahibi (v5) olmalıdır.
+
+## Rust CPI
+
+AMM v4'ten farklı olarak, v6 farm programı, ön uç ve SDK kaynakları ile birlikte yayınlanan bir Anchor crate'i (`raydium_farm_v6`) ile birlikte gelir. Minimal bir `Deposit` taslağı:
+
+```rust
+use anchor_lang::prelude::*;
+use raydium_farm_v6::{self, cpi::accounts::Deposit as RaydiumDeposit};
+
+#[derive(Accounts)]
+pub struct ProxyFarmDeposit<'info> {
+    /// CHECK:
+    pub farm_program: UncheckedAccount<'info>,
+    #[account(mut)] pub user: Signer<'info>,
+    #[account(mut)] /// CHECK:
+    pub user_ledger: UncheckedAccount<'info>,
+    #[account(mut)] /// CHECK:
+    pub farm_state: UncheckedAccount<'info>,
+    /// CHECK:
+    pub farm_authority: UncheckedAccount<'info>,
+    #[account(mut)] /// CHECK:
+    pub staking_vault: UncheckedAccount<'info>,
+    #[account(mut)] /// CHECK:
+    pub user_staking_ata: UncheckedAccount<'info>,
+    // Followed in remaining_accounts by (reward_vault_i, user_reward_ata_i) pairs
+    // for each live reward stream on the farm.
+    pub token_program: UncheckedAccount<'info>,
+    pub system_program: Program<'info, System>,
+}
+
+pub fn proxy_deposit<'info>(
+    ctx: Context<'_, '_, '_, 'info, ProxyFarmDeposit<'info>>,
+    amount: u64,
+) -> Result<()> {
+    let cpi_ctx = CpiContext::new(
+        ctx.accounts.farm_program.to_account_info(),
+        RaydiumDeposit {
+            user:             ctx.accounts.user.to_account_info(),
+            user_ledger:      ctx.accounts.user_ledger.to_account_info(),
+            farm_state:       ctx.accounts.farm_state.to_account_info(),
+            farm_authority:   ctx.accounts.farm_authority.to_account_info(),
+            staking_vault:    ctx.accounts.staking_vault.to_account_info(),
+            user_staking_ata: ctx.accounts.user_staking_ata.to_account_info(),
+            token_program:    ctx.accounts.token_program.to_account_info(),
+            system_program:   ctx.accounts.system_program.to_account_info(),
+        },
+    ).with_remaining_accounts(ctx.remaining_accounts.to_vec());
+
+    raydium_farm_v6::cpi::deposit(cpi_ctx, amount)
+}
+```
+
+`remaining_accounts` dilimi farm'ın aktif ödül yuvalarıyla 1'e 1 eşleşmelidir (`reward_vault_i`, `user_reward_ata_i` çiftleri dizin sırasında). Bunları atlayarak veya yanlış sıralayarak sessiz bir yanlış muhasebe üretilir — program yanlış miktarı aktaracaktır.
+
+## Tuzaklar
+
+- **Çekmeden önce talep etmeyi unutmak.** Zararsız — `Withdraw`, bekleyen ödülleri önce kapatır. Ancak kullanıcı arayüzünüz "talep"i "çekme"den ayrı gösteriyorsa, kullanıcı `Withdraw` sonrası talep edecek bir şey daha olduğunu düşünebilir. Yoktur; bu noktaya kadar olan her şey ödendi.
+- **Emisyon sırasında `total_staked = 0`**. Hiçbir şey stake edilmeyken tahakkuk eden emisyonlar kaybedilir (`reward_per_share` güncelleme formülü 0'a bölür ve program güncellemeleri atlar). Planlanan `open_time` ile programlar için, bu kaçınmak için `open_time`'da "seed stake" çalıştırın.
+- **Token-2022 transfer ücretleri.** Token-2022 ödül mint'leri ile v6 farmlarında, transfer ücreti yayın sırasında geçerli olur (kasa → kullanıcı). Bunu APR fiyatlarına ekleyin.
+- **v5'te küçük `per_second`.** v5'in `u64` oranı, herhangi bir `per_second < 1` token-birimi saniye başına (9+ ondalak basamaklı mint'lerde bu genellikle istenen oran) ifade edilemeyeceği anlamına gelir — akış oranı 0'a yuvarlanır ve farm hiçbir şey yayan olmaz. v6'yı kullanın.
+
+## Sırada ne var
+
+- [`/tr/products/farm-staking/instructions`](/tr/products/farm-staking/instructions) — temel talimat başvurusu.
+- [`/tr/products/clmm/fees`](/tr/products/clmm/fees) — CLMM'nin yerel ödül akışlarıyla karşılaştırın.
+- [`/tr/user-flows/migrate-amm-v4-to-cpmm`](/tr/user-flows/migrate-amm-v4-to-cpmm) — sıklıkla yeni bir CPMM farm'ı başlatmanın yanında yapılır.
+
+Kaynaklar:
+
+- [Raydium SDK v2](https://github.com/raydium-io/raydium-sdk-V2)
+- Farm v6 IDL [`raydium-io/raydium-sdk-V2`](https://github.com/raydium-io/raydium-sdk-V2) içinde `src/raydium/farm/` altında paketlenmiş.

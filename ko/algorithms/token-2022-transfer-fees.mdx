@@ -1,0 +1,179 @@
+---
+title: "스왑에서 Token-2022 이전 수수료"
+description: "Token-2022의 이전 수수료 확장이 스왑 전후 금액 계산을 어떻게 변경하는지, 어떤 Raydium 상품이 지원하는지, 통합자가 처리해야 할 엣지 케이스(비대칭 수수료, 수수료 업데이트, 최대 수수료 상한, 비전송 가능 확장)를 설명합니다."
+---
+
+<Info>
+  **이 페이지는 AI 자동 번역입니다. 모든 내용은 영문판을 기준으로 합니다.**
+
+  [영문판 보기 →](/algorithms/token-2022-transfer-fees)
+</Info>
+
+<Info>
+  지원 매트릭스: **CPMM**은 이전 수수료 민트를 포함하여 Token-2022를 완전히 지원합니다. **CLMM**은 명시적 `SwapV2` 계정을 통해 이전 수수료가 있는 Token-2022를 지원합니다. **AMM v4**는 Token-2022를 전혀 지원하지 않습니다. **LaunchLab**은 기본 민트에 대해 Token-2022를 지원하지 않습니다(클래식 SPL 민트를 생성함). **Farm v6**은 스테이킹 및 보상 민트 모두에서 Token-2022를 지원합니다.
+</Info>
+
+## 이전 수수료란
+
+Token-2022는 두 번째 SPL Token 프로그램입니다(`TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA` → `TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb`). 확장 기능 중에서 **이전 수수료** 확장은 토큰 민트의 모든 `TransferChecked`에서 전송된 금액에서 수수료를 공제합니다. 수수료는 민트 권한자가 지정한 수신자에게 라우팅되며 권한자가 업데이트할 수 있습니다(한도 내에서).
+
+이전 수수료가 있는 민트에는 두 가지 관련 매개변수가 있습니다.
+
+- **`transfer_fee_basis_points`** — 비율(예: 100 = 1%).
+- **`maximum_fee`** — 전송당 절대 상한(거대한 금액을 이동하는 고래도 무한정 수수료를 내지 않음).
+
+민트는 한 번에 **두 가지** 활성 이전 수수료 구성을 가질 수 있습니다: "최신" 구성(지금 유효) 및 "이전" 구성(예정 중). 이것이 "에포크 전환" 설계입니다. 이전 수수료 변경은 에포크 경계를 넘어 적용되어 진행 중인 트랜잭션을 놀라게 하지 않습니다.
+
+## 스왑에서 중요한 이유
+
+풀의 볼트는 실제 잔액을 보유합니다. 사용자가 Raydium 스왑을 호출할 때:
+
+1. 사용자가 `amount_in`을 풀 볼트로 보냅니다. **입력 민트**에 이전 수수료가 있으면 볼트는 `amount_in − fee_in`을 받으며 `amount_in`이 아닙니다.
+2. 스왑 수학은 볼트가 받은 금액으로 작동합니다.
+3. 풀이 `amount_out`을 사용자의 ATA로 보냅니다. **출력 민트**에 이전 수수료가 있으면 사용자는 `amount_out − fee_out`을 받으며 `amount_out`이 아닙니다.
+
+스왑 프로그램이 단순하면 원시 `amount_in` 인수를 사용하므로 불변성 검사가 실패합니다. 왜냐하면 볼트는 프로그램이 생각한 것보다 적게 받았기 때문입니다. 반대로 아웃바운드 이전 수수료를 빼지 않고 `amount_out`을 계산하면 사용자는 부족분을 보고 프로그램을 탓합니다.
+
+Raydium CPMM 및 CLMM(`SwapV2`를 통해)은 다음과 같이 처리합니다:
+
+- **스왑 전**: `in_after_fee = amount_in − transfer_fee_on(amount_in, in_mint)`을 계산하고 곡선 수학에서 `in_after_fee`를 사용합니다.
+- **스왑 후**: `out_gross = amount_out_from_curve`를 계산하고 `out_gross`를 사용자에게 `TransferChecked`를 통해 보내며, Token-2022 프로그램 자체가 이전 수수료로 줄입니다.
+
+사용자의 `minAmountOut` 슬리피지 한계는 `out_gross`(풀이 보내는 것)에 대해 확인되며, 사용자가 받는 것에 대해서는 **아닙니다**. 이것이 모든 주요 Solana DEX가 Token-2022를 처리하는 방식이며, 이 문제가 중요한 이유는:
+
+- 풀이 수수료 후를 확인하면 견적과 실행 사이의 수수료 업데이트로 인해 거래가 되돌려집니다.
+- 수수료 전을 확인하면 실패를 견적의 품질에 고정하며, 사용자의 역외 수수료 변경에는 고정하지 않습니다.
+
+UI는 "받는 금액"을 사용자에게 표시할 때 예상 Token-2022 이전 수수료를 빼야 합니다.
+
+## Token-2022 수수료 계산
+
+SPL Token-2022 프로그램은 결정론적 헬퍼를 노출합니다. Rust에서:
+
+```rust
+use spl_token_2022::extension::transfer_fee::TransferFeeConfig;
+use spl_token_2022::extension::StateWithExtensions;
+
+let mint_data = ...;
+let state = StateWithExtensions::<Mint>::unpack(&mint_data)?;
+let config = state.get_extension::<TransferFeeConfig>()?;
+
+let epoch = Clock::get()?.epoch;
+let fee_bp = config.get_epoch_fee(epoch).transfer_fee_basis_points;
+let max_fee = u64::from(config.get_epoch_fee(epoch).maximum_fee);
+
+let fee = (amount as u128 * fee_bp as u128 / 10_000).min(max_fee as u128) as u64;
+```
+
+TypeScript에서(`@solana/spl-token` 사용):
+
+```ts
+import { getTransferFeeConfig, getTransferFeeAmount } from "@solana/spl-token";
+
+const config = getTransferFeeConfig(mintAccount);
+const currentEpochFee = config.olderTransferFee.epoch <= currentEpoch
+  ? config.newerTransferFee
+  : config.olderTransferFee;
+
+const rate   = currentEpochFee.transferFeeBasisPoints;
+const maxFee = currentEpochFee.maximumFee;
+const fee    = Math.min(Math.floor(amount * rate / 10_000), Number(maxFee));
+```
+
+## 조정된 스왑 공식(CPMM, 정확한 입력)
+
+`f_pool`을 풀 수수료 비율, `f_in`을 입력 민트 이전 수수료 비율, `max_in`을 최대 상한, `f_out`을 출력 민트 이전 수수료 비율, `max_out`을 최대 상한이라 하면:
+
+```
+transfer_fee_in  = min(amount_in · f_in / 10_000, max_in)
+vault_received   = amount_in − transfer_fee_in
+
+pool_fee         = ceil(vault_received · f_pool / 1_000_000)
+amount_after     = vault_received − pool_fee
+amount_out_gross = y · amount_after / (x + amount_after)
+
+transfer_fee_out = min(amount_out_gross · f_out / 10_000, max_out)
+user_receives    = amount_out_gross − transfer_fee_out
+```
+
+슬리피지 검사: `amount_out_gross ≥ min_amount_out`(`user_receives ≥ min_amount_out`이 아님). 사용자의 `minAmountOut`은 SDK에 의해 `expected_gross · (1 − slippage)`으로 설정됩니다. 한계를 "발송" 측에 유지하고 "수신" 측에는 유지하지 않습니다.
+
+## 조정된 공식(CPMM, 정확한 출력)
+
+SDK는 `user_receives = amount_out_exact`가 되도록 `amount_in`을 찾기 위해 반복합니다:
+
+```
+# 사용자는 이전 수수료 후 amount_out_exact를 받기를 원함
+amount_out_gross = amount_out_exact + transfer_fee_out_for(amount_out_exact)
+
+# 그 다음 CPMM 정확한 출력에서 amount_after 해결:
+amount_after     = ceil(x · amount_out_gross / (y − amount_out_gross))
+
+# 그 다음 풀 수수료 추가:
+vault_received   = ceil(amount_after · 1_000_000 / (1_000_000 − f_pool))
+
+# 그 다음 입력 이전 수수료 추가:
+amount_in = ceil(vault_received · 10_000 / (10_000 − f_in))
+# (또는 반복 — 아래 수수료 상한 엣지 케이스 참조)
+```
+
+`max_in` / `max_out` 상한은 상한에 도달하면 수수료가 더 이상 증가하지 않으므로 계산을 비선형으로 만듭니다. SDK의 `computeAmountIn` / `computeAmountOut`은 순진한 공식이 상한을 넘을 경우 반복하여 이를 처리합니다.
+
+## 엣지 케이스
+
+### 비대칭 수수료(한쪽에만 수수료가 있음)
+
+실제로 흔합니다. 위의 공식은 이미 이를 처리합니다. 한쪽에 `f_in = 0`이 있으면 관련 항이 축소됩니다. 프로그램에는 특별한 경우가 없습니다.
+
+### 스왑 중간 수수료 업데이트
+
+민트의 이전 수수료가 견적 시간과 실행 시간 사이에 변경되면 스왑은 약간 더 나쁜 경제로 진행되거나(사용자가 슬리피지 허용치 내에서 차이를 부담) 되돌려집니다(총 출력이 `minAmountOut` 아래로 떨어짐). 슬리피지 한계가 이를 흡수하며, 추가 보호는 필요하지 않습니다.
+
+### 최대 수수료 상한
+
+거래가 충분히 크면 `maximum_fee`에 도달하고 수수료는 포화되며 추가 증가는 0입니다. 이는 매우 큰 거래의 유효 비율을 0에 점근하게 하며, 깊이 있는 비유동성 시장에서 이상한 가격 곡선을 야기할 수 있습니다. SDK의 `computeAmountOut`은 이를 설명합니다.
+
+### 비전송 가능 확장
+
+일부 Token-2022 민트는 `NonTransferable` 확장을 사용하여 민트 권한자에서의 전송을 제외한 모든 `Transfer` 호출을 거부합니다. 그러한 민트는 Raydium 풀에서 전혀 사용할 수 **없습니다**. `CreatePool`은 초기화에서 이를 거부합니다.
+
+### 이자 기반 민트
+
+Token-2022는 또한 `InterestBearingConfig` 확장을 지원하여 시간에 따라 잔액이 증가하도록 합니다. Raydium의 풀은 원시 볼트 잔액을 읽습니다(이자 발생을 무시함). 따라서 이자 기반 민트가 있는 풀에서 LP는 상환할 때마다 순수 선물로 발생한 이자를 캡처합니다(볼트 잔액이 LP 공급 표현보다 빠르게 증가). 통합자는 이를 비문제로 취급해야 하지만 LP 측을 위해 문서화해야 합니다.
+
+### 이전 훅
+
+Token-2022의 `TransferHook` 확장은 모든 이전에서 임의의 CPI를 허용합니다. Raydium CPMM은 이를 지원합니다. 스왑 명령은 훅 계정을 전달하지만, CU 오버헤드를 추가하고 훅이 올바르게 작동해야 합니다. CLMM `SwapV2`도 훅을 지원합니다. AMM v4는 Token-2022를 전혀 지원하지 않으므로 이 질문은 발생하지 않습니다.
+
+## 작동 예제
+
+CPMM 풀, `x = 1_000_000 USDY, y = 1_000_000 USDC`, 풀 수수료 0.25%.
+
+- USDY는 1% 이전 수수료, `max_fee = 10_000`(6자리로 0.01 USDY)을 가집니다.
+- USDC는 이전 수수료가 없습니다.
+
+사용자가 `amount_in = 1_000 USDY`를 USDC로 스왑합니다(정확한 입력).
+
+```
+transfer_fee_in = min(1_000 · 100 / 10_000, 10_000)  = 10     // 1%, 상한을 훨씬 아래
+vault_received  = 1_000 − 10 = 990
+
+pool_fee        = ceil(990 · 2_500 / 1_000_000)  = 3    // 0.25%
+amount_after    = 990 − 3 = 987
+
+amount_out_gross = 1_000_000 · 987 / (1_000_000 + 987) = 986_027 / ...  ≈ 985.97
+```
+
+≈ 985.97 USDC. 아웃바운드 이전 수수료 없음, 따라서 사용자는 985.97 USDC를 받습니다.
+
+## 참고자료
+
+- [`products/cpmm/overview`](/ko/products/cpmm/overview) — CPMM Token-2022 지원.
+- [`products/clmm/instructions`](/ko/products/clmm/instructions) — Token-2022 라우팅을 위한 `SwapV2` 대 `Swap`.
+- [`solana-fundamentals/spl-token-and-token-2022`](/ko/solana-fundamentals/spl-token-and-token-2022) — 일반 Token-2022 확장 모델.
+
+출처:
+
+- [SPL Token-2022 transfer-fee extension docs](https://spl.solana.com/token-2022/extensions#transfer-fees)
+- Raydium CPMM 프로그램 소스(`SwapBaseInput` / `SwapBaseOutput` Token-2022 처리).
+- Raydium CLMM 프로그램 소스(`SwapV2`).

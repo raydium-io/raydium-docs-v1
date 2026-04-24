@@ -1,0 +1,179 @@
+---
+title: "Transfer-fees Token-2022 в свопах"
+description: "Как расширение transfer-fee Token-2022 изменяет учёт сумм до и после свопа, какие продукты Raydium его поддерживают, и какие граничные случаи должны обрабатывать интеграторы (асимметричные комиссии, обновления комиссий, ограничения на максимум, расширения, запрещающие передачу)."
+---
+
+<Info>
+  **Эта страница переведена с помощью ИИ. За эталон принимается английская версия.**
+
+  [Открыть английскую версию →](/algorithms/token-2022-transfer-fees)
+</Info>
+
+<Info>
+  Матрица поддержки: **CPMM** полностью поддерживает Token-2022, включая миинты с transfer-fee. **CLMM** поддерживает Token-2022 с transfer-fee через явные аккаунты `SwapV2`. **AMM v4** вообще не поддерживает Token-2022. **LaunchLab** не поддерживает Token-2022 для базового мипта (создаёт классические SPL-миинты). **Farm v6** поддерживает Token-2022 на обоих минтах: staking и reward.
+</Info>
+
+## Что такое transfer-fee
+
+Token-2022 — это вторая программа SPL Token (`TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA` → `TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb`). Среди её расширений расширение **transfer-fee** вычитает комиссию из каждого `TransferChecked` на минте. Комиссия идёт на адрес, назначенный администратором минта, и может быть обновлена администратором (в пределах ограничений).
+
+Минт с transfer-fee имеет два релевантных параметра:
+
+- **`transfer_fee_basis_points`** — ставка (например, 100 = 1%).
+- **`maximum_fee`** — абсолютный лимит за один перевод (чтобы киты, переводящие огромные суммы, не платили неограниченные комиссии).
+
+Минт может иметь **две** активные конфигурации transfer-fee одновременно: «новую» (действует сейчас) и «старую» (выводится). Это дизайн «epoch transition» — изменения transfer-fee вступают в силу на границе эпохи, чтобы не удивлять транзакции в полёте.
+
+## Почему это важно для свопов
+
+Хранилища пула содержат реальные балансы. Когда пользователь вызывает своп Raydium:
+
+1. Пользователь отправляет `amount_in` в хранилище пула. Если **входящий минт** имеет transfer-fee, хранилище получит `amount_in − fee_in`, а не `amount_in`.
+2. Математика свопа операционирует полученной хранилищем суммой.
+3. Пул отправляет `amount_out` на ATA пользователя. Если **исходящий минт** имеет transfer-fee, пользователь получит `amount_out − fee_out`, а не `amount_out`.
+
+Если программа свопа наивно использует сырой аргумент `amount_in`, проверка инварианта не пройдёт, потому что хранилище получило меньше, чем программа думает. И наоборот, если она вычисляет `amount_out` без вычитания исходящей комиссии, пользователь видит недостачу и винит программу.
+
+Raydium CPMM и CLMM (через `SwapV2`) разрешают это так:
+
+- **До свопа**: вычисляют `in_after_fee = amount_in − transfer_fee_on(amount_in, in_mint)` и используют `in_after_fee` в математике кривой.
+- **После свопа**: вычисляют `out_gross = amount_out_from_curve`, отправляют `out_gross` пользователю через `TransferChecked`, которую сама программа Token-2022 уменьшит на transfer-fee.
+
+`minAmountOut` слипиджа пользователя проверяется против `out_gross` (того, что отправил пул), **а не** против того, что получил пользователь. Так работает каждый крупный DEX на Solana, и это важно, потому что:
+
+- Если пул проверял пост-комиссию, обновление комиссии между котировкой и исполнением привело бы к revert сделки.
+- Проверка пре-комиссии привязывает отказ к качеству самой котировки, а не к внеочередным изменениям пользовательских комиссий.
+
+UI-ы должны вычитать ожидаемую transfer-fee Token-2022 при показе «Вы получите» пользователю.
+
+## Вычисление комиссии Token-2022
+
+Программа SPL Token-2022 предоставляет детерминированный помощник. На Rust:
+
+```rust
+use spl_token_2022::extension::transfer_fee::TransferFeeConfig;
+use spl_token_2022::extension::StateWithExtensions;
+
+let mint_data = ...;
+let state = StateWithExtensions::<Mint>::unpack(&mint_data)?;
+let config = state.get_extension::<TransferFeeConfig>()?;
+
+let epoch = Clock::get()?.epoch;
+let fee_bp = config.get_epoch_fee(epoch).transfer_fee_basis_points;
+let max_fee = u64::from(config.get_epoch_fee(epoch).maximum_fee);
+
+let fee = (amount as u128 * fee_bp as u128 / 10_000).min(max_fee as u128) as u64;
+```
+
+На TypeScript (через `@solana/spl-token`):
+
+```ts
+import { getTransferFeeConfig, getTransferFeeAmount } from "@solana/spl-token";
+
+const config = getTransferFeeConfig(mintAccount);
+const currentEpochFee = config.olderTransferFee.epoch <= currentEpoch
+  ? config.newerTransferFee
+  : config.olderTransferFee;
+
+const rate   = currentEpochFee.transferFeeBasisPoints;
+const maxFee = currentEpochFee.maximumFee;
+const fee    = Math.min(Math.floor(amount * rate / 10_000), Number(maxFee));
+```
+
+## Скорректированные формулы свопа (CPMM, exact-input)
+
+Пусть `f_pool` — ставка комиссии пула, `f_in` — ставка transfer-fee входящего минта, `max_in` — его максимальный лимит, `f_out` — ставка transfer-fee исходящего минта, `max_out` — его максимальный лимит.
+
+```
+transfer_fee_in  = min(amount_in · f_in / 10_000, max_in)
+vault_received   = amount_in − transfer_fee_in
+
+pool_fee         = ceil(vault_received · f_pool / 1_000_000)
+amount_after     = vault_received − pool_fee
+amount_out_gross = y · amount_after / (x + amount_after)
+
+transfer_fee_out = min(amount_out_gross · f_out / 10_000, max_out)
+user_receives    = amount_out_gross − transfer_fee_out
+```
+
+Проверка слипиджа: `amount_out_gross ≥ min_amount_out` (а не `user_receives ≥ min_amount_out`). `minAmountOut` пользователя устанавливается SDK как `expected_gross · (1 − slippage)` — держите границу на стороне «отправленного», а не «полученного».
+
+## Скорректированные формулы (CPMM, exact-output)
+
+SDK итерирует, чтобы найти `amount_in` такой, что `user_receives = amount_out_exact`:
+
+```
+# пользователь хочет получить amount_out_exact после transfer-fee
+amount_out_gross = amount_out_exact + transfer_fee_out_for(amount_out_exact)
+
+# затем решаем CPMM exact-output для amount_after:
+amount_after     = ceil(x · amount_out_gross / (y − amount_out_gross))
+
+# затем добавляем комиссию пула:
+vault_received   = ceil(amount_after · 1_000_000 / (1_000_000 − f_pool))
+
+# затем добавляем входящую transfer-fee:
+amount_in = ceil(vault_received · 10_000 / (10_000 − f_in))
+# (или итерируем — см. граничный случай с лимитом ниже)
+```
+
+Лимиты `max_in` / `max_out` делают вычисление нелинейным, потому что как только лимит достигнут, комиссия перестаёт расти. `computeAmountIn` / `computeAmountOut` SDK-а обрабатывают это итерацией, если наивная формула проталкивала бы за лимит.
+
+## Граничные случаи
+
+### Асимметричные комиссии (одна сторона имеет комиссию, другая — нет)
+
+Частое явление на практике. Приведённые выше формулы это уже обрабатывают — если одна сторона имеет `f_in = 0`, релевантные члены исчезают. Специального случая в программе нет.
+
+### Обновления комиссии во время свопа
+
+Если transfer-fee минта изменится между временем котировки и исполнением, своп либо приземлится с немного худшей экономикой (пользователь несёт разницу в пределах допуска слипиджа), либо вернётся (валовой выход упадёт ниже `minAmountOut`). Границы слипиджа это абсорбируют; дополнительная защита не требуется.
+
+### Максимальный лимит комиссии
+
+Когда сделка достаточно велика, чтобы достичь `maximum_fee`, комиссия насыщается и дальнейший рост равен нулю. Это делает эффективную ставку асимптотической к нулю для очень крупных сделок, что может вызвать странные кривые цен на глубоко неликвидных рынках. `computeAmountOut` SDK-а это учитывает.
+
+### Расширение NonTransferable
+
+Некоторые Token-2022 миинты используют расширение `NonTransferable`, которое отклоняет все вызовы `Transfer` кроме как к и от администратора минта. Такие миинты **не могут** вообще использоваться в пуле Raydium. `CreatePool` их отклоняет при инициализации.
+
+### Interest-bearing миинты
+
+Token-2022 также поддерживает расширение `InterestBearingConfig`, которое делает балансы растущими со временем. Пулы Raydium читают сырые балансы хранилищ (которые игнорируют накопление процентов), поэтому в пуле с interest-bearing минтом LPs захватывают накопленные проценты как чистый подарок всякий раз, когда они redeem (баланс хранилища рос быстрее, чем представление LP-снабжения). Интеграторы должны рассматривать это как неважное, но задокументировать для LP-стороны.
+
+### Transfer hooks
+
+Расширение `TransferHook` Token-2022 позволяет произвольный CPI на каждой передаче. Raydium CPMM это поддерживает — инструкция свопа пересылает аккаунты hook — но это добавляет CU overhead и требует, чтобы hook был хорошо себя вёл. CLMM `SwapV2` также поддерживает hooks. AMM v4 не поддерживает Token-2022 вообще, так что вопрос не возникает.
+
+## Разобранный пример
+
+Пул CPMM, `x = 1_000_000 USDY, y = 1_000_000 USDC`, комиссия пула 0.25%.
+
+- USDY имеет 1% transfer-fee, `max_fee = 10_000` (0.01 USDY с 6 decimals).
+- USDC не имеет transfer-fee.
+
+Пользователь меняет `amount_in = 1_000 USDY` на USDC (exact-input).
+
+```
+transfer_fee_in = min(1_000 · 100 / 10_000, 10_000)  = 10     // 1%, хорошо под лимитом
+vault_received  = 1_000 − 10 = 990
+
+pool_fee        = ceil(990 · 2_500 / 1_000_000)  = 3    // 0.25%
+amount_after    = 990 − 3 = 987
+
+amount_out_gross = 1_000_000 · 987 / (1_000_000 + 987) = 986_027 / ...  ≈ 985.97
+```
+
+≈ 985.97 USDC. Нет исходящей transfer-fee, поэтому пользователь получает 985.97 USDC.
+
+## Указатели
+
+- [`/ru/products/cpmm/overview`](/ru/products/cpmm/overview) — поддержка Token-2022 в CPMM.
+- [`/ru/products/clmm/instructions`](/ru/products/clmm/instructions) — `SwapV2` vs `Swap` для маршрутизации Token-2022.
+- [`/ru/solana-fundamentals/spl-token-and-token-2022`](/ru/solana-fundamentals/spl-token-and-token-2022) — общая модель расширений Token-2022.
+
+Источники:
+
+- [Документация расширения transfer-fee SPL Token-2022](https://spl.solana.com/token-2022/extensions#transfer-fees)
+- Исходный код программы Raydium CPMM (обработка Token-2022 в `SwapBaseInput` / `SwapBaseOutput`).
+- Исходный код программы Raydium CLMM (`SwapV2`).

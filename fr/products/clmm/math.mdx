@@ -1,0 +1,369 @@
+---
+title: "Mathématiques du CLMM"
+description: "Représentation de la racine carrée du prix, conversion liquidity ↔ montants de tokens, étape de swap à tick unique, itération multi-tick et comptabilité des frais croissants."
+---
+
+<Info>
+  **Cette page est traduite automatiquement par IA. La version anglaise fait foi.**
+
+  [Voir la version anglaise →](/products/clmm/math)
+</Info>
+
+## Représentation du prix en racine carrée
+
+Le CLMM stocke le prix sous la forme `sqrt_price_x64` — la racine carrée du prix token1 par token0, comme nombre en virgule fixe Q64.64 :
+
+$$
+\text{sqrt\_price\_x64} = \lfloor \sqrt{p} \cdot 2^{64} \rfloor
+$$
+
+où `p = token1_amount / token0_amount`. En travaillant en `sqrt` plutôt qu'en `p`, on linéarise les mathématiques du swap (les variations de montants de tokens deviennent linéaires en `Δsqrt_price`), et la virgule fixe `x64` maintient la précision à travers de nombreux ticks.
+
+La conversion tick ↔ sqrt-price est précalculée via une approximation logarithmique `bit-by-bit` :
+
+$$
+\text{sqrt\_price\_x64}(t) \approx 2^{64} \cdot (1.0001)^{t/2}
+$$
+
+implémentée comme une exponentiation basée sur recherche en table dans `tick_math::get_sqrt_price_at_tick`.
+
+## La liquidité comme unité canonique
+
+À l'intérieur d'une plage `[sqrt_a, sqrt_b]` (avec `sqrt_a < sqrt_b`), une position de **liquidité `L`** correspond à des montants de tokens comme suit. Soit `sqrt_c = sqrt_price_x64` le prix courant du pool.
+
+| Cas | `amount0` | `amount1` |
+|------|-----------|-----------|
+| `sqrt_c <= sqrt_a` (prix du pool en dessous de la plage) | `L · (sqrt_b - sqrt_a) / (sqrt_a · sqrt_b)` | `0` |
+| `sqrt_a < sqrt_c < sqrt_b` (dans la plage) | `L · (sqrt_b - sqrt_c) / (sqrt_c · sqrt_b)` | `L · (sqrt_c - sqrt_a)` |
+| `sqrt_c >= sqrt_b` (prix du pool au-dessus de la plage) | `0` | `L · (sqrt_b - sqrt_a)` |
+
+Les trois identités proviennent de l'invariant `x = L / sqrt_p`, `y = L · sqrt_p` que la liquidité concentrée respecte dans une plage.
+
+Les intégrateurs veulent généralement l'inverse : étant donné un dépôt de `amount0` / `amount1`, calculer le `L` maximal qui rentre dans la plage. La méthode `LiquidityMath.getLiquidityFromTokenAmounts` du SDK le fait. La formule pour le cas dans la plage :
+
+$$
+L_0 = \text{amount0} \cdot \frac{\text{sqrt\_c} \cdot \text{sqrt\_b}}{\text{sqrt\_b} - \text{sqrt\_c}},
+\qquad
+L_1 = \frac{\text{amount1}}{\text{sqrt\_c} - \text{sqrt\_a}},
+\qquad
+L = \min(L_0, L_1)
+$$
+
+Celui des deux côtés qui se relie en premier détermine le ratio réellement consommé ; l'autre côté peut avoir un excédent.
+
+## Étape de swap à tick unique
+
+Un swap se déroule par **étapes**. Chaque étape soit (a) consomme toute l'entrée disponible dans la plage de tick courante sans franchir un tick, soit (b) déplace le prix exactement jusqu'au prochain tick initialisé.
+
+Étant donné l'état courant `(sqrt_c, L)` et un swap **montant** (token0 in, token1 out, `sqrt_price` augmente), la distance jusqu'au prochain tick initialisé est `sqrt_t`. À l'intérieur de ce micro-intervalle, la relation entre l'entrée et le prix est :
+
+$$
+\Delta\text{amount0} = L \cdot \left( \frac{1}{\text{sqrt\_c}} - \frac{1}{\text{sqrt\_t}} \right)
+= \frac{L \cdot (\text{sqrt\_t} - \text{sqrt\_c})}{\text{sqrt\_c} \cdot \text{sqrt\_t}}
+$$
+
+et
+
+$$
+\Delta\text{amount1} = L \cdot (\text{sqrt\_t} - \text{sqrt\_c})
+$$
+
+Le programme fait l'une de deux choses :
+
+- **L'entrée complète rentre-t-elle ?** Si l'entrée restante (après frais) est inférieure à `Δamount0` pour atteindre `sqrt_t`, résoudre pour le nouveau `sqrt_c'` exactement :
+
+  $$
+  \text{sqrt\_c}' = \frac{L \cdot \text{sqrt\_c}}{L + \Delta\text{input} \cdot \text{sqrt\_c}}
+  $$
+
+  (pour un swap exact-input `token0 → token1`). Le swap se termine à cette étape sans franchir de tick.
+
+- **L'entrée dépasse `Δamount0` ?** Définir `sqrt_c' = sqrt_t`, franchir le tick (appliquer `liquidity_net`), décrémenter l'entrée restante de `Δamount0`, incrémenter la sortie de `Δamount1`, et répéter.
+
+Pour la direction opposée (`token1 → token0`, le prix baisse), les formules ont `sqrt_c` et `sqrt_t` échangés et l'inversion dans l'autre position.
+
+L'implémentation Rust complète se trouve dans `raydium-clmm/programs/amm/src/libraries/swap_math.rs`. La logique correspond mot pour mot à `SwapMath.computeSwapStep` d'Uniswap v3.
+
+## Frais à chaque étape
+
+Les frais commerciaux sont prélevés sur le montant d'**entrée** à chaque étape, même convention que le CPMM :
+
+```
+step_fee_amount  = ceil(step_input * trade_fee_rate / 1_000_000)
+step_net_input   = step_input - step_fee_amount
+protocol_portion = floor(step_fee_amount * protocol_fee_rate / 1_000_000)
+fund_portion     = floor(step_fee_amount * fund_fee_rate     / 1_000_000)
+lp_portion       = step_fee_amount - protocol_portion - fund_portion
+```
+
+La portion LP est répartie sur la liquidité actuellement dans la plage en mettant à jour l'accumulateur global de frais croissants :
+
+$$
+\text{fee\_growth\_global}_{\text{in}} \mathrel{+}= \text{lp\_portion} \cdot \frac{2^{64}}{L}
+$$
+
+— c'est-à-dire qu'elle est dénominée en *frais par unité de liquidité*, Q64.64, de sorte qu'une position de taille `L_i` qui est restée dans la plage durant ce swap lira plus tard `L_i · Δfee_growth_global / 2^{64}` tokens dus.
+
+Les portions protocole et fonds s'accumulent respectivement dans `PoolState.protocol_fees_token_{0,1}` et `PoolState.fund_fees_token_{0,1}`, identique au CPMM. Elles sont collectées par `CollectProtocolFee` / `CollectFundFee`.
+
+## Frais croissants en dehors et à l'intérieur
+
+La partie délicate de la comptabilité des frais du CLMM : une position gagne des frais uniquement lorsque le prix du pool se trouve **à l'intérieur** de sa plage. Le pool suit les frais cumulatifs globalement ; la position a besoin de connaître les frais cumulatifs *à l'intérieur de sa plage spécifique*.
+
+La solution est un accumulateur **basé sur les ticks**. Chaque tick stocke :
+
+```
+fee_growth_outside_0_x64
+fee_growth_outside_1_x64
+```
+
+Au moment de l'initialisation du tick :
+
+- Si le prix du pool est **au-dessus** de ce tick (`tick_current >= this_tick`), `fee_growth_outside = fee_growth_global`. (Tout ce qui a été gagné jusqu'à présent est « à l'extérieur » — c'est-à-dire au-dessous — de ce tick, par rapport au prix courant.)
+- Sinon `fee_growth_outside = 0`.
+
+Lorsque le prix franchit un tick, le programme **bascule** le `fee_growth_outside` de ce tick :
+
+$$
+\text{fee\_growth\_outside} \gets \text{fee\_growth\_global} - \text{fee\_growth\_outside}
+$$
+
+L'invariant que cela préserve : pour tout tick `t`, `fee_growth_outside(t)` égale les frais qui se sont accumulés pendant que `tick_current` était de l'autre côté de `t`.
+
+**La croissance des frais à l'intérieur d'une plage `[tick_lower, tick_upper]`** est alors dérivée :
+
+```
+if tick_current >= tick_upper:
+    fee_growth_below = fee_growth_outside(tick_lower)
+    fee_growth_above = fee_growth_global - fee_growth_outside(tick_upper)
+elif tick_current >= tick_lower:
+    fee_growth_below = fee_growth_outside(tick_lower)
+    fee_growth_above = fee_growth_outside(tick_upper)
+else:
+    fee_growth_below = fee_growth_global - fee_growth_outside(tick_lower)
+    fee_growth_above = fee_growth_outside(tick_upper)
+
+fee_growth_inside = fee_growth_global - fee_growth_below - fee_growth_above
+```
+
+C'est la formule de croissance des frais d'Uniswap v3, inchangée.
+
+## Ce qu'une position stocke et ce qu'elle lit
+
+Un `PersonalPositionState` stocke `fee_growth_inside_0_last_x64` et `fee_growth_inside_1_last_x64` : les valeurs `fee_growth_inside` à la dernière fois où la position a été touchée.
+
+À tout toucher ultérieur (augmentation, diminution, collecte), le programme :
+
+1. Calcule le `fee_growth_inside_{0,1}_x64` courant en utilisant la formule ci-dessus.
+2. Calcule `Δ = fee_growth_inside_now − fee_growth_inside_last` (soustraction modulaire sur u128).
+3. Ajoute `Δ × position.liquidity / 2^{64}` à `tokens_fees_owed_{0,1}`.
+4. Met à jour `fee_growth_inside_last` à la nouvelle valeur.
+
+Les tokens bougent réellement hors des vaults uniquement sur `CollectFees` / `DecreaseLiquidity`, contre `tokens_fees_owed`.
+
+## Récompenses
+
+Chacun des flux de récompense jusqu'à 3 du pool utilise la même machinerie croissance-dans, dans son propre accumulateur `reward_growth_global_x64`. Au moment de l'émission :
+
+$$
+\text{reward\_growth\_global} \mathrel{+}= \text{emission\_per\_second} \cdot \Delta t \cdot \frac{2^{64}}{L}
+$$
+
+— les émissions se mettent à l'échelle inversement avec la liquidité active, donc un pool plus dense paie chaque position proportionnellement moins par seconde, mais sur plus de positions au total. La récompense par position due est
+
+$$
+\text{reward\_owed} = (\text{reward\_growth\_inside}_{\text{now}} - \text{reward\_growth\_inside}_{\text{last}}) \cdot L / 2^{64}
+$$
+
+et est réclamée via `CollectReward`. Voir [`products/clmm/fees`](/fr/products/clmm/fees).
+
+## Exemple détaillé : swap exact-input
+
+Supposons :
+
+- `tick_spacing = 60`
+- `sqrt_price_x64 = 1 × 2^{64}` — prix = 1.0, donc `tick_current = 0`.
+- Liquidité active `L = 1_000_000 × 2^{64}`.
+- Prochain tick initialisé au-dessus : `t = 60` (sqrt_price_b ≈ `1.003004 × 2^{64}`).
+- Taux de frais commerciaux : 500 (0.05%).
+
+Utilisateur : `SwapBaseInput` exact-input 1 000 token0.
+
+Étape 1 — frais :
+
+```
+trade_fee       = ceil(1000 * 500 / 1_000_000)  = 1
+step_net_input  = 999
+```
+
+Étape 2 — 999 rentre-t-il dans la plage de tick courante ?
+
+```
+Δ jusqu'au prochain tick (amount0):
+  L · (sqrt_t - sqrt_c) / (sqrt_c * sqrt_t)
+  ≈ 1_000_000 · (1.003004 − 1) / (1 · 1.003004)
+  ≈ 2995.5 token0
+```
+
+`999 < 2995.5`, donc l'entrée complète rentre sans franchir le tick.
+
+Étape 3 — nouveau prix :
+
+```
+sqrt_c' = L · sqrt_c / (L + Δin · sqrt_c)
+        = 1_000_000 · 1 / (1_000_000 + 999 · 1)
+        ≈ 0.999001
+```
+
+c'est-à-dire `sqrt_c'` légèrement en dessous de `sqrt_c`. Note que la formule ci-dessus est pour un swap `token1 → token0`. L'exemple ici est `token0 → token1`, qui pousse le prix **vers le haut**, pas vers le bas — donc on utilise la forme correspondante pour `token0 in` :
+
+```
+sqrt_c' = sqrt_c + Δin / L
+        = 1 + 999 / 1_000_000
+        = 1.000999
+```
+
+(cela correspond à la direction de swap attendue pour `token0 → token1` : `sqrt_c` monte avec le prix.)
+
+Étape 4 — montant sortant :
+
+```
+Δout token1 = L · (sqrt_c' − sqrt_c)
+            = 1_000_000 · 0.000999
+            = 999.00
+```
+
+Après avoir tenu compte de l'arrondi, l'utilisateur reçoit ≈ 999 token1. Les frais (1 token0) sont répartis entre LP, protocole et fonds par `trade_fee_rate × protocol_fee_rate / 1e6` (et similaire pour fonds) ; la portion LP s'écoule dans `fee_growth_global_0_x64`.
+
+## Correspondance des ordres à limite lors du swap
+
+Quand une étape de swap franchit un tick qui contient des ordres à limite ouverts, ces ordres consomment l'entrée du swap **avant** que la courbe LP le fasse, au prix exact du tick. La correspondance est FIFO au sein du tick par cohorte `order_phase`.
+
+### État par cohorte sur `TickState`
+
+```
+order_phase                  : u64    identifiant de cohorte monotone
+orders_amount                : u64    total en tokens d'entrée dans la cohorte courante (la plus récente)
+part_filled_orders_remaining : u64    entrée restante de la cohorte que le swap remplit actuellement
+unfilled_ratio_x64           : u128   ratio de remplissage Q64.64 pour la cohorte partiellement remplie
+```
+
+La disposition à deux cohortes existe car de nouveaux ordres peuvent être ouverts sur un tick *tandis que* une cohorte plus ancienne est toujours en cours de remplissage. Les ordres nouvellement ouverts rejoignent `orders_amount` et héritent de la prochaine `order_phase` ; ils ne peuvent pas se remplir jusqu'à ce que la cohorte précédente soit entièrement consommée.
+
+### Étape de correspondance
+
+Pseudo-code pour la correspondance qui se produit à chaque franchissement de tick lors d'un swap :
+
+```
+fn match_limit_orders_at_tick(tick, swap_input_remaining, sqrt_p):
+    # 1. Essayer de remplir d'abord la cohorte partiellement remplie.
+    if tick.part_filled_orders_remaining > 0:
+        consume = min(tick.part_filled_orders_remaining, swap_input_remaining)
+        # Mettre à jour le ratio non-rempli pour cette cohorte.
+        tick.unfilled_ratio_x64 *= (1 - consume / tick.part_filled_orders_remaining)
+        tick.part_filled_orders_remaining -= consume
+        swap_input_remaining -= consume
+        if tick.part_filled_orders_remaining == 0:
+            tick.unfilled_ratio_x64 = 0
+        if swap_input_remaining == 0: return
+
+    # 2. Promouvoir la cohorte active.
+    if tick.orders_amount > 0:
+        tick.part_filled_orders_remaining = tick.orders_amount
+        tick.orders_amount = 0
+        tick.order_phase += 1
+        tick.unfilled_ratio_x64 = ONE_X64
+        # Récursif avec la cohorte nouvellement promue.
+        return match_limit_orders_at_tick(tick, swap_input_remaining, sqrt_p)
+
+    return  # le tick n'a plus d'ordres à limite
+```
+
+Les tokens de sortie allant aux propriétaires d'ordres à limite ne sont **pas** transférés par swap. Ils restent virtuellement dans le vault de sortie du pool jusqu'à ce que le propriétaire de l'ordre appelle `SettleLimitOrder` (ou `DecreaseLimitOrder`). Le pool suit simplement combien de la cohorte est maintenant remplie via `unfilled_ratio_x64`. Chaque `LimitOrderState` stocke son propre snapshot `(order_phase, unfilled_ratio_x64)` au moment de l'ouverture, donc le règlement se réduit à :
+
+```
+filled_amount  = total_amount × (1 − tick_now.unfilled_ratio_x64 / order.unfilled_ratio_x64)
+                if tick_now.order_phase > order.order_phase
+                else 0
+output_amount  = price_at(tick_index) × filled_amount   # ajusté selon la direction
+```
+
+Ce règlement O(1) est tout l'intérêt de la conception des cohortes — un tick peut remplir arbitrairement de nombreux ordres sans gaz par-ordre.
+
+### Interaction avec la courbe LP
+
+Dans une étape de swap, la correspondance des ordres à limite se produit **au** tick (zéro `Δsqrt_price`) ; la consommation de la courbe LP se produit **entre** les ticks. L'ordre est donc :
+
+1. Franchir le tick `t_cross` (appliquer d'abord le changement LP `liquidity_net`, puisque c'est ainsi qu'Uniswap-V3 le fait).
+2. Remplir tous les ordres à limite assis à `t_cross`.
+3. Continuer le long de la courbe LP jusqu'au prochain tick initialisé ou jusqu'à épuisement de `swap_input`.
+
+Les ordres à limite donnent donc aux traders *plus* de liquidité effective exactement au prix du tick de l'ordre (un effet d'amélioration de prix), au coût que les LP ne gagnent pas de frais sur cette portion du volume de swap — la portion d'ordre à limite du trade est sans frais pour le swappeur, puisque le placer d'ordres à limite agit comme un maker. La surcharge de frais dynamiques (si activée) s'applique toujours à la portion LP du même swap.
+
+## Dérivation des frais dynamiques
+
+`PoolState.dynamic_fee_info` porte l'état de volatilité. Chaque étape de swap calcule le taux de frais par étape comme :
+
+$$
+\text{fee\_rate}_{\text{total}} = \text{trade\_fee\_rate}_{\text{config}} +
+\underbrace{\frac{\text{dynamic\_fee\_control} \cdot (\text{vol\_acc} \cdot \text{tick\_spacing})^2}
+{D_{\text{ctrl}} \cdot S_{\text{vol}}^2}}_{\text{surcharge dynamique}}
+$$
+
+où :
+
+- $D_{\text{ctrl}} = 100{,}000$ — `DYNAMIC_FEE_CONTROL_DENOMINATOR`
+- $S_{\text{vol}} = 10{,}000$ — `VOLATILITY_ACCUMULATOR_SCALE`
+- `vol_acc` est l'accumulateur par-swap après la règle de mise à jour ci-dessous
+- `tick_spacing` est de `PoolState.tick_spacing`
+
+Le résultat est plafonné à $100{,}000 / 10^6 = 10\%$.
+
+### Mise à jour de l'accumulateur
+
+Deux règles sont appliquées à chaque swap, dans l'ordre :
+
+**Décroissance.** L'étage de référence décroît en fonction du temps depuis la dernière mise à jour :
+
+$$
+\text{vol\_ref} = \begin{cases}
+0 & \text{si } \Delta t > \text{decay\_period} \\
+\text{vol\_acc}_{\text{prev}} \cdot \dfrac{\text{reduction\_factor}}{10{,}000} & \text{si } \text{filter\_period} < \Delta t \le \text{decay\_period} \\
+\text{vol\_ref}_{\text{prev}} & \text{si } \Delta t \le \text{filter\_period}
+\end{cases}
+$$
+
+**Accumulation.** Le nouvel accumulateur est la référence plus la distance de tick traversée depuis l'indice de référence précédent :
+
+$$
+\text{vol\_acc} = \min\left(
+    \text{vol\_ref} + \left| t_{\text{ref}} - t_{\text{now}} \right| \cdot S_{\text{vol}},
+    \text{max\_vol\_acc}
+\right)
+$$
+
+`tick_spacing_index_reference` ($t_{\text{ref}}$) est en unités de tick-spacing, pas en ticks bruts : $t_{\text{ref}} = \lfloor \text{tick\_current} / \text{tick\_spacing} \rfloor$.
+
+### Pourquoi parabolique en distance de tick
+
+Mettre au carré l'accumulateur signifie que les frais augmentent comme le *carré* de la distance que le prix a parcourue loin de son point de référence. Empiriquement, cela correspond à la mise à l'échelle de la variance du prix sous pression de marche aléatoire : une excursion de tick de 2× implique 4× la volatilité implicite, donc charge 4× la surcharge. Le paramètre `dynamic_fee_control` calibre le niveau absolu.
+
+La fenêtre `filter_period` empêche les minuscules oscillations sub-seconde (par exemple, les bots MEV sandwich) de gonfler l'accumulateur. La fenêtre `decay_period` empêche un pic passé unique de charger des frais indéfiniment après que le marché se soit calmé.
+
+## Robustesse numérique
+
+- Tous les produits intermédiaires passent par l'arithmétique de forme `u128` ou `u256`. CLMM utilise les aides `U128Sqrt` et les motifs `FullMath::mulDiv` directement portés d'Uniswap v3.
+- L'arrondi de la division est choisi par étape pour appliquer l'invariant `k' ≥ k` localement. `SwapBaseInput` arrondit la sortie **vers le bas** ; `SwapBaseOutput` arrondit l'entrée **vers le haut**.
+- Les franchissements de tick qui abaissent `PoolState.liquidity` à zéro sont autorisés (le prix peut traverser un « trou de liquidité ») mais le swap avance simplement vers le prochain tick initialisé sans consommer d'entrée, sans charger de frais.
+- Garde de débordement : `sqrt_price_x64` est maintenu dans la plage inclusive `[MIN_SQRT_PRICE_X64, MAX_SQRT_PRICE_X64]` correspondant à `[MIN_TICK, MAX_TICK]`. Un swap qui pousserait au-delà d'une limite s'annule avec `SqrtPriceLimitOverflow`.
+
+## Où aller ensuite
+
+- [`products/clmm/ticks-and-positions`](/fr/products/clmm/ticks-and-positions) pour comment la carte de ticks participe à la marche.
+- [`products/clmm/fees`](/fr/products/clmm/fees) pour le côté frais/récompense des mathématiques en détail.
+- [`algorithms/clmm-math`](/fr/algorithms/clmm-math) pour les dérivations derrière `L = sqrt(x · y)` et les formules plage-vs-liquidité.
+
+Sources :
+
+- [`raydium-io/raydium-clmm` — `libraries/swap_math.rs`, `libraries/tick_math.rs`](https://github.com/raydium-io/raydium-clmm)
+- « Uniswap v3 Core » whitepaper, §6–7

@@ -1,0 +1,217 @@
+---
+title: "Akun LaunchLab"
+description: "PoolState (root per-peluncuran), vault base dan quote, PDA authority, dan grafik akun per-peluncuran. GlobalConfig tingkat protokol dan PlatformConfig tingkat platform tersedia di halaman terpisah."
+---
+
+<Info>
+  **Halaman ini diterjemahkan secara otomatis oleh AI. Versi bahasa Inggris adalah acuan resmi.**
+
+  [Lihat versi bahasa Inggris →](/products/launchlab/accounts)
+</Info>
+
+Halaman ini mendokumentasikan **grafik akun per-peluncuran**: `PoolState` (akun state root untuk satu peluncuran), dua vaultnya, PDA authority, dan referensi pasca-kelulusan yang diperolehnya ketika peluncuran diselesaikan.
+
+Untuk config tingkat protokol yang membatasi setiap peluncuran, lihat [`products/launchlab/global-config`](/id/products/launchlab/global-config). Untuk overlay per-platform, lihat [`products/launchlab/platform-config`](/id/products/launchlab/platform-config). Untuk akun vesting (`VestingSchedule` di `PoolState`, `VestingRecord` per penerima), lihat [`products/launchlab/vesting`](/id/products/launchlab/vesting).
+
+## Inventori akun
+
+| Akun | Pemilik | Tujuan |
+|---------|-------|---------|
+| [`GlobalConfig`](/id/products/launchlab/global-config) | Program LaunchLab | Aturan tingkat protokol: biaya, floor pasokan, dompet migrasi. Satu per `(curve_type, index)`. |
+| [`PlatformConfig`](/id/products/launchlab/platform-config) | Program LaunchLab | Overlay per-platform: branding, biaya platform, pemisahan NFT saat kelulusan, whitelist bentuk kurva. |
+| `PoolState` | Program LaunchLab | State root per-peluncuran: mint, vault, parameter kurva, counter terjual, counter biaya, jadwal vesting, status kelulusan. |
+| `authority` | Program LaunchLab | PDA tunggal di seed `[b"vault_auth_seed"]` yang memiliki vault di semua peluncuran dan menandatangani CPI pasca-kelulusan. |
+| `base_vault` | SPL Token / Token-2022 | Vault per-peluncuran yang menampung token base yang tidak terjual. |
+| `quote_vault` | SPL Token | Vault per-peluncuran yang menampung token quote yang terakumulasi. |
+| [`VestingRecord`](/id/products/launchlab/vesting) | Program LaunchLab | Catatan cliff + linear-unlock per-penerima. Opsional. |
+| `creator_fee_vault` | SPL Token | Vault per-kreator + per-quote-mint yang menampung biaya kreator yang terkumpul, disapu oleh `ClaimCreatorFee`. |
+| `platform_fee_vault` | SPL Token | Vault per-platform + per-quote-mint yang menampung biaya platform yang terkumpul, disapu oleh `ClaimPlatformFeeFromVault`. |
+| (pasca-kelulusan) `cpmm_pool_state` *atau* `amm_pool_state` | Program CPMM / AMM v4 | Pool yang dibuat oleh `MigrateToCpswap` / `MigrateToAmm`. |
+| (pasca-kelulusan) Fee Key NFT | Program LP-Lock | Membungkus irisan LP kreator pada kelulusan CPMM; memberi hak pemegang untuk `ClaimCreatorFee` di pool CPMM. |
+
+SDK's `raydium.launchpad.getLaunchById` mengembalikan `PoolState` ditambah flag yang menunjukkan apakah peluncuran telah lulus; jika ya, ID pool pasca-migrasi disertakan.
+
+## `PoolState`
+
+State root per-peluncuran. Nama field di bawah cocok dengan struct Rust on-chain (`states/pool.rs`); beberapa nilai disederhanakan untuk keterbacaan — lihat sumber untuk tata letak memori yang tepat.
+
+```rust
+// states/pool.rs (abridged)
+pub struct PoolState {
+    pub epoch:                     u64,        // recent_epoch tracker
+    pub auth_bump:                 u8,
+    pub status:                    u8,         // PoolStatus enum
+    pub base_decimals:             u8,
+    pub quote_decimals:            u8,
+    pub migrate_type:              u8,         // 0 = AMM v4, 1 = CPMM
+    pub supply:                    u64,        // total base tokens (no decimals)
+    pub total_base_sell:           u64,        // base supply allocated to the curve
+    pub virtual_base:              u64,        // virtual-reserve seed
+    pub virtual_quote:             u64,        // virtual-reserve seed
+    pub real_base:                 u64,        // base sold so far
+    pub real_quote:                u64,        // quote raised so far (excl. fees)
+    pub total_quote_fund_raising:  u64,        // graduation threshold in quote
+
+    pub quote_protocol_fee:        u64,        // accrued, pending CollectFee
+    pub platform_fee:              u64,        // accrued, pending ClaimPlatformFee
+    pub migrate_fee:               u64,        // accrued, pending CollectMigrateFee
+    pub vesting_schedule:          VestingSchedule,
+
+    pub global_config:             Pubkey,
+    pub platform_config:           Pubkey,
+    pub creator:                   Pubkey,
+    pub base_mint:                 Pubkey,
+    pub quote_mint:                Pubkey,
+    pub base_vault:                Pubkey,
+    pub quote_vault:               Pubkey,
+
+    pub amm_creator_fee_on:        u8,         // 0 = QuoteToken, 1 = BothToken (CPMM-only)
+    pub token_program_flag:        u8,         // bit flags for SPL Token vs Token-2022
+    pub padding:                   [u8; 54],
+}
+
+#[derive(Default, Debug, Clone)]
+pub struct VestingSchedule {
+    pub total_locked_amount:    u64,
+    pub cliff_period:           u64,
+    pub unlock_period:          u64,
+    pub start_time:             u64,           // set at graduation
+    pub allocated_share_amount: u64,           // running sum across VestingRecords
+}
+```
+
+Nilai `PoolStatus` (dari Anchor IDL):
+
+```
+0 = Funding         — menerima beli / jual; di bawah quote_reserve_target
+1 = Migrate         — quote_reserve_target tercapai; menunggu MigrateTo*
+2 = Migrated        — MigrateTo* sudah dijalankan; jam vesting berjalan
+```
+
+Field yang menghadap integrator:
+
+- **`status`** — tiga nilai, monoton (Funding → Migrate → Migrated). Pembacaan selalu aman; penulisan dibatasi.
+- **`real_base`**, **`real_quote`** — state kurva saat ini. Dikombinasikan dengan `virtual_base` / `virtual_quote` cukup untuk menghitung harga spot tanpa menyentuh vault. Lihat [`bonding-curve`](/id/products/launchlab/bonding-curve).
+- **`total_base_sell`** vs `real_base` — rasio "kemajuan menuju kelulusan" untuk UI.
+- **`migrate_type`** — memilih apakah `MigrateToAmm` atau `MigrateToCpswap` adalah jalur kelulusan yang valid. Peluncuran Token-2022 harus menggunakan CPMM.
+- **`amm_creator_fee_on`** — hanya bermakna saat kelulusan ke CPMM. Memilih `creator_fee_on = OnlyQuoteToken` (`0`) atau `BothToken` (`1`) di pool CPMM pasca-kelulusan. *Terlepas dari namanya, enum ini secara efektif juga mendorong target migrasi — `BothToken` dipasangkan dengan `MigrateToAmm` dalam praktik operasional saat ini; `QuoteToken` dengan `MigrateToCpswap`.* Lihat [`creator-fees`](/id/products/launchlab/creator-fees).
+- **`quote_protocol_fee` / `platform_fee` / `migrate_fee`** — tiga counter biaya independen. Masing-masing memiliki instruksi klaim sendiri; lihat [`instructions`](/id/products/launchlab/instructions).
+- **`vesting_schedule`** — ada di setiap `PoolState` tetapi tidak aktif ketika `total_locked_amount == 0`. Lihat [`vesting`](/id/products/launchlab/vesting) untuk siklus hidup lengkap.
+
+## PDA authority
+
+LaunchLab menggunakan **satu** PDA authority di semua peluncuran, diturunkan tanpa seed per-peluncuran:
+
+```ts
+const LAUNCHLAB_PROGRAM_ID = new PublicKey("<LAUNCHLAB_ID>"); // lihat reference/program-addresses
+
+const [authority, bump] = PublicKey.findProgramAddressSync(
+  [Buffer.from("vault_auth_seed")],
+  LAUNCHLAB_PROGRAM_ID,
+);
+```
+
+PDA tunggal itu adalah:
+
+- Authority pada setiap `base_vault` dan `quote_vault` peluncuran.
+- `mint_authority` pada setiap `base_mint` peluncuran (pra-kelulusan).
+- Penandatangan pada CPI pasca-kelulusan ke AMM v4 / CPMM (`MigrateTo*`).
+- Penandatangan pada transfer `ClaimVestedToken` keluar dari base vault.
+
+`mint_authority` dibatalkan segera setelah `MigrateToAmm` / `MigrateToCpswap` sehingga pasokan tetap terbatas selamanya.
+
+Dua PDA tambahan membatasi vault biaya:
+
+```ts
+const [creatorFeeVaultAuthority] = PublicKey.findProgramAddressSync(
+  [Buffer.from("creator_fee_vault_auth_seed")],
+  LAUNCHLAB_PROGRAM_ID,
+);
+
+const [platformFeeVaultAuthority] = PublicKey.findProgramAddressSync(
+  [Buffer.from("platform_fee_vault_auth_seed")],
+  LAUNCHLAB_PROGRAM_ID,
+);
+```
+
+Ini menandatangani transfer keluar dari vault biaya terkait selama `ClaimCreatorFee` dan `ClaimPlatformFeeFromVault`.
+
+## Base mint
+
+Dibuat inline oleh `Initialize` dengan:
+
+- `mint_authority = authority` (dibatalkan saat kelulusan).
+- `freeze_authority = None`.
+- `supply = supply`, seluruhnya dimint ke `base_vault`.
+- `decimals` dipilih oleh kreator di `Initialize` (biasanya 6).
+
+Karena pasokan penuh dimint sebelumnya, `base_mint.supply` konstan selama peluncuran berlangsung. Pembelian kurva memindahkan token dari `base_vault` ke pembeli, tetapi tidak memanggil `mint_to`.
+
+`Initialize` / `InitializeV2` membuat peluncuran SPL Token. Instruksi dedicated `InitializeWithToken2022` memungkinkan base mint menjadi Token-2022 mint (dengan opsional `TransferFeeConfig`); quote mint tetap SPL Token. Peluncuran Token-2022 harus lulus ke pool CPMM karena AMM v4 hanya mendukung vault SPL Token.
+
+## Vault
+
+Baik `base_vault` maupun `quote_vault` adalah akun SPL Token standar yang dimiliki oleh PDA LaunchLab `authority`. Alamat disimpan di `PoolState` dan juga dapat diturunkan:
+
+```ts
+const [baseVault] = PublicKey.findProgramAddressSync(
+  [Buffer.from("pool_vault"), poolState.toBuffer(), baseMint.toBuffer()],
+  LAUNCHLAB_PROGRAM_ID,
+);
+const [quoteVault] = PublicKey.findProgramAddressSync(
+  [Buffer.from("pool_vault"), poolState.toBuffer(), quoteMint.toBuffer()],
+  LAUNCHLAB_PROGRAM_ID,
+);
+```
+
+(Verifikasi awalan seed yang tepat dari struct akun `Initialize` sumber sebelum mengandalkan derivasi dalam produksi.)
+
+## Vault biaya
+
+Dua PDA mengagregasi biaya di semua peluncuran:
+
+- **Creator fee vault** — PDA di seed `[creator, quote_mint]`. Setiap peluncuran yang mengumpulkan biaya kreator yang sama pada quote mint yang sama dituangkan ke vault yang sama. Kreator menyapunya melalui `ClaimCreatorFee`.
+- **Platform fee vault** — PDA di seed `[platform_config, quote_mint]`. Setiap peluncuran yang dirutekan melalui platform yang sama yang menggunakan quote mint yang sama dituangkan ke vault yang sama. `platform_fee_wallet` platform menyapunya melalui `ClaimPlatformFeeFromVault`. Ada juga varian sapuan per-peluncuran (`ClaimPlatformFee`) yang ditarik dari `quote_vault` peluncuran secara langsung tanpa melewati vault yang diagregasi.
+
+Pola vault agregasi adalah yang memungkinkan kreator atau platform volume tinggi mengamortisasi biaya sewa akumulasi biaya di banyak peluncuran.
+
+## Quote vault ↔ `real_quote`
+
+`quote_vault.balance` dan `PoolState.real_quote` harus tetap sinkron. Mereka dapat melenceng paling banyak jumlah tiga counter biaya tertunda (`quote_protocol_fee`, `platform_fee`, `migrate_fee`), yang berada di vault tetapi milik counter biaya dan bukan reserve kurva. Matematika kurva selalu menggunakan `real_quote`, tidak pernah saldo vault mentah.
+
+Invarian pra-kelulusan:
+
+```
+quote_vault.balance ==
+   real_quote
+ + quote_protocol_fee
+ + platform_fee
+ + migrate_fee
+```
+
+## Transisi akun siklus hidup
+
+| Peristiwa | Status | `real_base` | `real_quote` | Pool pasca-kelulusan |
+|-------|--------|-------------|--------------|----------------------|
+| `Initialize` | Funding | 0 | 0 | — |
+| `BuyExactIn` / `BuyExactOut` | Funding | `+base_out` | `+quote_in_after_fee` | — |
+| `SellExactIn` / `SellExactOut` | Funding | `−base_in` | `−quote_out_before_fee` | — |
+| `MigrateToAmm` / `MigrateToCpswap` | Funding → Migrate → Migrated | (beku) | (beku) | dibuat, LP split per `PlatformConfig` |
+| `ClaimCreatorFee` / `ClaimPlatformFee*` | apa saja | — | — | mengeringkan vault biaya |
+| `CreateVestingAccount` | Funding | — | — | bump `vesting_schedule.allocated_share_amount` |
+| `ClaimVestedToken` | Migrated saja | — | — | mengeringkan `base_vault` |
+
+## Ke mana lanjut
+
+- [`products/launchlab/bonding-curve`](/id/products/launchlab/bonding-curve) — matematika di balik `real_base` ↔ `real_quote`.
+- [`products/launchlab/instructions`](/id/products/launchlab/instructions) — daftar akun per-instruksi.
+- [`products/launchlab/global-config`](/id/products/launchlab/global-config) — ikatan tingkat protokol.
+- [`products/launchlab/platform-config`](/id/products/launchlab/platform-config) — overlay platform.
+- [`products/launchlab/vesting`](/id/products/launchlab/vesting) — mekanik pasokan terkunci.
+- [`products/cpmm/accounts`](/id/products/cpmm/accounts) — tampilan `cpmm_pool_state` pasca-kelulusan.
+
+Sumber:
+
+- `raydium-launch/programs/launchpad/src/states/pool.rs` — `PoolState`, `PoolStatus`, `VestingSchedule`, `AmmCreatorFeeOn`.
+- `raydium-launch/programs/launchpad/src/lib.rs` — konstanta seed PDA (`AUTH_SEED`, `CREATOR_FEE_VAULT_AUTH_SEED`, `PLATFORM_FEE_VAULT_AUTH_SEED`).
+- [Modul Raydium SDK v2 `launchpad`](https://github.com/raydium-io/raydium-sdk-V2).

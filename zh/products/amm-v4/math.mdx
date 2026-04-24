@@ -1,0 +1,183 @@
+---
+title: "AMM v4 数学"
+description: "常数乘积不变式与 AMM v4 的费用约定、储备金至订单簿价格转换、目标订单网格构造以及 PnL 结算步骤。"
+---
+
+<Info>
+  **本页内容由 AI 自动翻译，所有内容以英文版本为准。**
+
+  [查看英文版 →](/products/amm-v4/math)
+</Info>
+
+## 不变式
+
+池子维持 `coin_reserve × pc_reserve = k`，其中：
+
+```
+coin_reserve = coin_vault_balance
+             + orders_posted_on_openbook.base
+             + pending_coin_fill_not_yet_settled
+pc_reserve   = pc_vault_balance
+             + orders_posted_on_openbook.quote
+             + pending_pc_fill_not_yet_settled
+             - accrued_pnl_pc
+```
+
+需要注意两点：
+
+1. 储备金包括**在 OpenBook 上提交的**金额。AMM 的限价单仍然是其流动性的一部分——它们并未"丢失"到订单簿中，只是被托管在那里。仅根据链上金库余额计算 `k` 会低估储备金。
+2. PnL 累计值（`need_take_pnl_*`）被减去，以便在管理员扫除费用时保持曲线不变。这与 CPMM 的 `protocol_fees_*` 排除原则相同。
+
+每次 `Swap*` 操作都会强制执行 `k' ≥ k`，在把流动性提供者的费用份额加回到储备金后。
+
+## 费用约定
+
+AMM v4 使用**比例费用**（分子/分母对），而不是 CPMM / CLMM 的 `1/1_000_000` 约定。链上 `Fees` 结构体（见[程序源中的 `Fees::initialize`](https://github.com/raydium-io/raydium-amm/blob/master/program/src/state.rs)）默认为：
+
+```
+Fees {
+  min_separate_numerator:    5,
+  min_separate_denominator:  10_000,   //  5/10_000 = 0.05%
+
+  trade_fee_numerator:      25,
+  trade_fee_denominator:    10_000,    // 25/10_000 = 0.25% — 用于 OpenBook 限价单定价
+
+  pnl_numerator:            12,
+  pnl_denominator:          100,       // 12/100   = 12%   — 协议在交换费中的份额
+
+  swap_fee_numerator:       25,
+  swap_fee_denominator:     10_000,    // 25/10_000 = 0.25% — AMM 路径交换的总费用
+}
+```
+
+解释（发布的主网默认值）：
+
+- **总交换费：** `swap_fee = amount_in × 25 / 10_000 = 0.25%` 的总输入。
+- **协议份额：** `pnl_numerator / pnl_denominator = 12 / 100 = 12%` **占交换费的**，相当于交易量的 `0.25% × 12% = 0.03%`。这部分累计到 PnL 计数器中，由 `WithdrawPnl` 扫除。
+- **流动性提供者份额：** 交换费的剩余 `88%`，相当于交易量的 `0.25% × 88% = 0.22%`。留在池子中并增加 `k`。
+- **无基金份额。** AMM v4 没有 CPMM/CLMM 的基金费用拆分。
+
+注意 `pnl_numerator / pnl_denominator` 是费用的一个分数**，而不是**交易量的分数——这是这些字段名称常见的误读。
+
+`trade_fee_numerator / trade_fee_denominator`（也是 `25 / 10_000`）是一个独立的字段，由 OpenBook 集成使用，用于计算 AMM 限价单网格的费用包含价格；默认情况下它等于 `swap_fee`，但从不同的代码路径读取。
+
+偏离这些默认值的情况很少见，但在少数几个遗留池子中确实存在；在引用之前，请始终从 `AmmInfo.fees` 读取费用。
+
+## 直接交换数学（AMM 路径）
+
+最简单的情况：用户针对池子的金库进行交换，而不与 OpenBook 互动。池子的内部储备金（包括在簿上的分配）是分母。
+
+**SwapBaseIn（精确输入）：**
+
+```
+amount_after_fee = amount_in − ceil(amount_in × swap_fee_numerator / swap_fee_denominator)
+amount_out = amount_after_fee × out_reserve
+           / (in_reserve + amount_after_fee)
+require(amount_out >= minimum_amount_out)
+```
+
+这里使用的储备金是**有效**储备金。从历史上讲，这是 `coin_vault_balance + coin_posted_on_openbook + ...`（AMM 的金库加上它锁定在 OpenBook 订单中的代币）。**自 OpenBook 停用后，在簿上的余额为零**，因此有效储备金等于原始金库余额。曾经用于刷新 OpenBook 端的 `MonitorStep` / 隐式结算路径在实践中不再需要。
+
+**SwapBaseOut（精确输出）：**
+
+```
+amount_in_after_fee = ceil(in_reserve × amount_out / (out_reserve − amount_out))
+amount_in_gross     = ceil(amount_in_after_fee × swap_fee_denominator
+                            / (swap_fee_denominator − swap_fee_numerator))
+require(amount_in_gross <= maximum_amount_in)
+```
+
+## 订单簿交互（历史）
+
+<Note>
+  **不再活跃。** 本节中描述的网格构造反映了 AMM v4 **最初**如何将曲线镜像到 OpenBook 市场的方式。OpenBook 集成已被停用；池子不再在 OpenBook 上发布或维护订单。以下数学保留用于参考——它解释了链上 `target_orders` / `amm_open_orders` 账户的大小以及为什么程序即使 keeper 不再执行它们也仍然验证 `MonitorStep` 相关参数。
+</Note>
+
+与用户交换分开，AMM v4 历史上在 OpenBook 市场上放置了一个**限价单网格**。该网格从 `AmmInfo` 参数计算：
+
+- **`depth`** — 每一侧的价格水平数量。
+- **`amount_wave`** — 每个水平的基本大小单位。
+- **`min_size`**、**`coin_lot_size`**、**`pc_lot_size`** — OpenBook 市场约束。
+- **`state_data.swap_acc_coin_fee`**、**`swap_acc_pc_fee`** — 自上次 `TakePnl` 以来的累计费用计数器。
+
+程序通过从当前曲线价格开始，以恒定比率步长走出来推导每个水平的价格：
+
+```
+price_level(k) = curve_price × (1.0001 ^ k)       # 概念上
+size_level(k)  = amount_wave × f(depth, k)        # 按深度锥化
+```
+
+精确的价格和大小由 `build_orders` 计算的 `target_orders` 确定，并与每个 `MonitorStep` 中的 `amm_open_orders` 进行比较。任何偏差都会导致取消 + 新发布。OpenBook 上新填充的订单在刷新 OpenBook 端的下一次操作时结算到池子金库中。
+
+集成者很少需要计算网格——Raydium keeper 维护它——但了解以下情况很有用：
+
+- 具有大量**在簿上**流动性的池子将该流动性贡献给 `k`，而不是闲置。
+- 陈旧的 OpenBook 市场（事件队列已满，crank 被阻止）会阻止网格更新；AMM 随后可以引用与可见订单簿不同的价格，直到下一次 crank。
+
+## 结算步骤（PnL）
+
+0.03% 的协议份额累计到 `state_data.need_take_pnl_coin` 和 `state_data.need_take_pnl_pc`。`TakePnl` 将这些金额从金库移出到管理员指定的目标地址，然后清零计数器。
+
+关键属性：不变式中的储备金始终计算时**减去**累计 PnL，所以 `TakePnl` 不会移动曲线。这与 CPMM 约定相匹配。
+
+## 计算示例
+
+池子状态：
+
+- `coin_reserve = 1_000_000_000_000`（100 万币方；6 位小数）
+- `pc_reserve   = 2_000_000_000_000`（200 万 pc 方；6 位小数）
+- 费用：默认 `swap = 25/10_000`、`pnl = 3/10_000`。
+
+用户：`SwapBaseIn` 精确输入 `1_000_000_000` 个币（1,000 个币）。
+
+```
+swap_fee        = ceil(1_000_000_000 * 25 / 10_000)    = 2_500_000
+amount_after_fee =                                      997_500_000
+
+amount_out = amount_after_fee * pc_reserve
+           / (coin_reserve + amount_after_fee)
+           = 997_500_000 * 2_000_000_000_000
+           / (1_000_000_000_000 + 997_500_000)
+           ≈ 1_995_015_009  (1,995.015 pc)
+
+// 在 2_500_000 交换费中：
+pnl_share = 2_500_000 * 3 / 25  = 300_000    (通过 need_take_pnl_coin 进入协议)
+lp_share  = 2_500_000 * 22 / 25 = 2_200_000  (留在 coin_reserve 中)
+
+new coin_reserve = 1_000_000_000_000 + 1_000_000_000                 = 1_001_000_000_000
+                   (其中 300_000 是累计 PnL)
+  curve coin_reserve = 1_001_000_000_000 − 300_000 = 1_000_999_700_000
+new pc_reserve   = 2_000_000_000_000 − 1_995_015_009                 ≈ 1_998_004_984_991
+
+k' = curve_coin_reserve * new_pc_reserve
+   ≈ 2.000_002_701E24
+k  = 1_000_000_000_000 * 2_000_000_000_000
+   = 2.0E24
+k' > k   ✓
+```
+
+LP 份额（`2_200_000`）不会在任何地方被单独显示——它只是将 `k'` 提高的剩余部分。
+
+## 精度规则
+
+- 储备金乘法使用 `u128`；最终除法向零舍入。
+- `swap_fee` 向上舍入（使池子不会低收费）。
+- `SwapBaseOut` 的 `amount_in` 向上舍入（使用户不会少付）。
+- 具有极端储备金比率的池子在非常小的输入上可能会触发 `ZeroTradingTokens`；与 CPMM 的约定相同。
+
+## 相比 CPMM 的限制
+
+- AMM v4 的储备金包括 OpenBook 托管部分，所以集成者不能仅从 `getTokenAccountBalance` 中正确报价。始终获取完整状态（金库 + `open_orders.free` + `open_orders.locked`），或使用 SDK / API 报价。
+- AMM v4 不公开结构化的链上 TWAP。想要 AMM v4 支持价格的外部消费者必须自己从交易日志计算。
+- 不支持 Token-2022。
+
+## 后续内容
+
+- [`products/amm-v4/instructions`](/zh/products/amm-v4/instructions) — `SwapBaseIn`、`Deposit` 等的说明。
+- [`products/amm-v4/fees`](/zh/products/amm-v4/fees) — 完整费用机制、`TakePnl` 详情。
+- [`algorithms/constant-product`](/zh/algorithms/constant-product) — 共享的推导。
+
+来源：
+
+- [Raydium AMM 程序源 — `raydium-io/raydium-amm`](https://github.com/raydium-io/raydium-amm)
+- Raydium SDK v2 `Liquidity` 模块

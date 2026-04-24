@@ -1,0 +1,213 @@
+---
+title: "錢包整合"
+description: "在錢包 UI 中顯示 Raydium 頭寸、流動性池份額、農場質押和待領獎勵——檢測模式、交易預覽的模擬，以及 Token-2022 顯示細節。"
+---
+
+<Info>
+  **本頁內容由 AI 自動翻譯，所有內容以英文版本為準。**
+
+  [查看英文版 →](/integration-guides/wallet-integration)
+</Info>
+
+<Info>
+  錢包整合 Raydium 時，通常需要針對每位使用者回答四個問題：該使用者在哪些流動性池中有 LP？他們持有哪些頭寸（CLMM NFT）？他們質押了哪些農場？這一切的價值有多少？本頁記載了各項細節。
+</Info>
+
+## 檢測 Raydium 頭寸
+
+### 經典 LP 代幣（CPMM、AMM v4）
+
+這些看起來就像任何其他 SPL Token：使用者的 ATA 中持有餘額。錢包預設將其視為另一種代幣。要將其揭示為 Raydium LP 頭寸：
+
+1. 列舉使用者的代幣帳戶：`connection.getParsedTokenAccountsByOwner(user, { programId: TOKEN_PROGRAM_ID })`。
+2. 針對每個 mint，檢查 Raydium 的 mint 列表：`GET https://api-v3.raydium.io/pools/info/lps?lps=<LP_MINT>,...`（每次呼叫最多批量約 50 個 LP mint）。
+3. 對於相符的 mint，API 會傳回流動性池參考。使用它來計算該頭寸的代幣面額價值：
+
+```
+token_a_owned = user_lp_balance * poolReserves.A / lpMint.supply
+token_b_owned = user_lp_balance * poolReserves.B / lpMint.supply
+usd_value     = token_a_owned * priceA_usd + token_b_owned * priceB_usd
+```
+
+同時顯示 LP 餘額和展開後的金額——使用者以基礎代幣而非 LP 單位進行思考。
+
+### CLMM 頭寸 NFT
+
+CLMM 頭寸是 NFT。每個頭寸的 `PersonalPositionState` PDA 是從 NFT mint 衍生的。要檢測：
+
+1. 列舉使用者的 NFT。對於舊版 Metaplex NFT：將代幣帳戶篩選為供應量為 1 且小數點為 0 的帳戶。
+2. 針對每個 NFT mint，嘗試衍生 PersonalPositionState PDA：
+
+```ts
+import { CLMM_PROGRAM_ID } from "@raydium-io/raydium-sdk-v2";
+
+const [positionPda] = PublicKey.findProgramAddressSync(
+  [Buffer.from("position"), nftMint.toBuffer()],
+  CLMM_PROGRAM_ID,
+);
+
+const accountInfo = await connection.getAccountInfo(positionPda);
+if (!accountInfo || !accountInfo.owner.equals(CLMM_PROGRAM_ID)) return null;
+// 這是 Raydium CLMM 頭寸——進行解碼。
+```
+
+3. 透過 `raydium.clmm.getPositionInfo({ positionPda })` 進行解碼以取得：
+   - `poolId` → 取得流動性池以解析 mint
+   - `tickLower`、`tickUpper` → 顯示範圍
+   - `liquidity`、`tokensOwedA/B` → 計算頭寸價值 + 待領手續費
+   - `rewardInfos` → 每個獎勵流的待領獎勵
+
+4. 對於在 Token-2022 下發行的頭寸 NFT（`OpenPositionWithToken22Nft`），NFT mint 的程式是 Token-2022 而非 SPL Token。掃描時需列舉兩者。
+
+### 農場質押
+
+農場 v3 / v5 / v6 各有一個針對每位使用者的帳本 PDA。衍生方式：
+
+```ts
+// 針對使用者的每個潛在農場互動，嘗試所有三個農場版本。
+// 最廉價的方法：先問 API，它已索引所有使用者頭寸。
+
+const r = await fetch(
+  `https://api-v3.raydium.io/positions/staking?wallet=${user.toBase58()}`
+).then(r => r.json());
+
+for (const s of r.data.stakings) {
+  // s.farmId、s.stakedAmount、s.pendingRewards[]、s.poolApr、...
+}
+```
+
+對於偏好完全鏈上檢測的錢包：透過將使用者與精選「可能」農場 ID 列表雜湊，反覆可能的 `UserLedger` PDA。完全列舉所有農場 ID 並不實際（存在數千個）；請使用 API。
+
+## 計算頭寸價值
+
+### CPMM / AMM v4 LP
+
+```ts
+const poolInfo = await raydium.<type>.getPoolInfoFromRpc({ poolId });
+const myShare  = userLpBalance / poolInfo.lpMint.supply;
+const tokensA  = BigInt(poolInfo.mintAmountA) * BigInt(userLpBalance)
+                / BigInt(poolInfo.lpMint.supply);
+const tokensB  = BigInt(poolInfo.mintAmountB) * BigInt(userLpBalance)
+                / BigInt(poolInfo.lpMint.supply);
+```
+
+然後將各個乘以 mint 的美元價格（來自 `raydium.token` 或價格預言機）。
+
+### CLMM 頭寸
+
+```ts
+const position = await raydium.clmm.getPositionInfo({ positionPda });
+const pool     = await raydium.clmm.getPoolInfoFromRpc({ poolId: position.poolId });
+
+const { amountA, amountB } = PoolUtils.getAmountsFromLiquidity({
+  sqrtPriceX64:  pool.sqrtPriceX64,
+  tickLower:     position.tickLower,
+  tickUpper:     position.tickUpper,
+  liquidity:     position.liquidity,
+  slippage:      0,  // 顯示用，無滑點
+});
+
+// 待領手續費——另行顯示為「未收取」
+const fees = {
+  A: position.tokenFeesOwedA,
+  B: position.tokenFeesOwedB,
+};
+
+// 待領獎勵——CLMM 流動性池有 0-3 個獎勵流。
+const rewards = position.rewardInfos.map(r => ({
+  mint:          r.rewardMint,
+  rewardAmount:  r.rewardAmountOwed,
+}));
+```
+
+渲染為：
+
+- 流動性價值（當前價格）
+- 未收取的手續費
+- 每個流的待領獎勵
+- 範圍：`[tickLower_price, tickUpper_price]`，顯示當前價格是否在範圍內的視覺條
+
+### 農場質押
+
+```ts
+// API 回應已包含待領獎勵；直接使用。
+const apr       = stakingFarm.apr;               // %，年化
+const staked    = stakingFarm.stakedAmount;      // 質押 mint 的最小單位
+const rewards   = stakingFarm.pendingRewards;    // 陣列，{ mint, amount }
+```
+
+對於鏈上計算，應鏡像農場的會計：
+
+```
+pending_reward_i = user.deposited
+                 * farm.reward_per_share_x64[i] / 2^64
+                 - user.reward_debts[i]
+```
+
+在計算前務必使用延遲更新公式重新整理 `reward_per_share_x64`（經過時間 × 發行速率 ÷ 總質押）。
+
+## 交易預覽的模擬
+
+在使用者簽署前，錢包通常會預覽餘額變化。使用 `simulateTransaction`：
+
+```ts
+const sim = await connection.simulateTransaction(tx, {
+  sigVerify: false,
+  commitment: "confirmed",
+  accounts: {
+    encoding: "base64",
+    addresses: [userTokenAtaA, userTokenAtaB, userLpAta].map(a => a.toBase58()),
+  },
+});
+
+// 解碼每個傳回帳戶的餘額，並與交易前的餘額進行差異對比。
+for (const [i, acctData] of sim.value.accounts!.entries()) {
+  const newBalance = decodeTokenAccount(acctData!.data[0]).amount;
+  // 與交易前的餘額進行對比，顯示 Δ
+}
+```
+
+`accounts` 參數要求驗證程序針對列出的位址傳回模擬後的帳戶狀態。比嘗試從指令形狀單獨預測餘額變化要準確得多。
+
+### 模擬陷阱
+
+- **CLMM 交換需要有效的 tick 陣列。** 如果使用者的輸入大小會進入未初始化的 tick 陣列，模擬會回溯（與執行相同）。在 UI 中清楚地顯示此情況。
+- **優先費用。** 模擬執行時不應用計算預算指令。對於大型交易如果會超過預設 200k CU，模擬會失敗但使用明確 CU 限制的實際執行會成功。也在被模擬的交易上設定 CU 限制。
+- **新鮮的 blockhash。** 模擬使用當前 blockhash；如果簽署需要超過 60 秒，交易會變成無效。如果使用者猶豫不決，請重新模擬。
+
+## Token-2022 顯示
+
+Token-2022 程式下的代幣應在錢包的代幣列表中標示為此類，因為它們具有不同的風險表面：
+
+- **轉帳費用 mint**：在餘額旁顯示目前的 `transferFeeBasisPoints` 為「轉帳費用：X%」。接收時發出警告——使用者可能沒意識到他們會收到少於發送者傳送的金額。
+- **轉帳鉤子 mint**：顯示鉤子程式 ID。惡意鉤子可以阻止出站轉帳；使用者應驗證鉤子是他們預期的。
+- **不可轉帳 mint**：顯示「不可轉帳」並禁用交換/傳送。這些通常是靈魂綁定代幣或憑證。
+- **利息型 mint**：從 `TokenAccount.amount` 衍生的 UI 餘額**不**反映累積利息。使用來自 `@solana/spl-token` 的 `amountToUiAmount`（應用調整係數）作為顯示價值。
+
+## 農場 APR 顯示
+
+向使用者顯示的 APR 應結合所有現場獎勵流，轉換為美元並年化：
+
+```ts
+let apr = 0;
+for (const r of farm.rewardInfos) {
+  if (r.rewardState !== 1) continue;   // 跳過未執行的
+  const annualRewardTokens = Number(r.emissionPerSecond) * 86400 * 365 / 1e<decimals>;
+  const annualRewardValue  = annualRewardTokens * priceUsd(r.rewardMint);
+  const tvlValue           = Number(farm.totalStaked) * priceUsd(farm.stakingMint) / 1e<decimals>;
+  apr += annualRewardValue / tvlValue;
+}
+```
+
+顯示為 `APR: X.Y%`。如果質押 mint 是 LP 代幣，也計算基礎 LP 的基本手續費 APR 並將總和標示為「總 APR」或「APR + 手續費」。
+
+## 指標
+
+- [`products/clmm/ticks-and-positions`](/zh-Hant/products/clmm/ticks-and-positions) — 頭寸價值衍生。
+- [`products/farm-staking/accounts`](/zh-Hant/products/farm-staking/accounts) — 農場狀態欄位。
+- [`algorithms/token-2022-transfer-fees`](/zh-Hant/algorithms/token-2022-transfer-fees) — 轉帳費用代幣的顯示語義。
+
+來源：
+
+- Raydium SDK v2 — 頭寸/農場助手。
+- `api-v3.raydium.io` 上的使用者頭寸端點。

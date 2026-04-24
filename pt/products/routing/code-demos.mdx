@@ -1,0 +1,440 @@
+---
+title: "Demonstrações de código para roteamento"
+description: "Exemplos em TypeScript: swap multi-hop baseado em SDK através do roteador e construção manual de instruções."
+---
+
+<Info>
+  **Esta página foi traduzida automaticamente por IA. A versão em inglês é a fonte oficial.**
+
+  [Ver versão em inglês →](/products/routing/code-demos)
+</Info>
+
+## Informações de versão
+
+- **SDK:** `@raydium-io/raydium-sdk-v2@0.2.42-alpha`
+- **Rede:** mainnet-beta
+- **ID do programa roteador:** `routeUGWgWzqBWFcrCfv8tritsqukccJPu3q5GPP3xS`
+- **Verificado:** abril de 2026
+
+## Exemplo 1: Roteamento baseado em SDK
+
+Fonte: [`src/trade/routeSwap.ts`](https://github.com/raydium-io/raydium-sdk-V2-demo/blob/master/src/trade/routeSwap.ts)
+
+O SDK da Raydium abstrai a construção de rotas. Use as funções de negociação do SDK para compor uma rota multi-hop e executá-la através do roteador automaticamente.
+
+### Configuração
+
+```typescript
+import {
+  Raydium,
+  Router,
+  Token,
+  TokenAmount,
+  toApiV3Token,
+  toFeeConfig,
+  TxVersion,
+} from "@raydium-io/raydium-sdk-v2";
+import {
+  Connection,
+  Keypair,
+  PublicKey,
+} from "@solana/web3.js";
+import { NATIVE_MINT, TOKEN_2022_PROGRAM_ID } from "@solana/spl-token";
+
+const connection = new Connection("https://api.mainnet-beta.solana.com", "confirmed");
+const wallet = Keypair.fromSecretKey(/* your key bytes */);
+
+const raydium = await Raydium.load({
+  connection,
+  owner: wallet,                 // the SDK will sign with this Keypair
+  cluster: "mainnet",
+  disableFeatureCheck: true,
+  blockhashCommitment: "finalized",
+});
+
+// The router needs a chain-time anchor for CLMM hops.
+await raydium.fetchChainTime();
+```
+
+### Construir um swap multi-hop
+
+O roteamento em `@raydium-io/raydium-sdk-v2` é exposto em `raydium.tradeV2`. A forma completa — buscando dados do pool, computando rotas, classificando por output e construindo a transação de swap — é mostrada abaixo; isto corresponde ao exemplo canônico em [`raydium-sdk-V2-demo/src/trade/routeSwap.ts`](https://github.com/raydium-io/raydium-sdk-V2-demo/blob/master/src/trade/routeSwap.ts).
+
+```typescript
+// 1. Choose input/output mints and amount.
+const inputMint = NATIVE_MINT;                                     // wSOL
+const outputMint = new PublicKey("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"); // USDC
+const inputAmount = "8000000";                                     // 0.008 SOL (lamports)
+
+// 2. Fetch all pool basic info. Cache this aggressively — it's a large RPC fan-out.
+const poolData = await raydium.tradeV2.fetchRoutePoolBasicInfo();
+
+// 3. Enumerate every viable route across AMM v4, CPMM, CLMM, and Stable AMM.
+const routes = raydium.tradeV2.getAllRoute({
+  inputMint,
+  outputMint,
+  ...poolData,
+});
+
+// 4. Hydrate routes with the live RPC state (reserves, ticks, mint info).
+const {
+  routePathDict,
+  mintInfos,
+  ammPoolsRpcInfo,
+  ammSimulateCache,
+  clmmPoolsRpcInfo,
+  computeClmmPoolInfo,
+  computePoolTickData,
+  computeCpmmData,
+} = await raydium.tradeV2.fetchSwapRoutesData({
+  routes,
+  inputMint,
+  outputMint,
+});
+
+// 5. Compute output amounts for every candidate route. Result is sorted descending by output.
+const swapRoutes = raydium.tradeV2.getAllRouteComputeAmountOut({
+  inputTokenAmount: new TokenAmount(
+    new Token({
+      mint: inputMint.toBase58(),
+      decimals: mintInfos[inputMint.toBase58()].decimals,
+      isToken2022: mintInfos[inputMint.toBase58()].programId.equals(TOKEN_2022_PROGRAM_ID),
+    }),
+    inputAmount,
+  ),
+  directPath: routes.directPath.map(
+    (p) =>
+      ammSimulateCache[p.id.toBase58()] ||
+      computeClmmPoolInfo[p.id.toBase58()] ||
+      computeCpmmData[p.id.toBase58()],
+  ),
+  routePathDict,
+  simulateCache: ammSimulateCache,
+  tickCache: computePoolTickData,
+  mintInfos,
+  outputToken: toApiV3Token({
+    ...mintInfos[outputMint.toBase58()],
+    programId: mintInfos[outputMint.toBase58()].programId.toBase58(),
+    address: outputMint.toBase58(),
+    freezeAuthority: undefined,
+    mintAuthority: undefined,
+    extensions: { feeConfig: toFeeConfig(mintInfos[outputMint.toBase58()].feeConfig) },
+  }),
+  chainTime: Math.floor(raydium.chainTimeData?.chainTime ?? Date.now() / 1000),
+  slippage: 0.005, // 0.5%
+  epochInfo: await raydium.connection.getEpochInfo(),
+});
+
+const targetRoute = swapRoutes[0];
+if (!targetRoute) throw new Error("no swap routes were found");
+
+// 6. Resolve the pool keys for the chosen route.
+const poolKeys = await raydium.tradeV2.computePoolToPoolKeys({
+  pools: targetRoute.poolInfoList,
+  ammRpcData: ammPoolsRpcInfo,
+  clmmRpcData: clmmPoolsRpcInfo,
+});
+
+// 7. Build, sign, and execute the swap transaction(s).
+const { execute, transactions } = await raydium.tradeV2.swap({
+  routeProgram: Router,
+  txVersion: TxVersion.V0,
+  swapInfo: targetRoute,
+  swapPoolKeys: poolKeys,
+  ownerInfo: {
+    associatedOnly: true,
+    checkCreateATAOwner: true,
+  },
+  computeBudgetConfig: {
+    units: 600_000,
+    microLamports: 465_915,
+  },
+});
+
+// `sequentially: true` is important — the first transaction may need to create
+// intermediate ATAs that subsequent transactions rely on.
+const { txIds } = await execute({ sequentially: true });
+console.log("txIds:", txIds);
+```
+
+### Comportamento esperado
+
+O SDK trata:
+
+- Descoberta de rotas através de AMM v4, CPMM, CLMM e Stable AMM.
+- Derivação de contas (estados do pool, vaults, contas de observação, pré-criação de ATA).
+- Empacotamento de instruções para o programa roteador (`Router`) quando a rota é multi-hop, ou um swap de pool direto quando um único pool já oferece o melhor preço.
+- Aplicação de slippage através do parâmetro `slippage` em `getAllRouteComputeAmountOut`.
+
+`raydium.tradeV2.swap` pode retornar mais de uma `transaction` — a primeira geralmente inicializa ATAs intermediárias e a segunda realiza o swap propriamente. Sempre passe `sequentially: true` para `execute()` para que elas se confirmem na ordem correta.
+
+---
+
+## Exemplo 2: Construção manual de instruções (pseudocódigo semelhante ao Rust)
+
+Se você precisa de controle mais fino ou está construindo um programa que faz CPI no roteador, construa as instruções manualmente. O exemplo abaixo usa **tag 8 (`SwapBaseIn`)** — a variante Current recomendada — e roteamento através de ATAs de propriedade do usuário de ponta a ponta.
+
+### Cenário: USDC → SOL (CPMM) → mSOL (CPMM)
+
+#### Passo 1: Derivar as ATAs do usuário
+
+```typescript
+import { getAssociatedTokenAddressSync } from "@solana/spl-token";
+import { PublicKey } from "@solana/web3.js";
+
+const ROUTER_PROGRAM_ID = new PublicKey(
+  "routeUGWgWzqBWFcrCfv8tritsqukccJPu3q5GPP3xS"
+);
+
+const USDC_MINT = new PublicKey(
+  "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+);
+const SOL_MINT = new PublicKey(
+  "So11111111111111111111111111111111111111112"
+);
+const MSOL_MINT = new PublicKey(
+  "mSoL1MK4LCEDcTYVhPnD6DHK4PMGQ8WyXDEMXbnQAaW"
+);
+
+// User input / intermediate / output ATAs — all owned by the caller.
+const user_usdc_ata = getAssociatedTokenAddressSync(USDC_MINT, wallet.publicKey);
+const user_sol_ata  = getAssociatedTokenAddressSync(SOL_MINT,  wallet.publicKey, true); // wSOL: allowOwnerOffCurve
+const user_msol_ata = getAssociatedTokenAddressSync(MSOL_MINT, wallet.publicKey);
+
+// If the user's intermediate / output ATAs do not yet exist, create them up
+// front via the Associated Token Account program (or use CreateSyncNative for
+// the wSOL ATA on tag 5).
+```
+
+#### Passo 2: Coletar contas para cada hop
+
+Hop 1 é USDC/SOL no CPMM. Hop 2 é SOL/mSOL no CPMM.
+
+```typescript
+// Hop 1: USDC/SOL swap on CPMM
+const CPMM_PROGRAM_ID = new PublicKey(
+  "CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C"
+);
+
+// Fetch pool state for USDC/SOL
+const usdc_sol_pool = await connection.getParsedAccountInfo(
+  USDC_SOL_POOL_STATE
+);
+
+// Pool state, authority, vaults, mints, token programs, etc.
+// (see products/cpmm/accounts for the full 11-account list)
+const hop1_accounts = [
+  CPMM_PROGRAM_ID,           // Identifies this as CPMM
+  USDC_SOL_POOL_STATE,
+  CPMM_AUTHORITY,
+  USDC_SOL_VAULT_TOKEN0,
+  USDC_SOL_VAULT_TOKEN1,
+  USDC_MINT,
+  SOL_MINT,
+  LP_MINT,
+  OBSERVATION_STATE,
+  TOKEN_PROGRAM,
+  ASSOCIATED_TOKEN_PROGRAM,
+  SYSTEM_PROGRAM,
+];
+
+// Hop 2: SOL/mSOL swap on CPMM
+const sol_msol_pool = await connection.getParsedAccountInfo(
+  SOL_MSOL_POOL_STATE
+);
+
+const hop2_accounts = [
+  CPMM_PROGRAM_ID,           // Identifies this as CPMM
+  SOL_MSOL_POOL_STATE,
+  CPMM_AUTHORITY,
+  SOL_MSOL_VAULT_TOKEN0,
+  SOL_MSOL_VAULT_TOKEN1,
+  SOL_MINT,
+  MSOL_MINT,
+  LP_MINT_2,
+  OBSERVATION_STATE_2,
+  TOKEN_PROGRAM,
+  ASSOCIATED_TOKEN_PROGRAM,
+  SYSTEM_PROGRAM,
+];
+```
+
+#### Passo 3: Construir a instrução
+
+```typescript
+import BN from "bn.js";
+
+// Arguments
+const amount_in = new BN(1_000_000_000); // 1000 USDC (6 decimals)
+const minimum_amount_out = new BN(500_000_000_000); // 500 mSOL (9 decimals)
+
+// No CLMM hops, so limit_prices is empty
+const limit_prices: BN[] = [];
+
+// Pack arguments
+let data = Buffer.alloc(1024);
+let offset = 0;
+
+// Tag 8: SwapBaseIn (Current variant; empty limit_prices is allowed)
+data[offset++] = 8;
+
+// amount_in (u64)
+data.writeBigUInt64LE(BigInt(amount_in.toString()), offset);
+offset += 8;
+
+// minimum_amount_out (u64)
+data.writeBigUInt64LE(BigInt(minimum_amount_out.toString()), offset);
+offset += 8;
+
+// limit_prices (VecDeque<u128>) — empty (no CLMM hops in this route).
+// Tag 8 accepts an empty deque without error. Write zero entries (no u128s).
+
+data = data.slice(0, offset);
+
+// Construct accounts list — every intermediate ATA is user-owned.
+const accounts = [
+  { pubkey: user_usdc_ata, isSigner: true,  isWritable: true },
+  { pubkey: user_sol_ata,  isSigner: false, isWritable: true },
+  { pubkey: user_msol_ata, isSigner: false, isWritable: true },
+  ...hop1_accounts.map((pk, i) => ({
+    pubkey: pk,
+    isSigner: false,
+    isWritable: i === 0 ? false : true, // program ID is not writable
+  })),
+  ...hop2_accounts.map((pk, i) => ({
+    pubkey: pk,
+    isSigner: false,
+    isWritable: i === 0 ? false : true,
+  })),
+];
+
+const instruction = new TransactionInstruction({
+  programId: ROUTER_PROGRAM_ID,
+  keys: accounts,
+  data,
+});
+```
+
+#### Passo 4: Enviar transação
+
+```typescript
+const { blockhash } = await connection.getLatestBlockhash();
+
+const tx = new VersionedTransaction(
+  new TransactionMessage({
+    instructions: [instruction],
+    payerKey: wallet.publicKey,
+    recentBlockhash: blockhash,
+  }).compileToV0Message()
+);
+
+tx.sign([wallet]);
+const sig = await connection.sendTransaction(tx);
+await connection.confirmTransaction(sig);
+```
+
+---
+
+## Exemplo 3: Tratamento de erros
+
+Erros comuns e como recuperar:
+
+### ExceededSlippage
+
+O output foi menor que `minimum_amount_out`. Tente novamente com tolerância de slippage mais alta ou obtenha uma nova cotação da rota.
+
+```typescript
+try {
+  const sig = await connection.sendTransaction(tx);
+} catch (error) {
+  if (error.message.includes("ExceededSlippage")) {
+    console.log(
+      "Route price moved. Re-quote and rebuild transaction."
+    );
+  }
+}
+```
+
+### SqrtPriceX64 (CLMM)
+
+O preço de um hop CLMM saiu dos limites de `limit_prices`. Atualize os limites e tente novamente.
+
+### InvalidOwner
+
+Uma ATA intermediária ou de output não é de propriedade do chamador. O roteador valida a propriedade a cada slot; certifique-se de que cada ATA que você passa foi derivada da carteira do usuário (não de nenhuma outra autoridade).
+
+---
+
+## Dicas e melhores práticas
+
+### Pré-criar ATAs intermediárias
+
+Antes de rotear através de um novo token intermediário pela primeira vez, crie a ATA do usuário para que a rota não falhe na validação:
+
+```typescript
+import { createAssociatedTokenAccountInstruction } from "@solana/spl-token";
+
+const createAtaIx = createAssociatedTokenAccountInstruction(
+  wallet.publicKey,  // payer
+  user_sol_ata,      // ATA to create
+  wallet.publicKey,  // owner — always the user
+  SOL_MINT,
+);
+
+// Bundle createAtaIx into the same transaction as the first route, or send it
+// once up front; the rent (~0.002 SOL) is reclaimable later via tag 6
+// (CloseTokenAccount) once the ATA is empty.
+```
+
+Para wSOL especificamente, prefira [`CreateSyncNative`](/pt/products/routing/instructions#createsyncnative-tag-5) (tag 5) — ele cria a ATA, transfere o SOL e sincroniza em uma única instrução.
+
+### Obter cotação antes de executar
+
+Sempre consulte os pools e calcule o output esperado antes de construir a instrução:
+
+```typescript
+// Pseudocode: get the current pool state and compute price
+const pool1State = await connection.getAccountInfo(USDC_SOL_POOL_STATE);
+const amount_out_hop1 = computeSwapOutput(
+  amount_in,
+  pool1State,
+  USDC_MINT,
+  SOL_MINT
+);
+
+const pool2State = await connection.getAccountInfo(SOL_MSOL_POOL_STATE);
+const amount_out_hop2 = computeSwapOutput(
+  amount_out_hop1,
+  pool2State,
+  SOL_MINT,
+  MSOL_MINT
+);
+
+const minimum_amount_out = amount_out_hop2 * 0.99; // 1% slippage
+```
+
+### Use as variantes mais novas de instruções (8–9)
+
+As tags 8 e 9 (`SwapBaseIn` e `SwapBaseOut`) são mais flexíveis com `limit_prices`. Prefira-as sobre as variantes legadas se você não precisar de validação de preço CLMM.
+
+```typescript
+// Tag 8: SwapBaseIn with optional limit_prices
+data[offset++] = 8;
+// ... rest of packing; limit_prices deque can be empty
+```
+
+---
+
+## Próximos passos
+
+- [`products/routing/instructions`](/pt/products/routing/instructions) — referência completa de instruções.
+- [`products/routing/accounts`](/pt/products/routing/accounts) — detalhes de derivação de contas.
+- [`products/cpmm/code-demos`](/pt/products/cpmm/code-demos) — exemplos de swap CPMM para comparação.
+- [`reference/program-addresses`](/pt/reference/program-addresses) — IDs de programa canônicos e endereços devnet.
+
+Fontes:
+
+- [`@raydium-io/raydium-sdk-v2` on npm](https://www.npmjs.com/package/@raydium-io/raydium-sdk-v2)
+- [`raydium-io/raydium-sdk-V2`](https://github.com/raydium-io/raydium-sdk-V2) (open source)
+- [`raydium-io/raydium-sdk-V2-demo`](https://github.com/raydium-io/raydium-sdk-V2-demo) — demonstrações oficiais de ponta a ponta incluindo `routeSwap.ts`
+- O código-fonte do programa AMM Routing não está disponível publicamente; verifique o ID do programa contra a API ao vivo e o bytecode on-chain

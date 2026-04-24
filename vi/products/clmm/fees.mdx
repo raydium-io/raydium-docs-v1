@@ -1,0 +1,266 @@
+---
+title: "Phí và phần thưởng CLMM"
+description: "Cách CLMM phân chia phí giao dịch cho LP, giao thức và quỹ; cách hệ thống phần thưởng ba khe phát ra cho các vị thế trong phạm vi; và cách cả hai quy về số dư trên từng vị thế."
+---
+
+<Info>
+  **Trang này được dịch tự động bằng AI. Phiên bản tiếng Anh là bản chính thức.**
+
+  [Xem bản tiếng Anh →](/products/clmm/fees)
+</Info>
+
+## Các mức phí
+
+Pool CLMM được gắn với một `AmmConfig` tại thời điểm tạo; config này quyết định tỷ lệ phí giao dịch, tỷ phần giao thức và quỹ, cùng với **khoảng cách tick** (xem [`products/clmm/ticks-and-positions`](/vi/products/clmm/ticks-and-positions)). Các mức phí tiêu chuẩn thường thấy (xác nhận trực tiếp qua `GET https://api-v3.raydium.io/main/clmm-config`):
+
+| Chỉ số `AmmConfig` | `trade_fee_rate` | Khoảng cách tick | Trường hợp sử dụng |
+|---|---|---|---|
+| 0 | `100` (0.01%) | 1 | Cặp stablecoin |
+| 1 | `500` (0.05%) | 10 | Blue-chip tương quan |
+| 2 | `2_500` (0.25%) | 60 | Cặp tiêu chuẩn |
+| 3 | `10_000` (1.00%) | 120 | Tài sản biến động cao hoặc long-tail |
+
+Tỷ lệ phí giao dịch tính theo đơn vị `1/FEE_RATE_DENOMINATOR = 1/1_000_000` của khối lượng. Tỷ lệ giao thức và quỹ dùng cùng mẫu số nhưng được áp dụng trên **phí giao dịch**, không phải trên khối lượng — quy ước giống với CPMM.
+
+## Phân chia phí mỗi lần swap
+
+Ở mỗi bước của một swap (xem [`products/clmm/math`](/vi/products/clmm/math)):
+
+```
+step_trade_fee   = ceil(step_input * trade_fee_rate / 1_000_000)
+step_protocol    = floor(step_trade_fee * protocol_fee_rate / 1_000_000)
+step_fund        = floor(step_trade_fee * fund_fee_rate     / 1_000_000)
+step_lp          = step_trade_fee - step_protocol - step_fund
+```
+
+- `step_lp` được đưa vào `fee_growth_global_{input_side}_x64` theo tỷ lệ với thanh khoản đang hoạt động: `fee_growth_global += step_lp × 2^64 / pool.liquidity`.
+- `step_protocol` tích lũy vào `PoolState.protocol_fees_token_{input_side}` — được thu qua `CollectProtocolFee`.
+- `step_fund` tích lũy vào `PoolState.fund_fees_token_{input_side}` — được thu qua `CollectFundFee`.
+
+Giống như CPMM, phần phí giao thức và quỹ vẫn nằm trong vault nhưng **bị loại ra khỏi tầm nhìn thanh khoản của curve**: công thức swap đọc `pool.liquidity`, vốn không bị thổi phồng bởi các khoản phí đang chờ thu.
+
+## Lý do phí được tính theo từng phía
+
+Khác với CPMM (nơi phí của một swap luôn được tính bằng token đầu vào và phía còn lại của pool không ghi nhận khoản tích lũy giao thức/quỹ cho swap đó), trong CLMM cùng quy tắc áp dụng tại mỗi bước: **phí tích lũy ở phía token nào là đầu vào của bước đó**. Vì một swap qua nhiều tick có hướng nhất quán, tất cả các bước đều tính phí bằng cùng một token — nên trên thực tế, phí của bất kỳ swap nào đều chỉ về *một* phía.
+
+Nếu người dùng swap token0 → token1, `fee_growth_global_0_x64` tăng; `fee_growth_global_1_x64` không thay đổi. Các vị thế nhận phí bằng token0 trong swap đó. Swap tiếp theo có thể đi theo chiều ngược lại và ghi vào `fee_growth_global_1_x64`. Theo thời gian, một pool cân bằng sẽ tích lũy phí trên cả hai phía.
+
+## Phí một chiều (`CollectFeeOn`)
+
+Các pool được tạo qua [`CreateCustomizablePool`](/vi/products/clmm/instructions) có thể chọn chế độ thu phí không mặc định. Chế độ này được cố định tại thời điểm tạo pool và lưu trong `PoolState.fee_on`.
+
+| Giá trị `CollectFeeOn` | Byte `fee_on` | Hành vi |
+|---|---|---|
+| `FromInput` (mặc định) | `0` | Kiểu Uniswap-V3 cổ điển — phí luôn được khấu trừ từ token đầu vào của mỗi bước swap. Token đầu vào thay đổi theo chiều swap. |
+| `Token0Only` | `1` | Phí luôn được tính bằng token0. Với swap 0→1, phí là token đầu vào (giống `FromInput`). Với swap 1→0, phí được lấy từ đầu ra của swap (token0). |
+| `Token1Only` | `2` | Đối xứng với `Token0Only` — phí luôn bằng token1. |
+
+**Lý do pool chọn `Token0Only` hoặc `Token1Only`** — để cung cấp cho LP một đồng tiền tích lũy nhất quán và dễ dự đoán. Các cặp như `MEMECOIN / USDC` mà LP tính toán theo USD sẽ được lợi từ `Token1Only` (phí luôn quy về USDC); lãi/lỗ của LP khi đó không bị ảnh hưởng bởi chiều giao dịch nào chiếm ưu thế. Đánh đổi là ở các chiều mà phí lấy từ đầu ra swap, người dùng nhận được `out − fee` thay vì `out − ε` từ đầu vào, nên logic định giá phải trừ phí từ phía đầu ra. Hàm `computeAmountOut` của SDK xử lý nhánh này dựa trên `fee_on`; code phía client đọc `pool.fee_on` trực tiếp cần phản ánh các hàm trợ giúp trên `PoolState`:
+
+```rust
+pool.is_fee_on_input(zero_for_one: bool) -> bool   // true → fee is deducted from input
+pool.is_fee_on_token0(zero_for_one: bool) -> bool  // for telemetry / accounting
+```
+
+**Ảnh hưởng ở cấp LP** — phí vẫn được định tuyến qua các bộ tích lũy `fee_growth_global_{0,1}_x64` tiêu chuẩn theo mỗi bước swap, nên các vị thế vẫn quyết toán phí bằng cùng công thức `fee_growth_inside`. Sự bất đối xứng chỉ nằm ở *chiều* tích lũy phía, không phải ở công thức tính toán.
+
+`fee_on` **không** thể thay đổi sau khi tạo. Các pool tạo bằng `CreatePool` cũ đều là `FromInput` vĩnh viễn.
+
+## Phí động
+
+Các pool được tạo với `enable_dynamic_fee = true` áp dụng một khoản phụ phí dựa trên biến động giá, cộng thêm vào `AmmConfig.trade_fee_rate`. Cơ chế này được chuyển thể đơn giản hóa từ thiết kế phí động của Trader Joe / Meteora.
+
+### Trạng thái
+
+`PoolState.dynamic_fee_info` lưu năm tham số hiệu chỉnh (snapshot của `DynamicFeeConfig` tại thời điểm tạo pool) cùng bốn trường trạng thái được cập nhật sau mỗi swap. Xem [`products/clmm/accounts`](/vi/products/clmm/accounts#dynamicfeeconfig-and-dynamicfeeinfo) để biết bố cục byte.
+
+### Cập nhật mỗi lần swap
+
+Tại mỗi bước swap, chương trình thực hiện ba bước con:
+
+1. **Phân rã tham chiếu.** Nếu `now - last_update_timestamp > filter_period`, tham chiếu biến động sẽ phân rã:
+
+    ```
+    if elapsed > decay_period:
+        volatility_reference = 0
+    elif elapsed > filter_period:
+        volatility_reference = volatility_accumulator * reduction_factor / 10_000
+    # else: hold the previous reference
+    ```
+
+2. **Cập nhật bộ tích lũy.** Bộ tích lũy mới là tham chiếu cộng với khoảng cách tuyệt đối đã đi qua (theo đơn vị `tick_spacing`), nhân với hệ số độ chi tiết, và bị giới hạn ở mức tối đa đã cấu hình:
+
+    ```
+    delta_idx     = abs(tick_spacing_index_reference - current_tick_spacing_index)
+    accumulator   = volatility_reference + delta_idx * 10_000   // VOLATILITY_ACCUMULATOR_SCALE
+    accumulator   = min(accumulator, max_volatility_accumulator)
+    ```
+
+3. **Tính phụ phí.** Phụ phí có dạng parabol theo bộ tích lũy (vì "khoảng cách tick" của swap được bình phương trong công thức chuẩn), có hệ số khuếch đại là `dynamic_fee_control`:
+
+    ```
+    fee_increment_rate = dynamic_fee_control * (accumulator * tick_spacing)^2
+                       / (100_000 * 10_000^2)
+    fee_rate           = AmmConfig.trade_fee_rate + fee_increment_rate
+    fee_rate           = min(fee_rate, 100_000)              // 10% cap
+    ```
+
+Giới hạn 10% (`MAX_FEE_RATE_NUMERATOR = 100_000` theo đơn vị `1e6`) được mã hóa cứng như một rào cản an toàn; trong thực tế, các config được điều chỉnh tốt thường ở mức thấp hơn nhiều.
+
+### Lựa chọn tham số
+
+Các khoảng mặc định đã hoạt động tốt trong các pool thử nghiệm:
+
+| Tham số | Khoảng thường dùng | Ghi chú |
+|---|---|---|
+| `filter_period` | 30 – 60 giây | Giữ tham chiếu qua biến động vi mô; thấp hơn = phản ứng nhanh hơn |
+| `decay_period` | 300 – 1800 giây | Sau khoảng thời gian bình lặng này, phí trở về mức cơ sở |
+| `reduction_factor` | 4_000 – 8_000 | Trên `10_000`. Cao hơn = phí nâng cao duy trì lâu hơn |
+| `dynamic_fee_control` | 1_000 – 50_000 | Trên `100_000`. Hệ số khuếch đại của đường cong |
+| `max_volatility_accumulator` | 100_000 – 10_000_000 | Giới hạn mức tối đa mà phụ phí có thể đạt |
+
+Hiệu chỉnh bằng cách phát lại các swap lịch sử ngoại tuyến so với công thức, sau đó điều chỉnh `dynamic_fee_control` sao cho phí trung bình kết quả khớp với mục tiêu (ví dụ: 1.5× cơ sở vào ngày biến động 1σ, 5× vào ngày 3σ).
+
+### LP thấy gì
+
+Doanh thu phí động chảy qua cùng các bộ tích lũy với phí cơ sở — `fee_growth_global_{0,1}_x64`. Không có trường "dynamic fee growth" riêng biệt. LP trong các pool biến động đơn giản là kiếm được phí cao hơn trong thời kỳ biến động, không cần lệnh claim hay quyết toán bổ sung nào.
+
+### Điều integrator cần biết
+
+- Phí mà một quote trả về có thể thay đổi giữa block N và block N+1 dù dự trữ pool chưa dịch chuyển — mỗi swap đều thay đổi bộ tích lũy biến động. Các quote từ Trade API có giá trị tại block lúc quote và có thể lệch vài bps nếu pool phản ứng nhanh bị kích hoạt giữa quote và thực thi.
+- `volatility_accumulator` và `last_update_timestamp` là public trên chuỗi — client có thể tái hiện công thức phía client để mô phỏng ngoại tuyến.
+
+## Hạch toán phí trên từng vị thế
+
+Mỗi vị thế lưu, tại thời điểm cập nhật gần nhất:
+
+- `fee_growth_inside_0_last_x64` và `fee_growth_inside_1_last_x64` — mức tăng trưởng phí theo phạm vi tại snapshot đó.
+
+Mỗi lần vị thế được chạm đến tiếp theo (`IncreaseLiquidity`, `DecreaseLiquidity`, và ngầm định bất kỳ chuyển trạng thái nào cập nhật fee growth theo tick):
+
+1. Chương trình tính lại `fee_growth_inside_{0,1}_x64` từ fee growth **toàn cục** và hai tick endpoint `fee_growth_outside_*`.
+2. Δ được cộng vào `tokens_fees_owed_{0,1}` theo trọng số thanh khoản của vị thế:
+
+   ```
+   Δ_fee_growth_inside_0 = fee_growth_inside_now_0 - fee_growth_inside_last_0
+   tokens_fees_owed_0  += Δ_fee_growth_inside_0 * position.liquidity / 2^64
+   ```
+
+3. `fee_growth_inside_{0,1}_last_x64` được cập nhật.
+
+Token thực sự di chuyển chỉ khi `DecreaseLiquidity` hoặc qua đường `CollectFees` chuyên dụng (trong bộ lệnh hiện tại của Raydium, phí được thu cùng với `DecreaseLiquidity`). Đặt `liquidity = 0` trong lệnh `DecreaseLiquidity` là cách thông thường để "chỉ thu phí".
+
+### Vị thế ngoài phạm vi không kiếm được gì
+
+Nếu phạm vi của vị thế không chứa `tick_current`, `fee_growth_inside` được tính cho nó **bị giới hạn từ trên** và không thay đổi khi giá nằm ngoài phạm vi đó. Vị thế ngừng tích lũy phí cho đến khi giá quay trở lại phạm vi của nó. Đây là tính năng, không phải lỗi — đây chính là cách thanh khoản tập trung tập trung cả *lợi suất phí* lẫn vốn.
+
+## Luồng phần thưởng
+
+Một pool CLMM có thể có tối đa **ba** luồng phần thưởng hoạt động đồng thời. Mỗi luồng là một bộ gồm (reward mint, tỷ lệ phát thải, thời gian bắt đầu, thời gian kết thúc) được lưu trong `PoolState.reward_infos[i]`.
+
+```rust
+pub struct RewardInfo {
+    pub reward_state: u8,               // Uninitialized | Initialized | Open | Ended
+    pub open_time: u64,
+    pub end_time: u64,
+    pub last_update_time: u64,
+    pub emissions_per_second_x64: u128, // Q64.64 reward tokens per second
+    pub reward_total_emissioned: u64,
+    pub reward_claimed: u64,
+    pub token_mint:    Pubkey,
+    pub token_vault:   Pubkey,
+    pub authority:     Pubkey,           // who can SetRewardParams / fund
+    pub reward_growth_global_x64: u128,  // accumulator, Q64.64
+}
+```
+
+### Vòng lặp quyết toán
+
+Mỗi lệnh chạm đến thanh khoản (và `UpdateRewardInfos` độc lập) đẩy tất cả luồng đang hoạt động đến thời điểm `now`:
+
+```
+for each reward_info with state in {Open, Ended within grace}:
+    elapsed         = min(now, end_time) − last_update_time
+    if elapsed > 0 && pool.liquidity > 0:
+        reward_growth_global_x64 += emissions_per_second_x64 × elapsed × 2^64 / pool.liquidity
+        reward_total_emissioned  += emissions_per_second × elapsed
+    last_update_time = min(now, end_time)
+```
+
+Nếu `pool.liquidity == 0` trong một khoảng thời gian, phần thưởng của khoảng đó **không được** phân phối (không thể phân phối vì không có thanh khoản trong phạm vi để trả). Ngân sách còn lại ở trong vault phần thưởng. Các giao thức mint và bỏ qua có thể bổ sung hoặc kết thúc luồng qua `SetRewardParams`.
+
+### Tích lũy phần thưởng trên từng vị thế
+
+Hoàn toàn giống phí, với thêm một chiều theo từng luồng:
+
+```
+for each stream i:
+    reward_growth_inside_now_i   = compute_inside_i(pool, tick_lower, tick_upper)
+    Δ_i = reward_growth_inside_now_i - personal_position.reward_infos[i].growth_inside_last_x64
+    personal_position.reward_infos[i].reward_amount_owed += Δ_i * personal_position.liquidity / 2^64
+    personal_position.reward_infos[i].growth_inside_last_x64 = reward_growth_inside_now_i
+```
+
+Người dùng claim qua `CollectReward`, lệnh này chuyển `reward_amount_owed` từ vault của luồng sang người dùng và đặt lại bộ đếm về 0.
+
+### Chỉ vị thế trong phạm vi mới nhận phần thưởng
+
+`reward_growth_inside` dùng cùng công thức với `fee_growth_inside` — thông qua các bộ tích lũy tick-outside — nên các vị thế ngoài phạm vi giá hiện tại không tích lũy phần thưởng. Điều này phản ánh lựa chọn thiết kế của Uniswap v3 "ưu đãi dành cho thanh khoản đang hoạt động" và gắn kết lợi ích của LP với phạm vi bao phủ giá spot.
+
+### Nạp vốn và kết thúc luồng
+
+Luồng được tạo qua `InitializeReward`, lệnh này nạp toàn bộ ngân sách (`emissions_per_second × (end_time − open_time)`) vào vault phần thưởng của luồng ngay từ đầu. Chương trình từ chối `InitializeReward` nếu số dư của người nạp không đủ. `SetRewardParams` có thể kéo dài `end_time` hoặc tăng tỷ lệ phát thải; việc giảm bất kỳ tham số nào đều bị chặn để tránh rug-pull đối với phần thưởng đã hứa với LP.
+
+Khi `now > end_time`, luồng chuyển sang trạng thái `Ended` nhưng `reward_growth_global_x64` của nó vẫn tiếp tục được đọc — LP vẫn có thể `CollectReward` cho các khoản đã kiếm trong lịch sử lâu sau khi phát thải dừng.
+
+## Thu phí quản trị
+
+| Người ký | Lệnh | Tác động |
+|--------|-------------|--------|
+| `amm_config.owner` | `CollectProtocolFee` | Thu `protocol_fees_token_{0,1}` về một địa chỉ nhận. |
+| `amm_config.fund_owner` | `CollectFundFee` | Thu `fund_fees_token_{0,1}` về một địa chỉ nhận. |
+
+Cả hai đều không làm dịch chuyển curve — các khoản tích lũy đã nằm ngoài `pool.liquidity`. Xem [`security/admin-and-multisig`](/vi/security/admin-and-multisig) để biết ai nắm giữ các quyền ký này trên mainnet.
+
+## Tương tác với Token-2022
+
+Phí và phần thưởng đều được tính bằng một trong các token của pool hoặc luồng. Các extension của Token-2022 hoạt động giống như trong CPMM:
+
+- **Transfer fee trên mint đầu vào của swap.** Pool nhận được `amount_in − mint_transfer_fee`. Đầu vào bước của chương trình CLMM được tính theo số tiền thực, nên các bộ tích lũy phí của pool phản ánh token thực sự trong vault.
+- **Transfer fee trên mint đầu ra.** Pool gửi `amount_out`; người dùng nhận được `amount_out − mint_transfer_fee`. Kiểm tra slippage nên thực hiện dựa trên số tiền người dùng thực nhận.
+- **Transfer fee trên reward mint.** Phát thải được tính theo đơn vị "vào-vault" tại thời điểm `InitializeReward` (người nạp trả transfer fee mint vào vault). Khi rút qua `CollectReward` sẽ phát sinh thêm một lần transfer fee; LP nên kỳ vọng bị khấu trừ một phần nhỏ khi nhận token phần thưởng có transfer fee.
+- **Mint không thể chuyển / bảo mật / thành viên nhóm.** Bị từ chối tại `CreatePool` / `InitializeReward`.
+
+Tác động kết hợp trên một swap multi-hop có transfer fee có thể đáng kể. Các công cụ định giá bỏ qua điều này sẽ hứa hẹn quá mức; xem [`algorithms/token-2022-transfer-fees`](/vi/algorithms/token-2022-transfer-fees) để tham khảo phép tính chuẩn.
+
+## Đọc phí và phần thưởng ngoại tuyến
+
+```ts
+const pool = await raydium.clmm.getPoolInfoFromRpc(poolId);
+const position = await raydium.clmm.getOwnerPositionInfo({
+  wallet: owner.publicKey,
+});
+
+for (const p of position) {
+  console.log("Position", p.nftMint.toBase58(),
+              "range", p.tickLower, "→", p.tickUpper,
+              "L", p.liquidity.toString(),
+              "fees owed:", p.tokenFeesOwed0.toString(),
+              p.tokenFeesOwed1.toString(),
+              "rewards owed:", p.rewardInfos.map(r => r.rewardAmountOwed.toString()));
+}
+```
+
+`tokenFeesOwed*` và `rewardAmountOwed` là các snapshot từ lần cuối vị thế được chạm đến. Để xem giá trị **hiện tại** (phản ánh tăng trưởng kể từ đó), hãy gọi `IncreaseLiquidity` với thanh khoản bằng 0 trong một mô phỏng, hoặc đơn giản là tính lại bằng cách dùng `fee_growth_*` toàn cục và hai snapshot tick-outside.
+
+## Đọc thêm
+
+- [`products/clmm/math`](/vi/products/clmm/math) — dẫn xuất đầy đủ của `fee_growth_inside`.
+- [`products/clmm/instructions`](/vi/products/clmm/instructions) — danh sách tài khoản cho `CollectReward`, `InitializeReward`, `SetRewardParams`.
+- [`algorithms/token-2022-transfer-fees`](/vi/algorithms/token-2022-transfer-fees) — định giá với mint có transfer fee.
+- [`reference/fee-comparison`](/vi/reference/fee-comparison) — ma trận so sánh phí CLMM/CPMM/AMM-v4.
+
+Nguồn tham khảo:
+
+- [`raydium-io/raydium-clmm` — `states/pool.rs`, `libraries/fixed_point_64.rs`](https://github.com/raydium-io/raydium-clmm)
+- "Uniswap v3 Core" whitepaper, §7 (fee growth)

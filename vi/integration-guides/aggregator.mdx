@@ -1,0 +1,202 @@
+---
+title: "Tích hợp aggregator"
+description: "Cách khám phá các pool Raydium, lấy giá trên CPMM / CLMM / AMM v4, và định tuyến atomic swaps qua tập hợp chương trình thích hợp. Dành cho các aggregator DEX và giao diện swap của ví."
+---
+
+<Info>
+  **Trang này được dịch tự động bằng AI. Phiên bản tiếng Anh là bản chính thức.**
+
+  [Xem bản tiếng Anh →](/integration-guides/aggregator)
+</Info>
+
+<Info>
+  Nhiệm vụ của aggregator là cung cấp cho người dùng mức giá tốt nhất có thể trên nhiều pool, có khả năng chia một lượng input duy nhất trên nhiều tuyến pool, và thực hiện nó theo kiểu atomic. Trang này ghi chép các phần liên quan đến Raydium: khám phá, lấy giá, và lắp ráp giao dịch.
+</Info>
+
+## Khám phá
+
+### Danh sách pool
+
+Bạn cần có danh sách đầy đủ các pool Raydium hoạt động cho mỗi sản phẩm. Ba tùy chọn:
+
+1. **REST API** (đơn giản nhất): `GET https://api-v3.raydium.io/pools/info/list?poolType=all&pageSize=1000&page=1` trả về các pool theo lô 1000 cái. Phân trang cho đến khi có tất cả. Cache trong 1–5 phút.
+2. **Quét on-chain**: `getProgramAccounts` trên các ID chương trình CPMM, CLMM, và AMM v4, lọc theo discriminator của state account. Mang lại ~mọi pool hoạt động với ~10s thời gian RPC. Hữu ích khi API không hoạt động hoặc bị giới hạn tốc độ.
+3. **Kết hợp**: sử dụng API làm nguồn chính; chạy quét on-chain hàng ngày làm kiểm tra sự hiểu biết. Nhóm cam kết giữ API toàn diện, nhưng các pool được tạo thông qua CPI trực tiếp (không có frontend) có thể thỉnh thoảng bị chậm.
+
+### Tra cứu cặp mint
+
+Đối với một cặp `(mintA, mintB)` cụ thể, sử dụng `GET /pools/info/mint?mint1=...&mint2=...&poolType=all&sort=liquidity`. Trả về mọi pool ở bất kỳ mức phí nào và loại sản phẩm. Tới ~10 kết quả trên mỗi cặp là phổ biến trên các mint được giao dịch rộng rãi; sắp xếp theo TVL và lấy vài cái hàng đầu để định tuyến.
+
+## Lấy giá
+
+Toán học lấy giá khác nhau theo sản phẩm. Sử dụng các hàm toán học thuần túy của SDK để bạn không cần tái triển khai:
+
+```ts
+// CPMM
+const cpmmQuote = raydium.cpmm.computeAmountOut({
+  poolInfo: cpmmPool,
+  amountIn,
+  mintIn,
+  mintOut,
+  slippage: 0,        // compute exact expected; layer slippage at route level
+});
+
+// CLMM — crosses ticks; deterministic but more expensive.
+// `computeAmountOutFormat` is the canonical helper exposed via `PoolUtils` in
+// raydium-sdk-v2: the `*Format` suffix signals that it returns the output
+// pre-shaped for transaction building (including `remainingAccounts` for tick arrays).
+const { output: clmmOut, remainingAccounts } = PoolUtils.computeAmountOutFormat({
+  poolInfo:  clmmPool,
+  poolState: clmmPoolState,
+  tickArrayCache,
+  amountIn,
+  tokenIn:   mintIn,
+  slippage:  0,
+});
+
+// AMM v4
+const ammV4Quote = raydium.liquidity.computeAmountOut({
+  poolInfo: ammV4Pool,
+  amountIn,
+  mintIn: mintIn,
+  mintOut: mintOut,
+  slippage: 0,
+});
+```
+
+Trả về cho cả ba: `{ amountOut, fee, priceImpact, minAmountOut }`. Để so sánh aggregator, sử dụng `amountOut` (trước slippage).
+
+### Tính mới của cache
+
+Pool state trở thành cũ rất nhanh. Các mục tiêu tính mới được khuyến nghị:
+
+| Loại pool | Tần suất tải lại | Tại sao |
+|-----------|---------------------|-----|
+| CPMM với `<$100k` TVL | `<10s` | Reserves thay đổi trên mỗi giao dịch. |
+| CPMM với `>$10M` TVL | 30–60s | Reserves chiếm ưu thế; giao dịch nhỏ là nhiễu. |
+| CLMM | `<30s` | Ranh giới tick; một giao dịch lớn duy nhất có thể tái cấu hình tính thanh khoản. |
+| AMM v4 | `<30s` | Chuyển động phía OpenBook không được ghi lại trong vault. |
+
+Đối với aggregator lấy giá ở latency tương tác, hãy đăng ký cập nhật account WebSocket (`accountSubscribe`) trên mỗi pool state liên quan. Điều đó lật ngược mô hình từ polling thành push.
+
+### Điều chỉnh Token-2022
+
+Nếu bất kỳ mint nào trong tuyến có Token-2022 transfer fee, toán học lấy giá phải điều chỉnh input và output theo [`algorithms/token-2022-transfer-fees`](/vi/algorithms/token-2022-transfer-fees). SDK xử lý điều này nếu `poolInfo.mintA.extensions.transferFeeConfig` được điền. Xác nhận bằng cách xem trường `.extensions` trước khi tin tưởng giá trích dẫn.
+
+## Định tuyến
+
+### Tuyến single-pool
+
+Hầu hết các tuyến là single-pool. Chọn pool có `amountOut` cao nhất. Nếu nhiều pool gần bằng nhau, quyết định bằng mức phí (thấp hơn tốt hơn), sau đó là TVL (cao hơn an toàn hơn).
+
+### Định tuyến chia tách
+
+Đối với các giao dịch lớn trong đó một pool duy nhất có >5% price impact, chia tách trên các pool. Một thuật toán tham lam đơn giản:
+
+```
+remaining = amountIn
+routes    = []
+while remaining > 0:
+    best_pool, best_size = argmax over pools of:
+        marginal_out_per_in(pool, current_size_toward_pool + epsilon)
+    size = min(remaining, best_pool.max_size_at_target_impact)
+    routes.append((best_pool, size))
+    remaining -= size
+```
+
+Điều này tạo ra một vectơ định tuyến `[(pool_A, 0.6), (pool_B, 0.3), (pool_C, 0.1)]` giảm thiểu tác động tổng hợp. Một giải pháp tối ưu hóa convex thích hợp (ví dụ: cân bằng giá biên trên các pool) nằm trong ~1% của kết quả tham lam trong thực tế.
+
+### Tuyến multi-hop
+
+`USDC → RAY → SOL` thông qua hai pool riêng biệt là phổ biến khi không có pool `USDC-SOL` trực tiếp nào cho giá trích dẫn tốt (hiếm). Áp dụng giới hạn slippage cho mỗi hop; mỗi hop thực hiện `minAmountOut` của riêng nó. Xem [`algorithms/slippage-and-price-impact`](/vi/algorithms/slippage-and-price-impact).
+
+Multi-hop trên cùng một pool (ví dụ: hai hop CLMM trên `SOL-USDC`) luôn kém hơn so với một hop duy nhất — không tạo các tuyến như vậy.
+
+## Lắp ráp giao dịch
+
+### Single-hop, single-pool
+
+Sử dụng `raydium.trade.swap` của SDK trực tiếp:
+
+```ts
+const { execute } = await raydium.trade.swap({
+  poolKeys:        poolInfo,
+  amountIn,
+  amountOut:       quote.minAmountOut,
+  fixedSide:       "in",
+  inputMint:       mintIn,
+  txVersion:       TxVersion.V0,
+  computeBudgetConfig: {
+    units:         250_000,
+    microLamports: priorityFee,
+  },
+});
+```
+
+### Chia tách và multi-hop
+
+Tạo ATAs + instructions theo cách thủ công. Mẫu:
+
+```
+[1] ComputeBudget set_compute_unit_limit
+[2] ComputeBudget set_compute_unit_price
+[3] createATA (nếu cần, một lần cho mỗi mint mà người dùng không có)
+[4..N] SwapInstruction cho mỗi (pool, size) trong tuyến
+[N+1] CloseAccount (nếu bạn wrap/unwrap SOL)
+```
+
+Tất cả trong một giao dịch duy nhất để đảm bảo tính atomic. Đối với một split 3-pool trên V0 với address lookup tables, điều này thường vừa với ~1100 byte. Đối với 4+ pool, giới hạn kích thước giao dịch buộc phải thực hiện multi-tx hoặc hợp nhất tại một hub mint.
+
+### Tính atomic
+
+Các aggregator phải đảm bảo tính atomic: toàn bộ tuyến hoặc không có gì cả. Các swap instructions của Raydium revert trên `ExceededSlippage`, vì vậy một tuyến multi-pool trong đó một hop thất bại khiến toàn bộ giao dịch revert. Miễn phí.
+
+Ngoại lệ duy nhất: nếu tuyến của bạn đi qua Raydium + DEX của bên thứ ba, hãy chắc chắn rằng DEX đó cũng có mô hình revert-on-slippage. Một số chương trình bỏ qua giới hạn slippage (hiếm).
+
+## Cạm bẫy
+
+### 1. Giá trích dẫn cũ
+
+Giữa thời điểm người dùng thấy "Bạn nhận được 125.43 RAY" và giao dịch được ghi lại, reserves có thể thay đổi. Tải lại pool state ngay trước khi gửi; lấy giá lại; nếu giá mới tệ hơn >1%, tạm dừng và xác nhận lại với người dùng.
+
+### 2. Danh sách đen pool
+
+Một số pool Raydium là scam token với phí chuyển được đặt thành 99% hoặc có các extensions không thể chuyển. REST API đánh dấu những cái này (xem trường `tags`); bỏ qua bất kỳ pool nào được gắn thẻ `scam` hoặc `honeypot`. Chạy các kiểm tra an toàn riêng của bạn trên top của các thẻ của Raydium là thận trọng.
+
+### 3. Yêu cầu observation-state trên CLMM
+
+CLMM `SwapV2` lấy một account `observation_state`. SDK điền nó cho bạn; các instructions được tạo bằng tay thường quên, điều này khiến chương trình revert với `AccountNotFound`. Luôn bao gồm nó.
+
+### 4. Address lookup tables
+
+Raydium duy trì các bảng tra cứu công khai cho các account được sử dụng nhiều nhất (mints chính, ID chương trình, AmmConfigs). Các aggregator nên sử dụng những cái này — nó tiết kiệm ~100 byte cho mỗi giao dịch và cho phép các tuyến lớn hơn vừa với V0. Kéo địa chỉ LUT:
+
+```ts
+const raydiumLUTs = await raydium.getRaydiumLutAddresses();
+```
+
+### 5. Xử lý tắc nghẽn
+
+Trong các cửa sổ khối lượng cao, giao dịch có thể ngồi trong mempool trong nhiều block. Retry tích cực trên TX expiry (không phải trên revert — reverts là deterministic) được khuyên dùng. Tùy chọn `sendAndConfirm` của SDK thực hiện các retry cơ bản; các aggregator sản xuất lớp logic của riêng họ (Jito bundles, phát sóng multi-RPC) trên top.
+
+## Danh sách kiểm tra
+
+Trước khi đi live, hãy xác minh:
+
+- [ ] Khám phá pool bao gồm CPMM + CLMM + AMM v4 một cách toàn diện.
+- [ ] Giá trích dẫn khớp với giá trích dẫn giao diện người dùng Raydium của riêng nó trong 1 điểm cơ sở trên một vài giao dịch thử nghiệm.
+- [ ] Định tuyến chia tách kích hoạt cho các giao dịch >5% impact trên bất kỳ pool duy nhất nào.
+- [ ] Phí ưu tiên được định kích thước dựa trên phí chương trình pool gần đây (xem [`integration-guides/priority-fee-tuning`](/vi/integration-guides/priority-fee-tuning)).
+- [ ] Phí chuyển Token-2022 được tính toán và hiển thị cho người dùng.
+- [ ] Giao dịch revert sạch khi slippage bị vượt quá.
+- [ ] Logic retry phân biệt tx expiry (retry) với revert (không retry).
+
+## Con trỏ
+
+- [`integration-guides/routing-and-mev`](/vi/integration-guides/routing-and-mev) — sandwich resistance, bundles.
+- [`integration-guides/priority-fee-tuning`](/vi/integration-guides/priority-fee-tuning) — định kích thước compute-budget instructions.
+- [`sdk-api/rest-api`](/vi/sdk-api/rest-api) — pool-list endpoints.
+
+Nguồn:
+
+- [Raydium SDK v2 `trade` module](https://github.com/raydium-io/raydium-sdk-V2)

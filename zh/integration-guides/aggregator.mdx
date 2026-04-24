@@ -1,0 +1,202 @@
+---
+title: "聚合器集成"
+description: "如何发现 Raydium 池、跨 CPMM / CLMM / AMM v4 报价，以及通过正确的程序集路由原子交换。为 DEX 聚合器和钱包交换 UI 编写。"
+---
+
+<Info>
+  **本页内容由 AI 自动翻译，所有内容以英文版本为准。**
+
+  [查看英文版 →](/integration-guides/aggregator)
+</Info>
+
+<Info>
+  聚合器的工作是为用户在众多池中提供最优价格，可能将单个输入拆分到多个池路由中，并以原子方式执行。本页记录了该工作的 Raydium 特定部分：发现、报价和交易组装。
+</Info>
+
+## 发现
+
+### 池库存
+
+你需要获得每个产品的完整实时 Raydium 池列表。有三种选择：
+
+1. **REST API**（最简单）：`GET https://api-v3.raydium.io/pools/info/list?poolType=all&pageSize=1000&page=1` 以 1000 个为一批返回池。分页直到获得全部。缓存 1–5 分钟。
+2. **链上扫描**：在 CPMM、CLMM 和 AMM v4 程序 ID 上执行 `getProgramAccounts`，按状态账户判别器过滤。在约 10 秒 RPC 时间内返回所有实时池。在 API 断供或限流时很有用。
+3. **混合方案**：使用 API 作为主要来源；每天运行一次链上扫描作为完整性检查。团队承诺保持 API 全面性，但通过直接 CPI 创建的池（无前端）有时会滞后。
+
+### 交易对查询
+
+对于特定的 `(mintA, mintB)` 对，使用 `GET /pools/info/mint?mint1=...&mint2=...&poolType=all&sort=liquidity`。返回任何费用等级和产品类型的每个池。高流量交易对通常会返回多达 ~10 个结果；按 TVL 排序并选择前几个用于路由。
+
+## 报价
+
+报价数学因产品而异。使用 SDK 的纯数学函数，这样你就不需要重新实现：
+
+```ts
+// CPMM
+const cpmmQuote = raydium.cpmm.computeAmountOut({
+  poolInfo: cpmmPool,
+  amountIn,
+  mintIn,
+  mintOut,
+  slippage: 0,        // compute exact expected; layer slippage at route level
+});
+
+// CLMM — crosses ticks; deterministic but more expensive.
+// `computeAmountOutFormat` is the canonical helper exposed via `PoolUtils` in
+// raydium-sdk-v2: the `*Format` suffix signals that it returns the output
+// pre-shaped for transaction building (including `remainingAccounts` for tick arrays).
+const { output: clmmOut, remainingAccounts } = PoolUtils.computeAmountOutFormat({
+  poolInfo:  clmmPool,
+  poolState: clmmPoolState,
+  tickArrayCache,
+  amountIn,
+  tokenIn:   mintIn,
+  slippage:  0,
+});
+
+// AMM v4
+const ammV4Quote = raydium.liquidity.computeAmountOut({
+  poolInfo: ammV4Pool,
+  amountIn,
+  mintIn: mintIn,
+  mintOut: mintOut,
+  slippage: 0,
+});
+```
+
+所有三个的返回值：`{ amountOut, fee, priceImpact, minAmountOut }`。对于聚合器比较，使用 `amountOut`（滑点前）。
+
+### 缓存新鲜度
+
+池状态很快会变旧。推荐的新鲜度目标：
+
+| 池类型 | 重新获取频率 | 原因 |
+|-----------|---------------------|-----|
+| TVL `<$100k` 的 CPMM | `<10s` | 储备在每笔交易时移动。 |
+| TVL `>$10M` 的 CPMM | 30–60s | 储备占主导；小额交易是噪音。 |
+| CLMM | `<30s` | 刻度边界；单笔大交易可以重新配置流动性。 |
+| AMM v4 | `<30s` | OpenBook 方的移动未被捕获在金库中。 |
+
+对于在交互式延迟下获取报价的聚合器，订阅每个相关池状态的 WebSocket 账户更新（`accountSubscribe`）。这会将模型从轮询翻转为推送。
+
+### Token-2022 调整
+
+如果路由中的任何 mint 具有 Token-2022 转账费用，报价数学必须根据 [`algorithms/token-2022-transfer-fees`](/zh/algorithms/token-2022-transfer-fees) 调整输入和输出。如果 `poolInfo.mintA.extensions.transferFeeConfig` 被填充，SDK 会处理这个问题。在信任报价前，通过检查 `.extensions` 字段来确认。
+
+## 路由
+
+### 单池路由
+
+大多数路由都是单池。选择 `amountOut` 最高的池。如果多个接近，使用费用等级作为平手规则（低更好），然后按 TVL（多更安全）。
+
+### 分割路由
+
+对于单个池具有 >5% 价格影响的大额交易，跨池分割。一个简单的贪心算法：
+
+```
+remaining = amountIn
+routes    = []
+while remaining > 0:
+    best_pool, best_size = argmax over pools of:
+        marginal_out_per_in(pool, current_size_toward_pool + epsilon)
+    size = min(remaining, best_pool.max_size_at_target_impact)
+    routes.append((best_pool, size))
+    remaining -= size
+```
+
+这产生一个路由向量 `[(pool_A, 0.6), (pool_B, 0.3), (pool_C, 0.1)]` 来最小化聚合影响。一个适当的凸优化解决方案（例如 跨池均衡边际价格）在实践中的结果与贪心结果相差约 1%。
+
+### 多跳路由
+
+`USDC → RAY → SOL` 通过两个独立的池是常见的，当没有直接的 `USDC-SOL` 池给出好报价时（罕见）。应用逐跳滑点边界；每跳强制自己的 `minAmountOut`。参见 [`algorithms/slippage-and-price-impact`](/zh/algorithms/slippage-and-price-impact)。
+
+在同一池上的多跳（例如在 `SOL-USDC` 上的两个 CLMM 跳）相比单跳总是次优的——不要生成这样的路由。
+
+## 交易组装
+
+### 单跳、单池
+
+直接使用 SDK 的 `raydium.trade.swap`：
+
+```ts
+const { execute } = await raydium.trade.swap({
+  poolKeys:        poolInfo,
+  amountIn,
+  amountOut:       quote.minAmountOut,
+  fixedSide:       "in",
+  inputMint:       mintIn,
+  txVersion:       TxVersion.V0,
+  computeBudgetConfig: {
+    units:         250_000,
+    microLamports: priorityFee,
+  },
+});
+```
+
+### 分割和多跳
+
+手动组合 ATA + 指令。模式：
+
+```
+[1] ComputeBudget set_compute_unit_limit
+[2] ComputeBudget set_compute_unit_price
+[3] createATA (if needed, once per mint the user doesn't hold)
+[4..N] SwapInstruction for each (pool, size) in routes
+[N+1] CloseAccount (if you wrap/unwrap SOL)
+```
+
+全部在一个交易内以确保原子性。对于带有地址查询表的 V0 上的 3 池分割，这通常约为 ~1100 字节。对于 4+ 个池，交易大小限制会强制要么多交易，要么在中心 mint 处进行合并。
+
+### 原子性
+
+聚合器必须保证原子性：要么完整路由执行，要么都不执行。Raydium 的交换指令在 `ExceededSlippage` 时回滚，因此一个多池路由如果一跳失败，整个交易都会回滚。免费的。
+
+唯一的例外：如果你的路由通过 Raydium + 第三方 DEX，确保该 DEX 也具有回滚滑点模型。某些程序忽略滑点边界（罕见）。
+
+## 常见陷阱
+
+### 1. 过期报价
+
+在用户看到"您将收到 125.43 RAY"和交易登陆之间，储备可能会变化。在提交前立即重新获取池状态；重新报价；如果新报价差超过 1%，暂停并与用户重新确认。
+
+### 2. 池黑名单
+
+一些 Raydium 池是带有转账费用设置为 99% 或不可转移扩展的诈骗代币。REST API 标记这些（见 `tags` 字段）；跳过任何标记为 `scam` 或 `honeypot` 的池。在 Raydium 的标签之上运行自己的安全检查是明智的。
+
+### 3. CLMM 上的观察状态要求
+
+CLMM `SwapV2` 采用 `observation_state` 账户。SDK 为你填充它；手工构建的指令经常遗漏，这会导致程序以 `AccountNotFound` 回滚。始终包括它。
+
+### 4. 地址查询表
+
+Raydium 为其最常用的账户（主要 mint、程序 ID、AmmConfigs）维护公共查询表。聚合器应使用这些——它为每笔交易节省约 100 字节，并使更大的路由能够适应 V0。获取 LUT 地址：
+
+```ts
+const raydiumLUTs = await raydium.getRaydiumLutAddresses();
+```
+
+### 5. 处理拥堵
+
+在高交易量时段，交易可能在内存池中停留多个区块。在交易过期时积极重试（不是回滚——回滚是确定性的）被推荐。SDK 的 `sendAndConfirm` 选项进行基本重试；生产聚合器在其上层其自己的逻辑（Jito 捆绑、多 RPC 广播）。
+
+## 检查清单
+
+在上线前，验证：
+
+- [ ] 池发现全面覆盖 CPMM + CLMM + AMM v4。
+- [ ] 报价在几个测试交易中与 Raydium 自己的 UI 报价在 1 个基点内匹配。
+- [ ] 分割路由在任何单个池 >5% 影响的交易时启动。
+- [ ] 优先级费用根据最近的池程序费用调整大小（见 [`integration-guides/priority-fee-tuning`](/zh/integration-guides/priority-fee-tuning)）。
+- [ ] Token-2022 转账费用被计算并向用户显示。
+- [ ] 交易在超过滑点时干净地回滚。
+- [ ] 重试逻辑区分 tx 过期（重试）和回滚（不重试）。
+
+## 指针
+
+- [`integration-guides/routing-and-mev`](/zh/integration-guides/routing-and-mev) — 夹心阻力、捆绑。
+- [`integration-guides/priority-fee-tuning`](/zh/integration-guides/priority-fee-tuning) — 调整计算预算指令大小。
+- [`sdk-api/rest-api`](/zh/sdk-api/rest-api) — 池列表端点。
+
+来源：
+
+- [Raydium SDK v2 `trade` module](https://github.com/raydium-io/raydium-sdk-V2)

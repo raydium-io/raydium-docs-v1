@@ -1,0 +1,249 @@
+---
+title: "Stable AMM コード例"
+description: "API から Stable AMM プールを識別する方法、Liquidity モジュール経由でスワップする方法（version=5 プールをネイティブに対応）、およびオフチェーン stable-curve ヘルパーを使用する方法。"
+---
+
+<Info>
+  **このページは AI による自動翻訳です。すべての内容は英語版を正とします。**
+
+  [英語版を表示 →](/products/stable/code-demos)
+</Info>
+
+<Info>
+  **バージョン情報。**
+
+  - SDK: `@raydium-io/raydium-sdk-v2@0.2.42-alpha`
+  - クラスタ: Solana `mainnet-beta`
+  - Stable AMM プログラム ID: `5quBtoiQqxF9Jv6KYKctB59NT3gtJD2Y65kdnB1Uev3h` ([`reference/program-addresses`](/ja/reference/program-addresses) を参照)
+  - 最終確認: 2026-04
+
+  SDK の `liquidity` モジュールは Stable AMM プールをネイティブに対応しています。Stable プールは `ApiV3PoolInfoStandardItem` 上に **`version: 5`** または `pooltype: "StablePool"` として表示され、AMM v4（`version: 4`）の定数積プールと同じ `addLiquidity` / `removeLiquidity` / スワップ ヘルパーが機能します。SDK は自動的にバリアントを検出し、正しいインストラクションを生成します。オフチェーン stable-curve 計算は `src/raydium/liquidity/stable.ts` に格納されています。
+</Info>
+
+## セットアップ
+
+```bash
+npm install @raydium-io/raydium-sdk-v2 @solana/web3.js @solana/spl-token
+```
+
+```ts
+import { Raydium, TxVersion } from "@raydium-io/raydium-sdk-v2";
+import { Connection, Keypair, clusterApiUrl } from "@solana/web3.js";
+import BN from "bn.js";
+import bs58 from "bs58";
+
+const connection = new Connection(clusterApiUrl("mainnet-beta"));
+const owner = Keypair.fromSecretKey(bs58.decode(process.env.PRIVATE_KEY!));
+
+const raydium = await Raydium.load({
+  connection,
+  owner,
+  cluster: "mainnet",
+  // オプション: `liquidity/stable.ts` から直接クォーティング ヘルパーを呼び出す場合は、
+  // stable curve モデルレイアウトを読み込みます。プールレベルの スワップ / add / remove
+  // は自動的にこれを行うため、ほとんどの呼び出し元はこのステップをスキップできます。
+});
+
+// 1 回限り: オフチェーン stable-curve ヘルパーで使用される
+// オンチェーン モデルデータレイアウトをプリフェッチします。getStablePrice / getDxByDyBaseIn /
+// getDyByDxBaseIn を直接呼び出す場合にのみ必要です。addLiquidity / removeLiquidity / swap は不要です。
+await raydium.liquidity.initLayout();
+```
+
+## Stable プールの識別
+
+`ApiV3PoolInfoStandardItem` の 2 つの同等のシグナル:
+
+```ts
+const isStable =
+  pool.version === 5 ||
+  pool.pooltype.includes("StablePool"); // SDK は内部的にこの文字列チェックを使用します
+
+// または、プログラム ID で:
+const STABLE_AMM_PROGRAM_ID = "5quBtoiQqxF9Jv6KYKctB59NT3gtJD2Y65kdnB1Uev3h";
+const isStableByProgram = pool.programId === STABLE_AMM_PROGRAM_ID;
+```
+
+AMM v4（`version: 4`、定数積）と Stable AMM（`version: 5`）は両方とも SDK の同じ `LiquidityModule` API を通じます。内部的には、モジュールは以下にディスパッチします:
+
+- v4 プールの場合: `InstructionType.AmmV4AddLiquidity` / `AmmV4RemoveLiquidity`
+- v5（Stable）プールの場合: `InstructionType.AmmV5AddLiquidity` / `AmmV5RemoveLiquidity`
+
+プールの `programId`（プールキーとともに返される）は SDK にどのプログラムへ CPI するかを指示します。ハードコードする必要はありません。
+
+## ミント ペアでプールを検索
+
+```ts
+import { PublicKey } from "@solana/web3.js";
+
+// 例として使用する 2 つの一般的なミント
+const mintA = new PublicKey("Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB"); // USDT
+const mintB = new PublicKey("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"); // USDC
+
+const pools = await raydium.api.fetchPoolByMintPair({
+  mint1: mintA.toBase58(),
+  mint2: mintB.toBase58(),
+});
+
+const stablePool = pools.find(
+  (p) => p.version === 5 || p.pooltype.includes("StablePool"),
+);
+
+if (!stablePool) {
+  throw new Error("このミント ペアに対して Stable プールが存在しません");
+}
+
+console.log("Stable プール id:", stablePool.id);
+console.log("Stable プール programId:", stablePool.programId);
+console.log("TVL:", stablePool.tvl);
+```
+
+ミント ペアに v4（定数積）プールと v5（Stable）プールの両方がある場合、レスポンスには両方が含まれます。フローに必要なものを選択するか、[AMM ルーティング](/ja/products/routing) プログラムに渡して最適なルートを選択させてください。
+
+## Stable プール経由でスワップ
+
+`LiquidityModule.swap` フローは v4 プールの場合と同じです。v5 プール オブジェクトを渡すだけです:
+
+```ts
+import { Percent, TokenAmount, toToken } from "@raydium-io/raydium-sdk-v2";
+
+const inputAmount = new TokenAmount(toToken(stablePool.mintA), 1_000_000); // 1 USDT
+const slippage = new Percent(50, 10_000); // 0.5%
+
+// SDK の stable-curve ヘルパーを内部的に使用して期待される出力を計算します。
+const { amountOut, minAmountOut } = raydium.liquidity.computeAmountOut({
+  poolInfo: stablePool,
+  amountIn: inputAmount,
+  mintIn:  stablePool.mintA.address,
+  mintOut: stablePool.mintB.address,
+  slippage,
+});
+
+console.log("期待される出力:", amountOut.toSignificant());
+console.log("最小出力:", minAmountOut.toSignificant());
+
+// スワップ トランザクションをビルドして署名します。
+const { transaction, execute } = await raydium.liquidity.swap({
+  poolInfo: stablePool,
+  amountIn:    inputAmount.raw,
+  amountOut:   minAmountOut.raw,
+  fixedSide:   "in",
+  txVersion:   TxVersion.V0,
+});
+
+const { txId } = await execute({ sendAndConfirm: true });
+console.log("Stable スワップ tx:", txId);
+```
+
+SDK はプール キーからプールの `programId` を読み取り、Stable AMM プログラムにディスパッチします。特別な `programId` 引数は不要です。
+
+## リクイディティの追加と削除
+
+`addLiquidity` と `removeLiquidity` は v4 と v5 のプール間で同じように動作します:
+
+```ts
+import { Percent, TokenAmount, toToken } from "@raydium-io/raydium-sdk-v2";
+
+const amountInA = new TokenAmount(toToken(stablePool.mintA), 100_000_000); // 100 USDT
+const slippage  = new Percent(50, 10_000); // 0.5%
+
+// このサイズの A に対してカーブが必要とする一致する B 額を計算します。
+const { anotherAmount, minAnotherAmount } = raydium.liquidity.computePairAmount({
+  poolInfo: stablePool,
+  amount:   amountInA.toSignificant(),
+  baseIn:   true,
+  slippage,
+});
+
+const { execute } = await raydium.liquidity.addLiquidity({
+  poolInfo: stablePool,
+  amountInA,
+  amountInB:      anotherAmount,
+  otherAmountMin: minAnotherAmount,
+  fixedSide:      "a",
+  txVersion:      TxVersion.V0,
+});
+
+const { txId } = await execute({ sendAndConfirm: true });
+console.log("リクイディティ追加 tx:", txId);
+```
+
+内部的に SDK は `pooltype.includes("StablePool")` が true であるため `InstructionType.AmmV5AddLiquidity` を生成します。対応する `removeLiquidity` フローは対称です。`lpAmount` と各側で受け入れる最小額を入力します。
+
+## オフチェーン クォーティング ヘルパー (stable.ts)
+
+サーバー側のクォーティングまたはバックテストの場合、SDK は基盤となる stable-curve 計算を公開しています:
+
+```ts
+import {
+  getStablePrice,
+  getDxByDyBaseIn,
+  getDyByDxBaseIn,
+} from "@raydium-io/raydium-sdk-v2";
+
+// これらを使用する前に initLayout() を 1 回呼び出す必要があります（オンチェーン
+// `ModelDataInfo` PDA を SDK の StableLayout キャッシュに読み込みます）。
+await raydium.liquidity.initLayout();
+
+const modelData = raydium.liquidity.stableLayout;
+
+// プールの現在のリザーブでのスポット価格。
+const price = getStablePrice(modelData, /* x */, /* y */, /* withFee */);
+console.log("スポット価格:", price);
+
+// クォート: dx が与えられた場合、どの程度の dy が出ます（フィーは適用されません）?
+const dyOut = getDyByDxBaseIn(modelData, /* x */, /* y */, /* dx */);
+
+// クォート: dy 出力目標が与えられた場合、どの程度の dx が必要ですか?
+const dxIn  = getDxByDyBaseIn(modelData, /* x */, /* y */, /* dy */);
+```
+
+これらは純粋な関数です。RPC はなく、署名もありません。オンチェーン `ModelDataInfo` は `initLayout()` で 1 回フェッチされ、`raydium.liquidity.stableLayout` にキャッシュされます。現在のリザーブ（`x`、`y`）を渡すと、ヘルパーはルックアップテーブルをバイナリサーチして、周囲の 2 つの `DataElement` 行の間で線形補間により計算します。基盤となるアルゴリズムについては [`products/stable/math`](/ja/products/stable/math) を参照してください。
+
+## AMM ルーティング経由でルーティング (マルチホップ / 最高価格)
+
+ベニュー自体を選択したくない場合、[AMM ルーティング](/ja/products/routing) プログラムはすべての Raydium AMM（v4 / CPMM / CLMM / Stable）を検討し、最適な組み合わせを通じてルーティングします:
+
+```ts
+const route = await raydium.tradeV2.fetchRoutes({
+  inputMint:  mintA,
+  outputMint: mintB,
+  amount:     new BN(1_000_000),
+  slippage,
+});
+
+// route.routes[0].poolType は最適なルートが使用するプログラムを指示します。
+// Stable プールが最適なパスの一部である場合は、「Stable」がここに表示されます。
+console.log(route.routes[0]);
+
+const { execute } = await raydium.tradeV2.swap({
+  inputMint:    mintA,
+  outputMint:   mintB,
+  inputAmount:  new BN(1_000_000),
+  swapResult:   route.routes[0],
+  slippage,
+  txVersion:    TxVersion.V0,
+});
+
+const { txId } = await execute({ sendAndConfirm: true });
+```
+
+これは本番環境のスワッパーとアグリゲーター向けの推奨パスです。Stable プールが存在するか、またはそれが今日のより優れたベニューであるかを手動で決定する必要はありません。
+
+## 推奨事項
+
+1. **エンドユーザー スワップの場合**、[`tradeV2`](/ja/products/routing) ルーティング フローを優先してください。すべての Raydium プール タイプ（Stable を含む）を処理します。
+2. **プール固有の操作の場合**（既知の Stable プール上での LP の追加 / 削除）、`LiquidityModule` を直接使用してください。v5 プールを自動的に検出します。
+3. **オフチェーン クォーティング / 分析の場合**、`initLayout()` 後に `getStablePrice` / `getDyByDxBaseIn` / `getDxByDyBaseIn` を呼び出してください。モデルデータがキャッシュされた後、クォートごとに RPC トラフィックはありません。
+4. **生の `SwapBaseIn` インストラクションを手動でエンコードしないでください。** Stable AMM プログラム（AMM v4 からフォーク）は V1 スワップ エントリポイントに対して 17～19 個の OpenBook アカウントが必要で、`model_data_account` はそれらの間にスロットされています。SDK の事前構築ヘルパーはすべてのアカウントと順序を正確に処理します。独自にローリングするとエラーが発生しやすくなります。
+
+## 次のステップ
+
+- [Math](/ja/products/stable/math) — ルックアップテーブル補間がどのように機能するか。
+- [Instructions](/ja/products/stable/instructions) — 完全なインストラクション リファレンス。
+- [AMM ルーティング](/ja/products/routing) — AMM v4、CPMM、CLMM、Stable 全体のマルチプール ルーティング。
+
+ソース:
+
+- [`raydium-sdk-V2/src/raydium/liquidity/liquidity.ts`](https://github.com/raydium-io/raydium-sdk-V2/blob/master/src/raydium/liquidity/liquidity.ts) — モジュール エントリポイント; v4 / v5 ディスパッチ。
+- [`raydium-sdk-V2/src/raydium/liquidity/stable.ts`](https://github.com/raydium-io/raydium-sdk-V2/blob/master/src/raydium/liquidity/stable.ts) — `StableLayout`、`getStablePrice`、`getDxByDyBaseIn`、`getDyByDxBaseIn`。

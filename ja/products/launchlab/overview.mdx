@@ -1,0 +1,150 @@
+---
+title: "LaunchLab概要"
+description: "Raydiumのボンディングカーブローンチ機能がどのように動作するかの全体像：決定論的なカーブに対するプリグラデュエーション取引、グラデュエーションをトリガーするファンディング閾値、標準的なCPMMプールへの自動移行。"
+---
+
+<Info>
+  **このページは AI による自動翻訳です。すべての内容は英語版を正とします。**
+
+  [英語版を表示 →](/products/launchlab/overview)
+</Info>
+
+## LaunchLabが解決する問題
+
+LaunchLab以前は、Raydiumで新しいトークンをローンチするには、クリエイターがAMMプールの両側をあらかじめシード化する必要がありました。つまり、チームは事前に相手方流動性（SOLまたはUSDC）を自己資金で提供する必要があったということです。これは資金が潤沢なプロジェクトに有利であり、初期資本によってローンチパッドメカニズムへのアクセスが制限されていました。
+
+LaunchLabはそのオープニング段階を**ボンディングカーブ**に置き換えます。トークンはクォートミント（通常はSOLまたはUSDC）で価格が決まるカーブに対してデプロイされます。買い手はクォートをカーブに送ることでトークンを取得し、カーブは原子的にカーブ式と現在の供給量によって決定される価格で基本トークンユニットをミントするか解放します。事前にシード化された流動性は必要ありません。
+
+カーブが実際のAMMプール用の流動性式に合致するだけのクォートを集めると、それは**グラデュエート**します：プログラムはメインネット上にCPMMプールを作成し、カーブの基本リザーブとクォートリザーブでシード化し、その時点から取引はAMMに移ります。
+
+## ライフサイクル
+
+```
+             ┌───────────────────────┐
+creator  ──▶ │  Initialize (Launch)  │   ▸ mints the base token, funds the curve vaults,
+             │                        │     sets curve params and graduation threshold
+             └───────────┬────────────┘
+                         │
+                         ▼
+             ┌───────────────────────┐       repeated N times
+             │   Buy  /  Sell        │ ◀─── traders interact with the curve
+             └───────────┬────────────┘
+                         │ curve quote_reserve
+                         │ crosses threshold
+                         ▼
+             ┌───────────────────────┐   ▸ snapshots curve state
+             │      Graduate         │   ▸ deploys CPMM pool seeded with curve reserves
+             │                        │   ▸ locks / burns remaining base supply per policy
+             └───────────┬────────────┘
+                         │
+                         ▼
+             ┌───────────────────────┐
+             │   CPMM pool live      │   ▸ standard CPMM behavior going forward
+             └───────────────────────┘
+```
+
+すべてのローンチはこのシーケンスを正確に1回通過します。`Buy`と`Sell`は中間段階でユーザーが呼び出すことができる唯一のインストラクションです。`Graduate`はパーミッションレス（閾値を超えた時点で誰でも呼び出せます）ですが、実際にはSDKは閾値を超えるトランザクション内でそれを自動的に呼び出します。
+
+## 2つの固定的なパーティ
+
+LaunchLabの状態には2つの区別される アカウント があります：
+
+- **基本ミント** — ローンチされるトークン。そのミント権限はグラデュエーションまでLaunchLabプログラムによって保有され、その後は取り消されます。
+- **クォートミント** — 担保。常にメインストリームミント（SOL / USDC / RAY）です。ローンチ設定は`Initialize`でこれを選択します。変更することはできません。
+
+さらに2つのヴォルト：
+
+- **`base_vault`** — カーブにプリミントされているが、まだユーザーに売却されていない基本供給量の部分を保有します。ユーザーが買う際に減少します。
+- **`quote_vault`** — 買い手によって支払われたクォートを蓄積します。ユーザーが買う際に増加します。これはグラデュエーション閾値に対してチェックされるバランスです。
+
+## 価格モデル
+
+LaunchLabは複数のカーブ式をサポートしています（[`bonding-curve`](/ja/products/launchlab/bonding-curve)を参照してください）。最も一般的なのは**二次ボンディングカーブ**で、Pump.fun / Curve.fi / Bancore の血統に類似しています：
+
+```
+price(s) = k × (s / S_max)²     (or similar — exact formula is curve-config dependent)
+```
+
+ここで`s`はすでにユーザーに売却された基本の量であり、`S_max`はカーブの最大供給量です。価格は各買いで単調に上昇し、各売りで下落します。プログラムはAMM統合コストを正確に計算するため、任意のサイズの買いは正しい統合額を返します。カーブの自然な凸性を超えたトランザクションごとのスリッページはありません。
+
+## グラデュエーション
+
+`quote_vault.balance ≥ graduation_threshold`のときにローンチはグラデュエートします。閾値は`Initialize`で設定され、通常はグラデュエーション時のカーブの暗黙の価格がAMMプールが集められたリザーブで開く価格と一致するように選択されます。具体的には：
+
+```
+threshold ≈ S_graduate × price(S_graduate) × f
+```
+
+ここで`S_graduate`はすでに売却された基本の量、`price(S_graduate)`はそのポイントでのカーブの周辺価格、`f`はフィーラインを説明するための小さな係数（1～2%）です。
+
+グラデュエーション時：
+
+1. プログラムは`(base_vault_remaining, quote_vault)`をスナップショット します。
+2. これら2つのリザーブを使用してCPMM `CreatePool` CPIを呼び出し、初期LPをプログラム所有の権限にミントします（通常はポリシーに従って焼却/ロック）。
+3. 基本ミントのミント権限を取り消します（これ以上基本トークンはミントできません）。
+4. `LaunchState.status`が`Graduated`に反転します。
+
+グラデュエーション後、`Buy`と`Sell`は拒否されます。取引は結果のCPMMプール上で続行され、これは他のRaydium CPMMプールと区別できません。
+
+## 手数料
+
+カーブ段階では、各`Buy`と`Sell`は以下に分割される手数料を発生させます：
+
+- **カーブLP側** — カーブの暗黙の`k`を増加させます。これは後の買い手に利益をもたらします（より厳しい価格）。
+- **プロトコル** — LaunchLabアドミンに集約され、`CollectFees`を経由して収集されます。
+- **クリエイター** — オプション。`Initialize`で設定可能です。一部のローンチは進行中の収入源としてシェアをクリエイターに向けます。
+
+デフォルトレートは[`bonding-curve`](/ja/products/launchlab/bonding-curve)に記載されています。正確な分割は`LaunchState.fees`に格納され、ローンチごとに異なる可能性があります。
+
+グラデュエーション後の手数料は、プールが作成されたCPMM設定に従います（通常は`AmmConfig[0]`、0.25%層）。
+
+## グラデュエーション後にLPを保有するのは誰？
+
+LaunchLabは複数のグラデュエーション後のLPポリシーをサポートしています：
+
+- **バーン** — LPはデッドアドレスにミントされます。プールは永続的になります。誰も流動性を削除することはできません。
+- **ロック** — LPは時間ロック エスクローにミントされ、ベスティング期間後にクリエイターにリリースされます。
+- **クリエイターが即座に受け取る** — パーミッション付きローンチにのみ使用されます。
+
+ポリシーは`Initialize`で設定され、変更することはできません。ほとんどのオープンローンチは**バーン**を使用します。プールが存在するようになると、その流動性はそこに永遠に存在します。
+
+## 重要な不変量
+
+- **基本ミントはグラデュエーション後はインフレーションフリーです。** その`mint_authority`は取り消されています。`freeze_authority`は設定されていません。
+- **Token-2022は`initialize_with_token_2022`を経由してサポートされています。** 標準の`Initialize` / `InitializeV2`はSPLトークンローンチを作成します。専用の`InitializeWithToken2022`インストラクションは、基本ミントがToken-2022（オプションの`TransferFeeConfig`を備えた）であるローンチを作成します。Token-2022ローンチはCPMMプールにグラデュエートする必要があります。AMM v4にグラデュエートすることはできません。AMM v4はSPLトークンのみです。
+- **カーブ状態は1方向で単調です。** `base_sold`はBuy中にのみ上昇します。`quote_vault`はBuy中にのみ上昇します（Sell中に下落します。これは対称的に`base_sold`を減らします）。プログラムはカーブを負にすることはありません。
+- **グラデュエーションは一方向ゲートです。** グラデュエーション後の取引がAMMプール価格をグラデュエーション価格以下に押し戻したとしても、ローンチはカーブに戻りません。
+
+## LaunchLabを使用する時期
+
+<Note>
+  このページはプロトコルメカニクスのみを説明しています。ここに記載されていることは、財務、法律、または投資アドバイスを構成するものではありません。トークンローンチには大きな財務リスクがあります。公開資金調達を伴うトークンをローンチする前に、適切な専門家に相談してください。
+</Note>
+
+- 既存の市場を持たない新しいトークンをローンチしている。
+- オープニングCPMM価格が事前に宣言されるのではなく、市場によって決定されることを望んでいる。
+- チーム自体を含め、誰でも同じカーブで決定された価格で買い込むことができるようにしたい。ただし、インサイダーに前もって割引で割り当てることはない。
+
+LaunchLabを**使用しないでください**：
+
+- 確立された市場を持つ既存トークン（CPMMで直接`CreatePool`を使用してください）。
+- オープニングAMM価格を正確に制御する必要があるローンチ（慎重なカーブ設定で近似できますが、メカニズムはまだカーブ駆動です）。
+- LaunchLabが許可リストに入れていないToken-2022拡張機能を必要とするトークン（ローンチプログラムはToken-2022パスでさえ`TransferHook`や`PermanentDelegate`のような拡張機能を拒否します）。
+
+## チャプターの内容
+
+- [`bonding-curve`](/ja/products/launchlab/bonding-curve) — カーブ式、コストと収益計算、グラデュエーション閾値導出。
+- [`accounts`](/ja/products/launchlab/accounts) — `LaunchConfig`、`LaunchState`、ヴォルト、権限PDA。
+- [`instructions`](/ja/products/launchlab/instructions) — `Initialize`、`Buy`、`Sell`、`Graduate`、`CollectFees`、`SetParams`。
+- [`code-demos`](/ja/products/launchlab/code-demos) — エンドツーエンドのTypeScriptの例。
+
+## 次に進むべき場所
+
+- [`products/cpmm/overview`](/ja/products/cpmm/overview) — ローンチがグラデュエートした後の処理。
+- [`user-flows/create-cpmm-pool`](/ja/user-flows/create-cpmm-pool) — カーブを必要としないトークンの別のパス。
+- [`reference/program-addresses`](/ja/reference/program-addresses) — LaunchLabプログラムID。
+
+ソース：
+
+- [Raydium SDK v2 `LaunchLab` module](https://github.com/raydium-io/raydium-sdk-V2) (IDL under `src/raydium/launchpad/`).
+- LaunchLabプログラムソースは現在、スタンドアロンリポジトリとして公開されていません。上記のSDKにバンドルされているIDLが正規インターフェースです。

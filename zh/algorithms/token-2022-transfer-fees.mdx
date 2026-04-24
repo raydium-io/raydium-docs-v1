@@ -1,0 +1,179 @@
+---
+title: "Token-2022 转账费用在交换中的应用"
+description: "Token-2022 的转账费用扩展如何改变交换前后的金额计算、Raydium 的哪些产品支持它，以及集成者需要处理的边界情况（非对称费用、费用更新、最大费用上限、不可转账扩展）。"
+---
+
+<Info>
+  **本页内容由 AI 自动翻译，所有内容以英文版本为准。**
+
+  [查看英文版 →](/algorithms/token-2022-transfer-fees)
+</Info>
+
+<Info>
+  支持矩阵：**CPMM** 完全支持 Token-2022，包括带转账费用的代币。**CLMM** 通过显式的 `SwapV2` 账户支持带转账费用的 Token-2022。**AMM v4** 完全不支持 Token-2022。**LaunchLab** 不支持基础代币使用 Token-2022（它创建经典 SPL 代币）。**Farm v6** 在质押和奖励代币上都支持 Token-2022。
+</Info>
+
+## 什么是转账费用
+
+Token-2022 是第二个 SPL Token 程序（`TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA` → `TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb`）。在其众多扩展中，**转账费用**扩展使得代币的每次 `TransferChecked` 操作都会从转账金额中扣除费用。费用流向由代币权限指定的接收人，并可由权限更新（在限制内）。
+
+带转账费用的代币有两个相关参数：
+
+- **`transfer_fee_basis_points`** — 费率（例如 100 = 1%）。
+- **`maximum_fee`** — 每次转账的绝对上限（这样大额转账的人也不会支付无限的费用）。
+
+一个代币可以同时有**两个**活跃的转账费用配置：「较新的」（现在生效）和「较旧的」（被计划移除）。这是「纪元过渡」设计——转账费用变更在纪元边界时生效，以避免对途中的交易造成意外影响。
+
+## 这对交换为何重要
+
+池的金库持有实际余额。当用户调用 Raydium 交换时：
+
+1. 用户向池金库发送 `amount_in`。如果**入币**有转账费用，金库收到的是 `amount_in − fee_in`，而不是 `amount_in`。
+2. 交换数学运算基于金库收到的金额。
+3. 池向用户的 ATA 发送 `amount_out`。如果**出币**有转账费用，用户收到的是 `amount_out − fee_out`，而不是 `amount_out`。
+
+如果交换程序不考虑这一点，直接使用原始 `amount_in` 参数，不变量检查会失败，因为金库收到的金额少于程序预期的金额。相反，如果计算 `amount_out` 时不减去出站转账费用，用户会看到缺额并责怪程序。
+
+Raydium CPMM 和 CLMM（通过 `SwapV2`）通过以下方式处理此问题：
+
+- **交换前**：计算 `in_after_fee = amount_in − transfer_fee_on(amount_in, in_mint)`，并在曲线数学中使用 `in_after_fee`。
+- **交换后**：计算 `out_gross = amount_out_from_curve`，通过 `TransferChecked` 将其发送给用户，Token-2022 程序会自动从中减去转账费用。
+
+用户的 `minAmountOut` 滑点边界针对的是 `out_gross`（池发送的金额），**而不是**用户收到的金额。这是每个主要 Solana DEX 处理 Token-2022 的方式，之所以重要是因为：
+
+- 如果池检查费后金额，报价和执行之间的费用更新会导致交易回滚。
+- 检查费前金额将失败的责任归属于报价本身的质量，而不是用户报价后的费用变更。
+
+UI 应该在向用户展示「您将收到」时减去预期的 Token-2022 转账费用。
+
+## 计算 Token-2022 费用
+
+SPL Token-2022 程序公开了一个确定性的辅助函数。在 Rust 中：
+
+```rust
+use spl_token_2022::extension::transfer_fee::TransferFeeConfig;
+use spl_token_2022::extension::StateWithExtensions;
+
+let mint_data = ...;
+let state = StateWithExtensions::<Mint>::unpack(&mint_data)?;
+let config = state.get_extension::<TransferFeeConfig>()?;
+
+let epoch = Clock::get()?.epoch;
+let fee_bp = config.get_epoch_fee(epoch).transfer_fee_basis_points;
+let max_fee = u64::from(config.get_epoch_fee(epoch).maximum_fee);
+
+let fee = (amount as u128 * fee_bp as u128 / 10_000).min(max_fee as u128) as u64;
+```
+
+在 TypeScript 中（通过 `@solana/spl-token`）：
+
+```ts
+import { getTransferFeeConfig, getTransferFeeAmount } from "@solana/spl-token";
+
+const config = getTransferFeeConfig(mintAccount);
+const currentEpochFee = config.olderTransferFee.epoch <= currentEpoch
+  ? config.newerTransferFee
+  : config.olderTransferFee;
+
+const rate   = currentEpochFee.transferFeeBasisPoints;
+const maxFee = currentEpochFee.maximumFee;
+const fee    = Math.min(Math.floor(amount * rate / 10_000), Number(maxFee));
+```
+
+## 调整后的交换公式（CPMM，精确输入）
+
+设 `f_pool` 为池费率，`f_in` 为入币转账费率，`max_in` 为其最大上限，`f_out` 为出币转账费率，`max_out` 为其最大上限。
+
+```
+transfer_fee_in  = min(amount_in · f_in / 10_000, max_in)
+vault_received   = amount_in − transfer_fee_in
+
+pool_fee         = ceil(vault_received · f_pool / 1_000_000)
+amount_after     = vault_received − pool_fee
+amount_out_gross = y · amount_after / (x + amount_after)
+
+transfer_fee_out = min(amount_out_gross · f_out / 10_000, max_out)
+user_receives    = amount_out_gross − transfer_fee_out
+```
+
+滑点检查：`amount_out_gross ≥ min_amount_out`（而非 `user_receives ≥ min_amount_out`）。用户的 `minAmountOut` 由 SDK 设置为 `expected_gross · (1 − slippage)` ——在「发送」方保持边界，而不是「接收」方。
+
+## 调整后的公式（CPMM，精确输出）
+
+SDK 迭代来找到 `amount_in`，使得 `user_receives = amount_out_exact`：
+
+```
+# 用户想在转账费用后接收 amount_out_exact
+amount_out_gross = amount_out_exact + transfer_fee_out_for(amount_out_exact)
+
+# 然后为 amount_after 解出 CPMM 精确输出：
+amount_after     = ceil(x · amount_out_gross / (y − amount_out_gross))
+
+# 然后添加池费：
+vault_received   = ceil(amount_after · 1_000_000 / (1_000_000 − f_pool))
+
+# 然后添加入币转账费：
+amount_in = ceil(vault_received · 10_000 / (10_000 − f_in))
+# （或迭代——见下面的费用上限边界情况）
+```
+
+`max_in` / `max_out` 上限使计算变为非线性的，因为一旦达到上限，费用就停止增长。SDK 的 `computeAmountIn` / `computeAmountOut` 通过在朴素公式会突破上限时进行迭代来处理这个问题。
+
+## 边界情况
+
+### 非对称费用（一侧有费用，另一侧没有）
+
+实践中很常见。上面的公式已经处理了这种情况——如果一侧有 `f_in = 0`，相关项会消失。程序中没有特殊情况。
+
+### 交换中途的费用更新
+
+如果代币的转账费用在报价时间和执行时间之间发生变更，交换要么以稍差的经济状况完成（用户承担差异，在滑点容差内），要么回滚（总输出低于 `minAmountOut`）。滑点边界可以吸收这一点；不需要额外保护。
+
+### 最大费用上限
+
+一旦交易足够大以触及 `maximum_fee`，费用就饱和了，进一步增长为零。这使得有效费率对于非常大的交易渐近于零，在深度流动性不足的市场中可能会导致奇怪的定价曲线。SDK 的 `computeAmountOut` 会考虑这一点。
+
+### 不可转账扩展
+
+某些 Token-2022 代币使用 `NonTransferable` 扩展，它拒绝所有 `Transfer` 调用，除非转账对象是代币权限。这样的代币**根本无法**用于 Raydium 池中。`CreatePool` 在初始化时会拒绝它们。
+
+### 计息代币
+
+Token-2022 还支持 `InterestBearingConfig` 扩展，使得余额随时间增长。Raydium 的池读取原始金库余额（忽略利息累积），所以在具有计息代币的池中，LP 在赎回时会以纯礼物的形式获得累积利息（金库余额增长速度快于 LP 供应表示）。集成者应该将此视为非问题，但应为 LP 端进行文档记录。
+
+### 转账钩子
+
+Token-2022 的 `TransferHook` 扩展允许在每次转账时执行任意 CPI。Raydium CPMM 支持这些——交换指令转发钩子账户——但它增加了计算单元开销，并要求钩子表现良好。CLMM `SwapV2` 也支持钩子。AMM v4 完全不支持 Token-2022，所以这个问题不会出现。
+
+## 完整示例
+
+CPMM 池，`x = 1_000_000 USDY, y = 1_000_000 USDC`，池费 0.25%。
+
+- USDY 有 1% 的转账费，`max_fee = 10_000`（6 位小数中的 0.01 USDY）。
+- USDC 没有转账费。
+
+用户用 `amount_in = 1_000 USDY` 精确输入交换 USDC。
+
+```
+transfer_fee_in = min(1_000 · 100 / 10_000, 10_000)  = 10     // 1%，远低于上限
+vault_received  = 1_000 − 10 = 990
+
+pool_fee        = ceil(990 · 2_500 / 1_000_000)  = 3    // 0.25%
+amount_after    = 990 − 3 = 987
+
+amount_out_gross = 1_000_000 · 987 / (1_000_000 + 987) = 986_027 / ...  ≈ 985.97
+```
+
+≈ 985.97 USDC。没有出站转账费，所以用户收到 985.97 USDC。
+
+## 相关链接
+
+- [`products/cpmm/overview`](/zh/products/cpmm/overview) — CPMM Token-2022 支持。
+- [`products/clmm/instructions`](/zh/products/clmm/instructions) — Token-2022 路由的 `SwapV2` 与 `Swap`。
+- [`solana-fundamentals/spl-token-and-token-2022`](/zh/solana-fundamentals/spl-token-and-token-2022) — 通用 Token-2022 扩展模型。
+
+来源：
+
+- [SPL Token-2022 转账费用扩展文档](https://spl.solana.com/token-2022/extensions#transfer-fees)
+- Raydium CPMM 程序源码（`SwapBaseInput` / `SwapBaseOutput` Token-2022 处理）。
+- Raydium CLMM 程序源码（`SwapV2`）。

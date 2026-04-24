@@ -1,0 +1,373 @@
+---
+title: "CLMM 수학"
+description: "스콰트-가격 표현, 유동성 ↔ 토큰 수량, 단일 틱 스왑 스텝, 다중 틱 반복, 수수료 성장 회계."
+---
+
+<Info>
+  **이 페이지는 AI 자동 번역입니다. 모든 내용은 영문판을 기준으로 합니다.**
+
+  [영문판 보기 →](/products/clmm/math)
+</Info>
+
+<Info>
+  이 페이지는 실제 동작하는 페이지입니다. CLMM 프로그램에서 사용하는 공식, 고정소수점 규칙, 단계별 로직을 다룹니다. 집중 유동성 곡선 자체의 원리 — `L = sqrt(x · y)`가 중요한 이유 — 에 대해서는 [`algorithms/clmm-math`](/ko/algorithms/clmm-math)를 참고하세요. 이 페이지는 해당 내용을 이미 읽었다고 가정합니다.
+</Info>
+
+## 스콰트-가격 표현
+
+CLMM은 가격을 `sqrt_price_x64`로 저장합니다. 이는 token1-per-token0 가격의 제곱근을 Q64.64 고정소수점 수로 나타낸 것입니다:
+
+$$
+\text{sqrt\_price\_x64} = \lfloor \sqrt{p} \cdot 2^{64} \rfloor
+$$
+
+여기서 `p = token1_amount / token0_amount`입니다. `p` 대신 `sqrt`를 사용하면 스왑 수학이 선형화되어 (토큰 수량 변화가 `Δsqrt_price`에 대해 선형이 됨) 많은 틱을 거치는 스왑에서도 `x64` 고정소수점이 정밀도를 유지합니다.
+
+틱 ↔ 스콰트-가격 변환은 `비트-단위` 로그 근사를 통해 사전에 계산됩니다:
+
+$$
+\text{sqrt\_price\_x64}(t) \approx 2^{64} \cdot (1.0001)^{t/2}
+$$
+
+이는 `tick_math::get_sqrt_price_at_tick`의 조회 기반 지수 연산으로 구현됩니다.
+
+## 유동성을 정준 단위로
+
+범위 `[sqrt_a, sqrt_b]` 내 (`sqrt_a < sqrt_b`인) **유동성 `L`** 포지션은 다음과 같이 토큰 수량으로 매핑됩니다. `sqrt_c = sqrt_price_x64`를 풀의 현재 가격이라 하면:
+
+| 경우 | `amount0` | `amount1` |
+|------|-----------|-----------|
+| `sqrt_c <= sqrt_a` (풀 가격이 범위 아래) | `L · (sqrt_b - sqrt_a) / (sqrt_a · sqrt_b)` | `0` |
+| `sqrt_a < sqrt_c < sqrt_b` (범위 내) | `L · (sqrt_b - sqrt_c) / (sqrt_c · sqrt_b)` | `L · (sqrt_c - sqrt_a)` |
+| `sqrt_c >= sqrt_b` (풀 가격이 범위 위) | `0` | `L · (sqrt_b - sqrt_a)` |
+
+세 가지 항등식은 집중 유동성이 범위 내에서 만족하는 불변식 `x = L / sqrt_p`, `y = L · sqrt_p`에서 나옵니다.
+
+통합자는 보통 역을 원합니다: `amount0` / `amount1` 입금이 주어졌을 때 범위에 맞는 최대 `L`을 계산합니다. SDK의 `LiquidityMath.getLiquidityFromTokenAmounts`가 이를 수행합니다. 범위 내 경우의 공식:
+
+$$
+L_0 = \text{amount0} \cdot \frac{\text{sqrt\_c} \cdot \text{sqrt\_b}}{\text{sqrt\_b} - \text{sqrt\_c}},
+\qquad
+L_1 = \frac{\text{amount1}}{\text{sqrt\_c} - \text{sqrt\_a}},
+\qquad
+L = \min(L_0, L_1)
+$$
+
+어느 쪽이든 제약이 결정되면 실제로 소비되는 비율이 정해지고, 다른 쪽에는 남은 부분이 있을 수 있습니다.
+
+## 단일 틱 스왑 스텝
+
+스왑은 **스텝**으로 진행됩니다. 각 스텝은 (a) 현재 틱 범위 내의 모든 사용 가능한 입력을 소비하되 틱을 넘지 않거나, (b) 가격을 다음 초기화된 틱으로 정확히 이동시킵니다.
+
+현재 상태 `(sqrt_c, L)`과 **상향** 스왑 (token0 입력, token1 출력, `sqrt_price` 증가)이 주어졌을 때, 다음 초기화된 틱까지의 거리를 `sqrt_t`라 하면, 이 미세 구간 내에서 입력과 가격의 관계는:
+
+$$
+\Delta\text{amount0} = L \cdot \left( \frac{1}{\text{sqrt\_c}} - \frac{1}{\text{sqrt\_t}} \right)
+= \frac{L \cdot (\text{sqrt\_t} - \text{sqrt\_c})}{\text{sqrt\_c} \cdot \text{sqrt\_t}}
+$$
+
+그리고
+
+$$
+\Delta\text{amount1} = L \cdot (\text{sqrt\_t} - \text{sqrt\_c})
+$$
+
+프로그램은 다음 두 가지 중 하나를 수행합니다:
+
+- **전체 입력이 들어맞나요?** 남은 입력 (수수료 차감 후)이 `sqrt_t`에 도달하는 `Δamount0`보다 적으면 새로운 `sqrt_c'`를 정확히 풀어냅니다:
+
+  $$
+  \text{sqrt\_c}' = \frac{L \cdot \text{sqrt\_c}}{L + \Delta\text{input} \cdot \text{sqrt\_c}}
+  $$
+
+  (정확한 입력 `token0 → token1` 스왑의 경우). 스왑은 틱을 넘지 않고 이 스텝에서 완료됩니다.
+
+- **입력이 `Δamount0`을 초과하나요?** `sqrt_c' = sqrt_t`로 설정하고, 틱을 넘으면서 (`liquidity_net` 적용), 남은 입력을 `Δamount0`만큼 감소시키고, 출력을 `Δamount1`만큼 증가시킨 후 반복합니다.
+
+반대 방향 (`token1 → token0`, 가격 하향)의 경우 공식은 `sqrt_c`와 `sqrt_t`가 바뀌고 반전이 다른 슬롯에 있습니다.
+
+전체 Rust 구현은 `raydium-clmm/programs/amm/src/libraries/swap_math.rs`에 있습니다. 그 로직은 Uniswap v3의 `SwapMath.computeSwapStep`과 일대일로 일치합니다.
+
+## 각 스텝의 수수료
+
+거래 수수료는 각 스텝의 **입력** 수량에서 차감됩니다. CPMM과 동일한 규칙입니다:
+
+```
+step_fee_amount  = ceil(step_input * trade_fee_rate / 1_000_000)
+step_net_input   = step_input - step_fee_amount
+protocol_portion = floor(step_fee_amount * protocol_fee_rate / 1_000_000)
+fund_portion     = floor(step_fee_amount * fund_fee_rate     / 1_000_000)
+lp_portion       = step_fee_amount - protocol_portion - fund_portion
+```
+
+LP 부분은 글로벌 수수료 성장 누적기를 업데이트하여 현재 범위 내 유동성에 분산됩니다:
+
+$$
+\text{fee\_growth\_global}_{\text{in}} \mathrel{+}= \text{lp\_portion} \cdot \frac{2^{64}}{L}
+$$
+
+즉, **유동성 단위당 수수료**로 표현되며, Q64.64입니다. 따라서 이 스왑 동안 범위 내에 있던 크기 `L_i`의 포지션은 나중에 `L_i · Δfee_growth_global / 2^{64}` 토큰을 받을 것으로 읽습니다.
+
+프로토콜 및 펀드 부분은 각각 `PoolState.protocol_fees_token_{0,1}`과 `PoolState.fund_fees_token_{0,1}`에 누적되며, CPMM과 동일합니다. 이들은 `CollectProtocolFee` / `CollectFundFee`로 정산됩니다.
+
+## 범위 내외 수수료 성장
+
+CLMM 수수료 회계의 까다로운 부분: 포지션은 풀의 가격이 **범위 내에** 있는 동안에만 수수료를 얻습니다. 풀은 글로벌 누적 수수료를 추적하지만, 포지션은 특정 범위 내의 누적 수수료를 알아야 합니다.
+
+해결책은 **틱 기반** 누적기입니다. 각 틱은 다음을 저장합니다:
+
+```
+fee_growth_outside_0_x64
+fee_growth_outside_1_x64
+```
+
+틱 초기화 시점에:
+
+- 풀의 가격이 **이 틱 위에** 있으면 (`tick_current >= this_tick`), `fee_growth_outside = fee_growth_global`입니다. (지금까지 벌어진 모든 것은 현재 가격 상대로 이 틱 "아래" 즉 "바깥"입니다.)
+- 그렇지 않으면 `fee_growth_outside = 0`입니다.
+
+가격이 틱을 넘을 때 프로그램은 그 틱의 `fee_growth_outside`를 **뒤집습니다**:
+
+$$
+\text{fee\_growth\_outside} \gets \text{fee\_growth\_global} - \text{fee\_growth\_outside}
+$$
+
+이것이 유지하는 불변식: 모든 틱 `t`에 대해 `fee_growth_outside(t)`는 `tick_current`가 `t`의 반대쪽에 있던 동안 발생한 수수료와 같습니다.
+
+**범위 `[tick_lower, tick_upper]` 내의 수수료 성장**은 다음과 같이 유도됩니다:
+
+```
+if tick_current >= tick_upper:
+    fee_growth_below = fee_growth_outside(tick_lower)
+    fee_growth_above = fee_growth_global - fee_growth_outside(tick_upper)
+elif tick_current >= tick_lower:
+    fee_growth_below = fee_growth_outside(tick_lower)
+    fee_growth_above = fee_growth_outside(tick_upper)
+else:
+    fee_growth_below = fee_growth_global - fee_growth_outside(tick_lower)
+    fee_growth_above = fee_growth_outside(tick_upper)
+
+fee_growth_inside = fee_growth_global - fee_growth_below - fee_growth_above
+```
+
+이것은 Uniswap-v3 수수료 성장 공식으로, 변하지 않았습니다.
+
+## 포지션이 저장하는 것과 읽는 것
+
+`PersonalPositionState`는 `fee_growth_inside_0_last_x64`와 `fee_growth_inside_1_last_x64`를 저장합니다: 포지션을 마지막으로 건드렸을 때의 `fee_growth_inside` 값입니다.
+
+그 후 건드릴 때마다 (증가, 감소, 수집), 프로그램은:
+
+1. 위 공식을 사용하여 현재 `fee_growth_inside_{0,1}_x64`를 계산합니다.
+2. `Δ = fee_growth_inside_now − fee_growth_inside_last`를 계산합니다 (u128에 대한 모듈로 뺄셈).
+3. `Δ × position.liquidity / 2^{64}`을 `tokens_fees_owed_{0,1}`에 더합니다.
+4. `fee_growth_inside_last`를 새 값으로 업데이트합니다.
+
+토큰이 실제로 금고를 떠나는 것은 `CollectFees` / `DecreaseLiquidity`에서만, `tokens_fees_owed`를 상대로 합니다.
+
+## 보상
+
+풀의 최대 3개 보상 스트림은 각각의 `reward_growth_global_x64` 누적기에서 동일한 범위-내 기계를 사용합니다. 발행 시간에:
+
+$$
+\text{reward\_growth\_global} \mathrel{+}= \text{emission\_per\_second} \cdot \Delta t \cdot \frac{2^{64}}{L}
+$$
+
+— 발행이 활동 유동성에 반비례하므로, 더 높은 밀도의 풀은 각 포지션당 초당 비례적으로 적게 지급하지만, 더 많은 포지션 총수에 걸쳐 지급합니다. 포지션당 보상 미지급은
+
+$$
+\text{reward\_owed} = (\text{reward\_growth\_inside}_{\text{now}} - \text{reward\_growth\_inside}_{\text{last}}) \cdot L / 2^{64}
+$$
+
+이며 `CollectReward`로 청구합니다. [`products/clmm/fees`](/ko/products/clmm/fees)를 참고하세요.
+
+## 작업 예: 정확한 입력 스왑
+
+다음을 가정합니다:
+
+- `tick_spacing = 60`
+- `sqrt_price_x64 = 1 × 2^{64}` — 가격 = 1.0, 따라서 `tick_current = 0`.
+- 활동 유동성 `L = 1_000_000 × 2^{64}`.
+- 위의 다음 초기화된 틱: `t = 60` (sqrt_price_b ≈ `1.003004 × 2^{64}`).
+- 거래 수수료율: 500 (0.05%).
+
+사용자: 정확한 입력 1,000 token0로 `SwapBaseInput`.
+
+스텝 1 — 수수료:
+
+```
+trade_fee       = ceil(1000 * 500 / 1_000_000)  = 1
+step_net_input  = 999
+```
+
+스텝 2 — 999가 현재 틱 범위 내에 들어가나요?
+
+```
+다음 틱까지의 거리 (amount0):
+  L · (sqrt_t - sqrt_c) / (sqrt_c * sqrt_t)
+  ≈ 1_000_000 · (1.003004 − 1) / (1 · 1.003004)
+  ≈ 2995.5 token0
+```
+
+`999 < 2995.5`이므로 전체 입력이 틱을 넘지 않고 들어갑니다.
+
+스텝 3 — 새로운 가격:
+
+```
+sqrt_c' = L · sqrt_c / (L + Δin · sqrt_c)
+        = 1_000_000 · 1 / (1_000_000 + 999 · 1)
+        ≈ 0.999001
+```
+
+즉, `sqrt_c'`이 `sqrt_c` 약간 아래입니다. 위의 공식은 `token1 → token0` 스왑용입니다. 여기 예는 `token0 → token1`이므로 가격을 **위로** 올립니다 — `token0 입력`에 대한 해당 형식을 사용합니다:
+
+```
+sqrt_c' = sqrt_c + Δin / L
+        = 1 + 999 / 1_000_000
+        = 1.000999
+```
+
+(이는 `token0 → token1` 스왑의 예상 방향과 일치합니다: 가격과 함께 `sqrt_c`가 올라갑니다.)
+
+스텝 4 — 출력 수량:
+
+```
+Δout token1 = L · (sqrt_c' − sqrt_c)
+            = 1_000_000 · 0.000999
+            = 999.00
+```
+
+반올림을 계산한 후, 사용자는 ≈ 999 token1을 받습니다. 수수료 (1 token0)는 `trade_fee_rate × protocol_fee_rate / 1e6` (펀드도 유사함)로 LP, 프로토콜, 펀드 간에 분할됩니다; LP 부분은 `fee_growth_global_0_x64`로 흐릅니다.
+
+## 스왑 중 리미트 오더 매칭
+
+스왑 스텝이 열린 리미트 오더를 보유한 틱을 넘을 때, 그 오더들은 스왑 입력을 **먼저** 소비합니다 (LP 곡선보다 전), 틱의 정확한 가격으로. 매칭은 `order_phase` 코호트별로 틱 내에서 FIFO입니다.
+
+### `TickState`의 코호트별 상태
+
+```
+order_phase                  : u64    단조 코호트 id
+orders_amount                : u64    현재 (가장 최신) 코호트의 입력-토큰 합계
+part_filled_orders_remaining : u64    스왑이 현재 채우고 있는 코호트의 남은 입력
+unfilled_ratio_x64           : u128   부분 채워진 코호트의 Q64.64 채움 비율
+```
+
+2-코호트 배치는 새 오더가 스왑 중에 틱에서 열려 있을 수 있기 때문에 존재합니다 (이전 코호트가 여전히 채워지고 있는 동안). 새로 열린 오더는 `orders_amount`에 참여하고 다음 `order_phase`를 상속받습니다; 이전 코호트가 완전히 소비될 때까지 채울 수 없습니다.
+
+### 매칭 스텝
+
+스왑 중 각 틱 교차 시 발생하는 매칭의 의사-코드:
+
+```
+fn match_limit_orders_at_tick(tick, swap_input_remaining, sqrt_p):
+    # 1. 부분 채워진 코호트를 먼저 채우려고 시도합니다.
+    if tick.part_filled_orders_remaining > 0:
+        consume = min(tick.part_filled_orders_remaining, swap_input_remaining)
+        # 그 코호트의 미충전 비율을 업데이트합니다.
+        tick.unfilled_ratio_x64 *= (1 - consume / tick.part_filled_orders_remaining)
+        tick.part_filled_orders_remaining -= consume
+        swap_input_remaining -= consume
+        if tick.part_filled_orders_remaining == 0:
+            tick.unfilled_ratio_x64 = 0
+        if swap_input_remaining == 0: return
+
+    # 2. 활동 코호트를 승격합니다.
+    if tick.orders_amount > 0:
+        tick.part_filled_orders_remaining = tick.orders_amount
+        tick.orders_amount = 0
+        tick.order_phase += 1
+        tick.unfilled_ratio_x64 = ONE_X64
+        # 새로 승격된 코호트로 재귀합니다.
+        return match_limit_orders_at_tick(tick, swap_input_remaining, sqrt_p)
+
+    return  # 틱에는 더 이상 리미트 오더가 없습니다
+```
+
+리미트-오더 소유자에게 가는 출력 토큰은 스왑당 **전송되지 않습니다**. 오더 소유자가 `SettleLimitOrder` (또는 `DecreaseLimitOrder`)를 호출할 때까지 풀의 출력 금고에 가상으로 앉아있습니다. 풀은 단순히 `unfilled_ratio_x64`를 통해 코호트가 얼마나 채워졌는지 추적합니다. 각 `LimitOrderState`는 열린 시간에 자신의 `(order_phase, unfilled_ratio_x64)` 스냅샷을 저장하므로, 정산은:
+
+```
+filled_amount  = total_amount × (1 − tick_now.unfilled_ratio_x64 / order.unfilled_ratio_x64)
+                if tick_now.order_phase > order.order_phase
+                else 0
+output_amount  = price_at(tick_index) × filled_amount   # 방향에 맞게 조정
+```
+
+이 O(1) 정산이 바로 코호트 설계의 핵심입니다 — 틱은 오더당 가스 없이 임의로 많은 오더를 채울 수 있습니다.
+
+### LP 곡선과의 상호작용
+
+스왑 스텝에서 리미트-오더 매칭은 틱 **에서** 일어나고 (영 `Δsqrt_price`); LP 곡선 소비는 틱 **사이에서** 일어납니다. 따라서 순서는:
+
+1. 틱 `t_cross` 교차 (LP `liquidity_net` 변화를 먼저 적용합니다. Uniswap-V3이 이렇게 하기 때문).
+2. `t_cross`에 앉아있는 리미트 오더를 채웁니다.
+3. 다음 초기화된 틱이나 `swap_input` 소진까지 LP 곡선을 따라 계속합니다.
+
+리미트 오더는 따라서 거래자에게 정확히 오더의 틱 가격에서 *더* 효과적인 유동성을 제공합니다 (가격 개선 효과). 대신 LP는 스왑 거래량의 그 부분에 대해 수수료를 얻지 못합니다 — 리미트-오더 부분의 거래는 스왑퍼에게는 수수료 없습니다. 리미트-오더 배치자는 메이커로 행동하기 때문입니다. 동적 수수료 할증 (활성화된 경우)은 여전히 동일 스왑의 LP 부분에 적용됩니다.
+
+## 동적 수수료 파생
+
+`PoolState.dynamic_fee_info`는 변동성 상태를 전달합니다. 각 스왑 스텝은 스텝당 수수료율을 다음과 같이 계산합니다:
+
+$$
+\text{fee\_rate}_{\text{total}} = \text{trade\_fee\_rate}_{\text{config}} +
+\underbrace{\frac{\text{dynamic\_fee\_control} \cdot (\text{vol\_acc} \cdot \text{tick\_spacing})^2}
+{D_{\text{ctrl}} \cdot S_{\text{vol}}^2}}_{\text{동적 할증}}
+$$
+
+여기서:
+
+- $D_{\text{ctrl}} = 100{,}000$ — `DYNAMIC_FEE_CONTROL_DENOMINATOR`
+- $S_{\text{vol}} = 10{,}000$ — `VOLATILITY_ACCUMULATOR_SCALE`
+- `vol_acc`는 아래 업데이트 규칙 후의 스텝당 누적기입니다
+- `tick_spacing`은 `PoolState.tick_spacing`에서 나옵니다
+
+결과는 $100{,}000 / 10^6 = 10\%$에서 크램핑됩니다.
+
+### 누적기 업데이트
+
+매 스왑마다 두 규칙을 이 순서로 적용합니다:
+
+**감소.** 참조 바닥은 마지막 업데이트 이후 시간에 따라 감소합니다:
+
+$$
+\text{vol\_ref} = \begin{cases}
+0 & \text{if } \Delta t > \text{decay\_period} \\
+\text{vol\_acc}_{\text{prev}} \cdot \dfrac{\text{reduction\_factor}}{10{,}000} & \text{if } \text{filter\_period} < \Delta t \le \text{decay\_period} \\
+\text{vol\_ref}_{\text{prev}} & \text{if } \Delta t \le \text{filter\_period}
+\end{cases}
+$$
+
+**누적.** 새 누적기는 참조에 이전 참조 인덱스 이후 순회한 틱-거리를 더한 것입니다:
+
+$$
+\text{vol\_acc} = \min\left(
+    \text{vol\_ref} + \left| t_{\text{ref}} - t_{\text{now}} \right| \cdot S_{\text{vol}},
+    \text{max\_vol\_acc}
+\right)
+$$
+
+`tick_spacing_index_reference` ($t_{\text{ref}}$)는 원시 틱이 아니라 틱-스펙 단위입니다: $t_{\text{ref}} = \lfloor \text{tick\_current} / \text{tick\_spacing} \rfloor$.
+
+### 틱 거리에서 포물선인 이유
+
+누적기를 제곱하면 수수료는 가격이 참조점에서 걸어간 거리의 *제곱*으로 올라갑니다. 경험상 이는 무작위 이동 압력 하에서 가격의 분산 스케일링과 일치합니다: 2× 틱 편차는 4× 암시된 변동성을 의미하므로 4× 할증을 부과합니다. `dynamic_fee_control` 파라미터는 절대 수준을 보정합니다.
+
+`filter_period` 윈도우는 작은 소수점 이하 진동 (예: MEV 봇의 샌드위칭)이 누적기를 부풀리는 것을 방지합니다. `decay_period` 윈도우는 과거의 단일 스파이크가 시장이 진정된 후 무한정 수수료를 부과하는 것을 방지합니다.
+
+## 수치 견고성
+
+- 모든 중간 곱은 `u128` 또는 `u256` 형태 산술을 통과합니다. CLMM은 `U128Sqrt` 헬퍼와 `FullMath::mulDiv` 패턴을 Uniswap v3에서 직접 이식합니다.
+- 나눗셈 반올림은 불변식 `k' ≥ k`를 로컬에서 시행하기 위해 스텝별로 선택됩니다. `SwapBaseInput`은 출력을 **내림**합니다; `SwapBaseOutput`은 입력을 **올림**합니다.
+- `PoolState.liquidity`를 0으로 떨어뜨리는 틱 교차는 허용됩니다 (가격은 "유동성 구멍"을 통과할 수 있음) 하지만 스왑은 단순히 다음 초기화된 틱으로 진행하며 입력을 소비하지 않고 수수료를 부과하지 않습니다.
+- 오버플로우 가드: `sqrt_price_x64`는 포함 범위 `[MIN_SQRT_PRICE_X64, MAX_SQRT_PRICE_X64]` 내에 유지됩니다. `[MIN_TICK, MAX_TICK]`에 해당합니다. 경계 중 하나를 넘을 스왑은 `SqrtPriceLimitOverflow`로 되돌립니다.
+
+## 다음에 갈 곳
+
+- [`products/clmm/ticks-and-positions`](/ko/products/clmm/ticks-and-positions) 틱 맵이 걸음에 어떻게 참여하는지.
+- [`products/clmm/fees`](/ko/products/clmm/fees) 수학의 수수료/보상 쪽을 자세히.
+- [`algorithms/clmm-math`](/ko/algorithms/clmm-math) `L = sqrt(x · y)` 및 범위-대-유동성 공식 뒤의 유도.
+
+출처:
+
+- [`raydium-io/raydium-clmm` — `libraries/swap_math.rs`, `libraries/tick_math.rs`](https://github.com/raydium-io/raydium-clmm)
+- "Uniswap v3 Core" 백서, §6–7

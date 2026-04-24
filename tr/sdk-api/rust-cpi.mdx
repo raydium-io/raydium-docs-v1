@@ -1,0 +1,256 @@
+---
+title: "Rust CPI"
+description: "Raydium programlarını başka bir Solana programından çağırma — hesap listesi oluşturma, imzalayan seed'leri, işlem bütçesi ve CPMM, CLMM, farm v6 ve LaunchLab için hata yayılımı desenleri. AMM v4 ayrı olarak kapsanmıştır çünkü Anchor crate'i yoktur."
+---
+
+<Info>
+  **Bu sayfa yapay zekâ tarafından otomatik olarak çevrilmiştir. İngilizce sürüm esas alınır.**
+
+  [İngilizce sürümü görüntüle →](/sdk-api/rust-cpi)
+</Info>
+
+## Cargo bağımlılıkları
+
+```toml
+[dependencies]
+anchor-lang            = "0.29"
+anchor-spl             = "0.29"
+raydium_cp_swap        = { git = "https://github.com/raydium-io/raydium-cp-swap", features = ["cpi"] }
+raydium_amm_v3         = { git = "https://github.com/raydium-io/raydium-clmm",    features = ["cpi"] }
+# AMM v4 ve farm v6: yayınlanmış Anchor CPI crate'i yok. "AMM v4 / farm v6" bölümüne bakın.
+```
+
+`cpi` özellik bayrağı, crate'lerin tam program yerine sadece CPI yüzeyine (hesap struct'ları + invoker'lar) derlemesini sağlar, böylece ikili dosyanızın boyutu küçük kalır.
+
+Hesap struct'larını baştan sona bağlayan çalışan CPI örnekleri için, bkz. [`raydium-io/raydium-cpi-example`](https://github.com/raydium-io/raydium-cpi-example) (AMM v4, CPMM ve CLMM'yi kapsar).
+
+## Hesap listesi oluşturma
+
+Her Raydium CPI, çağıran programda bir `Accounts` struct'ı gerektirir. Alanlar, programın instruction hesap sırasına 1'e 1 eşlenir, alan düzeyinde doğrulayıcılarla:
+
+```rust
+use anchor_lang::prelude::*;
+use anchor_spl::token::{Token, TokenAccount, Mint};
+
+#[derive(Accounts)]
+pub struct MyProxySwap<'info> {
+    #[account(mut)]
+    pub user: Signer<'info>,
+
+    /// CHECK: CPMM tarafından doğrulanır
+    #[account(mut)]
+    pub pool_state: UncheckedAccount<'info>,
+
+    /// CHECK: aynı şekilde
+    pub amm_config: UncheckedAccount<'info>,
+
+    /// CHECK: aynı şekilde
+    pub pool_authority: UncheckedAccount<'info>,
+
+    #[account(mut)]
+    pub input_vault: Account<'info, TokenAccount>,
+    #[account(mut)]
+    pub output_vault: Account<'info, TokenAccount>,
+
+    pub input_mint: Account<'info, Mint>,
+    pub output_mint: Account<'info, Mint>,
+
+    #[account(mut)]
+    pub user_input_ata:  Account<'info, TokenAccount>,
+    #[account(mut)]
+    pub user_output_ata: Account<'info, TokenAccount>,
+
+    pub cpmm_program: Program<'info, raydium_cp_swap::program::RaydiumCpSwap>,
+    pub token_program: Program<'info, Token>,
+    pub token_program_2022: Program<'info, anchor_spl::token_2022::Token2022>,
+    /// CHECK: observation PDA
+    #[account(mut)]
+    pub observation_state: UncheckedAccount<'info>,
+}
+```
+
+Raydium tarafındaki hesapların çoğu `UncheckedAccount`'dir çünkü çağrılan program (Raydium) doğrulamaya sahiptir. Çağıran programınız sadece *sizin* sahip olduğunuz hesapları titizlikle doğrular — kullanıcı ATA'ları, kendi PDA'larınız. `/// CHECK:` yorum satırı Anchor'ın eksik kontroller hakkındaki uyarısını bastırır.
+
+## CPI çağrısı oluşturma
+
+Anchor, her instruction için bir helper üretir:
+
+```rust
+use raydium_cp_swap::cpi::{self, accounts::Swap as CpmmSwap};
+
+pub fn my_proxy_swap(
+    ctx: Context<MyProxySwap>,
+    amount_in: u64,
+    minimum_amount_out: u64,
+) -> Result<()> {
+    let cpi_accounts = CpmmSwap {
+        payer:                ctx.accounts.user.to_account_info(),
+        authority:            ctx.accounts.user.to_account_info(),
+        amm_config:           ctx.accounts.amm_config.to_account_info(),
+        pool_state:           ctx.accounts.pool_state.to_account_info(),
+        input_token_account:  ctx.accounts.user_input_ata.to_account_info(),
+        output_token_account: ctx.accounts.user_output_ata.to_account_info(),
+        input_vault:          ctx.accounts.input_vault.to_account_info(),
+        output_vault:         ctx.accounts.output_vault.to_account_info(),
+        input_token_program:  ctx.accounts.token_program.to_account_info(),
+        output_token_program: ctx.accounts.token_program.to_account_info(),
+        input_token_mint:     ctx.accounts.input_mint.to_account_info(),
+        output_token_mint:    ctx.accounts.output_mint.to_account_info(),
+        observation_state:    ctx.accounts.observation_state.to_account_info(),
+    };
+    let cpi_ctx = CpiContext::new(
+        ctx.accounts.cpmm_program.to_account_info(),
+        cpi_accounts,
+    );
+
+    cpi::swap_base_input(cpi_ctx, amount_in, minimum_amount_out)?;
+    Ok(())
+}
+```
+
+`cpi::swap_base_input` IDL'den üretilir; argüman listesi Anchor instruction'ının argüman listesini yansıtır.
+
+## İmzalayan seed'leri (PDA-imzalı CPI)
+
+Programınız bir PDA adına CPI'ı imzaladığında (vault'lar, escrow'lar vb. için yaygın), `CpiContext::new_with_signer` kullanın:
+
+```rust
+let bump         = ctx.accounts.my_authority_bump;
+let signer_seeds: &[&[&[u8]]] = &[&[b"my_authority", &[bump]]];
+
+let cpi_ctx = CpiContext::new_with_signer(
+    ctx.accounts.cpmm_program.to_account_info(),
+    cpi_accounts,
+    signer_seeds,
+);
+
+cpi::swap_base_input(cpi_ctx, amount_in, minimum_amount_out)?;
+```
+
+İmzalayan seed'leri PDA'nın türetilmesiyle eşleşmelidir. `authority` (veya benzer imzalayan rol) olarak iletilen herhangi bir hesap için Solana çalışma zamanı, PDA'nın bu seed'ler aracılığıyla imzaladığını kontrol eder.
+
+## Kalan hesaplar
+
+Bazı Raydium instruction'ları **kalan hesapları** alır — sabit hesaplardan sonra eklenen değişken uzunlukta bir liste. Kanonik örnekler:
+
+- **CLMM `SwapV2`**: swap'ın geçebileceği tick dizilerine karşılık gelen 1–8 `TickArrayState` hesabı ekler.
+- **Farm v6 `Deposit`**: her canlı reward akışı için `(reward_vault, user_reward_ata)` çiftlerini ekler.
+
+Anchor'ın CPI helper'ları kalan hesapları tür-kontrol etmez. `.with_remaining_accounts(...)` aracılığıyla iletiniz:
+
+```rust
+let cpi_ctx = CpiContext::new(program, accounts)
+    .with_remaining_accounts(ctx.remaining_accounts.to_vec());
+```
+
+Sıra önemlidir: alıcı program kalan hesapları ilettiğiniz sıraya göre yineler. CLMM için tick dizileri yönsel olarak sıralanmalı (swap yönündeki ilk dizi önce). Farm v6 için reward slot'ları slot indeks sırasına göre gider.
+
+## Hata yayılımı
+
+Raydium'un programları kendi hata enum'larını döndürür. Anchor onları sarar; çağıran programınız onları `Err(ProgramError::Custom(code))` olarak görür. Belirli hataları işlemek için:
+
+```rust
+use raydium_cp_swap::error::ErrorCode as CpmmErr;
+
+match cpi::swap_base_input(cpi_ctx, amount_in, minimum_amount_out) {
+    Ok(_) => Ok(()),
+    Err(e) => {
+        msg!("CPMM swap başarısız: {:?}", e);
+        // Yeniden oluştur veya kendi hata türüne dönüştür.
+        Err(e)
+    }
+}
+```
+
+Hata kodu numarası IDL politikasına göre sabittir ([`sdk-api/anchor-idl`](/tr/sdk-api/anchor-idl)). Sayısal değere karşı karşılaştırarak belirli kodlara karşı test edebilirsiniz.
+
+## Bileşik CPI'larda işlem bütçesi
+
+Her CPI frame'inin ek yükü vardır (~çağrı kendisi için 1.500 CU) ve çağrılanın kendi CU tüketimi bunun üzerine yığılır. Programınızın içinden CPMM swap çağıran bir işlem şunları harcar:
+
+```
+your_program_cu
++ ~1_500       (CPI ek yükü)
++ ~150_000     (CPMM swap, SPL-token varyantı)
++ ~200_000     (Token-2022 aktarım ücreti ile)
++ ~10_000      (observation güncellemesi)
+```
+
+Yığılı yönlendirme için (programınız → aggregator → CPMM + CLMM + farm harvest), bütçe ≥500k CU. İşlemde her zaman açık bir `ComputeBudgetProgram::set_compute_unit_limit(...)` instruction'ı ayarlayın — varsayılan 200k CU limiti sessizce tükenecektir.
+
+## AMM v4 — manuel Instruction oluşturma
+
+AMM v4'ün Anchor crate'i yoktur. `Instruction`'ı elle oluşturun:
+
+```rust
+use anchor_lang::solana_program::program::invoke_signed;
+use anchor_lang::solana_program::instruction::{Instruction, AccountMeta};
+
+const AMM_V4_PROGRAM_ID: Pubkey = pubkey!("675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8");
+
+// SwapBaseIn ayırt edicisi 9'dur.
+let mut data = vec![9u8];
+data.extend_from_slice(&amount_in.to_le_bytes());
+data.extend_from_slice(&minimum_amount_out.to_le_bytes());
+
+let ix = Instruction {
+    program_id: AMM_V4_PROGRAM_ID,
+    accounts: vec![
+        AccountMeta::new_readonly(token_program_id, false),
+        AccountMeta::new(amm_id, false),
+        AccountMeta::new_readonly(amm_authority, false),
+        // ... products/amm-v4/instructions başına kalan hesaplar ...
+    ],
+    data,
+};
+invoke_signed(&ix, &account_infos, signer_seeds)?;
+```
+
+Tam hesap listesi için bkz. [`products/amm-v4/code-demos`](/tr/products/amm-v4/code-demos).
+
+## Farm v6 — reward-çift kalan hesaplar
+
+Farm v6'nın `Deposit` / `Withdraw` / `Harvest`'i kalan hesaplarda `(reward_vault_i, user_reward_ata_i)` çift deseni kullanır. Tam sıra:
+
+```
+remaining_accounts = [
+    reward_vault_0, user_reward_ata_0,
+    reward_vault_1, user_reward_ata_1,
+    ...
+]
+```
+
+**Canlı** (çalışan veya talep edilmemiş sonu biten) reward slot'ı başına bir çift. Kullanılmayan slot'ları atlayın; program `farm_state.reward_infos[i].reward_state` dışında gönderir.
+
+## CPI akışını test etme
+
+Yerel geliştirme, Raydium programlarının test validator'ünüzde mevcut olmasını gerektirir. Seçenekler:
+
+1. **Program klonla `anchor test`** — `Anchor.toml` içinde:
+
+   ```toml
+   [test.validator]
+   clone = [
+     { address = "CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK" },  # CPMM
+     { address = "CLMM...program-id..." },                          # CLMM
+     { address = "farm-v6-program-id..." },                         # farm v6
+   ]
+   ```
+
+   Bu, dağıtılan bytecode'unu mainnet'ten yerel validator'ünüze çeker.
+
+2. **Devnet** — Raydium tüm programları devnet'e mainnet ile aynı program ID'leri ile dağıtır. Canlı koda vurmak için `anchor test --provider.cluster devnet` çalıştırın.
+
+3. **Yerel dağıtım** — Raydium repo'larını klonlayın ve yerel validator'e `anchor deploy` yapın. Test döngüsü ek yükü ekler ancak hata ayıklama için çağrılanı değiştirmenize izin verir.
+
+## İşaretçiler
+
+- [`products/cpmm/code-demos`](/tr/products/cpmm/code-demos), [`products/clmm/code-demos`](/tr/products/clmm/code-demos), [`products/amm-v4/code-demos`](/tr/products/amm-v4/code-demos), [`products/farm-staking/code-demos`](/tr/products/farm-staking/code-demos) — ürüne özgü CPI örnekleri.
+- [`sdk-api/anchor-idl`](/tr/sdk-api/anchor-idl) — IDL alınması ve müşteri yeniden oluşturması.
+- [`integration-guides/cpi-integration`](/tr/integration-guides/cpi-integration) — daha yüksek düzey desenler: escrow'lar, vault'lar, aggregator bileşimi.
+
+Kaynaklar:
+
+- [raydium-cp-swap](https://github.com/raydium-io/raydium-cp-swap)
+- [raydium-clmm](https://github.com/raydium-io/raydium-clmm)
+- [Anchor CPI docs](https://www.anchor-lang.com/docs/cross-program-invocations)

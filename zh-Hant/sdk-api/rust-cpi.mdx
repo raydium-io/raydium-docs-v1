@@ -1,0 +1,260 @@
+---
+title: "Rust CPI"
+description: "從另一個 Solana 程式叫用 Raydium 程式 — 帳戶列表構造、簽署者種子、運算預算，以及 CPMM、CLMM、farm v6 和 LaunchLab 的錯誤傳播模式。AMM v4 因為沒有 Anchor crate，所以單獨涵蓋。"
+---
+
+<Info>
+  **本頁內容由 AI 自動翻譯，所有內容以英文版本為準。**
+
+  [查看英文版 →](/sdk-api/rust-cpi)
+</Info>
+
+<Info>
+  CPI（「跨程式叫用」）是一個 Solana 程式呼叫另一個程式的機制。Raydium 的 Anchor 程式附帶 CPI 包裝 crate，讓呼叫端看起來像是有型別的函式呼叫 — 包含驗證過的欄位名稱的帳戶結構體和 `cpi::<ix>()` 輔助函式。本頁文件涵蓋一般模式；對於特定產品的程式碼片段，請參閱各產品章節的 code-demos 頁面。
+</Info>
+
+## Cargo 相依性
+
+```toml
+[dependencies]
+anchor-lang            = "0.29"
+anchor-spl             = "0.29"
+raydium_cp_swap        = { git = "https://github.com/raydium-io/raydium-cp-swap", features = ["cpi"] }
+raydium_amm_v3         = { git = "https://github.com/raydium-io/raydium-clmm",    features = ["cpi"] }
+# AMM v4 和 farm v6：沒有已發佈的 Anchor CPI crate。見下方「AMM v4 / farm v6」。
+```
+
+`cpi` 特性旗標讓 crate 僅編譯至 CPI 介面面（帳戶結構體 + 叫用程式），而不是完整程式，因此你的二進位檔保持小巧。
+
+如需從頭到尾連接帳戶結構體的有效 CPI 範例，請見 [`raydium-io/raydium-cpi-example`](https://github.com/raydium-io/raydium-cpi-example)（涵蓋 AMM v4、CPMM 和 CLMM）。
+
+## 帳戶列表構造
+
+每個 Raydium CPI 都需要呼叫程式中的 `Accounts` 結構體。欄位與程式的指令帳戶順序一一對應，並具備欄位級驗證器：
+
+```rust
+use anchor_lang::prelude::*;
+use anchor_spl::token::{Token, TokenAccount, Mint};
+
+#[derive(Accounts)]
+pub struct MyProxySwap<'info> {
+    #[account(mut)]
+    pub user: Signer<'info>,
+
+    /// CHECK: validated by CPMM
+    #[account(mut)]
+    pub pool_state: UncheckedAccount<'info>,
+
+    /// CHECK: ditto
+    pub amm_config: UncheckedAccount<'info>,
+
+    /// CHECK: ditto
+    pub pool_authority: UncheckedAccount<'info>,
+
+    #[account(mut)]
+    pub input_vault: Account<'info, TokenAccount>,
+    #[account(mut)]
+    pub output_vault: Account<'info, TokenAccount>,
+
+    pub input_mint: Account<'info, Mint>,
+    pub output_mint: Account<'info, Mint>,
+
+    #[account(mut)]
+    pub user_input_ata:  Account<'info, TokenAccount>,
+    #[account(mut)]
+    pub user_output_ata: Account<'info, TokenAccount>,
+
+    pub cpmm_program: Program<'info, raydium_cp_swap::program::RaydiumCpSwap>,
+    pub token_program: Program<'info, Token>,
+    pub token_program_2022: Program<'info, anchor_spl::token_2022::Token2022>,
+    /// CHECK: observation PDA
+    #[account(mut)]
+    pub observation_state: UncheckedAccount<'info>,
+}
+```
+
+大多數 Raydium 端帳戶都是 `UncheckedAccount`，因為被呼叫程式（Raydium）負責驗證。你的呼叫程式只需嚴格驗證**你**擁有的帳戶 — 使用者 ATA、你自己的 PDA。`/// CHECK:` 文件註解會抑制 Anchor 關於遺失檢查的警告。
+
+## 構建 CPI 呼叫
+
+Anchor 為每條指令產生一個輔助函式：
+
+```rust
+use raydium_cp_swap::cpi::{self, accounts::Swap as CpmmSwap};
+
+pub fn my_proxy_swap(
+    ctx: Context<MyProxySwap>,
+    amount_in: u64,
+    minimum_amount_out: u64,
+) -> Result<()> {
+    let cpi_accounts = CpmmSwap {
+        payer:                ctx.accounts.user.to_account_info(),
+        authority:            ctx.accounts.user.to_account_info(),
+        amm_config:           ctx.accounts.amm_config.to_account_info(),
+        pool_state:           ctx.accounts.pool_state.to_account_info(),
+        input_token_account:  ctx.accounts.user_input_ata.to_account_info(),
+        output_token_account: ctx.accounts.user_output_ata.to_account_info(),
+        input_vault:          ctx.accounts.input_vault.to_account_info(),
+        output_vault:         ctx.accounts.output_vault.to_account_info(),
+        input_token_program:  ctx.accounts.token_program.to_account_info(),
+        output_token_program: ctx.accounts.token_program.to_account_info(),
+        input_token_mint:     ctx.accounts.input_mint.to_account_info(),
+        output_token_mint:    ctx.accounts.output_mint.to_account_info(),
+        observation_state:    ctx.accounts.observation_state.to_account_info(),
+    };
+    let cpi_ctx = CpiContext::new(
+        ctx.accounts.cpmm_program.to_account_info(),
+        cpi_accounts,
+    );
+
+    cpi::swap_base_input(cpi_ctx, amount_in, minimum_amount_out)?;
+    Ok(())
+}
+```
+
+`cpi::swap_base_input` 是由 IDL 產生的；其引數列表反映 Anchor 指令的引數列表。
+
+## 簽署者種子（PDA 簽署 CPI）
+
+當你的程式代表 PDA 簽署 CPI 時（對於保管庫、託管等很常見），請使用 `CpiContext::new_with_signer`：
+
+```rust
+let bump         = ctx.accounts.my_authority_bump;
+let signer_seeds: &[&[&[u8]]] = &[&[b"my_authority", &[bump]]];
+
+let cpi_ctx = CpiContext::new_with_signer(
+    ctx.accounts.cpmm_program.to_account_info(),
+    cpi_accounts,
+    signer_seeds,
+);
+
+cpi::swap_base_input(cpi_ctx, amount_in, minimum_amount_out)?;
+```
+
+簽署者種子必須符合 PDA 的衍生。對於以 `authority`（或類似簽署者角色）傳遞的任何帳戶，Solana 執行時會檢查 PDA 是否透過這些種子簽署。
+
+## 剩餘帳戶
+
+某些 Raydium 指令會取用**剩餘帳戶** — 固定帳戶後面附加的可變長度列表。規範例子：
+
+- **CLMM `SwapV2`**：附加 1–8 個 `TickArrayState` 帳戶，對應交換可能遍歷的 tick 陣列。
+- **Farm v6 `Deposit`**：為每個活躍獎勵流附加 `(reward_vault, user_reward_ata)` 對。
+
+Anchor 的 CPI 輔助函式不會進行剩餘帳戶的型別檢查。透過 `.with_remaining_accounts(...)` 傳遞它們：
+
+```rust
+let cpi_ctx = CpiContext::new(program, accounts)
+    .with_remaining_accounts(ctx.remaining_accounts.to_vec());
+```
+
+順序很重要：接收程式按你傳遞的順序遍歷剩餘帳戶。對於 CLMM，tick 陣列必須按方向順序排列（交換方向的第一個陣列優先）。對於 farm v6，獎勵位置按位置索引順序排列。
+
+## 錯誤傳播
+
+Raydium 的程式會傳回它們自己的錯誤列舉。Anchor 會包裝它們；你的呼叫程式將其視為 `Err(ProgramError::Custom(code))`。若要處理特定錯誤：
+
+```rust
+use raydium_cp_swap::error::ErrorCode as CpmmErr;
+
+match cpi::swap_base_input(cpi_ctx, amount_in, minimum_amount_out) {
+    Ok(_) => Ok(()),
+    Err(e) => {
+        msg!("CPMM swap failed: {:?}", e);
+        // 重新拋出，或轉換為你自己的錯誤類型。
+        Err(e)
+    }
+}
+```
+
+根據 IDL 政策（[`sdk-api/anchor-idl`](/zh-Hant/sdk-api/anchor-idl)），錯誤代碼數字是穩定的。你可以透過與數值比較來測試特定程式碼。
+
+## 組成 CPI 中的運算預算
+
+每個 CPI 框架都有開銷（~1,500 CU 用於呼叫本身），被呼叫程式本身的 CU 消耗堆疊在你的之上。從你的程式內部呼叫 CPMM 交換的交易花費：
+
+```
+your_program_cu
++ ~1_500       (CPI overhead)
++ ~150_000     (CPMM swap, SPL-token variant)
++ ~200_000     (if Token-2022 with transfer fee)
++ ~10_000      (observation update)
+```
+
+對於堆疊路由（你的程式 → 聚合器 → CPMM + CLMM + farm harvest），預算 ≥500k CU。始終在交易中設定明確的 `ComputeBudgetProgram::set_compute_unit_limit(...)` 指令 — 預設 200k CU 限制會無聲地用盡。
+
+## AMM v4 — 手動 Instruction 構造
+
+AMM v4 沒有 Anchor crate。手動構建 `Instruction`：
+
+```rust
+use anchor_lang::solana_program::program::invoke_signed;
+use anchor_lang::solana_program::instruction::{Instruction, AccountMeta};
+
+const AMM_V4_PROGRAM_ID: Pubkey = pubkey!("675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8");
+
+// SwapBaseIn discriminator is 9.
+let mut data = vec![9u8];
+data.extend_from_slice(&amount_in.to_le_bytes());
+data.extend_from_slice(&minimum_amount_out.to_le_bytes());
+
+let ix = Instruction {
+    program_id: AMM_V4_PROGRAM_ID,
+    accounts: vec![
+        AccountMeta::new_readonly(token_program_id, false),
+        AccountMeta::new(amm_id, false),
+        AccountMeta::new_readonly(amm_authority, false),
+        // ... remaining accounts per products/amm-v4/instructions ...
+    ],
+    data,
+};
+invoke_signed(&ix, &account_infos, signer_seeds)?;
+```
+
+見 [`products/amm-v4/code-demos`](/zh-Hant/products/amm-v4/code-demos) 了解完整帳戶列表。
+
+## Farm v6 — 獎勵對剩餘帳戶
+
+Farm v6 的 `Deposit` / `Withdraw` / `Harvest` 在剩餘帳戶中使用 `(reward_vault_i, user_reward_ata_i)` 對模式。確切序列：
+
+```
+remaining_accounts = [
+    reward_vault_0, user_reward_ata_0,
+    reward_vault_1, user_reward_ata_1,
+    ...
+]
+```
+
+每個**活躍**（執行中或已結束但未認領）獎勵位置一對。省略未使用的位置；程式從 `farm_state.reward_infos[i].reward_state` 進行分配。
+
+## 測試 CPI 流
+
+本機開發需要 Raydium 程式在你的測試驗證器中可用。選項：
+
+1. **`anchor test` with program clone** — 在 `Anchor.toml` 中：
+
+   ```toml
+   [test.validator]
+   clone = [
+     { address = "CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK" },  # CPMM
+     { address = "CLMM...program-id..." },                          # CLMM
+     { address = "farm-v6-program-id..." },                         # farm v6
+   ]
+   ```
+
+   這會將已部署的位元組碼從主網拉入你的本機驗證器。
+
+2. **Devnet** — Raydium 將所有程式部署到 devnet，使用與主網相同的程式 ID。執行 `anchor test --provider.cluster devnet` 以叫用實時程式碼。
+
+3. **本機部署** — 複製 Raydium 儲存庫並 `anchor deploy` 至本機驗證器。增加測試週期開銷，但讓你可以修改被呼叫程式進行偵錯。
+
+## 指標
+
+- [`products/cpmm/code-demos`](/zh-Hant/products/cpmm/code-demos)、[`products/clmm/code-demos`](/zh-Hant/products/clmm/code-demos)、[`products/amm-v4/code-demos`](/zh-Hant/products/amm-v4/code-demos)、[`products/farm-staking/code-demos`](/zh-Hant/products/farm-staking/code-demos) — 特定產品的 CPI 範例。
+- [`sdk-api/anchor-idl`](/zh-Hant/sdk-api/anchor-idl) — IDL 檢索和用戶端重新產生。
+- [`integration-guides/cpi-integration`](/zh-Hant/integration-guides/cpi-integration) — 更高階的模式：託管、保管庫、聚合器組成。
+
+來源：
+
+- [raydium-cp-swap](https://github.com/raydium-io/raydium-cp-swap)
+- [raydium-clmm](https://github.com/raydium-io/raydium-clmm)
+- [Anchor CPI docs](https://www.anchor-lang.com/docs/cross-program-invocations)

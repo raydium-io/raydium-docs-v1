@@ -1,0 +1,159 @@
+---
+title: "Tick 和持仓"
+description: "CLMM 如何将价格离散化为 Tick，Tick 数组如何压缩存储，以及管理持仓位置的规则。"
+---
+
+<Info>
+  **本页内容由 AI 自动翻译，所有内容以英文版本为准。**
+
+  [查看英文版 →](/products/clmm/ticks-and-positions)
+</Info>
+
+## Tick 存在的原因
+
+CLMM 的流动性集中在价格范围内。为了在链上使范围易于处理，价格被量化为整数 **tick**，其中每个 tick 是前一个的常数倍数：
+
+$$
+\text{price}(i) = 1.0001^{\,i}
+$$
+
+一个 tick 对应 0.01% 的价格变动，或约 1 个基点。映射如下：
+
+| Tick 索引 `i` | 价格倍数 |
+|---|---|
+| `0` | `1.0000` |
+| `100` | `1.0100`（≈ +1.00%） |
+| `-100` | `0.9900`（≈ −0.99%） |
+| `10000` | `2.7181`（≈ e） |
+| `MAX_TICK = 443636` | ≈ `1.84e19` |
+| `MIN_TICK = -443636` | ≈ `5.42e-20` |
+
+`MIN_TICK` 和 `MAX_TICK` 的选择保证 `sqrt_price_x64` 在两端都能适配 `u128`。每个池都强制 `tick_lower >= MIN_TICK` 和 `tick_upper <= MAX_TICK`。实际上，Web UI 会将范围限制在更窄的范围内，以防止用户将流动性锁定在无法到达的 tick。
+
+## Tick 间距
+
+池的 `AmmConfig` 固定了一个 **tick 间距** — 持仓只能用此间距作为端点。如果 `tick_spacing = 60`，只有 `…, −120, −60, 0, 60, 120, …` 这些 tick 有效。尝试用端点 `31` 打开持仓会返回 `InvalidTickIndex` 错误。
+
+常见的公开间距：
+
+| 手续费等级 | `trade_fee_rate` | Tick 间距 | 每个 tick 持仓的最粗价格步长 |
+|----------|------------------|--------------|---------------------------------------|
+| 0.01% | `100` | 1 | 0.01% |
+| 0.05% | `500` | 10 | 0.10% |
+| 0.25% | `2500` | 60 | 0.60% |
+| 1.00% | `10000` | 120 | 1.21% |
+
+间距越粗，需初始化的 tick 数组越少，打开宽范围持仓的成本越低，价格边界越模糊。波动性强的交易对通常使用 120 间距等级；稳定币对使用 1 间距等级。
+
+## Tick 数组
+
+池不会在单独的账户中存储按 tick 的状态。相反，`TICK_ARRAY_SIZE` 个相邻的 tick（当前 Raydium CLMM 中为 60 个）被打包到单个 `TickArrayState`。数组的第一个 tick 是其 `start_tick_index`，它恰好覆盖 `TICK_ARRAY_SIZE * tick_spacing` 个整数 tick 单位。
+
+对于 `tick_spacing = 60` 和 `TICK_ARRAY_SIZE = 60`：
+
+- 每个 tick 数组跨越 `60 × 60 = 3600` 个整数 tick。
+- `start_tick_index` 是 3600 的倍数：`…, -7200, -3600, 0, 3600, 7200, …`。
+
+持仓端点 `t = 2040` 在 `tick_spacing = 60` 时位于 `start_tick_index = 0` 的 tick 数组中。持仓端点 `t = 4200` 位于 `start_tick_index = 3600` 的数组中。
+
+### 何时创建数组
+
+Tick 数组是懒加载的：引用其内任何 tick 的**第一个**持仓初始化该数组并支付租金。交换不初始化 tick 数组 — 它们使用位图跳过未初始化的数组。SDK 的打开持仓流程检查所选范围，计算其接触的 tick 数组列表，并在同一交易中与 `OpenPosition` 一起添加 `init_tick_array` 指令（如果有遗漏）。
+
+### Tick 数组不被关闭
+
+一旦 tick 数组被初始化，它就在池的生命周期内持续存在。程序**不**提供关闭 tick 数组的路径，即使 `initialized_tick_count` 返回到零。Tick 数组没有租金恢复；第一个接触数组的持仓支付的租金被永久锁定在该账户中。这是一个有意的权衡：重用现有 tick 数组对每个后续持仓都是免费的，因此繁忙交易的池只需为每个 `(pool, start_tick_index)` 槽支付一次租金成本，无论变动多频繁。
+
+### 位图
+
+找到"当前 tick 左侧/右侧的下一个初始化 tick"必须很快 — 一次交换可能会跨越许多 tick。池在 `PoolState` 中存储一个围绕 tick 0 的 ±1,024 数组范围的 1 位每 tick 数组位图。超出该范围（全范围持仓、异常设置），`TickArrayBitmapExtension` 提供溢出。
+
+交换遍历位图：`lowest_set_bit_above(tick_current_array_index)` 给出交换正在跨越的一侧的下一个具有初始化 tick 的数组。在该数组内，类似的位扫描定位下一个初始化 tick。
+
+## `liquidity_gross` 和 `liquidity_net`
+
+每个**初始化的** tick 存储两个流动性值：
+
+- **`liquidity_gross`** — 将此 tick 作为任一端点的所有持仓的 `L` 之和。当 `liquidity_gross` 降至零时，该 tick 变为未初始化，可从位图中移除。
+- **`liquidity_net`** — 当价格**向上跨越**此 tick（在 tick 空间中从左到右）时，对池级 `liquidity` 的*有符号*变化。如果此 tick 是大小为 `L` 的持仓的下界，它贡献 `+L`；如果是上界，贡献 `−L`。
+
+实例：同一池上的两个持仓。
+
+- 持仓 A：`tick_lower = -120`，`tick_upper = 0`，流动性 `L_A = 100`。
+- 持仓 B：`tick_lower = -60`，`tick_upper = 60`，流动性 `L_B = 50`。
+
+逐 tick 状态：
+
+| Tick | 涉及方 | `liquidity_gross` | `liquidity_net` |
+|------|------------|-------------------|------------------|
+| `-120` | A 下界 | 100 | +100 |
+| `-60` | B 下界 | 50 | +50 |
+| `0` | A 上界 | 100 | −100 |
+| `60` | B 上界 | 50 | −50 |
+
+不同 `tick_current` 值的池级 `liquidity`：
+
+- `tick_current = -180`：`liquidity = 0`（任何持仓之前）
+- `tick_current = -90`：`liquidity = 100`（仅在 A 内）
+- `tick_current = -30`：`liquidity = 150`（在 A 和 B 内）
+- `tick_current = 30`：`liquidity = 50`（仅在 B 内）
+- `tick_current = 90`：`liquidity = 0`（两个都过了）
+
+在交换期间每次 tick 跨越时，程序将 `liquidity_net`（可能为负）添加到 `PoolState.liquidity`。这是精确的 Uniswap v3 机制。
+
+## 作为 NFT 的持仓
+
+Raydium CLMM 持仓是 NFT。打开持仓会将一个全新的铸币（供应量为 1）铸入调用者的钱包，该铸币的权限由 CLMM 程序持有。程序将持仓所有权关联到 **CPI 时该铸币的 ATA 中持有余额的任何人**。
+
+结果：
+
+- **持仓是可转移的。** 钱包可以通过转移 NFT 来出售或空投持仓。新持有人可以随后调用 `CollectRewards`、`IncreaseLiquidity` 等。
+- **持仓在 CLMM 外可寻址。** 市场和钱包将持仓显示为其他 NFT。SDK 在铸币元数据上设置合理的 `name`/`symbol`。
+- **持仓的 PDA 从 NFT 铸币衍生。** 你可以找到 `PersonalPositionState` 而无需知道谁当前持有它。
+
+### Token-2022 持仓
+
+较新的 CLMM 池可以在 Token-2022 下铸造持仓，而不是经典的 SPL Token。程序暴露两个并行的打开指令 — `OpenPosition` 和 `OpenPositionWithToken22Nft` — 除了哪个代币程序拥有 NFT 铸币外，语义相同。钱包和市场兼容性有所不同；Raydium 的 UI 追踪两者。
+
+## 允许范围规则
+
+在 `OpenPosition` 时，程序强制执行：
+
+1. `tick_lower < tick_upper`。
+2. `tick_lower % tick_spacing == 0` 且 `tick_upper % tick_spacing == 0`。
+3. `MIN_TICK <= tick_lower` 且 `tick_upper <= MAX_TICK`。
+4. 调用者已供应包含 `tick_lower` 和 `tick_upper` 的 tick 数组 — 要么已初始化，要么通过同一交易中的 `init_tick_array`。
+5. 位图扩展账户，如果此持仓扩展到扩展范围。
+
+如果任何检查失败，指令会返回 `InvalidTickIndex`、`NotApproved` 或 `InsufficientLiquidity` 之一，取决于哪个约束。见 [`reference/error-codes`](/zh/reference/error-codes)。
+
+## "在范围内"与"在范围外"
+
+当 `tick_lower <= tick_current < tick_upper` 时，持仓是**在范围内**。只有在范围内的持仓对 `PoolState.liquidity` 有贡献，因此只有它们赚取交换费。
+
+范围外的持仓：
+
+- 持有 **100% 的一个**代币（其范围已走过的那个）。具体来说，如果 `tick_current < tick_lower`，持仓仅持有 token1（它已被价格移动"卖出"）；如果 `tick_current >= tick_upper`，仅持有 token0。
+- **不**赚取交换费。
+- **确实**继续累积奖励，如果池的奖励流向范围外流动性发送 — 但 Raydium 的默认行为是"仅向范围内发送"，符合 Uniswap v3 约定。见 [`products/clmm/fees`](/zh/products/clmm/fees)。
+
+管理 CLMM 持仓的 LP 花费大部分精力将持仓保持在范围内，因为价格在移动。
+
+## 常见集成陷阱
+
+- **间距外端点。** 从目标价格计算 tick 的代码必须在将其传给 `OpenPosition` 之前捕捉到 `tick_spacing` 的倍数。SDK 帮助程序（`TickUtils.getTickWithPriceAndTickspacing`）会做这个；自创数学通常不会。
+- **遗漏 tick 数组。** 打开宽范围持仓可能需要初始化多个 tick 数组；忘记将它们作为可写账户传递会导致返回。SDK 的 `openPositionFromBase` 为你返回列表。
+- **交换后的陈旧 tick。** `tick_current` 在一次交换中可以跨越多个 tick。如果你的 UX 显示来自一个 RPC 调用的"当前 tick"，然后在后来的调用中打开持仓，相对于实时价格的持仓相对位置可能相差数十个 tick。在签署前重新获取。
+- **带有额外元数据的持仓 NFT。** 如果你建立一个识别 Raydium 持仓的钱包，通过其铸币权限（= CLMM 程序的 PDA）检测它们，而不是通过硬编码的元数据字段。
+
+## 接下来去哪里
+
+- [数学](/zh/products/clmm/math) — 交换步骤和 tick 边界参与的费用增长推导。
+- [账户](/zh/products/clmm/accounts) — `TickArrayState` 和 `PositionState` 布局。
+- [费用和奖励](/zh/products/clmm/fees) — 范围内状态如何门控费用累积。
+- [`algorithms/clmm-math`](/zh/algorithms/clmm-math) — 集中流动性公式的共享推导。
+
+来源：
+
+- [`raydium-io/raydium-clmm` — `tick_array`、`tick`、`position` 模块](https://github.com/raydium-io/raydium-clmm)
+- "Uniswap v3 Core" 白皮书，§6（tick），§7（费用增长）

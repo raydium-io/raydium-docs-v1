@@ -1,0 +1,440 @@
+---
+title: "Примеры кода маршрутизации"
+description: "Примеры TypeScript: многопрыжковый своп через маршрутизатор на основе SDK и построение необработанных инструкций."
+---
+
+<Info>
+  **Эта страница переведена с помощью ИИ. За эталон принимается английская версия.**
+
+  [Открыть английскую версию →](/products/routing/code-demos)
+</Info>
+
+## Информация о версии
+
+- **SDK:** `@raydium-io/raydium-sdk-v2@0.2.42-alpha`
+- **Сеть:** mainnet-beta
+- **ID программы маршрутизатора:** `routeUGWgWzqBWFcrCfv8tritsqukccJPu3q5GPP3xS`
+- **Проверено:** апрель 2026
+
+## Пример 1: маршрутизация на основе SDK
+
+Источник: [`src/trade/routeSwap.ts`](https://github.com/raydium-io/raydium-sdk-V2-demo/blob/master/src/trade/routeSwap.ts)
+
+Raydium SDK абстрагирует построение маршрутов. Используйте функции торговли SDK для составления многопрыжкового маршрута и его автоматического выполнения через маршрутизатор.
+
+### Настройка
+
+```typescript
+import {
+  Raydium,
+  Router,
+  Token,
+  TokenAmount,
+  toApiV3Token,
+  toFeeConfig,
+  TxVersion,
+} from "@raydium-io/raydium-sdk-v2";
+import {
+  Connection,
+  Keypair,
+  PublicKey,
+} from "@solana/web3.js";
+import { NATIVE_MINT, TOKEN_2022_PROGRAM_ID } from "@solana/spl-token";
+
+const connection = new Connection("https://api.mainnet-beta.solana.com", "confirmed");
+const wallet = Keypair.fromSecretKey(/* your key bytes */);
+
+const raydium = await Raydium.load({
+  connection,
+  owner: wallet,                 // SDK будет подписывать этим Keypair
+  cluster: "mainnet",
+  disableFeatureCheck: true,
+  blockhashCommitment: "finalized",
+});
+
+// Маршрутизатору нужна временная точка привязки для прыжков CLMM.
+await raydium.fetchChainTime();
+```
+
+### Построение многопрыжкового свопа
+
+Маршрутизация в `@raydium-io/raydium-sdk-v2` доступна через `raydium.tradeV2`. Полный конец‑в‑конец процесс — выборка данных пула, вычисление маршрутов, ранжирование по выходу и построение транзакции своpa — показан ниже; это соответствует каноническому примеру в [`raydium-sdk-V2-demo/src/trade/routeSwap.ts`](https://github.com/raydium-io/raydium-sdk-V2-demo/blob/master/src/trade/routeSwap.ts).
+
+```typescript
+// 1. Выберите входящие/выходящие миинты и количество.
+const inputMint = NATIVE_MINT;                                     // wSOL
+const outputMint = new PublicKey("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"); // USDC
+const inputAmount = "8000000";                                     // 0.008 SOL (lamports)
+
+// 2. Выберите всю базовую информацию о пулах. Кэшируйте это агрессивно — это большой RPC fan-out.
+const poolData = await raydium.tradeV2.fetchRoutePoolBasicInfo();
+
+// 3. Переберите все жизнеспособные маршруты через AMM v4, CPMM, CLMM и Stable AMM.
+const routes = raydium.tradeV2.getAllRoute({
+  inputMint,
+  outputMint,
+  ...poolData,
+});
+
+// 4. Гидрируйте маршруты с живым состоянием RPC (резервы, тики, информация о миинтах).
+const {
+  routePathDict,
+  mintInfos,
+  ammPoolsRpcInfo,
+  ammSimulateCache,
+  clmmPoolsRpcInfo,
+  computeClmmPoolInfo,
+  computePoolTickData,
+  computeCpmmData,
+} = await raydium.tradeV2.fetchSwapRoutesData({
+  routes,
+  inputMint,
+  outputMint,
+});
+
+// 5. Вычислите выходные количества для каждого кандидата маршрута. Результат отсортирован по убыванию выхода.
+const swapRoutes = raydium.tradeV2.getAllRouteComputeAmountOut({
+  inputTokenAmount: new TokenAmount(
+    new Token({
+      mint: inputMint.toBase58(),
+      decimals: mintInfos[inputMint.toBase58()].decimals,
+      isToken2022: mintInfos[inputMint.toBase58()].programId.equals(TOKEN_2022_PROGRAM_ID),
+    }),
+    inputAmount,
+  ),
+  directPath: routes.directPath.map(
+    (p) =>
+      ammSimulateCache[p.id.toBase58()] ||
+      computeClmmPoolInfo[p.id.toBase58()] ||
+      computeCpmmData[p.id.toBase58()],
+  ),
+  routePathDict,
+  simulateCache: ammSimulateCache,
+  tickCache: computePoolTickData,
+  mintInfos,
+  outputToken: toApiV3Token({
+    ...mintInfos[outputMint.toBase58()],
+    programId: mintInfos[outputMint.toBase58()].programId.toBase58(),
+    address: outputMint.toBase58(),
+    freezeAuthority: undefined,
+    mintAuthority: undefined,
+    extensions: { feeConfig: toFeeConfig(mintInfos[outputMint.toBase58()].feeConfig) },
+  }),
+  chainTime: Math.floor(raydium.chainTimeData?.chainTime ?? Date.now() / 1000),
+  slippage: 0.005, // 0.5%
+  epochInfo: await raydium.connection.getEpochInfo(),
+});
+
+const targetRoute = swapRoutes[0];
+if (!targetRoute) throw new Error("no swap routes were found");
+
+// 6. Разрешите ключи пула для выбранного маршрута.
+const poolKeys = await raydium.tradeV2.computePoolToPoolKeys({
+  pools: targetRoute.poolInfoList,
+  ammRpcData: ammPoolsRpcInfo,
+  clmmRpcData: clmmPoolsRpcInfo,
+});
+
+// 7. Постройте, подпишите и выполните транзакцию(и) своapa.
+const { execute, transactions } = await raydium.tradeV2.swap({
+  routeProgram: Router,
+  txVersion: TxVersion.V0,
+  swapInfo: targetRoute,
+  swapPoolKeys: poolKeys,
+  ownerInfo: {
+    associatedOnly: true,
+    checkCreateATAOwner: true,
+  },
+  computeBudgetConfig: {
+    units: 600_000,
+    microLamports: 465_915,
+  },
+});
+
+// `sequentially: true` важно — первая транзакция может потребоваться создать
+// промежуточные ATA, на которые полагаются последующие транзакции.
+const { txIds } = await execute({ sequentially: true });
+console.log("txIds:", txIds);
+```
+
+### Ожидаемое поведение
+
+SDK обрабатывает:
+
+- Обнаружение маршрутов через AMM v4, CPMM, CLMM и Stable AMM.
+- Дериважию аккаунтов (состояния пулов, хранилища, аккаунты наблюдений, предварительное создание ATA).
+- Упаковку инструкций для программы маршрутизатора (`Router`), когда маршрут многопрыжковый, или прямой своп пула, когда один пул уже дает наилучшую цену.
+- Принудительное соблюдение slippage через параметр `slippage` на `getAllRouteComputeAmountOut`.
+
+`raydium.tradeV2.swap` может вернуть более одной `transaction` — первая обычно инициализирует промежуточные ATA, а вторая выполняет сам своп. Всегда передавайте `sequentially: true` в `execute()`, чтобы они подтверждались по порядку.
+
+---
+
+## Пример 2: построение необработанных инструкций (псевдокод в стиле Rust)
+
+Если вам нужен больший контроль или вы создаете программу, которая использует CPI в маршрутизатор, постройте инструкции вручную. Пример ниже использует **тег 8 (`SwapBaseIn`)** — рекомендуемый текущий вариант — и маршрутизирует через принадлежащие пользователю ATA конца в конец.
+
+### Сценарий: USDC → SOL (CPMM) → mSOL (CPMM)
+
+#### Шаг 1: дериважия ATA пользователя
+
+```typescript
+import { getAssociatedTokenAddressSync } from "@solana/spl-token";
+import { PublicKey } from "@solana/web3.js";
+
+const ROUTER_PROGRAM_ID = new PublicKey(
+  "routeUGWgWzqBWFcrCfv8tritsqukccJPu3q5GPP3xS"
+);
+
+const USDC_MINT = new PublicKey(
+  "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+);
+const SOL_MINT = new PublicKey(
+  "So11111111111111111111111111111111111111112"
+);
+const MSOL_MINT = new PublicKey(
+  "mSoL1MK4LCEDcTYVhPnD6DHK4PMGQ8WyXDEMXbnQAaW"
+);
+
+// ATA входящего / промежуточного / выходящего пользователя — все принадлежат вызывающей стороне.
+const user_usdc_ata = getAssociatedTokenAddressSync(USDC_MINT, wallet.publicKey);
+const user_sol_ata  = getAssociatedTokenAddressSync(SOL_MINT,  wallet.publicKey, true); // wSOL: allowOwnerOffCurve
+const user_msol_ata = getAssociatedTokenAddressSync(MSOL_MINT, wallet.publicKey);
+
+// Если промежуточные / выходящие ATA пользователя еще не существуют, создайте их
+// заранее через программу Associated Token Account (или используйте CreateSyncNative для
+// wSOL ATA на теге 5).
+```
+
+#### Шаг 2: сбор аккаунтов для каждого прыжка
+
+Прыжок 1 — это USDC/SOL на CPMM. Прыжок 2 — это SOL/mSOL на CPMM.
+
+```typescript
+// Прыжок 1: своп USDC/SOL на CPMM
+const CPMM_PROGRAM_ID = new PublicKey(
+  "CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C"
+);
+
+// Выберите состояние пула для USDC/SOL
+const usdc_sol_pool = await connection.getParsedAccountInfo(
+  USDC_SOL_POOL_STATE
+);
+
+// Состояние пула, полномочия, хранилища, миинты, программы токенов и т. д.
+// (см. products/cpmm/accounts для полного списка из 11 аккаунтов)
+const hop1_accounts = [
+  CPMM_PROGRAM_ID,           // Идентифицирует это как CPMM
+  USDC_SOL_POOL_STATE,
+  CPMM_AUTHORITY,
+  USDC_SOL_VAULT_TOKEN0,
+  USDC_SOL_VAULT_TOKEN1,
+  USDC_MINT,
+  SOL_MINT,
+  LP_MINT,
+  OBSERVATION_STATE,
+  TOKEN_PROGRAM,
+  ASSOCIATED_TOKEN_PROGRAM,
+  SYSTEM_PROGRAM,
+];
+
+// Прыжок 2: своп SOL/mSOL на CPMM
+const sol_msol_pool = await connection.getParsedAccountInfo(
+  SOL_MSOL_POOL_STATE
+);
+
+const hop2_accounts = [
+  CPMM_PROGRAM_ID,           // Идентифицирует это как CPMM
+  SOL_MSOL_POOL_STATE,
+  CPMM_AUTHORITY,
+  SOL_MSOL_VAULT_TOKEN0,
+  SOL_MSOL_VAULT_TOKEN1,
+  SOL_MINT,
+  MSOL_MINT,
+  LP_MINT_2,
+  OBSERVATION_STATE_2,
+  TOKEN_PROGRAM,
+  ASSOCIATED_TOKEN_PROGRAM,
+  SYSTEM_PROGRAM,
+];
+```
+
+#### Шаг 3: построение инструкции
+
+```typescript
+import BN from "bn.js";
+
+// Аргументы
+const amount_in = new BN(1_000_000_000); // 1000 USDC (6 десятичных знаков)
+const minimum_amount_out = new BN(500_000_000_000); // 500 mSOL (9 десятичных знаков)
+
+// Нет прыжков CLMM, поэтому limit_prices пуст
+const limit_prices: BN[] = [];
+
+// Упакуйте аргументы
+let data = Buffer.alloc(1024);
+let offset = 0;
+
+// Тег 8: SwapBaseIn (текущий вариант; пустой limit_prices разрешен)
+data[offset++] = 8;
+
+// amount_in (u64)
+data.writeBigUInt64LE(BigInt(amount_in.toString()), offset);
+offset += 8;
+
+// minimum_amount_out (u64)
+data.writeBigUInt64LE(BigInt(minimum_amount_out.toString()), offset);
+offset += 8;
+
+// limit_prices (VecDeque<u128>) — пусто (нет прыжков CLMM на этом маршруте).
+// Тег 8 принимает пустую deque без ошибки. Напишите нулевые записи (нет u128).
+
+data = data.slice(0, offset);
+
+// Конструируйте список аккаунтов — каждый промежуточный ATA принадлежит пользователю.
+const accounts = [
+  { pubkey: user_usdc_ata, isSigner: true,  isWritable: true },
+  { pubkey: user_sol_ata,  isSigner: false, isWritable: true },
+  { pubkey: user_msol_ata, isSigner: false, isWritable: true },
+  ...hop1_accounts.map((pk, i) => ({
+    pubkey: pk,
+    isSigner: false,
+    isWritable: i === 0 ? false : true, // ID программы не доступен для записи
+  })),
+  ...hop2_accounts.map((pk, i) => ({
+    pubkey: pk,
+    isSigner: false,
+    isWritable: i === 0 ? false : true,
+  })),
+];
+
+const instruction = new TransactionInstruction({
+  programId: ROUTER_PROGRAM_ID,
+  keys: accounts,
+  data,
+});
+```
+
+#### Шаг 4: отправка транзакции
+
+```typescript
+const { blockhash } = await connection.getLatestBlockhash();
+
+const tx = new VersionedTransaction(
+  new TransactionMessage({
+    instructions: [instruction],
+    payerKey: wallet.publicKey,
+    recentBlockhash: blockhash,
+  }).compileToV0Message()
+);
+
+tx.sign([wallet]);
+const sig = await connection.sendTransaction(tx);
+await connection.confirmTransaction(sig);
+```
+
+---
+
+## Пример 3: обработка ошибок
+
+Распространенные ошибки и способы их устранения:
+
+### ExceededSlippage
+
+Выход был меньше `minimum_amount_out`. Повторите попытку с более высокой толерантностью скольжения или переоценіте маршрут.
+
+```typescript
+try {
+  const sig = await connection.sendTransaction(tx);
+} catch (error) {
+  if (error.message.includes("ExceededSlippage")) {
+    console.log(
+      "Цена маршрута сдвинулась. Переоцените и перестройте транзакцию."
+    );
+  }
+}
+```
+
+### SqrtPriceX64 (CLMM)
+
+Цена прыжка CLMM выходила за границы `limit_prices`. Обновите границы и повторите попытку.
+
+### InvalidOwner
+
+Промежуточный или выходящий ATA не принадлежит вызывающей стороне. Маршрутизатор проверяет собственность в каждом слоте; убедитесь, что каждый ATA, который вы передали, был выведен из кошелька пользователя (не из какого-либо другого полномочия).
+
+---
+
+## Советы и лучшие практики
+
+### Предварительное создание промежуточных ATA
+
+Перед маршрутизацией через новый промежуточный токен в первый раз создайте ATA пользователя, чтобы маршрут не прошел проверку:
+
+```typescript
+import { createAssociatedTokenAccountInstruction } from "@solana/spl-token";
+
+const createAtaIx = createAssociatedTokenAccountInstruction(
+  wallet.publicKey,  // плательщик
+  user_sol_ata,      // ATA для создания
+  wallet.publicKey,  // владелец — всегда пользователь
+  SOL_MINT,
+);
+
+// Объедините createAtaIx в ту же транзакцию, что и первый маршрут, или отправьте его
+// один раз заранее; рента (~0.002 SOL) может быть возмещена позже через тег 6
+// (CloseTokenAccount), как только ATA пуст.
+```
+
+Для wSOL конкретно предпочитаете [`CreateSyncNative`](/ru/products/routing/instructions#createsyncnative-tag-5) (тег 5) — он создает ATA, передает SOL и синхронизирует в одной инструкции.
+
+### Цитирование перед выполнением
+
+Всегда запрашивайте пулы и вычисляйте ожидаемый выход перед построением инструкции:
+
+```typescript
+// Псевдокод: получить текущее состояние пула и вычислить цену
+const pool1State = await connection.getAccountInfo(USDC_SOL_POOL_STATE);
+const amount_out_hop1 = computeSwapOutput(
+  amount_in,
+  pool1State,
+  USDC_MINT,
+  SOL_MINT
+);
+
+const pool2State = await connection.getAccountInfo(SOL_MSOL_POOL_STATE);
+const amount_out_hop2 = computeSwapOutput(
+  amount_out_hop1,
+  pool2State,
+  SOL_MINT,
+  MSOL_MINT
+);
+
+const minimum_amount_out = amount_out_hop2 * 0.99; // 1% slippage
+```
+
+### Используйте более новые варианты инструкций (8–9)
+
+Теги 8 и 9 (`SwapBaseIn` и `SwapBaseOut`) более снисходительны к `limit_prices`. Предпочитайте их устаревшим вариантам, если вам не нужна проверка цены CLMM.
+
+```typescript
+// Тег 8: SwapBaseIn с необязательным limit_prices
+data[offset++] = 8;
+// ... остальная упаковка; deque limit_prices может быть пуста
+```
+
+---
+
+## Куда дальше
+
+- [`products/routing/instructions`](/ru/products/routing/instructions) — полный справочник инструкций.
+- [`products/routing/accounts`](/ru/products/routing/accounts) — детали дериважии аккаунтов.
+- [`products/cpmm/code-demos`](/ru/products/cpmm/code-demos) — примеры своппов CPMM для сравнения.
+- [`reference/program-addresses`](/ru/reference/program-addresses) — канонические ID программ и адреса devnet.
+
+Источники:
+
+- [`@raydium-io/raydium-sdk-v2` на npm](https://www.npmjs.com/package/@raydium-io/raydium-sdk-v2)
+- [`raydium-io/raydium-sdk-V2`](https://github.com/raydium-io/raydium-sdk-V2) (открытый исходный код)
+- [`raydium-io/raydium-sdk-V2-demo`](https://github.com/raydium-io/raydium-sdk-V2-demo) — официальные полнофункциональные демонстрации, включая `routeSwap.ts`
+- Источник программы маршрутизации AMM недоступен публично; проверьте ID программы по сравнению с прямым API и на цепочке байт-кодом

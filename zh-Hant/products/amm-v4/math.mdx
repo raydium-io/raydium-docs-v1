@@ -1,0 +1,183 @@
+---
+title: "AMM v4 數學"
+description: "常數乘積不變量與 AMM v4 的費用慣例、準備金與訂單簿價格轉換、目標訂單網格構建，以及損益結算步驟。"
+---
+
+<Info>
+  **本頁內容由 AI 自動翻譯，所有內容以英文版本為準。**
+
+  [查看英文版 →](/products/amm-v4/math)
+</Info>
+
+## 不變量
+
+池維持 `coin_reserve × pc_reserve = k`，其中：
+
+```
+coin_reserve = coin_vault_balance
+             + orders_posted_on_openbook.base
+             + pending_coin_fill_not_yet_settled
+pc_reserve   = pc_vault_balance
+             + orders_posted_on_openbook.quote
+             + pending_pc_fill_not_yet_settled
+             - accrued_pnl_pc
+```
+
+有兩點需要注意：
+
+1. 準備金包括 **在 OpenBook 上承諾的** 金額。AMM 的限價訂單保持為其流動性的一部分——它們不會「丟失」到訂單簿中，只是託管在那裡。僅根據鏈上金庫餘額計算 `k` 會低估準備金。
+2. 損益累計（`need_take_pnl_*`）被減去，以便在管理員收取費用時保持曲線守恆。這與 CPMM 的 `protocol_fees_*` 排除原則相同。
+
+每個 `Swap*` 操作在將 LP 的費用份額加回準備金後，都會強制 `k' ≥ k`。
+
+## 費用慣例
+
+AMM v4 使用 **比率費用**（分子/分母對），而不是 CPMM / CLMM 的 `1/1_000_000` 慣例。鏈上 `Fees` 結構（見程式源碼中的 [`Fees::initialize`](https://github.com/raydium-io/raydium-amm/blob/master/program/src/state.rs)）預設為：
+
+```
+Fees {
+  min_separate_numerator:    5,
+  min_separate_denominator:  10_000,   //  5/10_000 = 0.05%
+
+  trade_fee_numerator:      25,
+  trade_fee_denominator:    10_000,    // 25/10_000 = 0.25% — 用於 OpenBook 限價訂單定價
+
+  pnl_numerator:            12,
+  pnl_denominator:          100,       // 12/100   = 12%   — 協議的交換費用份額
+
+  swap_fee_numerator:       25,
+  swap_fee_denominator:     10_000,    // 25/10_000 = 0.25% — AMM 路徑交換的總費用
+}
+```
+
+解釋（已發佈的主網預設值）：
+
+- **總交換費用：**`swap_fee = amount_in × 25 / 10_000 = 0.25%` 總輸入。
+- **協議份額：**`pnl_numerator / pnl_denominator = 12 / 100 = 12%` **交換費用的百分比**，相當於 `0.25% × 12% = 0.03%` 的交易量。此份額累計到損益計數器中，由 `WithdrawPnl` 收取。
+- **LP 份額：**交換費用的剩餘 `88%`，相當於 `0.25% × 88% = 0.22%` 的交易量。保留在池中並增加 `k`。
+- **無基金份額。** AMM v4 沒有 CPMM/CLMM 的基金費用分割。
+
+注意 `pnl_numerator / pnl_denominator` 是費用 **的分數**，而不是交易量——這是對這些欄位名稱的常見誤讀。
+
+`trade_fee_numerator / trade_fee_denominator`（也是 `25 / 10_000`）是一個單獨的欄位，由 OpenBook 整合在計算 AMM 限價訂單網格的費用包含價格時使用；預設情況下等於 `swap_fee`，但從不同的代碼路徑讀取。
+
+偏離這些預設值是罕見的，但在一些舊版池中確實存在；在報價前，始終從 `AmmInfo.fees` 讀取費用。
+
+## 直接交換數學（AMM 路徑）
+
+最簡單的情況：用戶對池的金庫交換，不與 OpenBook 互動。池的內部準備金（包括帳上分配）是分母。
+
+**SwapBaseIn（精確輸入）：**
+
+```
+amount_after_fee = amount_in − ceil(amount_in × swap_fee_numerator / swap_fee_denominator)
+amount_out = amount_after_fee × out_reserve
+           / (in_reserve + amount_after_fee)
+require(amount_out >= minimum_amount_out)
+```
+
+此處使用的準備金是 **有效** 準備金。從歷史上看，這是 `coin_vault_balance + coin_posted_on_openbook + ...`（AMM 的金庫加上它鎖定在 OpenBook 訂單中的代幣）。**自 OpenBook 停用後，帳上餘額為零**，所以有效準備金等於原始金庫餘額。曾用來刷新 OpenBook 端的 `MonitorStep` / 隱式結算路徑實際上不再需要。
+
+**SwapBaseOut（精確輸出）：**
+
+```
+amount_in_after_fee = ceil(in_reserve × amount_out / (out_reserve − amount_out))
+amount_in_gross     = ceil(amount_in_after_fee × swap_fee_denominator
+                            / (swap_fee_denominator − swap_fee_numerator))
+require(amount_in_gross <= maximum_amount_in)
+```
+
+## 訂單簿互動（歷史）
+
+<Note>
+  **不再有效。** 本節描述的網格構建反映了 AMM v4 **最初** 如何將曲線鏡像到 OpenBook 市場。OpenBook 整合已被停用；池不再在 OpenBook 上發佈或維護訂單。下面的數學被保留用於上下文——它解釋了鏈上 `target_orders` / `amm_open_orders` 帳戶的大小以及為什麼程式仍然驗證 `MonitorStep` 相關參數，儘管看守者不再執行它們。
+</Note>
+
+除了用戶交換外，AMM v4 歷史上在 OpenBook 市場上放置了一個 **網格** 的限價訂單。網格由 `AmmInfo` 參數計算：
+
+- **`depth`** — 每邊的價格級別數。
+- **`amount_wave`** — 每個級別的基礎大小單位。
+- **`min_size`**、**`coin_lot_size`**、**`pc_lot_size`** — OpenBook 市場約束。
+- **`state_data.swap_acc_coin_fee`**、**`swap_acc_pc_fee`** — 自上次 `TakePnl` 以來的累計費用計數器。
+
+程式通過以恆定比率步長從當前曲線價格出發，派生出每個級別的價格：
+
+```
+price_level(k) = curve_price × (1.0001 ^ k)       # 概念上
+size_level(k)  = amount_wave × f(depth, k)        # 按深度逐漸變細
+```
+
+確切的價格和大小由 `build_orders` 計算的 `target_orders` 決定，並與每個 `MonitorStep` 的 `amm_open_orders` 比較。任何偏差都會導致取消 + 新的發佈。新成交的 OpenBook 訂單在下一個刷新 OpenBook 端的操作時結算到池金庫。
+
+整合者很少需要計算網格——Raydium 看守者維護它——但知道以下內容很有用：
+
+- 具有大量 **帳上** 流動性的池將該流動性貢獻給 `k`，而不是閒置。
+- 過時的 OpenBook 市場（事件隊列已滿、執行被阻止）會阻止網格更新；AMM 然後可能會引用與可見訂單簿不同的價格，直到下一次執行。
+
+## 結算步驟（損益）
+
+0.03% 協議份額累計到 `state_data.need_take_pnl_coin` 和 `state_data.need_take_pnl_pc`。`TakePnl` 將這些金額移出金庫到管理員指定的目的地，然後將計數器清零。
+
+關鍵特性：不變量中的準備金始終計算為 **減去** 累計損益，所以 `TakePnl` 不會移動曲線。這與 CPMM 慣例相符。
+
+## 工作示例
+
+池狀態：
+
+- `coin_reserve = 1_000_000_000_000`（100 萬幣側；6 位小數）
+- `pc_reserve   = 2_000_000_000_000`（200 萬 pc 側；6 位小數）
+- 費用：預設 `swap = 25/10_000`、`pnl = 3/10_000`。
+
+用戶：`SwapBaseIn` 精確輸入 `1_000_000_000` 幣（1,000 幣）。
+
+```
+swap_fee        = ceil(1_000_000_000 * 25 / 10_000)    = 2_500_000
+amount_after_fee =                                      997_500_000
+
+amount_out = amount_after_fee * pc_reserve
+           / (coin_reserve + amount_after_fee)
+           = 997_500_000 * 2_000_000_000_000
+           / (1_000_000_000_000 + 997_500_000)
+           ≈ 1_995_015_009  (1,995.015 pc)
+
+// 的 2_500_000 交換費用中：
+pnl_share = 2_500_000 * 3 / 25  = 300_000    (通過 need_take_pnl_coin 進入協議)
+lp_share  = 2_500_000 * 22 / 25 = 2_200_000  (保留在 coin_reserve)
+
+new coin_reserve = 1_000_000_000_000 + 1_000_000_000                 = 1_001_000_000_000
+                   (其中 300_000 是累計損益)
+  curve coin_reserve = 1_001_000_000_000 − 300_000 = 1_000_999_700_000
+new pc_reserve   = 2_000_000_000_000 − 1_995_015_009                 ≈ 1_998_004_984_991
+
+k' = curve_coin_reserve * new_pc_reserve
+   ≈ 2.000_002_701E24
+k  = 1_000_000_000_000 * 2_000_000_000_000
+   = 2.0E24
+k' > k   ✓
+```
+
+LP 份額（`2_200_000`）沒有在任何地方被拆分——它就是提升 `k'` 的剩餘部分。
+
+## 精度規則
+
+- 準備金乘法使用 `u128`；最終除法向零舍入。
+- `swap_fee` 舍入向上（所以池不會少收費）。
+- `SwapBaseOut` 的 `amount_in` 舍入向上（所以用戶不會少付）。
+- 具有極端準備金比率的池可能會在非常小的輸入上觸發 `ZeroTradingTokens`；與 CPMM 相同的慣例。
+
+## 相比 CPMM 的限制
+
+- AMM v4 的準備金包括 OpenBook 託管部分，所以整合者無法僅從 `getTokenAccountBalance` 正確報價。始終獲取完整狀態（金庫 + `open_orders.free` + `open_orders.locked`），或使用 SDK / API 報價。
+- AMM v4 不公開結構化的鏈上 TWAP。想要 AMM v4 支援價格的外部使用者必須從交易日誌自行計算。
+- 不支援 Token-2022。
+
+## 後續步驟
+
+- [`products/amm-v4/instructions`](/zh-Hant/products/amm-v4/instructions) — `SwapBaseIn`、`Deposit` 等的位置。
+- [`products/amm-v4/fees`](/zh-Hant/products/amm-v4/fees) — 完整的費用機制、`TakePnl` 詳情。
+- [`algorithms/constant-product`](/zh-Hant/algorithms/constant-product) — 共享推導。
+
+來源：
+
+- [Raydium AMM 程式源碼 — `raydium-io/raydium-amm`](https://github.com/raydium-io/raydium-amm)
+- Raydium SDK v2 `Liquidity` 模組

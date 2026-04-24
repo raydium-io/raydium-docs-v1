@@ -1,0 +1,288 @@
+---
+title: "Phí ưu tiên và ngân sách tính toán"
+description: "Điều chỉnh đúng giới hạn compute unit và phí ưu tiên cho các giao dịch Raydium — tiêu chuẩn per instruction, chiến lược ước tính, và các mẫu xử lý tắc nghẽn."
+---
+
+<Info>
+  **Trang này được dịch tự động bằng AI. Phiên bản tiếng Anh là bản chính thức.**
+
+  [Xem bản tiếng Anh →](/integration-guides/priority-fee-tuning)
+</Info>
+
+<Info>
+  Mỗi giao dịch Solana đặt (một cách rõ ràng hoặc ngầm) hai tham số: **giới hạn compute unit** (CU tối đa mà tx có thể tiêu thụ; mặc định 200.000 × số lượng instruction lên đến giới hạn per-tx) và **phí ưu tiên** tính bằng micro-lamport trên một CU. Nếu đặt quá thấp cho bất kỳ tham số nào đều sẽ làm hỏng giao dịch — giới hạn CU quá thấp gây ra lỗi `ProgramFailedToComplete`; phí ưu tiên quá thấp khiến tx nằm chưa xác nhận cho đến khi hết hạn.
+</Info>
+
+## Hai cài đặt
+
+```ts
+import { ComputeBudgetProgram } from "@solana/web3.js";
+
+const tx = new Transaction()
+  .add(ComputeBudgetProgram.setComputeUnitLimit({ units: 250_000 }))
+  .add(ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 50_000 }))
+  .add(yourRaydiumSwapIx);
+```
+
+- `setComputeUnitLimit(units)` — giới hạn tính toán; giao dịch thanh toán cho tối đa `units` CU.
+- `setComputeUnitPrice(microLamports)` — mức giá phí ưu tiên, tính bằng micro-lamport trên một CU. Tổng phí ưu tiên = `units × microLamports × 1e-6` lamport.
+
+Tính toán chi phí: giới hạn 250k CU ở mức 50k micro-lamport/CU sẽ chi trả `250_000 × 50_000 / 1e6 = 12.500` lamport ≈ 0,0000125 SOL ≈ \$0,003 khi SOL = \$200. Phí ưu tiên ở mức này là không đáng kể cho hầu hết các swap của người dùng nhưng là chi phí lớn đối với bot thực hiện 1000 tx/ngày.
+
+## Tiêu chuẩn CU per instruction
+
+Tiêu chuẩn từ các nhật ký thực thi mainnet, trung bình từ các lần chạy gần đây. Các con số là xấp xỉ (±15%); hãy đo lại cho các luồng cụ thể của bạn.
+
+| Instruction | SPL Token | Token-2022 (đơn giản) | Token-2022 (transfer fee) |
+|-------------|-----------|---------------------|---------------------------|
+| CPMM initialize_pool | 180.000 | 200.000 | — |
+| CPMM swap_base_input | 140.000 | 180.000 | 200.000 |
+| CPMM swap_base_output | 150.000 | 185.000 | 205.000 |
+| CPMM deposit | 130.000 | 160.000 | 180.000 |
+| CPMM withdraw | 120.000 | 150.000 | 170.000 |
+| CLMM create_pool | 70.000 | 85.000 | — |
+| CLMM open_position_v2 | 120.000 | 140.000 | 160.000 |
+| CLMM increase_liquidity_v2 | 150.000 | 175.000 | 195.000 |
+| CLMM decrease_liquidity_v2 | 140.000 | 165.000 | 185.000 |
+| CLMM swap_v2 (0 tick crossings) | 170.000 | 205.000 | 225.000 |
+| CLMM swap_v2 (1 tick crossing) | 220.000 | 255.000 | 275.000 |
+| CLMM swap_v2 (3 tick crossings) | 320.000 | 355.000 | 375.000 |
+| CLMM collect_fee | 80.000 | 95.000 | 105.000 |
+| AMM v4 swap_base_in | 140.000 | — | — |
+| AMM v4 deposit | 120.000 | — | — |
+| AMM v4 withdraw | 110.000 | — | — |
+| Farm v6 create_farm | 70.000 | 85.000 | — |
+| Farm v6 deposit (1 reward slot) | 130.000 | 155.000 | 175.000 |
+| Farm v6 deposit (3 reward slots) | 220.000 | 255.000 | 275.000 |
+| Farm v6 withdraw | matches deposit |
+| Farm v6 harvest | matches deposit |
+| Farm v3/v5 deposit | 100.000 | — | — |
+| LaunchLab initialize | 100.000 | — | — |
+| LaunchLab buy_exact_in | 140.000 | — | — |
+| LaunchLab graduate | 250.000 | — | — |
+
+Dòng "tick crossings" cho CLMM là yếu tố biến động CU lớn nhất. Nếu bạn không biết swap sẽ vượt qua bao nhiêu tick, hãy tính ngân sách cho trường hợp xấu nhất — 8 lần vượt là giới hạn cứng (chương trình tải tối đa 8 mảng tick).
+
+### Giao dịch bố cục
+
+Cộng các ngân sách riêng lẻ và thêm:
+
+- **+1.500 CU per CPI frame** — chi phí cố định của runtime cho mỗi lệnh gọi chéo chương trình.
+- **+20.000 CU per ATA creation** — `create_associated_token_account` không miễn phí.
+- **+5.000 CU cho mỗi `setComputeUnitLimit` / `setComputeUnitPrice`**.
+
+Ví dụ: swap của người dùng tạo ATA đầu ra và wrap SOL gốc:
+
+```
+wrap_sol (create_ata + system transfer + sync_native)   ≈ 30.000
+CPMM swap_base_input (SPL)                              ≈ 140.000
+close_account (unwrap)                                  ≈ 5.000
+ComputeBudget instructions                              ≈ 10.000
+────────────────────────────────────────────────────────
+Tổng cộng                                               ≈ 185.000 → ngân sách 250.000
+```
+
+Đệm: đặt giới hạn CU khoảng 25% trên mức sử dụng dự kiến. Ước tính quá thấp làm hỏng toàn bộ tx; ước tính quá cao chỉ làm tăng chi phí phí ưu tiên theo tỉ lệ (phí ưu tiên là `units × microLamports`, vì vậy quá ngân sách ~25% chi phí thêm 25% phí ưu tiên).
+
+## Ước tính phí ưu tiên
+
+Thị trường phí cục bộ của Solana có nghĩa là phí ưu tiên **per-writable-account**. Một tx ghi vào tài khoản nóng (trạng thái pool phổ biến) phải trả nhiều hơn một tx ghi vào tài khoản lạnh. Mức phí toàn cầu không phải là số liệu phù hợp cho các swap Raydium; bạn muốn phí trên các pool cụ thể mà bạn đang chạm vào.
+
+### Chiến lược 1: Bộ ước tính nhà cung cấp RPC
+
+Mỗi nhà cung cấp RPC chính yêu cầu một bộ ước tính phí ưu tiên truy vấn phí gần đây trên các tài khoản cụ thể:
+
+```ts
+// Helius
+const response = await fetch(`https://mainnet.helius-rpc.com/?api-key=${apiKey}`, {
+  method: "POST",
+  body: JSON.stringify({
+    jsonrpc: "2.0",
+    id:      "fee-estimate",
+    method:  "getPriorityFeeEstimate",
+    params: [{
+      accountKeys: [poolStatePubkey.toBase58()],
+      options:     { priorityLevel: "High" },
+    }],
+  }),
+});
+const { result } = await response.json();
+const microLamports = result.priorityFeeEstimate;
+```
+
+Các mức ưu tiên trên hầu hết các nhà cung cấp: `Min` / `Low` / `Medium` / `High` / `VeryHigh` / `UnsafeMax`. Ánh xạ chúng thành các phần trăm:
+
+| Mức | Phần trăm | Trường hợp sử dụng |
+|-------|-----------|----------|
+| Min | 25% | Lưu lượng truy cập bot nền tảng, không cấp bách |
+| Low | 50% | Swap bình thường của người dùng |
+| Medium | 60% | Mặc định cho UI ví |
+| High | 75% | Arbitrage nhạy cảm với thời gian |
+| VeryHigh | 95% | Thanh lý, thoát cuối cùng |
+
+Các nhà cung cấp: Helius (`getPriorityFeeEstimate`), Triton (`getRecentPrioritizationFees` với danh sách tài khoản), QuickNode (tương tự).
+
+### Chiến lược 2: Truy vấn RPC trực tiếp
+
+Sử dụng RPC `getRecentPrioritizationFees` tiêu chuẩn:
+
+```ts
+const fees = await connection.getRecentPrioritizationFees({
+  lockedWritableAccounts: [poolStatePubkey],
+});
+
+// fees: Array<{ slot, prioritizationFee }>
+// Các slot gần đây; mặc định ~150 slot.
+
+const median = percentile(fees.map(f => f.prioritizationFee), 0.5);
+```
+
+Đây là phương pháp RPC Solana vanilla; hoạt động với bất kỳ nhà cung cấp nào. Nhược điểm: mẫu nhỏ (150 slot ≈ 60 giây) và có tiếng ồn. Để có các ước tính mượt hơn, hãy sử dụng tổng hợp của nhà cung cấp.
+
+### Chiến lược 3: Tự điều chỉnh lịch sử
+
+Đối với bot chạy luồng liên tục, theo dõi các tỷ lệ hạ cánh so với hết hạn của bạn:
+
+```
+mục tiêu per-pool: tỷ lệ hạ cánh 80% tại <30s
+nếu current_land_rate < 80%: priorityFee += 10%
+nếu current_land_rate > 95%: priorityFee -= 5%
+```
+
+Điều này tự điều chỉnh nhanh hơn các bộ ước tính công cộng và nắm bắt cấu trúc per-pool mà các bộ ước tính công cộng không luôn thấy.
+
+## Xử lý các lỗi cạn kiệt CU
+
+Triệu chứng: tx thất bại với `exceeded maximum number of instructions allowed (200000)` hoặc `ProgramFailedToComplete`.
+
+Chẩn đoán:
+
+```bash
+solana confirm <tx-sig> -v
+# Tìm "consumed N of M compute units" và instruction nào cạn kiệt.
+```
+
+Cách khắc phục:
+
+1. **Tăng giới hạn CU.** Nếu tx của bạn đang sử dụng 195k của ngân sách 200k, hãy tăng lên 300k.
+2. **Chia tách giao dịch.** Nếu bạn đang chạm vào giới hạn 1,4M per-tx, hãy chia thành hai tx. Farm `harvest then stake` là một cách cổ điển để chia khi phần thưởng nhiều.
+3. **Cắt tài khoản.** Mỗi tài khoản có thể ghi thêm thêm ~2.000 CU. Loại bỏ các tài khoản không sử dụng sẽ giúp các trường hợp biên.
+4. **Sử dụng bảng tra cứu.** Tra cứu LUT là ~50 CU trên mỗi địa chỉ được giải quyết, tiết kiệm 5.000 CU của tham chiếu tài khoản đầy đủ cho mỗi mục.
+
+## Xử lý các giao dịch bị kẹt
+
+Triệu chứng: tx được gửi, không bao giờ xác nhận, cuối cùng hết hạn với `BlockhashNotFound`.
+
+Chẩn đoán:
+
+- `getSignatureStatuses([sig])` trả về `null` → leader không bao giờ thấy nó.
+- Trả về `{ confirmationStatus: null }` → leader thấy nó nhưng không bao gồm.
+
+Cách khắc phục:
+
+1. **Tăng phí ưu tiên.** Gửi lại với 2× phí hiện tại.
+2. **Xây dựng lại với blockhash tươi.** Thời gian tồn tại của Blockhash là ~60 giây; vượt quá điểm đó tx không hợp lệ bất kể phí.
+3. **Phát sóng RPC đa chiều.** Một số RPC có kết nối leader tốt hơn những cái khác. Gửi đến 3–5 cái song song.
+4. **Chuyển sang các gói Jito.** Xem [`integration-guides/routing-and-mev`](/vi/integration-guides/routing-and-mev). Các gói bỏ qua các hàng đợi gói công cộng.
+
+Bộ khung logic thử lại:
+
+```ts
+async function submitWithRetry(buildTx, maxAttempts = 5) {
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    const tx = await buildTx({
+      priorityFee: basePriorityFee * Math.pow(1.5, attempt),
+      blockhash:   (await connection.getLatestBlockhash()).blockhash,
+    });
+
+    try {
+      const sig = await connection.sendRawTransaction(tx.serialize(), {
+        skipPreflight: attempt > 0,  // bỏ qua sau lần thử đầu tiên để tiết kiệm độ trễ
+      });
+
+      const result = await connection.confirmTransaction(sig, "confirmed");
+      if (result.value.err) {
+        // Lỗi logic; không thử lại.
+        throw result.value.err;
+      }
+      return sig;
+
+    } catch (e) {
+      if (isExpiredError(e)) continue;  // thử lại
+      if (isRevertError(e)) throw e;    // không thử lại; lỗi xác định
+      throw e;
+    }
+  }
+  throw new Error("submit: exhausted retries");
+}
+```
+
+## Dưới tình trạng tắc nghẽn
+
+Khi mạng bị tắc nghẽn (bảng điều khiển Jupiter / Jito bundle hiển thị backlog, độ trễ RPC tăng vọt, tỷ lệ hết hạn tx tăng lên), hãy điều chỉnh:
+
+| Tham số | Điều kiện bình thường | Điều kiện tắc nghẽn |
+|-----------|-------------------|----------------------|
+| Giới hạn CU | +25% trên ước tính | +25% trên ước tính (không thay đổi) |
+| Phần trăm phí ưu tiên | 50% | 75%–95% |
+| Số lần thử lại | 3 | 5–7 |
+| Backoff thử lại | 500ms | 1000ms |
+| Sử dụng các gói Jito | Tùy chọn | Được khuyến nghị mạnh mẽ |
+| Làm mới Blockhash khi thử lại | Có | Có, bắt buộc |
+
+Theo dõi các tín hiệu tắc nghẽn:
+
+- Phần trăm 75% phí ưu tiên > 500k micro-lamport: tắc nghẽn.
+- Mẹo Jito 50% > 0,001 SOL: tắc nghẽn.
+- RPC response p99 > 2s: vấn đề cụ thể RPC hoặc tắc nghẽn.
+
+## Ngân sách phí cho bot
+
+Bot giao dịch chạy ~1000 tx/ngày cần một ngân sách phí ưu tiên. Tính toán sơ bộ:
+
+```
+CU trung bình per tx:            ~250.000
+Phí phần trăm 50%:              ~20.000 micro-lamport/CU
+Chi phí per tx:                 250_000 × 20_000 × 1e-6 = 5_000 lamport = 5e-6 SOL
+Chi phí hàng ngày (1000 tx):    5e-3 SOL ≈ $1 @ SOL $200
+Chi phí hàng tháng:             ~$30
+```
+
+Đó là mức tối thiểu. Trong tắc nghẽn, nhân với 5–10×. Dự phòng ~\$150–300/tháng cho phí ưu tiên cho bot luồng ổn định.
+
+Bot phải hạ cánh trong các slot cụ thể (thanh lý, arb) trả 95% phần trăm liên tục và chi tiêu ~10× hơn. Mẹo gói Jito chiếm ưu thế ở quy mô đó — thường >\$1000/tháng — nhưng giải pháp thay thế (bị xuyên phá hoặc hết hạn) còn tồi tệ hơn.
+
+## Cạm bẫy
+
+### 1. Quên giới hạn CU
+
+Mặc định là 200k CU × (instruction trong tx). Swap đơn instruction mặc định là 200k; đó là đủ cho CPMM trên SPL Token nhưng không phải CLMM với tick crossings hoặc bất kỳ Token-2022. Luôn đặt nó một cách rõ ràng.
+
+### 2. Phí ưu tiên trên tài khoản sai
+
+Nếu bạn ước tính phí ưu tiên so với token mint nhưng tài khoản nóng là trạng thái pool, ước tính của bạn quá thấp. Trạng thái pool là tài khoản writable phù hợp để nhắm mục tiêu cho Raydium.
+
+### 3. Phí tỉ lệ thuận với giới hạn CU
+
+`total_priority_fee = units × microLamports`. Tăng `units` từ 200k lên 1M ở 50k micro-lamport/CU nhân phí ưu tiên lên 5×. Không over-budget CU chỉ trong trường hợp; hãy đo lường.
+
+### 4. Phiên bản tx mặc định
+
+Giao dịch legacy có giới hạn tài khoản thấp hơn; giao dịch V0 với bảng tra cứu địa chỉ mở khóa các tuyến đường lớn hơn. SDK sử dụng V0 theo mặc định trong `txVersion: TxVersion.V0`. Không hạ xuống legacy trừ khi bạn cần tính tương thích ví.
+
+### 5. `skipPreflight` ẩn các lỗi CU
+
+`skipPreflight: true` gửi tx mà không mô phỏng cục bộ. Bạn tiết kiệm ~100ms nhưng mất phản hồi sớm về cạn kiệt CU. Sử dụng nó chỉ khi thử lại, không phải lần thử đầu tiên.
+
+## Con trỏ
+
+- [`integration-guides/routing-and-mev`](/vi/integration-guides/routing-and-mev) — chiến lược gói Jito.
+- [`integration-guides/aggregator`](/vi/integration-guides/aggregator) — lắp ráp giao dịch.
+- [`integration-guides/cpi-integration`](/vi/integration-guides/cpi-integration) — xếp chồng CU trên các CPI bố cục.
+- [Tài liệu chương trình ngân sách tính toán Solana](https://docs.solana.com/developing/programming-model/runtime#compute-budget)
+
+Nguồn:
+
+- [Solana `getRecentPrioritizationFees` RPC](https://docs.solana.com/api/http#getrecentprioritizationfees)
+- [API phí ưu tiên Helius](https://docs.helius.dev/solana-apis/priority-fee-api)
+- Tiêu chuẩn: nhật ký thực thi mainnet (bài kiểm tra tích hợp SDK Raydium, tháng 4 năm 2026).

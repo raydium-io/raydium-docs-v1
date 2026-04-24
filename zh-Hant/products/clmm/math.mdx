@@ -1,0 +1,369 @@
+---
+title: "CLMM 數學"
+description: "Sqrt 價格表示法、流動性 ↔ 代幣數量、單個 tick 交換步驟、多 tick 迭代和費用成長會計。"
+---
+
+<Info>
+  **本頁內容由 AI 自動翻譯，所有內容以英文版本為準。**
+
+  [查看英文版 →](/products/clmm/math)
+</Info>
+
+## Sqrt 價格表示法
+
+CLMM 將價格儲存為 `sqrt_price_x64` — token1 相對於 token0 價格的平方根，以 Q64.64 定點數表示：
+
+$$
+\text{sqrt\_price\_x64} = \lfloor \sqrt{p} \cdot 2^{64} \rfloor
+$$
+
+其中 `p = token1_amount / token0_amount`。以 `sqrt` 而非 `p` 進行運算能將交換數學線性化（代幣數量差值關於 `Δsqrt_price` 是線性的），而 `x64` 定點數在跨越多個 tick 的交換中保持精度。
+
+Tick ↔ sqrt 價格轉換通過 `bit-by-bit` 對數近似進行預計算：
+
+$$
+\text{sqrt\_price\_x64}(t) \approx 2^{64} \cdot (1.0001)^{t/2}
+$$
+
+在 `tick_math::get_sqrt_price_at_tick` 中實現為基於查表的冪運算。
+
+## 流動性作為規範單位
+
+在範圍 `[sqrt_a, sqrt_b]` 內（其中 `sqrt_a < sqrt_b`），**流動性 `L`** 的頭寸對應的代幣數量如下。設 `sqrt_c = sqrt_price_x64` 為池的當前價格。
+
+| 情況 | `amount0` | `amount1` |
+|------|-----------|-----------|
+| `sqrt_c <= sqrt_a`（池價格在範圍下方） | `L · (sqrt_b - sqrt_a) / (sqrt_a · sqrt_b)` | `0` |
+| `sqrt_a < sqrt_c < sqrt_b`（在範圍內） | `L · (sqrt_b - sqrt_c) / (sqrt_c · sqrt_b)` | `L · (sqrt_c - sqrt_a)` |
+| `sqrt_c >= sqrt_b`（池價格在範圍上方） | `0` | `L · (sqrt_b - sqrt_a)` |
+
+這三個恆等式都來自集中流動性在範圍內滿足的不變式 `x = L / sqrt_p`、`y = L · sqrt_p`。
+
+集成商通常需要反向運算：給定 `amount0` / `amount1` 的存款，計算符合範圍的最大 `L`。SDK 的 `LiquidityMath.getLiquidityFromTokenAmounts` 可做此計算。在範圍內的情況下的公式：
+
+$$
+L_0 = \text{amount0} \cdot \frac{\text{sqrt\_c} \cdot \text{sqrt\_b}}{\text{sqrt\_b} - \text{sqrt\_c}},
+\qquad
+L_1 = \frac{\text{amount1}}{\text{sqrt\_c} - \text{sqrt\_a}},
+\qquad
+L = \min(L_0, L_1)
+$$
+
+哪一側受限決定了實際消耗的比率；另一側可能有剩餘。
+
+## 單個 tick 交換步驟
+
+交換分**步**進行。每步要麼 (a) 在當前 tick 範圍內消耗所有可用輸入而不跨越 tick，要麼 (b) 將價格移動到下一個已初始化的 tick。
+
+給定當前狀態 `(sqrt_c, L)` 和向上的交換（token0 進入，token1 流出，`sqrt_price` 增加），到下一個已初始化 tick 的距離為 `sqrt_t`。在此微間隔內，輸入與價格的關係為：
+
+$$
+\Delta\text{amount0} = L \cdot \left( \frac{1}{\text{sqrt\_c}} - \frac{1}{\text{sqrt\_t}} \right)
+= \frac{L \cdot (\text{sqrt\_t} - \text{sqrt\_c})}{\text{sqrt\_c} \cdot \text{sqrt\_t}}
+$$
+
+及
+
+$$
+\Delta\text{amount1} = L \cdot (\text{sqrt\_t} - \text{sqrt\_c})
+$$
+
+程式執行以下兩種情況之一：
+
+- **整個輸入能否適應？** 如果剩餘輸入（扣除費用後）小於到達 `sqrt_t` 所需的 `Δamount0`，精確求解新的 `sqrt_c'`：
+
+  $$
+  \text{sqrt\_c}' = \frac{L \cdot \text{sqrt\_c}}{L + \Delta\text{input} \cdot \text{sqrt\_c}}
+  $$
+
+  （用於精確輸入 `token0 → token1` 交換）。交換在此步驟內完成，不跨越 tick。
+
+- **輸入超過 `Δamount0`？** 設 `sqrt_c' = sqrt_t`，跨越 tick（應用 `liquidity_net`），將剩餘輸入遞減 `Δamount0`，將輸出遞增 `Δamount1`，然後重複。
+
+相反方向（`token1 → token0`，價格下降）的公式中，`sqrt_c` 和 `sqrt_t` 互換，反演位置改變。
+
+完整的 Rust 實現位於 `raydium-clmm/programs/amm/src/libraries/swap_math.rs`。那裡的邏輯與 Uniswap v3 的 `SwapMath.computeSwapStep` 逐一對應。
+
+## 每個步驟的費用
+
+交易費從每個步驟的**輸入**金額中扣除，與 CPMM 的慣例相同：
+
+```
+step_fee_amount  = ceil(step_input * trade_fee_rate / 1_000_000)
+step_net_input   = step_input - step_fee_amount
+protocol_portion = floor(step_fee_amount * protocol_fee_rate / 1_000_000)
+fund_portion     = floor(step_fee_amount * fund_fee_rate     / 1_000_000)
+lp_portion       = step_fee_amount - protocol_portion - fund_portion
+```
+
+LP 部分通過更新全局費用成長累加器在當前在範圍內的流動性中分配：
+
+$$
+\text{fee\_growth\_global}_{\text{in}} \mathrel{+}= \text{lp\_portion} \cdot \frac{2^{64}}{L}
+$$
+
+— 即，以*每單位流動性費用*表示，Q64.64，以便大小為 `L_i` 且在此交換期間保持在範圍內的頭寸稍後能讀回 `L_i · Δfee_growth_global / 2^{64}` 欠款代幣。
+
+protocol 和 fund 部分分別應計到 `PoolState.protocol_fees_token_{0,1}` 和 `PoolState.fund_fees_token_{0,1}`，與 CPMM 相同。它們通過 `CollectProtocolFee` / `CollectFundFee` 進行清掃。
+
+## 範圍外和範圍內的費用成長
+
+CLMM 費用會計的棘手部分：頭寸僅在池價格**在**其範圍內時才賺取費用。池追蹤全局累積費用；頭寸需要知道*在其特定範圍內*的累積費用。
+
+解決方案是基於 **tick 的**累加器。每個 tick 儲存：
+
+```
+fee_growth_outside_0_x64
+fee_growth_outside_1_x64
+```
+
+在 tick 初始化時：
+
+- 如果池的價格**高於**此 tick（`tick_current >= this_tick`），`fee_growth_outside = fee_growth_global`。（到目前為止賺取的所有費用相對於當前價格位於此 tick 的「外面」— 即下方。）
+- 否則 `fee_growth_outside = 0`。
+
+當價格跨越 tick 時，程式**翻轉**該 tick 的 `fee_growth_outside`：
+
+$$
+\text{fee\_growth\_outside} \gets \text{fee\_growth\_global} - \text{fee\_growth\_outside}
+$$
+
+此規則保持的不變式：對於任何 tick `t`，`fee_growth_outside(t)` 等於在 `tick_current` 位於 `t` 的另一側時累積的費用。
+
+**範圍 `[tick_lower, tick_upper]` 內的費用成長**隨後推導為：
+
+```
+if tick_current >= tick_upper:
+    fee_growth_below = fee_growth_outside(tick_lower)
+    fee_growth_above = fee_growth_global - fee_growth_outside(tick_upper)
+elif tick_current >= tick_lower:
+    fee_growth_below = fee_growth_outside(tick_lower)
+    fee_growth_above = fee_growth_outside(tick_upper)
+else:
+    fee_growth_below = fee_growth_global - fee_growth_outside(tick_lower)
+    fee_growth_above = fee_growth_outside(tick_upper)
+
+fee_growth_inside = fee_growth_global - fee_growth_below - fee_growth_above
+```
+
+這是 Uniswap-v3 費用成長公式，未做更改。
+
+## 頭寸儲存和讀取的內容
+
+`PersonalPositionState` 儲存 `fee_growth_inside_0_last_x64` 和 `fee_growth_inside_1_last_x64`：上次觸及頭寸時的 `fee_growth_inside` 值。
+
+在任何後續觸及（增加、減少、收集），程式：
+
+1. 使用上述公式計算當前的 `fee_growth_inside_{0,1}_x64`。
+2. 計算 `Δ = fee_growth_inside_now − fee_growth_inside_last`（u128 上的模運算）。
+3. 將 `Δ × position.liquidity / 2^{64}` 加入 `tokens_fees_owed_{0,1}`。
+4. 將 `fee_growth_inside_last` 更新為新值。
+
+代幣實際上只在 `CollectFees` / `DecreaseLiquidity` 時從保險庫移出，針對 `tokens_fees_owed`。
+
+## 獎勵
+
+池最多 3 個獎勵流中的每一個都使用相同的範圍內成長機制，在其自己的 `reward_growth_global_x64` 累加器中。在發放時：
+
+$$
+\text{reward\_growth\_global} \mathrel{+}= \text{emission\_per\_second} \cdot \Delta t \cdot \frac{2^{64}}{L}
+$$
+
+— 發放隨活躍流動性反向縮放，因此更稠密的池每位置每秒支付更少，但跨越更多位置總體。每個頭寸欠款的獎勵為
+
+$$
+\text{reward\_owed} = (\text{reward\_growth\_inside}_{\text{now}} - \text{reward\_growth\_inside}_{\text{last}}) \cdot L / 2^{64}
+$$
+
+並通過 `CollectReward` 領取。參見 [`/zh-Hant/products/clmm/fees`](/zh-Hant/products/clmm/fees)。
+
+## 實際例子：精確輸入交換
+
+假設：
+
+- `tick_spacing = 60`
+- `sqrt_price_x64 = 1 × 2^{64}` — 價格 = 1.0，因此 `tick_current = 0`。
+- 活躍流動性 `L = 1_000_000 × 2^{64}`。
+- 上方下一個已初始化 tick：`t = 60`（sqrt_price_b ≈ `1.003004 × 2^{64}`）。
+- 交易費率：500（0.05%）。
+
+用戶：`SwapBaseInput` 精確輸入 1,000 token0。
+
+步驟 1 — 費用：
+
+```
+trade_fee       = ceil(1000 * 500 / 1_000_000)  = 1
+step_net_input  = 999
+```
+
+步驟 2 — 999 是否符合當前 tick 範圍？
+
+```
+到下一個 tick 的 Δ（amount0）：
+  L · (sqrt_t - sqrt_c) / (sqrt_c * sqrt_t)
+  ≈ 1_000_000 · (1.003004 − 1) / (1 · 1.003004)
+  ≈ 2995.5 token0
+```
+
+`999 < 2995.5`，所以整個輸入符合而不跨越 tick。
+
+步驟 3 — 新價格：
+
+```
+sqrt_c' = L · sqrt_c / (L + Δin · sqrt_c)
+        = 1_000_000 · 1 / (1_000_000 + 999 · 1)
+        ≈ 0.999001
+```
+
+即，`sqrt_c'` 略低於 `sqrt_c`。注意上面的公式適用於 `token1 → token0` 交換。這裡的例子是 `token0 → token1`，它向**上**驅動價格，而非向下 — 因此我們使用 `token0 進入` 的相應形式：
+
+```
+sqrt_c' = sqrt_c + Δin / L
+        = 1 + 999 / 1_000_000
+        = 1.000999
+```
+
+（這與 `token0 → token1` 的預期交換方向相符：`sqrt_c` 隨著價格上升。）
+
+步驟 4 — 輸出金額：
+
+```
+Δout token1 = L · (sqrt_c' − sqrt_c)
+            = 1_000_000 · 0.000999
+            = 999.00
+```
+
+考慮到四捨五入後，用戶接收 ≈ 999 token1。費用（1 token0）由 `trade_fee_rate × protocol_fee_rate / 1e6` 在 LP、protocol 和 fund 之間分配（fund 類似）；LP 部分流入 `fee_growth_global_0_x64`。
+
+## 交換期間的限價單匹配
+
+當交換步驟跨越包含開放限價單的 tick 時，這些單在 LP 曲線**之前**在 tick 的精確價格處消耗交換輸入。匹配在 tick 內按 `order_phase` 隊列 FIFO 進行。
+
+### `TickState` 上的每個隊列狀態
+
+```
+order_phase                  : u64    單調隊列 id
+orders_amount                : u64    當前（最新）隊列中的輸入代幣總額
+part_filled_orders_remaining : u64    交換當前填充的隊列剩餘輸入
+unfilled_ratio_x64           : u128   部分填充隊列的 Q64.64 填充比率
+```
+
+兩隊列佈局存在是因為新單可能在舊隊列仍在填充時在 tick 上開放。新開單加入 `orders_amount` 並繼承下一個 `order_phase`；它們在前一隊列完全消耗前無法填充。
+
+### 匹配步驟
+
+在交換期間於每個 tick 交叉處發生的匹配的偽代碼：
+
+```
+fn match_limit_orders_at_tick(tick, swap_input_remaining, sqrt_p):
+    # 1. 首先嘗試填充部分填充的隊列。
+    if tick.part_filled_orders_remaining > 0:
+        consume = min(tick.part_filled_orders_remaining, swap_input_remaining)
+        # 更新該隊列的未填充比率。
+        tick.unfilled_ratio_x64 *= (1 - consume / tick.part_filled_orders_remaining)
+        tick.part_filled_orders_remaining -= consume
+        swap_input_remaining -= consume
+        if tick.part_filled_orders_remaining == 0:
+            tick.unfilled_ratio_x64 = 0
+        if swap_input_remaining == 0: return
+
+    # 2. 推進活躍隊列。
+    if tick.orders_amount > 0:
+        tick.part_filled_orders_remaining = tick.orders_amount
+        tick.orders_amount = 0
+        tick.order_phase += 1
+        tick.unfilled_ratio_x64 = ONE_X64
+        # 使用新推進的隊列遞迴。
+        return match_limit_orders_at_tick(tick, swap_input_remaining, sqrt_p)
+
+    return  # tick 沒有更多限價單
+```
+
+流向限價單所有者的輸出代幣**不會**在每次交換時轉移。它們在池的輸出保險庫中虛擬保存，直到單所有者調用 `SettleLimitOrder`（或 `DecreaseLimitOrder`）。池簡單地通過 `unfilled_ratio_x64` 追蹤隊列現在有多少已填充。每個 `LimitOrderState` 在開放時儲存其自己的 `(order_phase, unfilled_ratio_x64)` 快照，因此結算歸結為：
+
+```
+filled_amount  = total_amount × (1 − tick_now.unfilled_ratio_x64 / order.unfilled_ratio_x64)
+                if tick_now.order_phase > order.order_phase
+                else 0
+output_amount  = price_at(tick_index) × filled_amount   # 根據方向調整
+```
+
+此 O(1) 結算是隊列設計的全部要點 — tick 可以填充任意數量的單而無需按單 gas。
+
+### 與 LP 曲線的互動
+
+在交換步驟中，限價單匹配發生**在** tick（零 `Δsqrt_price`）；LP 曲線消耗發生**在** tick **之間**。因此順序為：
+
+1. 跨越 tick `t_cross`（首先應用 LP `liquidity_net` 變化，因為這是 Uniswap-V3 的做法）。
+2. 填充任何位於 `t_cross` 的限價單。
+3. 沿著 LP 曲線繼續到下一個已初始化的 tick 或 `swap_input` 耗盡。
+
+限價單因此給交易者在恰好單的 tick 價格處更多有效流動性（價格改進效應），代價是 LPs 不在該部分交換量上賺取費用 — 由於限價單放置者充當做市商，交換的限價單部分對交換者是無費用的。動態費用附加費（如果啟用）仍適用於同一交換的 LP 部分。
+
+## 動態費用推導
+
+`PoolState.dynamic_fee_info` 承載波動性狀態。每個交換步驟計算每步費率為：
+
+$$
+\text{fee\_rate}_{\text{total}} = \text{trade\_fee\_rate}_{\text{config}} +
+\underbrace{\frac{\text{dynamic\_fee\_control} \cdot (\text{vol\_acc} \cdot \text{tick\_spacing})^2}
+{D_{\text{ctrl}} \cdot S_{\text{vol}}^2}}_{\text{動態附加費}}
+$$
+
+其中：
+
+- $D_{\text{ctrl}} = 100{,}000$ — `DYNAMIC_FEE_CONTROL_DENOMINATOR`
+- $S_{\text{vol}} = 10{,}000$ — `VOLATILITY_ACCUMULATOR_SCALE`
+- `vol_acc` 是下面更新規則之後的每次交換累加器
+- `tick_spacing` 來自 `PoolState.tick_spacing`
+
+結果限制在 $100{,}000 / 10^6 = 10\%$。
+
+### 累加器更新
+
+每次交換按順序應用兩條規則：
+
+**衰減。** 參考下限基於上次更新以來的時間衰減：
+
+$$
+\text{vol\_ref} = \begin{cases}
+0 & \text{如果 } \Delta t > \text{decay\_period} \\
+\text{vol\_acc}_{\text{prev}} \cdot \dfrac{\text{reduction\_factor}}{10{,}000} & \text{如果 } \text{filter\_period} < \Delta t \le \text{decay\_period} \\
+\text{vol\_ref}_{\text{prev}} & \text{如果 } \Delta t \le \text{filter\_period}
+\end{cases}
+$$
+
+**累積。** 新累加器是參考加上自前一參考索引以來遍歷的 tick 距離：
+
+$$
+\text{vol\_acc} = \min\left(
+    \text{vol\_ref} + \left| t_{\text{ref}} - t_{\text{now}} \right| \cdot S_{\text{vol}},
+    \text{max\_vol\_acc}
+\right)
+$$
+
+`tick_spacing_index_reference`（$t_{\text{ref}}$）以 tick-spacing 單位，而非原始 tick：$t_{\text{ref}} = \lfloor \text{tick\_current} / \text{tick\_spacing} \rfloor$。
+
+### 為何關於 tick 距離為拋物線
+
+對累加器平方意味著費用隨著價格遠離其參考點走過的距離的**平方**上升。經驗上這與隨機遊走壓力下的價格方差縮放相符：2倍 tick 偏移意味著 4倍隱含波動率，因此收 4倍附加費。`dynamic_fee_control` 參數校準絕對水平。
+
+`filter_period` 窗口防止微小的次秒級振盪（例如 MEV 機器人三明治）膨脹累加器。`decay_period` 窗口防止單個過去尖峰在市場平靜後無限期地收費。
+
+## 數值穩健性
+
+- 所有中間乘積通過 `u128` 或 `u256` 形狀的算術進行。CLMM 使用 `U128Sqrt` 幫助程式和 `FullMath::mulDiv` 模式，直接移植自 Uniswap v3。
+- 除法四捨五入按步驟選擇以強制不變式 `k' ≥ k` 在本地。`SwapBaseInput` 將輸出四捨五入**向下**；`SwapBaseOutput` 將輸入四捨五入**向上**。
+- 將 `PoolState.liquidity` 降至零的 tick 交叉是允許的（價格可以穿過「流動性洞」），但交換簡單地前進到下一個已初始化的 tick 而不消耗輸入，不收費。
+- 溢出防護：`sqrt_price_x64` 保持在包含範圍 `[MIN_SQRT_PRICE_X64, MAX_SQRT_PRICE_X64]` 內，對應於 `[MIN_TICK, MAX_TICK]`。將超過任一界限的交換撤銷為 `SqrtPriceLimitOverflow`。
+
+## 下一步
+
+- [`/zh-Hant/products/clmm/ticks-and-positions`](/zh-Hant/products/clmm/ticks-and-positions) 瞭解 tick 圖參與遍歷方式。
+- [`/zh-Hant/products/clmm/fees`](/zh-Hant/products/clmm/fees) 詳細瞭解數學的費用/獎勵部分。
+- [`/zh-Hant/algorithms/clmm-math`](/zh-Hant/algorithms/clmm-math) 瞭解 `L = sqrt(x · y)` 和範圍與流動性公式背後的推導。
+
+源：
+
+- [`raydium-io/raydium-clmm` — `libraries/swap_math.rs`、`libraries/tick_math.rs`](https://github.com/raydium-io/raydium-clmm)
+- "Uniswap v3 Core" 白皮書，§6–7

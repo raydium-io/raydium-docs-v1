@@ -1,0 +1,280 @@
+---
+title: "Các Chương Trình và Anchor"
+description: "Cách các chương trình Solana được triển khai và nâng cấp, những tính năng mà framework Anchor cung cấp so với mô hình chương trình gốc của Solana, và cách đọc IDL của Raydium để tạo các client của riêng bạn."
+---
+
+<Info>
+  **Trang này được dịch tự động bằng AI. Phiên bản tiếng Anh là bản chính thức.**
+
+  [Xem bản tiếng Anh →](/solana-fundamentals/programs-and-anchor)
+</Info>
+
+<Info>
+  Các chương trình mới của Raydium (CPMM, CLMM, Farm v6, LaunchLab) được viết bằng **Anchor** — một framework Rust được xây dựng dựa trên mô hình chương trình gốc của Solana để cung cấp xác thực tài khoản, xử lý lỗi và IDL (interface description). AMM v4 và các farm cũ hơn ra đời trước khi có Anchor. Hiểu cả hai mô hình sẽ giúp bạn đọc mã, tạo client từ IDL và gỡ lỗi các sai sót không mong muốn.
+</Info>
+
+## Mô hình triển khai chương trình
+
+Mỗi chương trình Solana nằm tại một `Pubkey`. Bytecode của chương trình được lưu trữ trong một tài khoản **executable** được sở hữu bởi **BPF Upgradable Loader** (`BPFLoaderUpgradeab1e11111111111111111111111`).
+
+Một lần triển khai chương trình bao gồm ba tài khoản:
+
+1. **Program account**: tài khoản metadata nhỏ tại ID của chương trình. Chủ sở hữu: BPF Upgradable Loader.
+2. **ProgramData account**: chứa bytecode thực tế. Được tạo từ `[program_id, "programdata"]`.
+3. **Buffer account** (tạm thời): chứa bytecode mới trong quá trình nâng cấp. Bị loại bỏ sau khi nâng cấp.
+
+Tài khoản ProgramData có một **upgrade authority** — một khóa có thể thay thế bytecode bằng một phiên bản mới. Upgrade authority của Raydium là một multisig đằng sau timelock 24 giờ; xem [`security/admin-and-multisig`](/vi/security/admin-and-multisig).
+
+### Xác minh một chương trình được triển khai
+
+Để xác nhận điều gì đang on-chain phù hợp với những gì trong mã nguồn được kiểm toán:
+
+```bash
+# Dump the program from mainnet
+solana program dump CPMMoo8L3F4NbTegBCKVNunggL7H1Zpdmwpwh8KMoZ0F cpmm-onchain.so
+
+# Build from known source
+cargo build-bpf --manifest-path raydium-cp-swap/programs/cp-amm/Cargo.toml
+cp target/deploy/raydium_cp_swap.so cpmm-source.so
+
+# Compare
+sha256sum cpmm-onchain.so cpmm-source.so
+```
+
+Các hash phù hợp chứng minh rằng bạn đang tương tác với mã nguồn bạn nghĩ là mã của mình. Raydium xuất bản hướng dẫn xây dựng được xác minh trong ghi chú phát hành.
+
+## Anchor: một framework trên nền tảng Solana
+
+Các chương trình Solana thô là các hàm Rust với chữ ký này:
+
+```rust
+pub fn process_instruction(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    instruction_data: &[u8],
+) -> ProgramResult {
+    // Manually parse instruction_data
+    // Manually validate accounts
+    // Manually deserialize account data
+    // Manually check signer/writable flags
+    // ... then do the actual work
+}
+```
+
+Anchor bao bọc tất cả mã công thức và cho phép bạn viết:
+
+```rust
+#[program]
+pub mod cpmm {
+    use super::*;
+
+    pub fn swap_base_input(
+        ctx: Context<Swap>,
+        amount_in: u64,
+        min_out: u64,
+    ) -> Result<()> {
+        // Just the business logic — ctx is pre-validated
+    }
+}
+
+#[derive(Accounts)]
+pub struct Swap<'info> {
+    pub payer: Signer<'info>,
+    #[account(mut, seeds = [b"pool", config.key().as_ref(), ...], bump)]
+    pub pool_state: AccountLoader<'info, PoolState>,
+    #[account(mut)]
+    pub input_vault: Box<Account<'info, TokenAccount>>,
+    // ... more accounts
+}
+```
+
+Anchor:
+
+- Tự động tạo ra một **discriminator** 8 byte xác định cho mỗi lệnh và mỗi loại tài khoản.
+- Xác thực các ràng buộc tài khoản (owner, seeds, writable, signer, mint-matches, token-program-matches) trước khi mã của bạn chạy.
+- Tạo ra một **IDL** — một tệp mô tả giao diện mà các client sử dụng để gọi chương trình.
+- Đi kèm với một thư viện client-side Rust, TypeScript và Python.
+
+### Discriminator 8 byte
+
+Mỗi tài khoản Anchor và mỗi lệnh Anchor bắt đầu bằng một discriminator 8 byte — 8 byte đầu tiên của SHA-256 của một chuỗi cố định:
+
+```
+Account discriminator:     sha256("account:PoolState")[0..8]
+Instruction discriminator: sha256("global:swap_base_input")[0..8]
+```
+
+Khi bạn gọi một lệnh Anchor, 8 byte đầu tiên của dữ liệu lệnh là discriminator này; Anchor gửi đến trình xử lý đúng bằng cách tìm kiếm chúng.
+
+Khi bạn đọc một tài khoản Anchor, 8 byte đầu tiên cho biết loại của nó — rất quan trọng đối với các công cụ như `getProgramAccounts` liệt kê tất cả các tài khoản của một loại.
+
+### Lỗi
+
+Các chương trình Anchor định nghĩa lỗi thông qua `#[error_code]`:
+
+```rust
+#[error_code]
+pub enum ErrorCode {
+    #[msg("Slippage tolerance exceeded")]
+    SlippageExceeded,
+    #[msg("Pool is disabled")]
+    PoolDisabled,
+    // ...
+}
+```
+
+Anchor tự động gán các mã này bắt đầu từ 6000 (0x1770). Bảng mã lỗi đầy đủ của Raydium nằm trong [`reference/error-codes`](/vi/reference/error-codes).
+
+## IDL
+
+Một tệp **IDL** (Interface Description Language) của Anchor là mô tả JSON của một chương trình: các lệnh, tài khoản, loại, lỗi và sự kiện của nó. Nó tương đương với ABI của Ethereum.
+
+Raydium xuất bản IDL cho tất cả các chương trình Anchor. Lấy trực tiếp từ on-chain:
+
+```bash
+anchor idl fetch CPMMoo8L3F4NbTegBCKVNunggL7H1Zpdmwpwh8KMoZ0F -o cpmm.idl.json
+```
+
+Hoặc từ nguồn SDK: `src/raydium/*/idl/*.json`.
+
+### Cấu trúc IDL
+
+```json
+{
+  "version":      "0.1.0",
+  "name":         "raydium_cp_swap",
+  "instructions": [ { "name": "swap_base_input", "accounts": [ ... ], "args": [ ... ] }, ... ],
+  "accounts":     [ { "name": "PoolState", "type": { ... } }, ... ],
+  "types":        [ { "name": "AmmConfig", "type": { ... } }, ... ],
+  "errors":       [ { "code": 6000, "name": "SlippageExceeded", "msg": "..." }, ... ],
+  "events":       [ { "name": "SwapEvent", "fields": [ ... ] }, ... ]
+}
+```
+
+### Tạo client từ IDL
+
+CLI `anchor` của Anchor tạo các loại TypeScript và Rust:
+
+```bash
+anchor idl build -o target/idl/cpmm.json
+# TypeScript types auto-generated by Anchor's ts-client
+# Raydium SDK already includes these
+```
+
+Các công cụ của bên thứ ba như [Kinobi](https://github.com/metaplex-foundation/kinobi) có thể tạo client Rust, Python, C hoặc Go từ một IDL.
+
+### Khi IDL là bạn của bạn
+
+Nếu bạn muốn xây dựng một tích hợp tùy chỉnh không thông qua Raydium SDK:
+
+1. Lấy IDL (trực tiếp từ on-chain hoặc từ nguồn SDK).
+2. Tìm kiếm lệnh bạn muốn (ví dụ: `swap_base_input`).
+3. Xây dựng dữ liệu lệnh: discriminator 8 byte + các args được mã hóa.
+4. Chuyển các tài khoản theo thứ tự mà IDL chỉ định.
+
+Xem [`sdk-api/anchor-idl`](/vi/sdk-api/anchor-idl) để có các ví dụ thực tế.
+
+## Các chương trình trước Anchor: AMM v4 và Farm v3/v5
+
+Các chương trình này ra đời trước khi có Anchor. Chúng sử dụng:
+
+- **Manual instruction dispatch**: một tag `u8` trong `instruction_data` với một câu lệnh `match`.
+- **Manual account validation**: `if accounts[0].owner != &expected_program { ... }`.
+- **Borsh-serialized instruction args**: không có discriminator, chỉ `instruction_data[1..]`.
+- **Layout via `#[repr(C, packed)]`**: bố cục nhị phân struct C.
+
+Raydium SDK v2 cung cấp các layout TypeScript cho các lệnh AMM v4 không phải Anchor để các client có thể mã hóa/giải mã mà không cần Anchor:
+
+```ts
+import { liquidityStateV4Layout, swapInstructionData }
+  from "@raydium-io/raydium-sdk-v2";
+
+const data = swapInstructionData.encode({
+  instruction: 9,   // swap
+  amountIn:    1_000_000n,
+  minAmountOut: 950_000n,
+});
+```
+
+Mô hình tích hợp giống nhau — bạn chỉ không nhận được tự động tạo do IDL của Anchor.
+
+## Cơ chế nâng cấp chương trình
+
+Chỉ `upgrade_authority` của ProgramData mới có thể nâng cấp. Các bước:
+
+1. Biên dịch bytecode mới.
+2. Viết nó vào tài khoản buffer (`solana program write-buffer`).
+3. Gửi một lệnh nâng cấp: `BpfLoaderUpgradeable::Upgrade { buffer, program, authority }`.
+4. Runtime ngay lập tức thay thế bytecode của chương trình bằng nội dung của buffer.
+
+Raydium kiểm soát điều này bằng một **timelock 24 giờ** được triển khai trong cài đặt multisig của Squads. Một giao dịch nâng cấp phải chờ 24 giờ sau khi multisig phê duyệt trước khi có thể thực thi. Điều này bảo vệ chống lại các nâng cấp vội vàng hoặc bị ép buộc.
+
+Xem [`security/admin-and-multisig`](/vi/security/admin-and-multisig).
+
+### Làm cho một chương trình bất biến
+
+Một upgrade authority có thể được đặt thành `None`, khi đó chương trình trở thành vĩnh viễn bất biến. Raydium chưa làm điều này cho bất kỳ sản phẩm nào — nhóm vẫn giữ khả năng đẩy các bản vá bảo mật. Sự đánh đổi: người dùng phải tin tưởng quá trình multisig + timelock.
+
+## Các chương trình và tiền thuê
+
+Triển khai một chương trình tiêu tốn lamports miễn là thuê:
+
+- Một chương trình 50 KB: ~0.35 SOL tiền thuê.
+- Một chương trình 200 KB: ~1.4 SOL tiền thuê.
+
+Đóng một chương trình (thông qua `solana program close`) trả lại các lamport. Các chương trình Raydium vẫn hoạt động và không được lên lịch để đóng lại.
+
+## Gỡ lỗi các chương trình Anchor
+
+### Đầu ra nhật ký
+
+Macro `msg!` của Anchor ghi vào nhật ký giao dịch. Mô phỏng một giao dịch để xem nhật ký:
+
+```ts
+const sim = await connection.simulateTransaction(tx);
+console.log(sim.value.logs);
+```
+
+Nhật ký bao gồm:
+
+- Gọi chương trình (`Program CPMMoo8... invoke [1]`).
+- Các lệnh gọi `msg!` từ mã chương trình.
+- Tiêu thụ compute unit (`consumed 137842 of 400000 compute units`).
+- Thành công hoặc lỗi của chương trình.
+
+### Mã lỗi
+
+Nếu một chương trình Anchor đưa ra lỗi, nhật ký hiển thị:
+
+```
+Program CPMMoo8... failed: custom program error: 0x1770
+```
+
+0x1770 = 6000 thập phân = lỗi Anchor đầu tiên (ví dụ: `SlippageExceeded`). Tham chiếu chéo với mảng `errors` trong IDL.
+
+Xem [`reference/error-codes`](/vi/reference/error-codes) để có bảng lỗi đầy đủ của Raydium.
+
+### Không phù hợp với bố cục tài khoản
+
+Nếu bạn chuyển tài khoản sai ở vị trí sai, các macro xác thực tài khoản của Anchor sẽ trả về lỗi như:
+
+```
+AnchorError: AccountNotInitialized. Error Number: 3012
+```
+
+Các số lỗi dưới 6000 là lỗi tích hợp của Anchor (xem enum `ErrorCode` của Anchor); các lỗi ≥6000 là các mã tùy chỉnh của chương trình.
+
+## Con trỏ
+
+- [`solana-fundamentals/account-model`](/vi/solana-fundamentals/account-model) — cách các chương trình sở hữu tài khoản.
+- [`solana-fundamentals/pdas-and-cpis`](/vi/solana-fundamentals/pdas-and-cpis) — PDA như Anchor khai báo chúng.
+- [`sdk-api/anchor-idl`](/vi/sdk-api/anchor-idl) — lấy và sử dụng IDL của Raydium.
+- [`reference/program-addresses`](/vi/reference/program-addresses) — ID chương trình.
+- [`reference/error-codes`](/vi/reference/error-codes) — tham chiếu mã lỗi.
+- [`security/admin-and-multisig`](/vi/security/admin-and-multisig) — kiểm soát upgrade-authority.
+
+Các nguồn:
+
+- [Anchor book](https://book.anchor-lang.com).
+- [Solana program deployment](https://docs.solana.com/cli/deploy-a-program).
+- IDL của Raydium (xuất bản trong SDK `src/raydium/*/idl/*.json`).

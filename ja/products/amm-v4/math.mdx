@@ -1,0 +1,183 @@
+---
+title: "AMM v4 数学"
+description: "定数積インバリアントと AMM v4 のフィー規約、リザーブからオーダーブック価格への変換、ターゲット・オーダー・グリッド構築、および PnL 決済ステップ。"
+---
+
+<Info>
+  **このページは AI による自動翻訳です。すべての内容は英語版を正とします。**
+
+  [英語版を表示 →](/products/amm-v4/math)
+</Info>
+
+## インバリアント
+
+プールは `coin_reserve × pc_reserve = k` を維持します。定義は以下のとおりです：
+
+```
+coin_reserve = coin_vault_balance
+             + orders_posted_on_openbook.base
+             + pending_coin_fill_not_yet_settled
+pc_reserve   = pc_vault_balance
+             + orders_posted_on_openbook.quote
+             + pending_pc_fill_not_yet_settled
+             - accrued_pnl_pc
+```
+
+注目すべき点が 2 つあります：
+
+1. リザーブには **OpenBook にコミットされた** 金額が含まれます。AMM のリミット・オーダーはそのリクイディティの一部であり、オーダーブックに「失われた」わけではなく、単にそこにエスクローされています。オンチェーン・ボールト・バランスだけから `k` を計算すると、リザーブを過小評価することになります。
+2. PnL 累積（`need_take_pnl_*`）は減算されるため、管理者がフィーをスイープするときに曲線が保存されます。これは CPMM の `protocol_fees_*` 除外と同じ原理です。
+
+すべての `Swap*` 操作は、LP のフィー・シェアをリザーブに追加した後、`k' ≥ k` を強制します。
+
+## フィー規約
+
+AMM v4 は CPMM / CLMM の `1/1_000_000` 規約ではなく、**比率フィー**（分子/分母ペア）を使用します。オンチェーン `Fees` 構造体（プログラム・ソース内の [`Fees::initialize`](https://github.com/raydium-io/raydium-amm/blob/master/program/src/state.rs) を参照）のデフォルトは：
+
+```
+Fees {
+  min_separate_numerator:    5,
+  min_separate_denominator:  10_000,   //  5/10_000 = 0.05%
+
+  trade_fee_numerator:      25,
+  trade_fee_denominator:    10_000,    // 25/10_000 = 0.25% — OpenBook リミット・オーダー価格設定に使用
+
+  pnl_numerator:            12,
+  pnl_denominator:          100,       // 12/100   = 12%   — プロトコルのスワップ・フィーシェア
+
+  swap_fee_numerator:       25,
+  swap_fee_denominator:     10_000,    // 25/10_000 = 0.25% — AMM パス・スワップに対する総フィー
+}
+```
+
+解釈（公開メインネット・デフォルト）：
+
+- **総スワップ・フィー：** `swap_fee = amount_in × 25 / 10_000 = 0.25%`（入力額に対する）。
+- **プロトコル・シェア：** `pnl_numerator / pnl_denominator = 12 / 100 = 12%` **スワップ・フィーの**。つまり `0.25% × 12% = 0.03%`（ボリュームに対する）。このシェアは PnL カウンターに累積され、`WithdrawPnl` によってスイープされます。
+- **LP シェア：** スワップ・フィーの残り `88%`。つまり `0.25% × 88% = 0.22%`（ボリュームに対する）。プールに留まり、`k` をインフレさせます。
+- **ファンド・シェア なし。** AMM v4 には CPMM/CLMM のファンド・フィー分割がありません。
+
+`pnl_numerator / pnl_denominator` は取引ボリュームではなく **フィーの** 分数であることに注意してください。これはこれらのフィールド名の一般的な誤解です。
+
+`trade_fee_numerator / trade_fee_denominator`（同様に `25 / 10_000`）は別フィールドであり、AMM のリミット・オーダー・グリッドの手数料込み価格を計算するとき OpenBook インテグレーションによって使用されます。デフォルトでは `swap_fee` と等しいですが、別のコード・パスから読み込まれます。
+
+これらのデフォルトからの乖離は稀ですが、いくつかのレガシー・プールに存在します。見積りを示す前に常に `AmmInfo.fees` からフィーを読み込んでください。
+
+## 直接スワップ数学（AMM パス）
+
+最もシンプルなケース：ユーザーは OpenBook と相互作用することなく、プール・ボールトに対してスワップを実行します。プールの内部リザーブ（オンブック配分を含む）が分母になります。
+
+**SwapBaseIn（正確な入力）：**
+
+```
+amount_after_fee = amount_in − ceil(amount_in × swap_fee_numerator / swap_fee_denominator)
+amount_out = amount_after_fee × out_reserve
+           / (in_reserve + amount_after_fee)
+require(amount_out >= minimum_amount_out)
+```
+
+ここで使用されるリザーブは **有効** リザーブです。歴史的には `coin_vault_balance + coin_posted_on_openbook + ...`（AMM のボールト + OpenBook オーダーにロックされたトークン）でした。**OpenBook 無効化以降、オンブック・バランスはゼロ** であるため、有効リザーブはロー・ボールト・バランスと等しくなります。かつて OpenBook 側をリフレッシュしていた `MonitorStep` / 暗黙的決済パスは現在実質的に不要です。
+
+**SwapBaseOut（正確な出力）：**
+
+```
+amount_in_after_fee = ceil(in_reserve × amount_out / (out_reserve − amount_out))
+amount_in_gross     = ceil(amount_in_after_fee × swap_fee_denominator
+                            / (swap_fee_denominator − swap_fee_numerator))
+require(amount_in_gross <= maximum_amount_in)
+```
+
+## オーダーブック相互作用（歴史的）
+
+<Note>
+  **現在アクティブではありません。** このセクションで説明されているグリッド構築は、AMM v4 が *元々* 曲線を OpenBook マーケットにミラーリングしていた方法を反映しています。OpenBook インテグレーションは無効化されており、プールは OpenBook にオーダーをポストしたり維持したりしません。以下の数学は文脈のために保存されています。これはオンチェーン `target_orders` / `amm_open_orders` アカウントがサイズされた理由と、キーパーが `MonitorStep` 関連パラメータをクランクしなくなったにもかかわらずプログラムがそれらの検証を継続している理由を説明しています。
+</Note>
+
+ユーザー・スワップとは別に、AMM v4 は歴史的に OpenBook マーケットにリミット・オーダーの **グリッド** をプレイスしていました。グリッドは `AmmInfo` パラメータから計算されていました：
+
+- **`depth`** — 片側あたりの価格レベル数。
+- **`amount_wave`** — レベルあたりのサイズの基本単位。
+- **`min_size`**、**`coin_lot_size`**、**`pc_lot_size`** — OpenBook マーケット制約。
+- **`state_data.swap_acc_coin_fee`**、**`swap_acc_pc_fee`** — 最後の `TakePnl` 以降の累積フィー・カウンター。
+
+プログラムはレベルごとの価格を現在の曲線価格から定数比ステップで計算します：
+
+```
+price_level(k) = curve_price × (1.0001 ^ k)       # 概念的に
+size_level(k)  = amount_wave × f(depth, k)        # depth による減衰
+```
+
+正確な価格とサイズは `build_orders` で計算された `target_orders` により決定され、各 `MonitorStep` で `amm_open_orders` と比較されます。乖離があるとキャンセルと新規ポストが発生します。OpenBook で新たに約定したオーダーは、OpenBook 側をリフレッシュする次の操作でプール・ボールトに決済されます。
+
+インテグレーターがグリッドを計算する必要はほぼありません（Raydium キーパーがこれを維持します）が、以下を知っておくことは有用です：
+
+- **オンブック** リクイディティが有意なプールは、そのリクイディティが `k` に寄与し、アイドル状態で座っていません。
+- 陳腐化した OpenBook マーケット（イベント・キューが満杯、クランクがブロック）はグリッド更新を防止します。AMM は次のクランクまで見えるオーダーブックから乖離した価格を引用できます。
+
+## 決済ステップ（PnL）
+
+0.03% プロトコル・シェアは `state_data.need_take_pnl_coin` と `state_data.need_take_pnl_pc` に累積されます。`TakePnl` はこれらの金額をボールトから管理者指定の宛先に移動し、カウンターをゼロにします。
+
+重要な特性：インバリアント内のリザーブは常に **マイナス** 累積 PnL で計算されるため、`TakePnl` は曲線を移動させません。これは CPMM 規約と一致しています。
+
+## 計算例
+
+プール状態：
+
+- `coin_reserve = 1_000_000_000_000`（1,000,000 コイン・サイド、6 デシマル）
+- `pc_reserve   = 2_000_000_000_000`（2,000,000 pc・サイド、6 デシマル）
+- フィー：デフォルト `swap = 25/10_000`、`pnl = 3/10_000`。
+
+ユーザー：`SwapBaseIn` 正確な入力 `1_000_000_000` コイン（1,000 コイン）。
+
+```
+swap_fee        = ceil(1_000_000_000 * 25 / 10_000)    = 2_500_000
+amount_after_fee =                                      997_500_000
+
+amount_out = amount_after_fee * pc_reserve
+           / (coin_reserve + amount_after_fee)
+           = 997_500_000 * 2_000_000_000_000
+           / (1_000_000_000_000 + 997_500_000)
+           ≈ 1_995_015_009  (1,995.015 pc)
+
+// 2_500_000 スワップ・フィーのうち：
+pnl_share = 2_500_000 * 3 / 25  = 300_000    (need_take_pnl_coin 経由プロトコルへ)
+lp_share  = 2_500_000 * 22 / 25 = 2_200_000  (coin_reserve に留まる)
+
+new coin_reserve = 1_000_000_000_000 + 1_000_000_000                 = 1_001_000_000_000
+                   (うち 300_000 は PnL 累積)
+  curve coin_reserve = 1_001_000_000_000 − 300_000 = 1_000_999_700_000
+new pc_reserve   = 2_000_000_000_000 − 1_995_015_009                 ≈ 1_998_004_984_991
+
+k' = curve_coin_reserve * new_pc_reserve
+   ≈ 2.000_002_701E24
+k  = 1_000_000_000_000 * 2_000_000_000_000
+   = 2.0E24
+k' > k   ✓
+```
+
+LP シェア（`2_200_000`）は特に区別されません。`k'` をレイズする残基です。
+
+## 精度ルール
+
+- リザーブ乗算は `u128` を使用し、最終的な除算はゼロに向かってラウンドします。
+- `swap_fee` は切り上げます（プールが過少請求しないように）。
+- `SwapBaseOut` の `amount_in` は切り上げます（ユーザーが過少支払いしないように）。
+- 極端なリザーブ比率を持つプールは、非常に小さな入力で `ZeroTradingTokens` にヒットすることがあります。CPMM と同じ規約です。
+
+## CPMM との制限事項
+
+- AMM v4 のリザーブは OpenBook エスクロー部分を含むため、インテグレーターは `getTokenAccountBalance` だけで正しく見積りできません。常に完全な状態（ボールト + `open_orders.free` + `open_orders.locked`）を取得するか、SDK / API 見積りを使用してください。
+- AMM v4 は構造化されたオンチェーン TWAP を公開していません。AMM v4 裏付けの価格を必要とする外部消費者は、トレード・ログから自分自身で計算する必要があります。
+- Token-2022 はサポートされていません。
+
+## 次に見るべきもの
+
+- [`products/amm-v4/instructions`](/ja/products/amm-v4/instructions) — `SwapBaseIn`、`Deposit` など が統合される場所。
+- [`products/amm-v4/fees`](/ja/products/amm-v4/fees) — 完全なフィー・メカニクス、`TakePnl` の詳細。
+- [`algorithms/constant-product`](/ja/algorithms/constant-product) — 共有導出。
+
+出典：
+
+- [Raydium AMM プログラム・ソース — `raydium-io/raydium-amm`](https://github.com/raydium-io/raydium-amm)
+- Raydium SDK v2 `Liquidity` モジュール

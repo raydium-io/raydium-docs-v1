@@ -1,0 +1,285 @@
+---
+title: "Demo kode LaunchLab"
+description: "TypeScript end-to-end: buat peluncuran LaunchLab, beli dan jual di kurva bonding, lulus ke pool CPMM, dan kumpulkan biaya pembuat."
+---
+
+<Info>
+  **Halaman ini diterjemahkan secara otomatis oleh AI. Versi bahasa Inggris adalah acuan resmi.**
+
+  [Lihat versi bahasa Inggris →](/products/launchlab/code-demos)
+</Info>
+
+<Info>
+  **Spanduk versi.**
+
+  - SDK: `@raydium-io/raydium-sdk-v2@0.2.42-alpha`
+  - Cluster: Solana `mainnet-beta`
+  - Program ID: lihat [`reference/program-addresses`](/id/reference/program-addresses)
+  - Terakhir diverifikasi: 2026-04
+
+  Sematkan versi SDK di `package.json` Anda. Antarmuka kurva bonding telah berkembang antar rilis minor.
+</Info>
+
+## Setup
+
+Demo di sini mencerminkan file dalam [`raydium-sdk-V2-demo/src/launchpad`](https://github.com/raydium-io/raydium-sdk-V2-demo/tree/master/src/launchpad). Bootstrap mengikuti [`config.ts.template`](https://github.com/raydium-io/raydium-sdk-V2-demo/blob/master/src/config.ts.template) repositori demo:
+
+```ts
+import { Connection, Keypair, clusterApiUrl, PublicKey } from "@solana/web3.js";
+import { Raydium, TxVersion } from "@raydium-io/raydium-sdk-v2";
+import BN from "bn.js";
+import fs from "node:fs";
+
+const connection = new Connection(process.env.RPC_URL ?? clusterApiUrl("mainnet-beta"));
+const owner = Keypair.fromSecretKey(
+  new Uint8Array(JSON.parse(fs.readFileSync(process.env.KEYPAIR!, "utf8"))),
+);
+const raydium = await Raydium.load({
+  owner,
+  connection,
+  cluster: "mainnet",
+  disableFeatureCheck: true,
+  blockhashCommitment: "finalized",
+});
+export const txVersion = TxVersion.V0;
+```
+
+## Buat peluncuran
+
+Sumber: [`src/launchpad/createMint.ts`](https://github.com/raydium-io/raydium-sdk-V2-demo/blob/master/src/launchpad/createMint.ts) (dan [`createBonkMintApi.ts`](https://github.com/raydium-io/raydium-sdk-V2-demo/blob/master/src/launchpad/createBonkMintApi.ts) untuk varian Bonk berbasis API)
+
+```ts
+import { NATIVE_MINT } from "@solana/spl-token";
+
+const { execute, extInfo } = await raydium.launchpad.createLaunchpad({
+  programId: /* LaunchLab program ID from reference/program-addresses */,
+  // Token metadata untuk base mint baru:
+  name:   "Example Token",
+  symbol: "EXMPL",
+  uri:    "https://example.com/metadata.json",
+  decimals: 6,
+
+  // Curve params:
+  curveType: 0,                                      // 0 = quadratic
+  supply:    new BN(1_000_000_000).mul(new BN(10).pow(new BN(6))), // 1B base (6 dec)
+  graduationFractionBps: 8000,                       // 80% → graduation
+  initialK:  new BN("40"),                           // curve shape parameter
+
+  // Quote side:
+  quoteMint: NATIVE_MINT,                            // WSOL
+  openTime:  new BN(Math.floor(Date.now() / 1000) + 60),  // opens in 1min
+
+  // Fee policy:
+  fees: {
+    buyNumerator:   new BN(100),                     // 1.00%
+    buyDenominator: new BN(10_000),
+    sellNumerator:  new BN(100),
+    sellDenominator: new BN(10_000),
+    lpShare:         new BN(60),
+    creatorShare:    new BN(20),
+    protocolShare:   new BN(20),
+    totalShare:      new BN(100),
+  },
+
+  postGraduationLpPolicy: "burn",                    // "burn" | "lock" | "toCreator"
+
+  txVersion: TxVersion.V0,
+});
+
+const { txId } = await execute({ sendAndConfirm: true });
+console.log("Launch:", extInfo.launchState.toBase58());
+console.log("Base mint:", extInfo.baseMint.toBase58());
+console.log("Create tx:", txId);
+```
+
+Catatan:
+
+- `initialK` adalah faktor skala untuk kurva kuadratik. Sesuaikan untuk menargetkan harga CPMM pembukaan tertentu saat kelulusan. Lihat [`products/launchlab/bonding-curve`](/id/products/launchlab/bonding-curve) untuk penurunannya.
+- SDK menangani pembuatan base mint, metadata PDA, dan kedua vault dalam satu transaksi. Mungkin melebihi 1232 byte jika URI metadata panjang; dalam hal ini SDK membagi menjadi dua transaksi.
+- Setelah `Initialize`, peluncuran tidak dapat diperdagangkan sampai `openTime`. Atur `openTime` satu atau dua menit ke depan untuk memberikan front-runner peluang yang lebih rendah untuk menangkap pembelian pertama.
+
+## Ambil status peluncuran
+
+```ts
+const launchId = new PublicKey("<LAUNCH_STATE>");
+
+const launch = await raydium.launchpad.getLaunchById({ launchId });
+console.log("Status:", ["Active","Graduated","Cancelled"][launch.status]);
+console.log("Base sold:", launch.baseSold.toString(),
+            "/", launch.baseSupplyMax.toString());
+console.log("Quote collected:", launch.quoteReserveReal.toString(),
+            "target:", launch.quoteReserveTarget.toString());
+if (launch.status === 1) {
+  console.log("Post-graduation CPMM pool:", launch.cpmmPoolState.toBase58());
+}
+```
+
+`getLaunchById` mengembalikan `LaunchState` yang didekode plus fraksi "kemajuan menuju kelulusan" yang dihitung sebagai `Decimal`.
+
+## Beli — quote persis masuk
+
+Sumber: [`src/launchpad/buy.ts`](https://github.com/raydium-io/raydium-sdk-V2-demo/blob/master/src/launchpad/buy.ts)
+
+```ts
+const quoteIn        = new BN(1).mul(new BN(10).pow(new BN(9)));  // 1 SOL
+const minimumBaseOut = new BN(0);  // accept any; tighten for production
+
+// Preview the quote off-chain so your UI can show expected base_out:
+const preview = raydium.launchpad.computeBuyBase({
+  launchState: launch,
+  quoteIn,
+});
+console.log("Expected base_out:", preview.baseOut.toString(),
+            "price impact:", preview.priceImpact.toString());
+
+const { execute } = await raydium.launchpad.buyExactIn({
+  launchInfo: launch,
+  quoteIn,
+  minimumBaseOut,
+  txVersion: TxVersion.V0,
+});
+
+const { txId } = await execute({ sendAndConfirm: true });
+console.log("Buy tx:", txId);
+```
+
+`computeBuyBase` mencerminkan pemecah Newton on-chain (kurva kuadratik) atau inversi CPMM bentuk tertutup (curve_type 1). Gunakan untuk mengisi bidang UI "Anda menerima".
+
+## Beli — base keluar persis
+
+```ts
+const baseOut         = new BN(1_000_000).mul(new BN(10).pow(new BN(6)));  // 1M base
+const maximumQuoteIn  = new BN(2).mul(new BN(10).pow(new BN(9)));          // cap at 2 SOL
+
+const { execute } = await raydium.launchpad.buyExactOut({
+  launchInfo: launch,
+  baseOut,
+  maximumQuoteIn,
+  txVersion: TxVersion.V0,
+});
+
+await execute({ sendAndConfirm: true });
+```
+
+Berguna untuk UI "beli persis X token". Menolak dengan `ExceededSlippage` jika kurva telah berubah cukup sehingga persyaratan quote sekarang melebihi `maximumQuoteIn`.
+
+## Jual
+
+Sumber: [`src/launchpad/sell.ts`](https://github.com/raydium-io/raydium-sdk-V2-demo/blob/master/src/launchpad/sell.ts)
+
+```ts
+const baseIn           = new BN(500_000).mul(new BN(10).pow(new BN(6)));  // 0.5M base
+const minimumQuoteOut  = new BN(0);
+
+const { execute } = await raydium.launchpad.sellExactIn({
+  launchInfo: launch,
+  baseIn,
+  minimumQuoteOut,
+  txVersion: TxVersion.V0,
+});
+
+await execute({ sendAndConfirm: true });
+```
+
+Jalur penjualan kurva simetris dengan jalur beli: mengurangi `base_sold` sebesar `baseIn` mengembalikan `quote_out` sama dengan area terintegrasi di bawah kurva antara `base_sold − baseIn` dan `base_sold`, minus biaya penjualan.
+
+## Auto-graduate pada pembelian threshold-crossing
+
+SDK menghubungkan instruksi `Graduate` di dalam transaksi `buy*` ketika mendeteksi bahwa status post-buy akan melampaui ambang:
+
+```ts
+const { execute, willGraduate } = await raydium.launchpad.buyExactIn({
+  launchInfo: launch,
+  quoteIn: new BN(100).mul(new BN(10).pow(new BN(9))),    // large buy
+  minimumBaseOut: new BN(0),
+  txVersion: TxVersion.V0,
+  autoGraduate: true,                                      // default
+});
+
+if (willGraduate) {
+  console.log("This buy will trigger graduation.");
+}
+
+const { txId } = await execute({ sendAndConfirm: true });
+```
+
+Karena `Graduate` tidak memerlukan izin, siapa pun (termasuk bot MEV) dapat berlomba untuk mendaratkan `Graduate` pertama setelah ambang dilampaui — biasanya beberapa detik kemudian, bukan menit. Pendaratan pertama hanya membayar sewa untuk akun pool CPMM; mereka tidak mendapatkan manfaat lain.
+
+## Manual `Graduate`
+
+Jika `autoGraduate` dimatikan atau transaksi threshold-crossing gagal, Anda dapat memicu kelulusan secara terpisah:
+
+```ts
+const { execute } = await raydium.launchpad.graduate({
+  launchInfo: launch,
+  txVersion: TxVersion.V0,
+});
+
+await execute({ sendAndConfirm: true });
+```
+
+Kembali dengan `NotAtThreshold` jika `quote_reserve_real < quote_reserve_target` saat waktu pengiriman. Aman untuk mencoba ulang — upaya `Graduate` kedua setelah keberhasilan kembali dengan `NotActive`.
+
+## Kumpulkan biaya pembuat
+
+Sumber: [`src/launchpad/claimCreatorFee.ts`](https://github.com/raydium-io/raydium-sdk-V2-demo/blob/master/src/launchpad/claimCreatorFee.ts) (single mint) dan [`collectAllCreatorFees.ts`](https://github.com/raydium-io/raydium-sdk-V2-demo/blob/master/src/launchpad/collectAllCreatorFees.ts) (batched)
+
+```ts
+const { execute } = await raydium.launchpad.collectCreatorFees({
+  launchInfo: launch,
+  txVersion: TxVersion.V0,
+});
+
+await execute({ sendAndConfirm: true });
+```
+
+Mentransfer jumlah penghitung biaya pembuat yang terakumulasi ke ATA pembuat di quote mint. Dapat dipanggil sebelum atau sesudah kelulusan; gunakan secara berkala daripada menunggu keseimbangan besar untuk menumpuk.
+
+## Lacak peluncuran melalui siklus hidupnya
+
+Menyatukannya, skrip pemantauan mungkin terlihat seperti:
+
+```ts
+async function watch(launchId: PublicKey) {
+  while (true) {
+    const launch = await raydium.launchpad.getLaunchById({ launchId });
+    const progress =
+      Number(launch.quoteReserveReal) /
+      Number(launch.quoteReserveTarget);
+
+    console.log(
+      `status=${["Active","Graduated","Cancelled"][launch.status]}`,
+      `progress=${(progress * 100).toFixed(2)}%`,
+      `num_buys=${launch.stateData.numBuys}`,
+    );
+
+    if (launch.status === 1) {
+      console.log("Graduated to CPMM pool:", launch.cpmmPoolState.toBase58());
+      break;
+    }
+    await new Promise(r => setTimeout(r, 10_000));
+  }
+}
+```
+
+## Rust CPI
+
+Memanggil LaunchLab dari program Anchor Anda sendiri jarang terjadi (sebagian besar integrasi peluncuran hanya di sisi TS). Jika Anda melakukannya, program ini mengirimkan krate Anchor `raydium_launchlab` dengan `cpi::accounts::Buy`, `cpi::accounts::Sell`, dll. — pola mencerminkan contoh CPI CPMM / CLMM. Lihat [`sdk-api/rust-cpi`](/id/sdk-api/rust-cpi) untuk template umum setelah situs ini terisi.
+
+## Jebakan
+
+- **Aritmatika pembagian biaya off-by-one.** Jika `total_share` bukan persis `lp_share + creator_share + protocol_share`, `Initialize` kembali dengan `InvalidFeeShares`. Atur `totalShare` sama dengan jumlahnya.
+- **Menggunakan quote mint yang tidak diizinkan.** `launch_config.allowed_quote_mints` adalah daftar tetap; meneruskan mint lain apa pun kembali dengan reverts. Periksa dengan `raydium.launchpad.getConfig()` terlebih dahulu.
+- **Ukuran metadata.** String `uri` panjang mendorong Metaplex CPI di atas anggaran. Simpan `uri` di bawah ~200 karakter — sebagian besar metadata JSON yang dihosting CDN cocok dengan mudah.
+- **Perlombaan kelulusan.** Bot otomatis memantau `quote_reserve_real` dan front-run `Graduate` dalam satu atau dua slot setelah ambang batas terlampaui. Ini tidak berbahaya — hanya memerlukan biaya sewa — tetapi artinya UI Anda harus memperlakukan transisi `status` sebagai peristiwa cepat.
+
+## Ke mana selanjutnya
+
+- [`products/launchlab/bonding-curve`](/id/products/launchlab/bonding-curve) — matematika kurva.
+- [`products/cpmm/code-demos`](/id/products/cpmm/code-demos) — apa yang harus dilakukan dengan pool yang dihasilkan.
+- [`user-flows/launch-token-launchlab`](/id/user-flows/launch-token-launchlab) — panduan peluncuran token end-to-end, termasuk langkah off-chain.
+
+Sumber:
+
+- [Raydium SDK v2](https://github.com/raydium-io/raydium-sdk-V2)
+- Sumber program Raydium LaunchLab

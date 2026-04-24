@@ -1,0 +1,266 @@
+---
+title: "CLMM 수수료 및 리워드"
+description: "CLMM이 거래 수수료를 LP·프로토콜·펀드로 분배하는 방식, 세 개 슬롯 리워드 시스템이 인레인지 포지션에 배분되는 방식, 그리고 두 항목 모두 포지션별 잔액으로 정산되는 방식을 설명합니다."
+---
+
+<Info>
+  **이 페이지는 AI 자동 번역입니다. 모든 내용은 영문판을 기준으로 합니다.**
+
+  [영문판 보기 →](/products/clmm/fees)
+</Info>
+
+## 수수료 티어
+
+CLMM 풀은 생성 시 `AmmConfig`에 바인딩됩니다. 이 설정은 거래 수수료율, 프로토콜 및 펀드 배분율, 그리고 **틱 간격**을 결정합니다 ([`products/clmm/ticks-and-positions`](/ko/products/clmm/ticks-and-positions) 참조). 공개된 일반적인 티어는 다음과 같습니다(실제 값은 `GET https://api-v3.raydium.io/main/clmm-config`로 확인하세요):
+
+| `AmmConfig` 인덱스 | `trade_fee_rate` | 틱 간격 | 일반적인 용도 |
+|---|---|---|---|
+| 0 | `100` (0.01%) | 1 | 스테이블 페어 |
+| 1 | `500` (0.05%) | 10 | 상관관계 높은 블루칩 |
+| 2 | `2_500` (0.25%) | 60 | 표준 페어 |
+| 3 | `10_000` (1.00%) | 120 | 고변동성 또는 롱테일 |
+
+거래 수수료율의 단위는 거래량의 `1/FEE_RATE_DENOMINATOR = 1/1_000_000`입니다. 프로토콜 및 펀드 수수료율은 동일한 분모를 사용하지만, 거래량이 아닌 **거래 수수료**에 적용됩니다. 이는 CPMM과 동일한 방식입니다.
+
+## 스왑별 수수료 분배
+
+스왑의 각 단계에서 ([`products/clmm/math`](/ko/products/clmm/math) 참조):
+
+```
+step_trade_fee   = ceil(step_input * trade_fee_rate / 1_000_000)
+step_protocol    = floor(step_trade_fee * protocol_fee_rate / 1_000_000)
+step_fund        = floor(step_trade_fee * fund_fee_rate     / 1_000_000)
+step_lp          = step_trade_fee - step_protocol - step_fund
+```
+
+- `step_lp`는 현재 활성 유동성을 기준으로 스케일된 `fee_growth_global_{input_side}_x64`로 유입됩니다: `fee_growth_global += step_lp × 2^64 / pool.liquidity`.
+- `step_protocol`은 `PoolState.protocol_fees_token_{input_side}`에 누적되며 `CollectProtocolFee`로 수령합니다.
+- `step_fund`는 `PoolState.fund_fees_token_{input_side}`에 누적되며 `CollectFundFee`로 수령합니다.
+
+CPMM과 마찬가지로, 프로토콜 및 펀드 수수료 금액은 볼트 안에 보관되지만 **커브의 유동성 뷰에서는 제외**됩니다. 스왑 수학 계산은 `pool.liquidity`를 읽으며, 이 값은 미수령 수수료로 부풀려지지 않습니다.
+
+## 수수료가 토큰별로 구분되는 이유
+
+CPMM에서는 스왑 수수료가 항상 입력 토큰으로 부과되어 다른 쪽 토큰에는 프로토콜/펀드 누적이 발생하지 않는 것과 달리, CLMM에서도 동일한 규칙이 각 단계에 적용됩니다. **수수료는 해당 단계에서 입력 토큰으로 누적됩니다.** 멀티틱 스왑은 방향이 일관되므로 모든 단계에서 동일한 토큰에 수수료가 부과됩니다. 즉, 실제로 한 번의 스왑에서 발생하는 수수료는 *한쪽* 토큰에만 귀속됩니다.
+
+사용자가 token0 → token1로 스왑하면 `fee_growth_global_0_x64`가 증가하고 `fee_growth_global_1_x64`는 변하지 않습니다. 이때 포지션은 token0으로 수수료를 얻습니다. 반대 방향의 스왑이 발생하면 `fee_growth_global_1_x64`가 대신 증가합니다. 시간이 지남에 따라 균형 잡힌 풀은 양쪽 토큰 모두에서 수수료가 누적됩니다.
+
+## 단일 토큰 수수료 (`CollectFeeOn`)
+
+[`CreateCustomizablePool`](/ko/products/clmm/instructions)을 통해 생성된 풀은 기본값이 아닌 수수료 수집 모드를 선택할 수 있습니다. 이 모드는 풀 생성 시 고정되며 `PoolState.fee_on`에 저장됩니다.
+
+| `CollectFeeOn` 값 | `fee_on` 바이트 | 동작 방식 |
+|---|---|---|
+| `FromInput` (기본값) | `0` | 클래식 Uniswap-V3 방식 — 수수료는 항상 각 스왑 단계의 입력 토큰에서 차감됩니다. 입력 토큰은 스왑 방향에 따라 바뀝니다. |
+| `Token0Only` | `1` | 수수료는 항상 token0으로 표시됩니다. 0→1 스왑에서는 입력 토큰이 수수료 토큰입니다(`FromInput`과 동일). 1→0 스왑에서는 스왑 출력(token0)에서 수수료가 차감됩니다. |
+| `Token1Only` | `2` | `Token0Only`의 대칭 — 수수료는 항상 token1으로 표시됩니다. |
+
+**`Token0Only` 또는 `Token1Only`를 선택하는 이유** — LP에게 단일하고 예측 가능한 수수료 수령 통화를 제공하기 위함입니다. `MEMECOIN / USDC`와 같이 LP가 달러 기준으로 운용하는 페어는 `Token1Only`(수수료가 항상 USDC로 정산)를 사용하면 유리합니다. 이 경우 어느 쪽 거래가 더 많은지와 관계없이 LP의 손익이 영향을 받지 않습니다. 단, 출력에서 수수료가 차감되는 방향에서는 사용자가 입력에서 미미한 금액이 차감되는 방식 대신 `out − fee`를 받게 되므로, 견적 로직에서 출력 측 수수료를 빼야 합니다. SDK의 `computeAmountOut`이 `fee_on`에 따른 분기 처리를 담당합니다. `pool.fee_on`을 직접 읽는 클라이언트 코드는 `PoolState`의 헬퍼 함수를 그대로 따라야 합니다:
+
+```rust
+pool.is_fee_on_input(zero_for_one: bool) -> bool   // true → fee is deducted from input
+pool.is_fee_on_token0(zero_for_one: bool) -> bool  // for telemetry / accounting
+```
+
+**LP 레벨 효과** — 수수료는 여전히 스왑 단계별로 표준 `fee_growth_global_{0,1}_x64` 어큐뮬레이터를 통해 라우팅되므로, 포지션은 동일한 `fee_growth_inside` 공식으로 수수료를 정산합니다. 비대칭성은 *수수료가 누적되는 토큰 방향*에만 있을 뿐, 수학 공식에는 영향을 주지 않습니다.
+
+`fee_on`은 생성 이후 **변경할 수 없습니다.** 레거시 `CreatePool`로 생성된 풀은 영구적으로 `FromInput`입니다.
+
+## 동적 수수료
+
+`enable_dynamic_fee = true`로 생성된 풀은 `AmmConfig.trade_fee_rate` 위에 변동성 기반 추가 수수료를 적용합니다. 이 메커니즘은 Trader Joe / Meteora 동적 수수료 설계를 단순화한 버전입니다.
+
+### 상태
+
+`PoolState.dynamic_fee_info`는 풀 생성 시 `DynamicFeeConfig`의 스냅샷인 5개의 캘리브레이션 파라미터와, 매 스왑마다 갱신되는 4개의 상태 필드를 담고 있습니다. 바이트 레이아웃은 [`products/clmm/accounts`](/ko/products/clmm/accounts#dynamicfeeconfig-and-dynamicfeeinfo)를 참조하세요.
+
+### 스왑별 업데이트
+
+매 스왑 단계마다 프로그램은 다음 세 단계를 실행합니다:
+
+1. **레퍼런스 감쇠.** `now - last_update_timestamp > filter_period`이면 변동성 레퍼런스가 감쇠됩니다:
+
+    ```
+    if elapsed > decay_period:
+        volatility_reference = 0
+    elif elapsed > filter_period:
+        volatility_reference = volatility_accumulator * reduction_factor / 10_000
+    # else: hold the previous reference
+    ```
+
+2. **어큐뮬레이터 업데이트.** 새 어큐뮬레이터는 레퍼런스에 이동한 절대 거리(`tick_spacing` 단위)에 세분화 스케일을 곱한 값을 더하고, 설정된 최댓값으로 상한이 적용됩니다:
+
+    ```
+    delta_idx     = abs(tick_spacing_index_reference - current_tick_spacing_index)
+    accumulator   = volatility_reference + delta_idx * 10_000   // VOLATILITY_ACCUMULATOR_SCALE
+    accumulator   = min(accumulator, max_volatility_accumulator)
+    ```
+
+3. **추가 수수료 계산.** 추가 수수료는 어큐뮬레이터에 대해 포물선 형태를 띠며(정식 공식에서 스왑의 "틱 거리"가 제곱됨), `dynamic_fee_control`로 이득이 스케일됩니다:
+
+    ```
+    fee_increment_rate = dynamic_fee_control * (accumulator * tick_spacing)^2
+                       / (100_000 * 10_000^2)
+    fee_rate           = AmmConfig.trade_fee_rate + fee_increment_rate
+    fee_rate           = min(fee_rate, 100_000)              // 10% cap
+    ```
+
+10% 상한(`MAX_FEE_RATE_NUMERATOR = 100_000`, `1e6` 단위)은 안전 장치로 하드코딩되어 있으며, 실제로 잘 조정된 설정에서는 이 값보다 훨씬 낮게 유지됩니다.
+
+### 파라미터 선택 가이드
+
+파일럿 풀에서 효과적으로 작동한 일반적인 범위:
+
+| 파라미터 | 일반적인 범위 | 비고 |
+|---|---|---|
+| `filter_period` | 30 – 60초 | 미세 변동성 중에 레퍼런스를 유지합니다. 낮을수록 반응이 빠릅니다 |
+| `decay_period` | 300 – 1800초 | 이 조용한 구간이 지나면 수수료가 기본값으로 돌아옵니다 |
+| `reduction_factor` | 4_000 – 8_000 | `10_000` 기준. 높을수록 높은 수수료가 오래 유지됩니다 |
+| `dynamic_fee_control` | 1_000 – 50_000 | `100_000` 기준. 커브의 이득 값입니다 |
+| `max_volatility_accumulator` | 100_000 – 10_000_000 | 추가 수수료가 도달할 수 있는 최댓값을 포화시킵니다 |
+
+캘리브레이션은 과거 스왑 데이터를 오프라인으로 공식에 대입해 재현한 후, `dynamic_fee_control`을 조정하여 평균 수수료가 목표값(예: 1σ 일에는 기본의 1.5배, 3σ 일에는 5배)에 맞도록 튜닝하세요.
+
+### LP가 경험하는 것
+
+동적 수수료 수익은 기본 수수료와 동일한 어큐뮬레이터인 `fee_growth_global_{0,1}_x64`를 통해 흐릅니다. 별도의 "동적 수수료 성장" 필드는 없습니다. 변동성이 큰 풀의 LP는 변동성이 높은 기간에 더 높은 수수료를 얻을 뿐이며, 추가적인 청구 또는 정산 인스트럭션이 필요하지 않습니다.
+
+### 인티그레이터가 알아야 할 사항
+
+- 견적이 반환하는 수수료는 풀 리저브가 변하지 않더라도 블록 N과 N+1 사이에 달라질 수 있습니다. 매 스왑이 변동성 어큐뮬레이터를 변경하기 때문입니다. Trade API 견적은 견적 시점의 블록 기준이며, 반응형 풀이 견적과 실행 사이에 작동하면 몇 bps 오차가 발생할 수 있습니다.
+- `volatility_accumulator`와 `last_update_timestamp`는 온체인에 공개되어 있으므로, 클라이언트가 오프라인 시뮬레이션을 위해 공식을 클라이언트 측에서 재현할 수 있습니다.
+
+## 포지션별 수수료 회계
+
+각 포지션은 마지막 업데이트 시점에 다음 값을 저장합니다:
+
+- `fee_growth_inside_0_last_x64` 및 `fee_growth_inside_1_last_x64` — 해당 스냅샷 시점의 범위별 수수료 성장값.
+
+이후 모든 업데이트(`IncreaseLiquidity`, `DecreaseLiquidity`, 그리고 틱 바운드 수수료 성장을 갱신하는 상태 전환 포함)마다:
+
+1. 프로그램은 **글로벌** 수수료 성장과 두 엔드포인트 틱의 `fee_growth_outside_*`로부터 `fee_growth_inside_{0,1}_x64`를 재계산합니다.
+2. Δ에 포지션의 유동성을 가중하여 `tokens_fees_owed_{0,1}`에 더합니다:
+
+   ```
+   Δ_fee_growth_inside_0 = fee_growth_inside_now_0 - fee_growth_inside_last_0
+   tokens_fees_owed_0  += Δ_fee_growth_inside_0 * position.liquidity / 2^64
+   ```
+
+3. `fee_growth_inside_{0,1}_last_x64`가 갱신됩니다.
+
+토큰이 실제로 이동하는 것은 `DecreaseLiquidity` 또는 전용 `CollectFees` 경로에서만 발생합니다(현재 Raydium 인스트럭션 세트에서 수수료는 `DecreaseLiquidity`의 일부로 수령됩니다). `DecreaseLiquidity` 호출에서 `liquidity = 0`으로 설정하는 것이 "수수료만 수령"하는 관용적인 방법입니다.
+
+### 레인지 밖 포지션은 수수료를 얻지 못합니다
+
+포지션의 범위에 `tick_current`가 포함되지 않으면, 해당 포지션의 `fee_growth_inside`는 **상한이 고정**되어 가격이 범위 밖에 있는 동안 변하지 않습니다. 가격이 범위로 돌아올 때까지 수수료 누적이 멈춥니다. 이는 버그가 아닌 의도된 기능으로, 집중 유동성이 자본뿐만 아니라 *수수료 수익률*도 집중시키는 방식입니다.
+
+## 리워드 스트림
+
+CLMM 풀은 최대 **세 개**의 리워드 스트림을 동시에 운용할 수 있습니다. 각 스트림은 (리워드 민트, 배출 속도, 시작 시간, 종료 시간) 튜플로 구성되며 `PoolState.reward_infos[i]`에 저장됩니다.
+
+```rust
+pub struct RewardInfo {
+    pub reward_state: u8,               // Uninitialized | Initialized | Open | Ended
+    pub open_time: u64,
+    pub end_time: u64,
+    pub last_update_time: u64,
+    pub emissions_per_second_x64: u128, // Q64.64 reward tokens per second
+    pub reward_total_emissioned: u64,
+    pub reward_claimed: u64,
+    pub token_mint:    Pubkey,
+    pub token_vault:   Pubkey,
+    pub authority:     Pubkey,           // who can SetRewardParams / fund
+    pub reward_growth_global_x64: u128,  // accumulator, Q64.64
+}
+```
+
+### 정산 루프
+
+모든 유동성 관련 인스트럭션(및 독립 실행 시 `UpdateRewardInfos`)은 모든 활성 스트림을 `now`까지 진행시킵니다:
+
+```
+for each reward_info with state in {Open, Ended within grace}:
+    elapsed         = min(now, end_time) − last_update_time
+    if elapsed > 0 && pool.liquidity > 0:
+        reward_growth_global_x64 += emissions_per_second_x64 × elapsed × 2^64 / pool.liquidity
+        reward_total_emissioned  += emissions_per_second × elapsed
+    last_update_time = min(now, end_time)
+```
+
+어떤 구간 동안 `pool.liquidity == 0`이면, 해당 구간의 배출량은 **분배되지 않습니다** (인레인지 유동성이 없으므로 분배할 수 없습니다). 잔여 예산은 리워드 볼트에 남아 있습니다. 스트림을 생성하고 방치하는 프로토콜은 `SetRewardParams`로 예산을 추가하거나 스트림을 종료할 수 있습니다.
+
+### 포지션별 리워드 누적
+
+수수료와 동일하게, 스트림마다 추가 차원이 있습니다:
+
+```
+for each stream i:
+    reward_growth_inside_now_i   = compute_inside_i(pool, tick_lower, tick_upper)
+    Δ_i = reward_growth_inside_now_i - personal_position.reward_infos[i].growth_inside_last_x64
+    personal_position.reward_infos[i].reward_amount_owed += Δ_i * personal_position.liquidity / 2^64
+    personal_position.reward_infos[i].growth_inside_last_x64 = reward_growth_inside_now_i
+```
+
+사용자는 `CollectReward`를 통해 청구하며, 이 인스트럭션은 스트림의 볼트에서 `reward_amount_owed`를 사용자에게 전송하고 카운터를 0으로 초기화합니다.
+
+### 인레인지 포지션만 리워드를 얻습니다
+
+`reward_growth_inside`는 틱 외부 어큐뮬레이터를 통해 `fee_growth_inside`와 동일한 공식을 사용하므로, 현재 가격 범위 밖의 포지션은 리워드를 누적하지 않습니다. 이는 Uniswap v3의 "인센티브는 활성 유동성에 귀속된다"는 설계 원칙을 그대로 따르며, LP의 이해관계를 현재 가격 커버리지와 일치시킵니다.
+
+### 스트림 펀딩 및 종료
+
+스트림은 `InitializeReward`를 통해 생성되며, 총 예산(`emissions_per_second × (end_time − open_time)`)이 스트림의 리워드 볼트에 사전 입금됩니다. 펀더의 잔액이 부족하면 프로그램이 `InitializeReward`를 거부합니다. `SetRewardParams`로 `end_time`을 연장하거나 배출 속도를 높일 수 있으나, LP에게 이미 약속된 배출량을 러그풀하는 것을 방지하기 위해 줄이는 것은 차단됩니다.
+
+`now > end_time`이 되면 스트림은 `Ended` 상태로 전환되지만 `reward_growth_global_x64`는 계속 읽힙니다. 배출이 종료된 후에도 LP는 오랫동안 과거에 적립된 금액을 `CollectReward`로 수령할 수 있습니다.
+
+## 관리자 수령
+
+| 서명자 | 인스트럭션 | 효과 |
+|--------|-------------|--------|
+| `amm_config.owner` | `CollectProtocolFee` | `protocol_fees_token_{0,1}`을 수신자에게 전송합니다. |
+| `amm_config.fund_owner` | `CollectFundFee` | `fund_fees_token_{0,1}`을 수신자에게 전송합니다. |
+
+두 인스트럭션 모두 커브에 영향을 주지 않습니다. 누적 금액은 이미 `pool.liquidity` 외부에 존재합니다. 메인넷에서 이 서명자를 보유하는 주체에 대해서는 [`security/admin-and-multisig`](/ko/security/admin-and-multisig)를 참조하세요.
+
+## Token-2022 상호작용
+
+수수료와 리워드는 모두 풀 또는 스트림의 토큰으로 표시됩니다. Token-2022 익스텐션은 CPMM에서와 동일하게 동작합니다:
+
+- **스왑 입력 민트의 전송 수수료.** 풀은 `amount_in − mint_transfer_fee`를 수령합니다. CLMM 프로그램의 단계 입력은 순수금액 기준으로 계산되므로, 풀의 수수료 어큐뮬레이터는 볼트에 실제로 들어온 토큰을 반영합니다.
+- **출력 민트의 전송 수수료.** 풀은 `amount_out`을 전송하고, 사용자는 `amount_out − mint_transfer_fee`를 받습니다. 슬리피지 검사는 사용자가 실제로 받는 금액 기준으로 이루어져야 합니다.
+- **리워드 민트의 전송 수수료.** 배출량은 `InitializeReward` 시점에 "볼트 입금" 단위로 표시됩니다(펀더가 민트 전송 수수료를 볼트에 납부). `CollectReward` 시 출금에 또 다른 민트 전송 수수료가 발생하므로, LP는 전송 수수료가 있는 리워드 토큰에서 소폭의 차감을 예상해야 합니다.
+- **양도 불가 / 기밀 / 그룹 멤버 민트.** `CreatePool` / `InitializeReward` 시 거부됩니다.
+
+멀티홉 전송 수수료 스왑에서 이러한 효과가 결합되면 상당한 금액이 될 수 있습니다. 이를 무시하는 견적 도구는 과대 약속을 하게 됩니다. 참조 계산은 [`algorithms/token-2022-transfer-fees`](/ko/algorithms/token-2022-transfer-fees)를 참조하세요.
+
+## 오프체인에서 수수료 및 리워드 읽기
+
+```ts
+const pool = await raydium.clmm.getPoolInfoFromRpc(poolId);
+const position = await raydium.clmm.getOwnerPositionInfo({
+  wallet: owner.publicKey,
+});
+
+for (const p of position) {
+  console.log("Position", p.nftMint.toBase58(),
+              "range", p.tickLower, "→", p.tickUpper,
+              "L", p.liquidity.toString(),
+              "fees owed:", p.tokenFeesOwed0.toString(),
+              p.tokenFeesOwed1.toString(),
+              "rewards owed:", p.rewardInfos.map(r => r.rewardAmountOwed.toString()));
+}
+```
+
+`tokenFeesOwed*`와 `rewardAmountOwed`는 포지션이 마지막으로 업데이트된 시점의 스냅샷입니다. 그 이후의 성장을 반영한 **현재** 값을 확인하려면 제로 유동성으로 `IncreaseLiquidity`를 시뮬레이션하거나, 글로벌 `fee_growth_*`와 두 틱 외부 스냅샷을 사용해 직접 재계산하세요.
+
+## 다음 단계
+
+- [`products/clmm/math`](/ko/products/clmm/math) — `fee_growth_inside`의 전체 유도 과정.
+- [`products/clmm/instructions`](/ko/products/clmm/instructions) — `CollectReward`, `InitializeReward`, `SetRewardParams` 계정 목록.
+- [`algorithms/token-2022-transfer-fees`](/ko/algorithms/token-2022-transfer-fees) — 전송 수수료 민트를 사용한 견적.
+- [`reference/fee-comparison`](/ko/reference/fee-comparison) — CLMM/CPMM/AMM-v4 수수료 비교표.
+
+출처:
+
+- [`raydium-io/raydium-clmm` — `states/pool.rs`, `libraries/fixed_point_64.rs`](https://github.com/raydium-io/raydium-clmm)
+- "Uniswap v3 Core" 백서, §7 (fee growth)

@@ -1,0 +1,256 @@
+---
+title: "Rust CPI"
+description: "別の Solana プログラムから Raydium プログラムを呼び出す方法。アカウントリストの構築、署名者シード、コンピュートバジェット、CPMM・CLMM・farm v6・LaunchLab のエラー伝播パターンについて。AMM v4 は Anchor クレートがないため別途説明します。"
+---
+
+<Info>
+  **このページは AI による自動翻訳です。すべての内容は英語版を正とします。**
+
+  [英語版を表示 →](/sdk-api/rust-cpi)
+</Info>
+
+## Cargo の依存関係
+
+```toml
+[dependencies]
+anchor-lang            = "0.29"
+anchor-spl             = "0.29"
+raydium_cp_swap        = { git = "https://github.com/raydium-io/raydium-cp-swap", features = ["cpi"] }
+raydium_amm_v3         = { git = "https://github.com/raydium-io/raydium-clmm",    features = ["cpi"] }
+# AMM v4 and farm v6: no published Anchor CPI crate. See "AMM v4 / farm v6" below.
+```
+
+`cpi` フィーチャーフラグを使用することで、プログラム全体ではなく CPI サーフェス（アカウント構造体とインボーカー）のみをコンパイルして、バイナリサイズを抑えることができます。
+
+アカウント構造体を端から端まで結線した実動作 CPI 例は、[`raydium-io/raydium-cpi-example`](https://github.com/raydium-io/raydium-cpi-example)（AMM v4、CPMM、CLMM をカバー）を参照してください。
+
+## アカウントリストの構築
+
+すべての Raydium CPI は、呼び出し元プログラム内の `Accounts` 構造体が必要です。フィールドはプログラムの命令アカウント順序に 1 対 1 で対応し、フィールドレベルのバリデーターを備えています。
+
+```rust
+use anchor_lang::prelude::*;
+use anchor_spl::token::{Token, TokenAccount, Mint};
+
+#[derive(Accounts)]
+pub struct MyProxySwap<'info> {
+    #[account(mut)]
+    pub user: Signer<'info>,
+
+    /// CHECK: validated by CPMM
+    #[account(mut)]
+    pub pool_state: UncheckedAccount<'info>,
+
+    /// CHECK: ditto
+    pub amm_config: UncheckedAccount<'info>,
+
+    /// CHECK: ditto
+    pub pool_authority: UncheckedAccount<'info>,
+
+    #[account(mut)]
+    pub input_vault: Account<'info, TokenAccount>,
+    #[account(mut)]
+    pub output_vault: Account<'info, TokenAccount>,
+
+    pub input_mint: Account<'info, Mint>,
+    pub output_mint: Account<'info, Mint>,
+
+    #[account(mut)]
+    pub user_input_ata:  Account<'info, TokenAccount>,
+    #[account(mut)]
+    pub user_output_ata: Account<'info, TokenAccount>,
+
+    pub cpmm_program: Program<'info, raydium_cp_swap::program::RaydiumCpSwap>,
+    pub token_program: Program<'info, Token>,
+    pub token_program_2022: Program<'info, anchor_spl::token_2022::Token2022>,
+    /// CHECK: observation PDA
+    #[account(mut)]
+    pub observation_state: UncheckedAccount<'info>,
+}
+```
+
+Raydium 側のアカウントのほとんどが `UncheckedAccount` なのは、被呼び出し側（Raydium）がバリデーションを行うためです。呼び出し元プログラムは、あなたが所有するアカウント（ユーザー ATA、自分の PDA）だけを厳密にバリデーションします。`/// CHECK:` ドックコメントは、チェック不足についての Anchor の警告を抑制します。
+
+## CPI 呼び出しの構築
+
+Anchor は命令ごとに 1 つのヘルパーを生成します。
+
+```rust
+use raydium_cp_swap::cpi::{self, accounts::Swap as CpmmSwap};
+
+pub fn my_proxy_swap(
+    ctx: Context<MyProxySwap>,
+    amount_in: u64,
+    minimum_amount_out: u64,
+) -> Result<()> {
+    let cpi_accounts = CpmmSwap {
+        payer:                ctx.accounts.user.to_account_info(),
+        authority:            ctx.accounts.user.to_account_info(),
+        amm_config:           ctx.accounts.amm_config.to_account_info(),
+        pool_state:           ctx.accounts.pool_state.to_account_info(),
+        input_token_account:  ctx.accounts.user_input_ata.to_account_info(),
+        output_token_account: ctx.accounts.user_output_ata.to_account_info(),
+        input_vault:          ctx.accounts.input_vault.to_account_info(),
+        output_vault:         ctx.accounts.output_vault.to_account_info(),
+        input_token_program:  ctx.accounts.token_program.to_account_info(),
+        output_token_program: ctx.accounts.token_program.to_account_info(),
+        input_token_mint:     ctx.accounts.input_mint.to_account_info(),
+        output_token_mint:    ctx.accounts.output_mint.to_account_info(),
+        observation_state:    ctx.accounts.observation_state.to_account_info(),
+    };
+    let cpi_ctx = CpiContext::new(
+        ctx.accounts.cpmm_program.to_account_info(),
+        cpi_accounts,
+    );
+
+    cpi::swap_base_input(cpi_ctx, amount_in, minimum_amount_out)?;
+    Ok(())
+}
+```
+
+`cpi::swap_base_input` は IDL から生成されます。引数リストは Anchor 命令の引数リストを反映しています。
+
+## 署名者シード（PDA 署名付き CPI）
+
+プログラムが PDA に代わって CPI に署名する場合（ボルト、エスクロー等で一般的）は、`CpiContext::new_with_signer` を使用します。
+
+```rust
+let bump         = ctx.accounts.my_authority_bump;
+let signer_seeds: &[&[&[u8]]] = &[&[b"my_authority", &[bump]]];
+
+let cpi_ctx = CpiContext::new_with_signer(
+    ctx.accounts.cpmm_program.to_account_info(),
+    cpi_accounts,
+    signer_seeds,
+);
+
+cpi::swap_base_input(cpi_ctx, amount_in, minimum_amount_out)?;
+```
+
+署名者シードは PDA の派生と一致する必要があります。`authority`（または類似の署名者ロール）として渡されるすべてのアカウントについて、Solana ランタイムは PDA がこれらのシードを通じて署名することを確認します。
+
+## 残りのアカウント
+
+一部の Raydium 命令は、固定されたアカウントの後に追加される可変長リストである**残りのアカウント**を取ります。標準的な例は以下の通りです。
+
+- **CLMM `SwapV2`**: スワップが横断する可能性があるティック配列に対応する 1 ～ 8 個の `TickArrayState` アカウントを追加します。
+- **Farm v6 `Deposit`**: 各ライブ報酬ストリームの `(reward_vault, user_reward_ata)` ペアを追加します。
+
+Anchor の CPI ヘルパーは残りのアカウントをタイプチェックしません。`.with_remaining_accounts(...)` で渡します。
+
+```rust
+let cpi_ctx = CpiContext::new(program, accounts)
+    .with_remaining_accounts(ctx.remaining_accounts.to_vec());
+```
+
+順序が重要です。受け取り元プログラムは、渡した順序で残りのアカウントを反復処理します。CLMM の場合、ティック配列は方向順に並べられる必要があります（スワップ方向内の最初の配列が最初）。farm v6 の場合、報酬スロットはスロットインデックス順に並びます。
+
+## エラー伝播
+
+Raydium のプログラムは独自のエラー列挙型を返します。Anchor がそれをラップし、呼び出し元プログラムは `Err(ProgramError::Custom(code))` として見ます。特定のエラーを処理するには：
+
+```rust
+use raydium_cp_swap::error::ErrorCode as CpmmErr;
+
+match cpi::swap_base_input(cpi_ctx, amount_in, minimum_amount_out) {
+    Ok(_) => Ok(()),
+    Err(e) => {
+        msg!("CPMM swap failed: {:?}", e);
+        // 再スロー、または独自のエラータイプに変換します。
+        Err(e)
+    }
+}
+```
+
+エラーコード番号は IDL ポリシー（[`sdk-api/anchor-idl`](/ja/sdk-api/anchor-idl)）に従って安定しています。数値と比較して特定のコードをテストできます。
+
+## 構成された CPI のコンピュートバジェット
+
+各 CPI フレームはオーバーヘッド（呼び出し自体で約 1,500 CU）を持ち、被呼び出し側の CU 消費がその上に積み重なります。プログラム内から CPMM スワップを呼び出すトランザクションは以下を消費します。
+
+```
+your_program_cu
++ ~1_500       (CPI overhead)
++ ~150_000     (CPMM swap, SPL-token variant)
++ ~200_000     (if Token-2022 with transfer fee)
++ ~10_000      (observation update)
+```
+
+スタックされたルーティング（プログラム → アグリゲーター → CPMM + CLMM + ファーム収穫）の場合、バジェットは ≥500k CU です。常にトランザクションで明示的な `ComputeBudgetProgram::set_compute_unit_limit(...)` 命令を設定してください。デフォルトの 200k CU リミットは静かに枯渇します。
+
+## AMM v4 — 手動 Instruction 構築
+
+AMM v4 には Anchor クレートがありません。`Instruction` を手動で構築します。
+
+```rust
+use anchor_lang::solana_program::program::invoke_signed;
+use anchor_lang::solana_program::instruction::{Instruction, AccountMeta};
+
+const AMM_V4_PROGRAM_ID: Pubkey = pubkey!("675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8");
+
+// SwapBaseIn discriminator is 9.
+let mut data = vec![9u8];
+data.extend_from_slice(&amount_in.to_le_bytes());
+data.extend_from_slice(&minimum_amount_out.to_le_bytes());
+
+let ix = Instruction {
+    program_id: AMM_V4_PROGRAM_ID,
+    accounts: vec![
+        AccountMeta::new_readonly(token_program_id, false),
+        AccountMeta::new(amm_id, false),
+        AccountMeta::new_readonly(amm_authority, false),
+        // ... remaining accounts per products/amm-v4/instructions ...
+    ],
+    data,
+};
+invoke_signed(&ix, &account_infos, signer_seeds)?;
+```
+
+完全なアカウントリストは [`products/amm-v4/code-demos`](/ja/products/amm-v4/code-demos) を参照してください。
+
+## Farm v6 — 報酬ペアの残りのアカウント
+
+Farm v6 の `Deposit` / `Withdraw` / `Harvest` は、残りのアカウント内で `(reward_vault_i, user_reward_ata_i)` ペアパターンを使用します。正確なシーケンスは以下の通りです。
+
+```
+remaining_accounts = [
+    reward_vault_0, user_reward_ata_0,
+    reward_vault_1, user_reward_ata_1,
+    ...
+]
+```
+
+**ライブ**（実行中または終了したが未請求）の報酬スロットごとに 1 ペア。未使用スロットを省略します。プログラムは `farm_state.reward_infos[i].reward_state` から分派します。
+
+## CPI フローのテスト
+
+ローカル開発では、テストバリデーターで Raydium プログラムが利用可能である必要があります。オプションは以下の通りです。
+
+1. **プログラムクローンを使用した `anchor test`** — `Anchor.toml` 内：
+
+   ```toml
+   [test.validator]
+   clone = [
+     { address = "CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK" },  # CPMM
+     { address = "CLMM...program-id..." },                          # CLMM
+     { address = "farm-v6-program-id..." },                         # farm v6
+   ]
+   ```
+
+   これはメインネットから展開されたバイトコードをローカルバリデーターに取得します。
+
+2. **Devnet** — Raydium はすべてのプログラムをメインネットと同じプログラム ID で devnet に展開します。`anchor test --provider.cluster devnet` を実行してライブコードを操作します。
+
+3. **ローカル展開** — Raydium リポジトリをクローンしてローカルバリデーターに `anchor deploy` します。テストサイクルのオーバーヘッドを追加しますが、デバッグのため被呼び出し側を変更できます。
+
+## ポインター
+
+- [`products/cpmm/code-demos`](/ja/products/cpmm/code-demos)、[`products/clmm/code-demos`](/ja/products/clmm/code-demos)、[`products/amm-v4/code-demos`](/ja/products/amm-v4/code-demos)、[`products/farm-staking/code-demos`](/ja/products/farm-staking/code-demos) — 製品別 CPI 例。
+- [`sdk-api/anchor-idl`](/ja/sdk-api/anchor-idl) — IDL 取得およびクライアント再生成。
+- [`integration-guides/cpi-integration`](/ja/integration-guides/cpi-integration) — 高レベルパターン：エスクロー、ボルト、アグリゲーター構成。
+
+参照元：
+
+- [raydium-cp-swap](https://github.com/raydium-io/raydium-cp-swap)
+- [raydium-clmm](https://github.com/raydium-io/raydium-clmm)
+- [Anchor CPI docs](https://www.anchor-lang.com/docs/cross-program-invocations)

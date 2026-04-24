@@ -1,0 +1,241 @@
+---
+title: "قفل الأموال (Vesting) في LaunchLab"
+description: "الرموز المقفولة، جدول الإفراج بفترة انتظار (cliff) وفتح خطي، حساب VestingRecord لكل مستفيد، وتعليمات الإنشاء والمطالبة التي يستخدمها المنشئون والمنصات لتوزيع الإمدادات المحفوظة بعد التخرج."
+---
+
+<Info>
+  **هذه الصفحة مُترجَمة آليًا بواسطة الذكاء الاصطناعي. النسخة الإنجليزية هي المرجع المعتمد.**
+
+  [عرض النسخة الإنجليزية →](/products/launchlab/vesting)
+</Info>
+
+<Info>
+  قفل الأموال (Vesting) **اختياري** على إطلاقة LaunchLab. عيّن `vesting_param.total_locked_amount = 0` عند `Initialize` والقسم أدناه لا ينطبق. بمجرد التفعيل، يكون الجدول ثابتًا طوال عمر الإطلاقة؛ لا يمكن تغيير فترة الانتظار وفترات الفتح بأثر رجعي.
+</Info>
+
+## لماذا قفل الأموال
+
+منحنى الربط يبيع `base_supply_graduation` رموز أثناء جمع التمويل وينشئ مجمع ما بعد التخرج ببقية الرموز. يقوم قفل الأموال بحجز شريحة إضافية من الإمدادات، وتقفلها لفترة انتظار قابلة للتكوين، ثم يحررها خطيًا لمستفيد واحد أو أكثر — عادة فريق المنشئ أو المستشارون أو شركاء المنصة.
+
+حالات الاستخدام العملية:
+
+- **تخصيص الفريق.** يحتفظ المنشئ، على سبيل المثال، بـ 5% من الإمدادات لفريق التأسيس، مقفولة لمدة 6 أشهر والفتح الخطي على مدار 12 شهرًا التالية.
+- **تخصيص المنصة.** تتلقى منصة الإطلاقة شريحة من كل رمز تدرجه، على نفس الجدول، عبر `CreatePlatformVestingAccount`.
+- **منح المستشار / المساهم.** عدة مستفيدين لديهم حساباتهم الخاصة من `VestingRecord`، كل منها يتتبع المبلغ المطالب به بشكل مستقل.
+
+الرموز المقفولة لا تدخل المنحنى وليست جزءًا من مجمع التخرج. تبقى نائمة في `base_vault` الخاص بالمجمع حتى يستدعي كل مستفيد `ClaimVestedToken`.
+
+## شكل الجدول
+
+يتم وصف قفل الأموال للإطلاقة بثلاثة أرقام، مسجلة مرة واحدة في وقت `Initialize`:
+
+| الحقل | النوع | المعنى |
+|-------|-------|---------|
+| `total_locked_amount` | `u64` | مجموع جميع الرموز الأساسية المقفولة عبر جميع المستفيدين (المنشئ + المنصة). يجب أن يكون `total_locked_amount <= supply * max_lock_rate / 1_000_000` من `GlobalConfig` الملزمة. |
+| `cliff_period` | `u64` (ثانية) | وقت الانتظار بعد انتهاء جمع التمويل قبل فتح أي رموز. |
+| `unlock_period` | `u64` (ثانية) | مدة نافذة الفتح الخطي بعد فترة الانتظار. `0` يعني أن كل شيء يُفتح فورًا عند نهاية فترة الانتظار. |
+
+تعيش هذه القيم الثلاث على `PoolState.vesting_schedule` (struct `VestingSchedule`) بالإضافة إلى `start_time` على السلسلة، والذي يسجله البرنامج باسم `block_time + cliff_period` في لحظة انتهاء جمع التمويل بنجاح (عند استيفاء شروط التخرج لأول مرة).
+
+```rust
+// states/pool.rs
+pub struct VestingSchedule {
+    pub total_locked_amount:     u64,
+    pub cliff_period:            u64,
+    pub unlock_period:           u64,
+    pub start_time:              u64,   // set by the program at fundraising end
+    pub allocated_share_amount:  u64,   // running sum of allocations to vesting records
+}
+```
+
+`allocated_share_amount` هو المبلغ الإجمالي المخصص بالفعل لحسابات `VestingRecord` عبر `CreateVestingAccount` / `CreatePlatformVestingAccount`. يجب ألا تتجاوز أبدًا `total_locked_amount`. إذا أفرط المنشئ في التخصيص، فإن استدعاء `CreateVestingAccount` التالي سيرجع مع `InvalidTotalLockedAmount`.
+
+## صيغة الفتح الخطي
+
+بعد انتهاء جمع التمويل، يحسب البرنامج المبلغ المفتوح التراكمي لكل `VestingRecord` كـ:
+
+```
+elapsed         = min(now, start_time + unlock_period) − start_time
+unlocked_amount = token_share_amount × elapsed / unlock_period
+```
+
+إذا كان `unlock_period == 0`، فإن كل `token_share_amount` يصبح قابلاً للمطالبة في خطوة واحدة في `start_time`. وإلا فإن المنحنى هو خط مستقيم من 0 في `start_time` إلى `token_share_amount` في `start_time + unlock_period`، محصور في `token_share_amount` بعد ذلك.
+
+المبلغ المحول عند كل استدعاء `ClaimVestedToken` هو الفرق بين المبلغ المفتوح التراكمي المحسوب حديثًا وحقل `claimed_amount` الجاري على السجل.
+
+```
+delta_amount    = unlocked_amount − vesting_record.claimed_amount
+vesting_record.claimed_amount = unlocked_amount
+```
+
+المطالبة قبل `start_time` سترجع مع `VestingNotStarted`. المطالبة بعد `start_time + unlock_period` تسوي الباقي الكامل.
+
+## تخطيطات الحسابات
+
+### `VestingSchedule`
+
+يعيش مضمنًا على `PoolState`. انظر [`accounts`](/ar/products/launchlab/accounts).
+
+### `VestingRecord`
+
+سجل لكل مستفيد. PDA مشتق كـ:
+
+```
+seeds = [
+  b"pool_vesting",
+  pool_state.key(),
+  beneficiary.key(),
+]
+program = LaunchLab program
+```
+
+```rust
+// states/vesting.rs
+#[account]
+pub struct VestingRecord {
+    pub epoch:               u64,         // recent_epoch tracker
+    pub pool:                Pubkey,      // back-pointer to PoolState
+    pub beneficiary:         Pubkey,      // who can call ClaimVestedToken
+    pub claimed_amount:      u64,         // cumulative claimed
+    pub token_share_amount:  u64,         // total allocated to this beneficiary
+    pub padding:             [u64; 8],
+}
+```
+
+لا يمكن للمستفيد أن يكون لديه **واحد فقط** `VestingRecord` لكل إطلاقة. التخصيص مرة أخرى لنفس المستفيد على نفس الإطلاقة سيرجع لأن PDA موجود بالفعل.
+
+## التعليمات
+
+### `CreateVestingAccount`
+
+متاح فقط للمنشئ. يخصص شريحة من `total_locked_amount` الخاص بالمجمع لمستفيد جديد بتهيئة PDA `VestingRecord` جديد.
+
+**الوسائط**
+
+```
+share_amount: u64    // tokens to assign to this beneficiary
+```
+
+**الحسابات**
+
+| # | الاسم | W | S | الملاحظات |
+|---|-------|---|---|----------|
+| 1 | `creator` | W | S | يجب أن يساوي `pool_state.creator`؛ يدفع الإيجار للحساب الجديد. |
+| 2 | `beneficiary` | W |   | يتلقى الرموز المفتوحة لاحقًا. لا يمكن تغيير المفتاح العام المحفوظ هنا. |
+| 3 | `pool_state` | W |   | يتم تعديله لزيادة `vesting_schedule.allocated_share_amount`. |
+| 4 | `vesting_record` | W |   | `init`؛ PDA `[b"pool_vesting", pool_state, beneficiary]`. |
+| 5 | `system_program` |   |   | مطلوب لإنشاء الحساب. |
+
+**الشروط المسبقة**
+
+- `share_amount > 0`.
+- `pool_state.vesting_schedule.allocated_share_amount + share_amount <= total_locked_amount`.
+- لا يوجد `VestingRecord` حالي للمفتاح العام `beneficiary` لهذا المجمع.
+
+**الشروط اللاحقة**
+
+- تم تهيئة `vesting_record` مع `token_share_amount = share_amount`, `claimed_amount = 0`.
+- `pool_state.vesting_schedule.allocated_share_amount += share_amount`.
+
+**الأخطاء الشائعة** — `InvalidTotalLockedAmount`, `InvalidInput`.
+
+### `CreatePlatformVestingAccount`
+
+متغير المسؤول عن المنصة لـ `CreateVestingAccount`. محفظة قفل الأموال الخاصة بالمنصة (المخزنة على `PlatformConfig.platform_vesting_wallet`) هي المستفيد، والمشاركة محدودة بـ `PlatformConfig.platform_vesting_scale`.
+
+يجب أن يساوي الموقّع `platform_config.platform_vesting_wallet`. الحسابات الأخرى تعكس `CreateVestingAccount`. استخدم هذا عندما توافق المنصة على تلقي حصة قفل أموال ثابتة على كل إطلاقة تدرجها.
+
+### `ClaimVestedToken`
+
+متاح فقط للمستفيد. ينقل أي رموز مفتوحة حديثًا من `base_vault` الخاص بالمجمع إلى ATA الخاص بالمستفيد.
+
+**الوسائط**
+
+بدون وسائط (يحسب البرنامج مبلغ المطالبة من الجدول).
+
+**الحسابات**
+
+| # | الاسم | W | S | الملاحظات |
+|---|-------|---|---|----------|
+| 1 | `beneficiary` | W | S | يجب أن يساوي `vesting_record.beneficiary`. |
+| 2 | `authority` |   |   | PDA `[b"vault_auth_seed"]`؛ يوقّع نقل الخزان. |
+| 3 | `pool_state` | W |   | يتم تعديله فقط إذا كان الجدول يحتاج إلى إعادة التحقق. |
+| 4 | `vesting_record` | W |   | يتم تحديث `claimed_amount`. |
+| 5 | `base_vault` | W |   | خزان الرمز الأساسي للمجمع؛ يتم الخصم منه. |
+| 6 | `beneficiary_ata` | W |   | يتلقى الرموز المفتوحة؛ `init_if_needed`. |
+| 7 | `base_mint` |   |   | نعناع الرمز الأساسي للمجمع. |
+| 8 | `token_program` |   |   | برنامج SPL Token أو Token-2022. |
+| 9 | `associated_token_program` |   |   | لإنشاء ATA إذا لزم الأمر. |
+| 10 | `system_program` |   |   | مطلوب لإنشاء الحساب. |
+
+**الشروط المسبقة**
+
+- `block_time >= pool_state.vesting_schedule.start_time` (وإلا `VestingNotStarted`).
+- `pool_state.status == PoolStatus::Migrated` — يجب أن يكون التخرج قد حدث بالفعل. الاستدعاء قبل التخرج سيرجع.
+- فرق المبلغ المفتوح أكبر من صفر. استدعاء بدون فائدة (الفرق المحسوب هو 0) سيرجع.
+
+**الشروط اللاحقة**
+
+- `vesting_record.claimed_amount` يتقدم إلى المبلغ المفتوح التراكمي الجديد.
+- يتم نقل `delta_amount` من الرمز الأساسي إلى `beneficiary_ata`.
+
+**الأخطاء الشائعة** — `VestingNotStarted`, `NoAssetsToCollect`, `MathOverflow`.
+
+## مثال عملي
+
+تعيّن الإطلاقة:
+
+- `supply = 1_000_000_000`
+- `total_locked_amount = 100_000_000` (10% من الإمدادات)
+- `cliff_period = 180 * 86400` (180 يوم)
+- `unlock_period = 365 * 86400` (سنة واحدة خطية بعد فترة الانتظار)
+
+يخصص المنشئ حسابي `VestingRecord` فورًا بعد `Initialize`:
+
+- المستفيد أ (الفريق): `share_amount = 70_000_000`
+- المستفيد ب (المستشار): `share_amount = 30_000_000`
+
+`allocated_share_amount = 100_000_000`، يساوي `total_locked_amount` — لا توجد تخصيصات إضافية ممكنة.
+
+ينتهي جمع التمويل في `2027-01-01T00:00Z`. يعيّن البرنامج `start_time = 2027-01-01 + 180 يوم = 2027-06-30`.
+
+في `2027-09-30` (90 يوم بعد `start_time`)، يستدعي المستفيد أ `ClaimVestedToken`:
+
+```
+elapsed         = min(now, start_time + 365·86400) − start_time
+                = 90 · 86400
+unlocked_amount = 70_000_000 × (90 / 365) ≈ 17_260_274
+delta_amount    = 17_260_274 − 0 = 17_260_274
+```
+
+تتلقى محفظة أ 17.26 مليون رمز أساسي. يتقدم `vesting_record.claimed_amount` إلى 17_260_274.
+
+بعد ستة أشهر (`2028-03-31`، 270 يوم بعد `start_time`)، يطالب أ مرة أخرى:
+
+```
+unlocked_amount = 70_000_000 × (270 / 365) ≈ 51_780_822
+delta_amount    = 51_780_822 − 17_260_274 = 34_520_548
+```
+
+يتلقى أ 34.52 مليون رمز آخر. بعد `2028-06-30` (نهاية `unlock_period`)، تنقل المطالبة التالية ~18.22 مليون المتبقي وتترك `claimed_amount == token_share_amount`.
+
+## الحالات الحدية
+
+- **فقدان المستفيد لمفتاحه.** المفتاح العام على `VestingRecord.beneficiary` هو الموقّع الوحيد الذي يمكنه استدعاء `ClaimVestedToken`. لا توجد مسار استرجاع. عيّن المستفيد إلى multisig إذا كان الاسترجاع مهمًا.
+- **رسوم نقل Token-2022.** إذا كان نعناع الرمز الأساسي رمز Token-2022 بامتداد رسم نقل، يتلقى المستفيد `delta_amount − transfer_fee`، وليس الفرق الكامل. يسجل خزان المجمع المبلغ الإجمالي كمنقول — يتراكم الفرق في حساب الرسم المحتفظ به للنعناع.
+- **المجمع لم يتخرج.** استدعاء `ClaimVestedToken` قبل التخرج سيرجع. تبدأ ساعة قفل الأموال فقط عند انتهاء جمع التمويل بالفعل؛ الإطلاقة المجهضة (التي لا تعيّن `start_time`) تترك الرموز المقفولة غير قابلة للوصول في الخزان.
+- **محاولات الإفراط في التخصيص.** يفرض البرنامج `allocated_share_amount <= total_locked_amount` على كل `CreateVestingAccount`. البقية (إن وجدت) من `total_locked_amount` المتروكة غير مخصصة **مفقودة** — تبقى تلك الرموز في الخزان إلى الأبد بمجرد تخرج الإطلاقة. خصص المبلغ الكامل ما لم يكن هذا هو القصد.
+
+## المؤشرات
+
+- [`products/launchlab/accounts`](/ar/products/launchlab/accounts) — تخطيط `PoolState` الكامل بما في ذلك `VestingSchedule`.
+- [`products/launchlab/instructions`](/ar/products/launchlab/instructions) — دورة حياة التخرج.
+- [`products/launchlab/platform-config`](/ar/products/launchlab/platform-config) — دلالات `platform_vesting_scale` للتخصيصات على المنصة.
+- [`products/launchlab/global-config`](/ar/products/launchlab/global-config) — سقف `max_lock_rate` الذي يحدد `total_locked_amount`.
+
+المصادر:
+
+- `raydium-launch/programs/launchpad/src/states/vesting.rs` — `VestingRecord`.
+- `raydium-launch/programs/launchpad/src/states/pool.rs` — `VestingSchedule`, `VestingParams`, `is_vesting_started`, `vesting_end_time`.
+- `raydium-launch/programs/launchpad/src/instructions/create_vesting_account.rs`.
+- `raydium-launch/programs/launchpad/src/instructions/claim_vested_token.rs`.

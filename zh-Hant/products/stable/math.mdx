@@ -1,0 +1,143 @@
+---
+title: "穩定 AMM 數學"
+description: "使用二元搜尋和線性插值從查詢表報價。費用應用與 AMM v4 相同。OpenBook 整合和 MonitorStep。"
+---
+
+<Info>
+  **本頁內容由 AI 自動翻譯，所有內容以英文版本為準。**
+
+  [查看英文版 →](/products/stable/math)
+</Info>
+
+## 查詢表曲線
+
+穩定 AMM 使用**稀疏查詢表**取代公式 x·y=k，表中包含 (x, y, price) 元組。程式在報價交換時：
+
+1. 根據儲備金計算池的當前比率。
+2. **二元搜尋**表格以找到兩個條目來限定該比率。
+3. **線性插值**計算中間價格。
+4. 應用費用並返回報價。
+
+這種方法在公式的確定性和**管理員靈活性**進行權衡，能用於價格塑形，且足夠高效以適應 Solana 的計算預算。
+
+## 表格配置和二元搜尋
+
+`ModelDataInfo` 最多可保存 50,000 個 `DataElement` 條目，由管理員索引。只有前 `valid_data_count` 個條目是活躍的。每個條目：
+
+```
+DataElement {
+  x: u64,      // X 座標（coin 端金額，已縮放）
+  y: u64,      // Y 座標（pc 端金額，已縮放）
+  price: u64,  // price = x/y，由乘數縮放
+}
+```
+
+根據當前池儲備金 (x_real, y_real) 尋找價格：
+
+1. 計算比率：`target_ratio = (x_real * multiplier) / y_real`。
+2. 二元搜尋條目，使 `(element.x * multiplier) / element.y` 限定 `target_ratio`。
+3. 找到括號 `[min_idx, max_idx]` 後，執行插值。
+
+程式的二元搜尋程式碼約 150 行，位於 `state.rs::ModelDataInfo::get_mininum_range_by_xy_real`。關鍵不變量：**條目必須排序**（x 遞增，y 遞減，price 遞增），搜尋才能運作。
+
+## 線性插值
+
+兩個表點限定比率後，插值計算中間價格和儲備金對：
+
+```
+target = (x_real * multiplier) / y_real
+
+[x1, y1, p1] = table[min_idx]
+[x2, y2, p2] = table[max_idx]
+
+// 插值價格
+p = p1 + (p2 - p1) * (target - ratio1) / (ratio2 - ratio1)
+
+// 插值儲備金
+x = x1 + (x2 - x1) * (target - ratio1) / (ratio2 - ratio1)
+y = y1 + (y2 - y1) * (target - ratio1) / (ratio2 - ratio1)
+```
+
+結果是連接表點的分段線性曲線。
+
+## 縮放：乘數
+
+池儲備金和價格以不同的刻度儲存。`ModelDataInfo` 上的 `multiplier` 欄位負責處理這個問題。常見模式：
+
+- Coin 有 6 位小數，PC 有 18 位小數。
+- 乘數 = 10^6（或類似值）。
+- 表項以縮小的刻度儲存以適應 u64 邊界。
+
+程式透過以下方式在讀取/寫入時重新縮放：
+
+```
+real_value = table_value * ratio / multiplier
+table_value = real_value * multiplier / ratio
+```
+
+## 交換報價：`SwapBaseIn` 和 `SwapBaseOut`
+
+### SwapBaseIn（確切輸入）
+
+給定輸入金額 `amount_in`：
+
+1. 從 `(coin_vault, pc_vault)` 取得當前比率。
+2. 找到限定表項並插值以取得表空間比率。
+3. 轉換輸入到表空間：`dx_table = amount_in * multiplier / ratio`。
+4. 查詢新 X 座標處的表以找到新 Y。
+5. `dy_table = y_old - y_new`。
+6. 轉換回來：`dy_real = dy_table * ratio / multiplier`。
+7. 應用交易費：`dy_output = dy_real - (dy_real * trade_fee_numerator / trade_fee_denominator)`。
+8. 返回 `dy_output`。
+
+### SwapBaseOut（確切輸出）
+
+對稱：給定期望的 `amount_out`，求解所需的 `amount_in`。
+
+兩條路徑都先結算已填充的 OpenBook 訂單（透過內部 `MonitorStep` 類似邏輯），因此有效儲備金反映前一個區塊的任何成交。
+
+## 費用應用
+
+與 AMM v4 相同：詳見 [`/zh-Hant/products/amm-v4/math`](/zh-Hant/products/amm-v4/math)。
+
+```
+gross_fee = amount_in * (swap_fee_numerator / swap_fee_denominator)    // 例如 0.25%
+lp_portion = gross_fee - (gross_fee * pnl_numerator / pnl_denominator) // 例如 0.22%
+pnl_portion = gross_fee * (pnl_numerator / pnl_denominator)            // 例如 0.03%
+```
+
+`pnl_portion` 進入 `need_take_pnl_*` 並由管理員透過 `WithdrawPnl` 取出。`lp_portion` 保留在金庫中，膨脹 `k` 並惠及 LP 代幣持有人。
+
+## MonitorStep 和 OpenBook
+
+如同 AMM v4，`MonitorStep` 是**手動觸發指令**，其作用為：
+
+1. 結算待處理的 OpenBook 訂單成交（將代幣從金庫轉移到池）。
+2. 使用新的限價單槽位網格更新 `AmmInfo.target_orders`。
+3. 將新網格發佈到 OpenBook。
+
+網格根據表計算：程式使用查詢表找到價格點並將其轉換為 OpenBook 訂單。
+
+**MonitorStep 的計算成本**：約 150k–180k CU（與 AMM v4 類似）。
+
+## 總結：為何這有效
+
+查詢表 + 插值設計**既高效又靈活**：
+
+- **效率**：二元搜尋為 O(log 50,000) ≈ 16 次迭代，每次約 300–500 CU。插值為幾個乘法/除法。總報價成本約 5k–15k CU，遠便宜於每次交換時重新計算公式。
+- **靈活性**：管理員可編碼任何分段線性曲線。穩定幣對在 1:1 附近密度高；抵押對取得自訂曲線。
+- **OpenBook 可組合性**：AMM v4 的相同 `MonitorStep` / `TargetOrders` 邏輯適用。表中的價格發現進入訂單網格生成。
+
+深入了解插值邏輯，見 `raydium-stable/program/src/state.rs`，方法 `get_data_by_x`、`get_data_by_y`、`get_dy_by_dx_base_in` 等。
+
+## 後續步驟
+
+- [帳戶](/zh-Hant/products/stable/accounts) — `ModelDataInfo` 和 `DataElement` 欄位參考。
+- [指令](/zh-Hant/products/stable/instructions) — `InitModelData`、`UpdateModelData` 用於填充表格。
+- [費用](/zh-Hant/products/stable/fees) — 費用應用和 `WithdrawPnl`。
+- [`/zh-Hant/products/amm-v4/math`](/zh-Hant/products/amm-v4/math) — OpenBook 費用包含訂單定價邏輯。
+
+來源：
+
+- `raydium-stable/program/src/state.rs`（插值和二元搜尋實現）
+- `raydium-stable/program/src/math.rs`（計算器公用程式）

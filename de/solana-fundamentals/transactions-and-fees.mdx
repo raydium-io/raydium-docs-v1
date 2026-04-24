@@ -1,0 +1,278 @@
+---
+title: "Transaktionen und Gebühren"
+description: "Wie Solana-Transaktionen strukturiert sind, welche Limits sie unterliegen, und die zwei unterschiedlichen Gebührenkategorien — Solana-Netzwerkgebühren und Raydium-Protokollgebühren — die bei einem typischen Swap anfallen."
+---
+
+<Info>
+  **Diese Seite wurde mit KI automatisch übersetzt. Maßgeblich ist stets die englische Version.**
+
+  [Englische Version ansehen →](/solana-fundamentals/transactions-and-fees)
+</Info>
+
+Eine Solana-Transaktion ist eine Liste von Instruktionen, die atomar ausgeführt werden. Das Verständnis der Transaktionsstruktur — Instruktionen, Konten, Unterzeichner, Compute Budget — ist eine Voraussetzung für das Erstellen, Debuggen oder Optimieren von etwas mit Raydium. Diese Seite behandelt diese Struktur, die Limits, die sie einschränken, und wie sich die beiden Gebührenkategorien (Solana-Netzwerkgebühren, Raydium-Protokollgebühren) bei einem echten Swap addieren.
+
+## Transaktionsaufbau
+
+Eine Solana-Transaktion hat drei Kernkomponenten:
+
+- **Message**: die geordnete Liste der Instruktionen, die Konten, auf die sie verweisen, und den kürzlichen Blockhash.
+- **Signatures**: eine pro Unterzeichner, bestätigen, dass die Transaktion autorisiert wurde.
+- **Recent blockhash**: beweist, dass die Transaktion aktuell ist; Transaktionen mit veralteten Blockhashes (>150 Slots alt) werden abgelehnt.
+
+### Instruktionen
+
+Eine Instruktion legt fest:
+
+- `program_id` — das aufzurufende Programm.
+- `accounts` — die Konten (und deren writable/signer-Flags) die das Programm berühren darf.
+- `data` — undurchsichtige Bytes, die das Programm interpretiert.
+
+Eine einzelne Transaktion kann mehrere Instruktionen enthalten. Sie werden in Reihenfolge ausgeführt; wenn eine fehlschlägt, werden alle vorherigen Instruktionen zurückgerollt (atomar).
+
+Eine typische Raydium-Swap-Transaktion umfasst:
+
+1. `ComputeBudget::SetComputeUnitLimit` — erhöht das Standard-CU-Limit.
+2. `ComputeBudget::SetComputeUnitPrice` — setzt eine Prioritätsgebühr.
+3. Optional `CreateAssociatedTokenAccount` — erstellt das Ausgabe-ATA, falls der Benutzer noch keine hat.
+4. `Raydium::SwapBaseInput` — führt den Swap aus.
+5. Optional `CloseAccount` — schließt ein wrapped-SOL-ATA.
+
+Das SDK packt diese automatisch über `raydium.trade.swap()`.
+
+## Konten in Transaktionen
+
+Jedes Konto, das durch eine Instruktion in der Transaktion berührt wird, muss in der Kontoliste der Transaktion aufgeführt sein. Jedes Konto wird gekennzeichnet:
+
+- **Signer / non-signer**: muss der Inhaber des Kontos die Transaktion unterzeichnen?
+- **Writable / read-only**: kann die Transaktion das Konto ändern?
+
+Die Runtime erzwingt diese Flags: Ein Programm, das versucht, in ein nicht beschreibbares Konto zu schreiben, schlägt fehl, und die Runtime lehnt Transaktionen ab, denen erforderliche Unterzeichner fehlen.
+
+Bei einem CPMM-Swap hat die Kontoliste etwa 13 Einträge (siehe [`solana-fundamentals/account-model`](/de/solana-fundamentals/account-model)). CLMM-Swaps mit mehreren Tick-Array-Übergängen können 20+ haben.
+
+## Transaktionsgrößenlimit
+
+Solana begrenzt Transaktionen auf **1232 Bytes** einschließlich Signaturen, Message und Headers. Dies ist das häufigste Hindernis für komplexe Transaktionen — Raydiums CLMM mit Multi-Hop-Routing stoßen regelmäßig an diese Grenze.
+
+Aufschlüsselung eines typischen ~1000-Byte-Raydium-Swaps:
+
+| Komponente | Größe |
+|-----------|-------|
+| Signature | 64 B |
+| Signature count | 1 B |
+| Message header | 3 B |
+| Blockhash | 32 B |
+| Account keys (13 × 32 B) | 416 B |
+| Instructions (4 × ~100-150 B) | 400–600 B |
+| **Gesamt** | ~900–1100 B |
+
+### Address Lookup Tables (ALTs)
+
+ALTs ermöglichen es einer Transaktion, auf Konten über einen 1-Byte-Index in einer veröffentlichten Tabelle zu verweisen, anstatt einen vollständigen 32-Byte-Pubkey zu verwenden. Dies komprimiert eine Transaktion erheblich:
+
+- Eine Transaktion, die auf 20 Konten direkt verweist: ~640 B Pubkeys.
+- Dieselbe Transaktion mit ALTs: ~20 B Indizes + ALT-Referenzen.
+
+Raydium verwaltet ALTs für CPMM/CLMM-Swap-Pfade im Mainnet. Das SDK nutzt sie automatisch. Aggregatoren, die Multi-Hop-Routen erstellen, verlassen sich stark darauf.
+
+```ts
+import { VersionedTransaction } from "@solana/web3.js";
+
+// SDK builds a v0 (versioned) tx with ALT references
+const { transaction } = await raydium.trade.swap({ /* ... */ });
+// transaction is a VersionedTransaction, not a legacy Transaction.
+```
+
+## Compute Budget
+
+Jede Transaktion hat ein **Compute Unit (CU) Budget**. Die Überschreitung beendet die Ausführung und verursacht den Fehlschlag der Transaktion.
+
+- **Standard**: 200.000 CU pro Transaktion.
+- **Maximum**: 1.400.000 CU pro Transaktion (erhöht über `ComputeBudget::SetComputeUnitLimit`).
+- **Pro-Block-Obergrenze**: 48M CU pro Block (auf Protokollebene).
+
+Typischer Raydium-CU-Verbrauch (siehe [`integration-guides/priority-fee-tuning`](/de/integration-guides/priority-fee-tuning) für die vollständige Tabelle):
+
+| Instruktion | CU |
+|-------------|------|
+| CPMM swap | ~140.000 |
+| CLMM swap (keine Tick-Übergänge) | ~170.000 |
+| CLMM swap (4 Tick-Übergänge) | ~320.000 |
+| Farm v6 stake | ~130.000 |
+| CPMM pool creation | ~250.000 |
+
+Setzen Sie immer ein explizites CU-Limit über `ComputeBudget`; sonst erhalten Sie den 200k-Standard, was für die meisten Raydium-Instruktionen zu niedrig ist.
+
+```ts
+import { ComputeBudgetProgram } from "@solana/web3.js";
+
+tx.add(
+  ComputeBudgetProgram.setComputeUnitLimit({ units: 300_000 }),
+);
+```
+
+Wenn Sie das CU-Limit zu niedrig setzen, schlägt die Transaktion fehl, wenn sie die Obergrenze erreicht; setzen Sie es zu hoch, riskieren Sie unter Stau deprioritiert zu werden (und je nach Preismodell zahlen Sie für Compute, das Sie nie verwendet haben).
+
+## Prioritätsgebühren
+
+Über die Basisgebühr (5000 Lamports pro Signature) hinaus priorisieren Validatoren zunehmend Transaktionen, die **Prioritätsgebühren** zahlen: ein Pro-CU-Trinkgeld in Microlamports.
+
+```
+priority_fee = compute_unit_price (micro-lamports) × compute_unit_limit
+```
+
+Beispiel: 10.000 µL/CU × 300.000 CU = 3.000.000 µL = 0,003 SOL.
+
+Prioritätsgebühren sind lokal — sie beeinflussen nur die Reihenfolge innerhalb eines Blocks; sie verbessern nicht Ihre Chance, einbezogen zu werden oder nicht. Das Setzen einer angemessenen Prioritätsgebühr ist während Stau unerlässlich.
+
+```ts
+tx.add(
+  ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 10_000 }),
+);
+```
+
+Siehe [`integration-guides/priority-fee-tuning`](/de/integration-guides/priority-fee-tuning) für die Anpassung dieser dynamisch.
+
+## Limits für Instruktions- und Kontoanzahl
+
+Über das 1232-Byte-Gesamtlimit hinaus:
+
+- **Max Konten pro Transaktion**: 128.
+- **Max Konten pro Instruktion (CPI)**: 64.
+- **Max Instruktionen pro Transaktion**: kein hartes Limit, nur durch das Größenlimit beschränkt.
+- **Max CPI-Tiefe**: 4 (ein Programm kann ein anderes aufrufen, das wiederum ein anderes aufrufen kann, 4 Ebenen tief).
+
+Raydium-CLMM-Swaps, die mehrere Tick-Arrays überqueren, können hart gegen das Kontolimit stoßen — ein einzelner Swap berührt den Pool, Ein-/Ausgabetresore, Ein-/Ausgabe-ATAs, mehrere Tick-Arrays, möglicherweise zusätzliche Konten eines Transfer-Hook-Programms, plus die obligatorischen Compute-Budget-/System-/Token-Programm-Referenzen. Entwürfe, die Raydium über CPI komponieren (z. B. Auto-Compounder), müssen dies berücksichtigen.
+
+## Gebührenkategorien bei einem Raydium-Swap
+
+Eine Benutzer-Swap-Transaktion zahlt Gebühren in zwei Kategorien:
+
+### Solana-Netzwerkgebühren
+
+Bezahlt an Validatoren in SOL.
+
+- **Basisgebühr pro Signature**: 5000 Lamports pro Signature. Fast immer 1 Signature = 0,000005 SOL.
+- **Prioritätsgebühr**: CU-Preis × CU-Limit in Microlamports. Variiert mit Stau; siehe [`integration-guides/priority-fee-tuning`](/de/integration-guides/priority-fee-tuning).
+
+Diese Gebühren gehen an Validatoren, sind nicht mit Raydium verbunden und werden auch für fehlgeschlagene Transaktionen erhoben (außer in einigen Prioritätsgebühr-Grenzfällen).
+
+### Raydium-Protokollgebühren
+
+Werden vom Swap-Betrag abgezogen.
+
+- **Swap-Gebühr**: Prozentsatz der Eingabe (CPMM typischerweise 0,25%, CLMM 0,01%–1% pro Stufe). Aufgeteilt zwischen LPs und Protokoll-Zielen. Siehe [`ray/protocol-fees`](/de/ray/protocol-fees).
+
+Diese Gebühren sind intern in Raydiums Bilanzierung — der Benutzer sieht sie als einen kleineren Ausgabebetrag als ein gebührenfreier Pool produzieren würde.
+
+### Beispiel: \$1000 USDC → SOL über CPMM 0,25%-Stufe
+
+| Gebührenkategorie | Betrag | Geht zu |
+|------------------|--------|---------|
+| Basisgebühr pro Signature | 0,000005 SOL (~\$0,0007) | Validator |
+| Prioritätsgebühr (10k µL × 300k CU) | 0,003 SOL (~\$0,45) | Validator |
+| CPMM swap fee (0,25%) | \$2,50 | LPs + Protokoll |
+| **Gesamtkosten für Benutzer** | ~\$2,95 | |
+
+Slippage (Preisauswirkung + Marktbewegung) ist keine Gebühr, beeinflusst aber die gleiche Gesamtrechnung.
+
+## Versionierte Transaktionen
+
+Solana hat zwei Transaktionsformate:
+
+- **Legacy**: das ursprüngliche Format, kein ALT-Support.
+- **v0 (Versioned)**: unterstützt ALTs, erweiterbar für zukünftige Versionen.
+
+Alle modernen Solana-Tools verwenden v0. Das Raydium SDK sendet standardmäßig v0-Transaktionen.
+
+```ts
+// Building a v0 tx directly
+import { VersionedTransaction, TransactionMessage } from "@solana/web3.js";
+
+const msg = new TransactionMessage({
+  payerKey:        owner.publicKey,
+  recentBlockhash: blockhash,
+  instructions:    [ /* ... */ ],
+}).compileToV0Message([lookupTableAccount]);
+
+const tx = new VersionedTransaction(msg);
+tx.sign([owner]);
+```
+
+## Blockhash-Aktualität
+
+Eine Transaktion muss einen Blockhash aus den letzten ~150 Slots (~60 Sekunden) enthalten. Über dieses Fenster hinaus lehnen Validatoren es ab.
+
+Für Wiederholungsschleifen rufen Sie einen frischen Blockhash bei jedem Versuch ab:
+
+```ts
+async function sendWithRetry(tx, maxRetries = 3) {
+  for (let i = 0; i < maxRetries; i++) {
+    const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash();
+    tx.message.recentBlockhash = blockhash;
+    tx.sign([owner]);
+    try {
+      return await connection.sendRawTransaction(tx.serialize());
+    } catch (e) {
+      if (i === maxRetries - 1) throw e;
+    }
+  }
+}
+```
+
+Siehe [`integration-guides/priority-fee-tuning`](/de/integration-guides/priority-fee-tuning) für das vollständige Muster Wiederholung-mit-eskalierenden-Gebühren.
+
+## Parallele Ausführung
+
+Solana führt nicht konfligierende Transaktionen parallel auf Multi-Core-Validatoren aus. Zwei Transaktionen sind in Konflikt, wenn beide dasselbe Konto schreiben.
+
+Auswirkungen auf Raydium:
+
+- Zwei Swaps auf dem gleichen Pool können nicht parallel ausgeführt werden — beide schreiben in den Pool-Status.
+- Ein Swap auf Pool A und ein Swap auf Pool B führen parallel aus, wenn sich Kontolisten nicht überlappen.
+- Eine schreibgeschützte Transaktion blockiert nie einen Writer auf dem gleichen Konto (schreibgeschützt ist konzurrent mit sich selbst, aber nicht mit Writes).
+
+Deshalb kann Solana hohen DEX-Durchsatz aufrechterhalten, trotz Single-Pool-Serialisierung.
+
+## Transaktionsbestätigungsstufen
+
+Beim Einreichen einer Transaktion wählen Sie eine Bestätigungsstufe:
+
+| Stufe | Wartezeit | Finalität |
+|-------|-----------|-----------|
+| `processed` | ~400 ms | Nicht finalisiert; kann zurückgerollt werden |
+| `confirmed` | ~1 s | Supermajorität hat abgestimmt |
+| `finalized` | ~13 s | Supermajorität ist verwurzelt |
+
+Für Swap-UX ist `confirmed` Standard. Bei Operationen mit großem Wert (Pool-Erstellung, Reward-Top-ups) ist `finalized` sicherer.
+
+```ts
+await connection.sendAndConfirmTransaction(tx, [owner], {
+  commitment: "confirmed",
+});
+```
+
+## Simulation
+
+Solana unterstützt das Simulieren einer Transaktion vor der Einreichung:
+
+```ts
+const sim = await connection.simulateTransaction(tx);
+console.log(sim.value.logs);
+console.log(sim.value.unitsConsumed);
+```
+
+Das Raydium SDK nutzt Simulation intern bei der Berechnung von `getBestSwapInfo`, um zu überprüfen, dass die gewählte Route tatsächlich erfolgreich ist. Simulation ist nicht kostenlos — sie verbraucht RPC-Kapazität — aber sie fängt Fehler ab, bevor Sie dafür bezahlen.
+
+## Verweise
+
+- [`solana-fundamentals/account-model`](/de/solana-fundamentals/account-model) — Konten in Transaktionen.
+- [`solana-fundamentals/pdas-and-cpis`](/de/solana-fundamentals/pdas-and-cpis) — wie Programme sich gegenseitig aufrufen.
+- [`integration-guides/priority-fee-tuning`](/de/integration-guides/priority-fee-tuning) — Anpassung von CU-Limits und Prioritätsgebühren.
+- [`ray/protocol-fees`](/de/ray/protocol-fees) — Raydium-Protokollgebührenstruktur.
+
+Quellen:
+
+- [Solana Transaction docs](https://docs.solana.com/developing/programming-model/transactions).
+- [Address Lookup Tables proposal](https://docs.solana.com/developing/lookup-tables).
+- [Compute budget documentation](https://docs.solana.com/developing/programming-model/runtime).

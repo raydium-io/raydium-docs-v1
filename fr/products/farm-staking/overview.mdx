@@ -1,0 +1,109 @@
+---
+title: "Aperçu des farms / staking"
+description: "Comment le programme de farm de Raydium distribue des tokens de récompense aux stakers — la comptabilité par part, les générations de farm (v3, v5, v6), et comment les farms se rapportent aux pools AMM / CLMM mais en restent distinctes."
+---
+
+<Info>
+  **Cette page est traduite automatiquement par IA. La version anglaise fait foi.**
+
+  [Voir la version anglaise →](/products/farm-staking/overview)
+</Info>
+
+## Qu'est-ce qu'une farm
+
+Une **farm** est un programme on-chain autonome qui distribue un ou plusieurs **reward mints** aux comptes qui stakent un **staking mint**. Le staking mint est presque toujours un token LP émis par CPMM, AMM v4, ou un pool de paire hérité, mais les farms sur un seul actif (staker SOL, RAY, ou un token de projet directement) sont prises en charge et utilisées pour un petit nombre de programmes de longue durée.
+
+Propriétés clés :
+
+- **Basé sur l'émission, non sur les frais.** Contrairement aux flux de récompenses intégrés de CLMM, les récompenses de farm ne sont pas liées au volume d'échange ou à l'activité du pool. Le budget d'une farm est déposé à l'avance par le créateur et s'émet à un taux constant par seconde jusqu'à épuisement.
+- **Indépendante du pool.** Le pool ne sait pas que la farm existe. Déplacer des LP entre les portefeuilles ne notifie pas la farm ; un utilisateur doit d'abord effectuer un `Withdraw` de la farm. De même, un `Withdraw` du pool ne retire pas de la farm.
+- **Ledger par utilisateur et par récompense.** Chaque staker a un compte `UserStake` (ou « Ledger ») par farm qui suit son montant staké et son snapshot du compteur de récompense par part pour chacun des flux de récompenses de la farm.
+- **Multi-récompense.** Farm v5 supporte jusqu'à 2 récompenses ; v6 supporte jusqu'à 5. Chaque récompense a son propre vault, taux par seconde, heure de début et heure de fin.
+
+## Les trois versions actives
+
+Raydium a déployé trois versions du programme de farm. Toutes sont actives, et chacune porte son propre schéma PDA et ensemble d'instructions. Les intégrateurs doivent les traiter comme trois programmes distincts qui partagent un modèle conceptuel.
+
+| Version | Localisation du Program ID | Récompenses max | Différences notables |
+|---------|---------------------|-------------|----------------------|
+| **v3** | voir [`reference/program-addresses`](/fr/reference/program-addresses) | 1 | Schéma le plus ancien. Les plus anciennes farms (RAY-USDC, SOL-USDC) passent encore par ici. |
+| **v5** | voir [`reference/program-addresses`](/fr/reference/program-addresses) | 2 | Ajout d'une deuxième slot de récompense et `AddReward` pour les rehaussements. |
+| **v6** | voir [`reference/program-addresses`](/fr/reference/program-addresses) | 5 | Version actuelle. Slots élargis, admin plus propre, supporte le farming de positions CLMM via un adaptateur v6 spécifique (rare en pratique). |
+
+Le SDK expose `raydium.farm` comme une seule façade — la version est déduite du propriétaire du compte farm. Lors de la construction d'intégrations on-chain, vous devez dispatcher manuellement.
+
+## Comptabilité de récompense par part
+
+Le programme de farm utilise le pattern « master-chef » standard vu dans les contrats de rendement DeFi :
+
+```
+reward_per_share := total_rewards_distributed_by_stream / total_staked
+pending(user)    := user.staked × (reward_per_share − user.reward_debt)
+```
+
+- **`reward_per_share`** est stocké sur le compte farm comme un compteur en virgule fixe (Q64.64 en v5+, Q56.8 en v3). Il ne fait que croître.
+- **`user.reward_debt`** est le snapshot de `reward_per_share` à la dernière interaction de l'utilisateur. Ce n'est pas une dette que l'utilisateur doit ; c'est un offset utilisé pour calculer les accruals futurs.
+- Sur `Deposit` et `Withdraw`, la farm règle d'abord les récompenses en attente (en créditant `user.pending_reward` ou en envoyant directement à l'ATA de l'utilisateur, selon la version), puis met à jour `user.reward_debt` vers le compteur actuel.
+- Sur `Harvest`, la farm verse `pending_reward` et fait un snapshot de `reward_debt` à nouveau.
+
+Le taux d'émission par seconde entre dans la comptabilité via une mise à jour paresseuse :
+
+```
+elapsed        := min(now, reward.end_time) − reward.last_update_time
+new_emissions  := reward.per_second × elapsed
+if total_staked > 0:
+    reward_per_share += new_emissions / total_staked
+reward.last_update_time := now
+```
+
+Paresseuse : aucune instruction n'est émise « chaque seconde ». Le compteur est rafraîchi chaque fois que quelqu'un touche la farm (`Deposit`, `Withdraw`, `Harvest`, mise à jour admin). Les farms sans activité accumulent un écart croissant qui est comblé à la prochaine interaction.
+
+## Staking mint vs reward mint
+
+**Le staking mint est tenu en séquestre, non brûlé.** Quand un utilisateur stake 100 LP, la farm déplace 100 LP de l'ATA de l'utilisateur dans le vault de staking de la farm. Sur `Withdraw`, la farm redéplace 100 LP. La farm n'appelle jamais le pool.
+
+**Les reward mints sont payés à partir de vaults préfinancés par le créateur.** Quand un créateur configure une farm, il dépose le budget de récompense complet (disons, 1 000 000 RAY + 500 000 USDC) dans les deux vaults de récompense. Le programme de farm ne crée pas de nouveaux tokens ; il distribue simplement ce qui est dans le vault sur la durée du flux. Si le vault est vidé avant `end_time`, les émissions s'arrêtent.
+
+## Calendriers d'émission
+
+Chaque flux de récompenses a trois paramètres de temps :
+
+- **`start_time`** — le timestamp UNIX auquel les émissions commencent. Avant cela, aucune accrual.
+- **`end_time`** — le timestamp auquel les émissions s'arrêtent. Après cela, `reward_per_share` ne croît plus à partir de ce flux.
+- **`per_second`** — le taux d'émission tandis que `start_time ≤ now < end_time`.
+
+Une récompense peut être prolongée (pousser `end_time` en avant, remplir le vault) via `AddReward` / `SetRewards` sur v5 / v6. Elle peut être relancée après `end_time` via `RestartRewards`. Elle ne peut pas être raccourcie sans coopération admin.
+
+## Ce que les farms ne sont pas
+
+- **Pas un distributeur de frais.** CPMM et CLMM collectent les frais de trading directement dans l'état du pool. Les farms ne touchent pas aux frais du pool. Le seul chemin des frais de pool à un détenteur de token est la rédemption de LP ou `CollectFee` de CLMM.
+- **Pas automatique.** Le LP doit être explicitement staké pour gagner des récompenses de farm. Les détenteurs de LP qui laissent leurs tokens dans leur portefeuille ne gagnent rien de la farm.
+- **Pas fongible.** Chaque compte `UserStake` est lié à une paire `(farm, user)`. Vous ne pouvez pas transférer votre stake à un autre portefeuille sans d'abord vous unstaker.
+- **Non compatible directement avec les positions CLMM.** Farm v6 a introduit un adaptateur CLMM, mais en pratique les pools CLMM utilisent leurs propres flux de récompenses intégrés (voir [`products/clmm/fees`](/fr/products/clmm/fees)) plutôt que les émissions de farm.
+
+## Quand les farms sont l'outil approprié
+
+Utilisez une farm quand vous voulez :
+
+- Inciter le LP pour l'un de vos pools CPMM ou AMM v4 de projet avec un token externe (votre token de projet, le token d'un partenaire, etc.).
+- Exécuter un programme de staking sur un mint d'un seul actif (le classique « stake RAY, gagne RAY ») sans déployer votre propre contrat.
+- Superposer des récompenses supplémentaires au-dessus d'un pool existant sans avoir besoin d'accès administrateur à ce pool.
+
+Utilisez plutôt les flux de récompenses intégrés de CLMM quand votre pool est CLMM. Ils ont une économie identique mais participent à la comptabilité de croissance des frais internes à la position (les positions in-range gagnent pro rata, les positions out-of-range non) et ne nécessitent pas que les utilisateurs déplacent leur position NFT.
+
+## Contenu du chapitre
+
+- [`accounts`](/fr/products/farm-staking/accounts) — disposition complète de l'état on-chain par version.
+- [`instructions`](/fr/products/farm-staking/instructions) — chaque instruction de farm avec sa liste de comptes et ses pré/postconditions.
+- [`code-demos`](/fr/products/farm-staking/code-demos) — exemples TypeScript pour staker, harvest, et créer une nouvelle farm.
+
+## Où aller ensuite
+
+- [`products/clmm/fees`](/fr/products/clmm/fees) — comparez les émissions de farm au modèle de récompense intégré de CLMM.
+- [`reference/program-addresses`](/fr/reference/program-addresses) — les trois IDs de programme de farm.
+- [`protocol-overview/versions-and-migration`](/fr/protocol-overview/versions-and-migration) — quand utiliser chaque version de farm.
+
+Sources :
+
+- Farm v6 IDL fourni dans le SDK : [`raydium-io/raydium-sdk-V2`](https://github.com/raydium-io/raydium-sdk-V2) sous `src/raydium/farm/`.
+- [Module `Farm` du Raydium SDK v2](https://github.com/raydium-io/raydium-sdk-V2)

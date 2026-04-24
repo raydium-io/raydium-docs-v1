@@ -1,0 +1,150 @@
+---
+title: "Vue d'ensemble de LaunchLab"
+description: "Comment fonctionne le mécanisme de lancement de jetons de Raydium : trading en courbe de liaison déterministe avant graduation, le seuil de financement qui déclenche la graduation, et la migration automatique vers un pool CPMM standard."
+---
+
+<Info>
+  **Cette page est traduite automatiquement par IA. La version anglaise fait foi.**
+
+  [Voir la version anglaise →](/products/launchlab/overview)
+</Info>
+
+## Le problème que LaunchLab résout
+
+Avant LaunchLab, lancer un nouveau jeton sur Raydium exigeait que le créateur amorce un pool AMM avec les deux côtés de la paire dès le départ — ce qui signifiait que l'équipe devait fournir la liquidité du côté de la quote (SOL ou USDC) de sa propre poche. Cela favorisait les projets bien financés et limitait l'accès au mécanisme de launchpad au capital initial disponible.
+
+LaunchLab remplace cette étape par une **courbe de liaison** : le jeton est déployé sur une courbe tarifée dans une mint de quote (généralement SOL ou USDC). Les acheteurs acquièrent le jeton en envoyant de la quote à la courbe, qui émet ou libère atomiquement des unités de jeton de base à un prix déterminé par la formule de la courbe et l'offre actuelle. Aucune liquidité pré-amorcée requise.
+
+Une fois que la courbe accumule assez de quote pour correspondre à la formule de liquidité d'un vrai pool AMM, elle **se diplôme** : le programme crée un pool CPMM sur le réseau principal amorcé avec les réserves de base et de quote de la courbe, et à partir de là, le trading bascule vers l'AMM.
+
+## Cycle de vie
+
+```
+             ┌───────────────────────┐
+creator  ──▶ │  Initialize (Launch)  │   ▸ émet le jeton de base, alimente les vaults de la courbe,
+             │                        │     configure les paramètres de la courbe et le seuil de graduation
+             └───────────┬────────────┘
+                         │
+                         ▼
+             ┌───────────────────────┐       répété N fois
+             │   Buy  /  Sell        │ ◀─── les traders interagissent avec la courbe
+             └───────────┬────────────┘
+                         │ courbe quote_reserve
+                         │ franchit le seuil
+                         ▼
+             ┌───────────────────────┐   ▸ capture l'état de la courbe
+             │      Graduate         │   ▸ déploie le pool CPMM amorcé avec les réserves de la courbe
+             │                        │   ▸ verrouille / brûle l'offre de base restante selon la politique
+             └───────────┬────────────┘
+                         │
+                         ▼
+             ┌───────────────────────┐
+             │   CPMM pool actif     │   ▸ comportement CPMM standard dorénavant
+             └───────────────────────┘
+```
+
+Chaque lancement passe par cette séquence exactement une fois. `Buy` et `Sell` sont les seules instructions appelables par l'utilisateur dans la phase intermédiaire ; `Graduate` est sans permission (n'importe qui peut l'appeler une fois le seuil franchi), mais en pratique le SDK l'appelle automatiquement dans la transaction qui franchit le seuil.
+
+## Deux parties fixes
+
+Un état LaunchLab possède deux comptes distingués :
+
+- **La mint de base** — le jeton en cours de lancement. Son autorité de mint est détenue par le programme LaunchLab jusqu'à la graduation ; après la graduation, elle est révoquée.
+- **La mint de quote** — la garantie. Toujours une mint courante (SOL / USDC / RAY). La configuration de lancement en choisit une à `Initialize` ; elle ne peut pas être modifiée.
+
+Plus deux vaults :
+
+- **`base_vault`** — détient la portion de l'offre de base qui a été pré-émise pour la courbe mais pas encore vendue. Diminue à mesure que les utilisateurs achètent.
+- **`quote_vault`** — accumule la quote payée par les acheteurs. Augmente à mesure que les utilisateurs achètent. C'est le solde qui est vérifié par rapport au seuil de graduation.
+
+## Modèle de tarification
+
+LaunchLab supporte plusieurs formules de courbe (voir [`bonding-curve`](/fr/products/launchlab/bonding-curve)). La plus courante est une **courbe de liaison quadratique** analogue à la lignée Pump.fun / Curve.fi / Bancor :
+
+```
+price(s) = k × (s / S_max)²     (ou similaire — la formule exacte dépend de la configuration de la courbe)
+```
+
+où `s` est la quantité de base déjà vendue aux utilisateurs et `S_max` est l'offre maximale de la courbe. Le prix augmente de façon monotone à chaque achat et baisse à chaque vente. Parce que le programme calcule le coût intégré AMM exactement, un achat de n'importe quelle taille retourne le montant intégré correct ; il n'y a pas de slippage par transaction au-delà de la convexité naturelle de la courbe.
+
+## Graduation
+
+Un lancement se diplôme quand `quote_vault.balance ≥ graduation_threshold`. Le seuil est défini à `Initialize` et est généralement choisi pour que lors de la graduation, le prix implicite de la courbe corresponde au prix auquel le pool AMM s'ouvrira avec les réserves accumulées. Concrètement :
+
+```
+threshold ≈ S_graduate × price(S_graduate) × f
+```
+
+où `S_graduate` est la quantité de base déjà vendue, `price(S_graduate)` est le prix marginal de la courbe à ce moment, et `f` est un petit facteur pour tenir compte de la ligne de frais (1–2 %).
+
+Lors de la graduation :
+
+1. Le programme capture `(base_vault_remaining, quote_vault)`.
+2. Il appelle CPMM `CreatePool` CPI avec ces deux réserves, en émettant le LP initial vers une autorité détenue par le programme (généralement brûlée / verrouillée selon la politique).
+3. Il révoque l'autorité de mint du jeton de base (pour qu'aucun jeton de base supplémentaire ne puisse jamais être émis).
+4. `LaunchState.status` bascule vers `Graduated`.
+
+Après la graduation, `Buy` et `Sell` sont rejetés. Le trading continue sur le pool CPMM résultant, qui est indiscernable de tout autre pool CPMM de Raydium.
+
+## Frais
+
+Pendant la phase de courbe, chaque `Buy` et `Sell` entraîne des frais répartis entre :
+
+- **Côté LP de la courbe** — augmente le `k` implicite de la courbe, ce qui bénéficie aux acheteurs ultérieurs (prix plus serré).
+- **Protocole** — s'accumule pour l'administrateur LaunchLab, collecté via `CollectFees`.
+- **Créateur** — optionnel, configurable à `Initialize`. Certains lancements dirigent une part vers le créateur comme flux de revenus continu.
+
+Les taux par défaut sont documentés sur [`bonding-curve`](/fr/products/launchlab/bonding-curve). La répartition exacte est stockée sur `LaunchState.fees` et peut différer selon le lancement.
+
+Les frais après graduation suivent la configuration CPMM avec laquelle le pool a été créé (généralement `AmmConfig[0]`, la gamme 0,25 %).
+
+## Qui détient le LP après graduation ?
+
+LaunchLab supporte plusieurs politiques de LP après graduation :
+
+- **Brûler** — le LP est émis vers une adresse morte. Le pool devient permanent ; personne ne peut retirer de liquidités.
+- **Verrouiller** — le LP est émis vers un escrow verrouillé dans le temps qui se libère pour le créateur après une période d'acquisition.
+- **Reçu immédiatement par le créateur** — utilisé uniquement pour les lancements avec permission.
+
+La politique est définie à `Initialize` et ne peut pas être modifiée. La plupart des lancements ouverts utilisent **brûler** — une fois le pool créé, sa liquidité y reste pour toujours.
+
+## Invariants importants
+
+- **La mint de base est sans inflation après graduation.** Son `mint_authority` est révoquée ; `freeze_authority` n'a jamais été définie.
+- **Token-2022 est supporté via `initialize_with_token_2022`.** Les instructions standard `Initialize` / `InitializeV2` créent des lancements SPL Token ; l'instruction dédiée `InitializeWithToken2022` crée un lancement dont la mint de base est Token-2022 (avec optionnel `TransferFeeConfig`). Les lancements Token-2022 doivent se diplômer en pool CPMM — ils ne peuvent pas se diplômer en AMM v4, qui est exclusif à SPL Token.
+- **L'état de la courbe est monotone dans une direction.** `base_sold` ne augmente que pendant Buy, `quote_vault` ne augmente que pendant Buy (diminue pendant Sell — ce qui réduit symétriquement `base_sold`). Le programme ne laisse jamais la courbe devenir négative.
+- **La graduation est une porte unidirectionnelle.** Même si le trading après graduation pousse le prix du pool AMM en dessous du prix de graduation, le lancement ne revient pas à la courbe.
+
+## Quand utiliser LaunchLab
+
+<Note>
+  Cette page décrit uniquement la mécanique du protocole. Rien ici ne constitue un conseil financier, juridique ou d'investissement. Les lancements de jetons comportent des risques financiers importants. Consultez les professionnels appropriés avant de lancer un jeton impliquant une levée de fonds publique.
+</Note>
+
+- Vous lancez un nouveau jeton sans marché préexistant.
+- Vous voulez que le marché détermine le prix CPMM d'ouverture plutôt que de le pré-déclarer.
+- Vous voulez permettre à quiconque — y compris l'équipe elle-même — d'acheter aux mêmes prix déterminés par la courbe, plutôt que de pré-allouer aux initiés à rabais.
+
+N'utilisez **pas** LaunchLab pour :
+
+- Les jetons existants avec des marchés établis (utilisez `CreatePool` sur CPMM directement).
+- Les lancements où vous avez besoin d'un contrôle précis du prix AMM d'ouverture (vous pouvez l'approximer avec une configuration de courbe soigneuse, mais le mécanisme est toujours basé sur la courbe).
+- Les jetons qui nécessitent des extensions Token-2022 que LaunchLab n'autorise pas (le programme de lancement rejette les extensions comme `TransferHook` et `PermanentDelegate` même sur le chemin Token-2022).
+
+## Contenu du chapitre
+
+- [`bonding-curve`](/fr/products/launchlab/bonding-curve) — la formule de courbe, les mathématiques de coût et de produit, la dérivation du seuil de graduation.
+- [`accounts`](/fr/products/launchlab/accounts) — `LaunchConfig`, `LaunchState`, vaults, PDAs d'autorité.
+- [`instructions`](/fr/products/launchlab/instructions) — `Initialize`, `Buy`, `Sell`, `Graduate`, `CollectFees`, `SetParams`.
+- [`code-demos`](/fr/products/launchlab/code-demos) — exemples TypeScript de bout en bout.
+
+## Où aller ensuite
+
+- [`products/cpmm/overview`](/fr/products/cpmm/overview) — ce qui se passe après qu'un lancement se diplôme.
+- [`user-flows/create-cpmm-pool`](/fr/user-flows/create-cpmm-pool) — chemin alternatif pour les jetons qui n'ont pas besoin de courbe.
+- [`reference/program-addresses`](/fr/reference/program-addresses) — identifiant du programme LaunchLab.
+
+Sources :
+
+- [Module `LaunchLab` du SDK Raydium v2](https://github.com/raydium-io/raydium-sdk-V2) (IDL sous `src/raydium/launchpad/`).
+- Le code source du programme LaunchLab n'est pas actuellement publié comme dépôt autonome. L'IDL fourni avec le SDK ci-dessus est l'interface canonique.

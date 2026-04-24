@@ -1,0 +1,212 @@
+---
+title: "AMM à produit constant"
+description: "L'invariant x·y=k, la tarification basée sur les réserves, la dérivation du slippage et les variantes de gestion des frais utilisées par le CPMM de Raydium et l'AMM v4. Ceci est la page de référence mathématique à laquelle renvoient tous les produits x·y=k de Raydium."
+---
+
+<Info>
+  **Cette page est traduite automatiquement par IA. La version anglaise fait foi.**
+
+  [Voir la version anglaise →](/algorithms/constant-product)
+</Info>
+
+## L'invariant
+
+Un teneur de marché à produit constant (CPMM) détient deux réserves `x` et `y` et maintient :
+
+```
+x · y ≥ k       (après chaque transaction)
+```
+
+où `k` est le produit des réserves avant la transaction. Pour un marché sans frais, `x · y = k` exactement. Avec des frais, `k` augmente strictement (la part des frais allouée aux LP est conservée dans les réserves).
+
+L'invariant est délibérément géométrique : il garantit que, peu importe à quel point une réserve devient faible, l'autre augmente sans limite pour la compenser — c'est-à-dire que le pool ne peut jamais être vidé d'un côté ou de l'autre.
+
+## Tarification
+
+### Prix au comptant
+
+Le prix marginal de `y` libellé en `x` à tout instant est la tangente de la courbe :
+
+```
+p = y / x
+```
+
+(dérivation : la différenciation implicite de `x · y = k` donne `dy/dx = −y/x` ; en ignorant le signe, `|dy/dx| = y/x`).
+
+C'est le prix que le pool propose pour une transaction infinitésimalement petite. Pour toute transaction finie, le prix réalisé est moins avantageux en raison du slippage le long de la courbe.
+
+### Swap à montant exact en entrée (donner `Δx`, recevoir `Δy`)
+
+Avec des frais, soit `f` le taux de frais (par ex. `f = 0.0025` pour 25 bps). Appliquez les frais à l'entrée, puis utilisez l'invariant pour résoudre la sortie :
+
+```
+Δx_after_fee = Δx · (1 − f)
+Δy           = y · Δx_after_fee / (x + Δx_after_fee)
+```
+
+Réserves après la transaction :
+
+```
+x' = x + Δx
+y' = y − Δy
+```
+
+Le `Δx` complet entre dans les réserves. La portion des frais allouée aux LP reste dans `x'` ; la portion destinée au protocole est exclue de la courbe via une étape de comptabilité distincte (voir [Variantes de comptabilité des frais](#variantes-de-comptabilité-des-frais) ci-dessous).
+
+### Swap à montant exact en sortie (recevoir `Δy`, payer le minimum `Δx`)
+
+```
+Δx_after_fee = x · Δy / (y − Δy)
+Δx           = Δx_after_fee / (1 − f)
+```
+
+`Δx` est arrondi vers le haut pour garantir que le pool ne fait pas de sous-facturation.
+
+## Slippage et impact de prix
+
+**L'impact de prix** mesure le changement du prix au comptant du pool suite à la transaction :
+
+```
+p_before = y / x
+p_after  = y' / x' = (y − Δy) / (x + Δx)
+impact   = (p_before − p_after) / p_before
+```
+
+Pour petit `Δx / x`, une expansion au premier ordre donne :
+
+```
+impact ≈ 2 · Δx / x      (en ignorant les frais)
+```
+
+Intuition : une transaction de 1% cause ~2% d'impact de prix. Ce facteur 2 est la raison pour laquelle les pools CPMM cotés pour des transactions de taille moyenne semblent « peu liquides » comparés aux marchés de carnets d'ordres — vous n'achetez pas seulement contre la meilleure enchère actuelle, vous remontez votre propre prix marginal.
+
+**Prix effectif** payé par le trader :
+
+```
+effective = Δx / Δy
+```
+
+L'écart entre `p_before` et `effective` est le **slippage**. Le slippage dans l'interface utilisateur on-chain est généralement exprimé comme `(effective − p_before) / p_before` ; la méthode `computeAmountOut` du SDK retourne à la fois `amountOut` et `priceImpact` pour cette raison.
+
+## Vérification de l'invariant dans le code
+
+Après un swap, les protocoles re-vérifient :
+
+```
+k' = x' · y'  ≥  k  =  x · y
+```
+
+Toute violation est un bug du programme ou un débordement arithmétique. Les instructions de swap de Raydium rendent cette vérification explicite comme post-condition :
+
+```rust
+let k_before = coin_reserve_before as u128 * pc_reserve_before as u128;
+let k_after  = coin_reserve_after  as u128 * pc_reserve_after  as u128;
+require!(k_after >= k_before, ErrorCode::InvariantViolation);
+```
+
+## Variantes de comptabilité des frais
+
+La vérification de l'invariant suppose que les frais des LP restent dans les réserves. Différents produits Raydium gèrent différemment les composantes protocole / fonds / créateur :
+
+### Convention CPMM
+
+Les frais sont des taux similaires aux points de base `u64` sur un dénominateur `1_000_000`. Les frais de transaction sont divisés en `trade_fee_rate` (total) puis subdivisés via `protocol_fee_rate`, `fund_fee_rate`, `creator_fee_rate`. À chaque swap :
+
+```
+trade_fee     = ceil(Δx · trade_fee_rate / 1_000_000)
+protocol_fee  = trade_fee · protocol_fee_rate / 1_000_000
+fund_fee      = trade_fee · fund_fee_rate     / 1_000_000
+creator_fee   = trade_fee · creator_fee_rate  / 1_000_000
+lp_fee        = trade_fee − protocol_fee − fund_fee − creator_fee
+```
+
+Les trois parts non-LP s'accumulent dans des compteurs distincts (`protocol_fees_*`, `fund_fees_*`, `creator_fees_*`) qui sont **exclus** des réserves utilisées dans l'invariant. C'est ainsi que les frais peuvent être prélevés sans modifier la courbe. Voir [`products/cpmm/fees`](/fr/products/cpmm/fees).
+
+### Convention AMM v4
+
+Les frais sont des ratios `numerator / denominator` sur un dénominateur `10_000`. La répartition est fixée à la création du pool et stockée sur `AmmInfo.fees` :
+
+```
+swap_fee  = ceil(Δx · swap_fee_numerator / swap_fee_denominator)    // par ex. 0.25%
+pnl_share = swap_fee · pnl_numerator / swap_fee_numerator            // par ex. 0.03 / 0.25 = 12%
+lp_share  = swap_fee − pnl_share                                     // 0.22% du volume
+```
+
+`pnl_share` s'accumule dans `state_data.need_take_pnl_*` et est exclue des réserves ; `lp_share` reste dans le coffre. Voir [`products/amm-v4/fees`](/fr/products/amm-v4/fees).
+
+Les deux conventions préservent l'invariant de la même manière — la différence est cosmétique (dénominateur + nombre de sous-catégories).
+
+## Règles d'arrondi
+
+- **Le calcul des frais arrondit vers le haut.** Garantit que le pool ne fait jamais de sous-facturation sur les frais.
+- **Le montant de sortie arrondit vers le bas.** Garantit que l'invariant est strictement respecté (`k' > k` même avant que les frais soient ajoutés).
+- **Le montant d'entrée pour une sortie exacte arrondit vers le haut.** Garantit que l'utilisateur ne sous-paie pas.
+
+Tous les calculs utilisent `u128` pour les produits intermédiaires `x · Δx` pour éviter les débordements sur les grandes réserves. Les résultats finaux sont recastés vers `u64` avec une vérification de saturation.
+
+## Cas limites
+
+### Pool vide
+
+Avant le premier `Deposit`, `x = y = 0`. Les instructions de swap rejettent le pré-dépôt.
+
+### Sortie zéro
+
+Si `Δx` est suffisamment petit pour que le `Δy` arrondi vers le bas soit 0, l'instruction revient avec `ZeroTradingTokens`. Cela empêche l'extraction de valeur sans paiement ; cela signifie également que les petites transactions sur des pools très déséquilibrés échouent.
+
+### Poussière LP
+
+Le premier `Deposit` a un traitement spécial : il calcule l'approvisionnement initial en LP comme `sqrt(x · y)` et brûle une petite quantité « init burn » (généralement 100 unités LP) pour prévenir l'« attaque par inflation du premier déposant » (où un attaquant donne au coffre et gonfle la valeur du jeton LP). Les dépôts ultérieurs utilisent une mathématique pro-rata.
+
+## Relation avec l'arbitrage
+
+Le prix d'un pool CPMM ne change que via :
+
+1. Les transactions via le pool lui-même (les utilisateurs qui parcourent la courbe).
+2. Les donations (envoyer des jetons au coffre sans effectuer un swap).
+
+Étant donné que les transactions modifient le prix de manière déterministe avec la courbe, tout pool dont le prix diverge du prix du marché plus large crée une opportunité d'arbitrage. Les arbitrageurs ramènent le prix du pool vers le prix du marché en attente. C'est pourquoi les pools CPMM sont censés « coter un prix sans oracle » : le marché trouve le prix via l'arbitrage plutôt que le pool ne le lise en externe.
+
+L'autre aspect : le pool lui-même est la contrepartie de l'arbitrageur, donc tout profit d'arbitrage est une perte impermanente des LP (moins les frais capturés par les LP).
+
+## Exemples détaillés
+
+### Exemple 1 — petite transaction, slippage négligeable
+
+Pool : `x = 1_000_000, y = 2_000_000, k = 2·10^12`. Frais `f = 0.0025`.
+
+Transaction `Δx = 1_000` :
+
+```
+Δx_after_fee = 1000 · 0.9975  = 997.5
+Δy           = 2_000_000 · 997.5 / (1_000_000 + 997.5)
+             = 1_995_000_000 / 1_000_997.5
+             ≈ 1_993.01
+```
+
+Prix effectif : `1000 / 1993.01 ≈ 0.5018`. Prix au comptant avant : `0.5`. Impact : ~0.36%.
+
+### Exemple 2 — transaction de taille moyenne, slippage visible
+
+Même pool, `Δx = 100_000` (10% de `x`) :
+
+```
+Δx_after_fee = 100_000 · 0.9975 = 99_750
+Δy           = 2_000_000 · 99_750 / (1_000_000 + 99_750)
+             = 199_500_000_000 / 1_099_750
+             ≈ 181_405
+```
+
+Effectif : `100_000 / 181_405 ≈ 0.5513`. Impact : ~10.3% — environ la moitié de la règle empirique `2 · 10% = 20%` (la règle est un plafond dans le pire des cas pour une courbe à produit constant sans frais ; les frais de transaction plus l'inversion dans la formule la ramènent vers le bas).
+
+## Références
+
+- [`products/cpmm/math`](/fr/products/cpmm/math) — les choix spécifiques d'arrondi et de dénominateur des frais du CPMM.
+- [`products/amm-v4/math`](/fr/products/amm-v4/math) — comment les réserves intégrées à OpenBook de l'AMM v4 étendent ce modèle.
+- [`algorithms/slippage-and-price-impact`](/fr/algorithms/slippage-and-price-impact) — page dédiée au dimensionnement de la tolérance de slippage pour les interfaces utilisateur.
+
+Sources :
+
+- Livre blanc Uniswap v2 — l'énoncé canonique de `x · y = k`.
+- Code source du programme CPMM de Raydium.
+- Code source du programme AMM v4 de Raydium.

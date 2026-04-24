@@ -1,0 +1,369 @@
+---
+title: "رياضيات CLMM"
+description: "تمثيل الجذر التربيعي للسعر، والسيولة ↔ مبالغ الرموز، خطوة المبادلة أحادية التك، التكرار متعدد التك، ومحاسبة نمو الرسوم."
+---
+
+<Info>
+  **هذه الصفحة مُترجَمة آليًا بواسطة الذكاء الاصطناعي. النسخة الإنجليزية هي المرجع المعتمد.**
+
+  [عرض النسخة الإنجليزية →](/products/clmm/math)
+</Info>
+
+## تمثيل الجذر التربيعي للسعر
+
+يخزّن CLMM السعر بصيغة `sqrt_price_x64` — الجذر التربيعي لسعر token1 لكل token0، كرقم ثابت القيمة Q64.64:
+
+$$
+\text{sqrt\_price\_x64} = \lfloor \sqrt{p} \cdot 2^{64} \rfloor
+$$
+
+حيث `p = token1_amount / token0_amount`. العمل بالجذر التربيعي بدلاً من `p` يخطّي رياضيات المبادلة (تصبح الفروقات في مبالغ الرموز خطية بالنسبة إلى `Δsqrt_price`)، والرقم الثابت `x64` يحافظ على الدقة عبر المبادلات متعددة التك.
+
+يتم الحساب المسبق لتحويل التك ↔ الجذر التربيعي للسعر عبر تقريب لوغاريتمي `bit-by-bit`:
+
+$$
+\text{sqrt\_price\_x64}(t) \approx 2^{64} \cdot (1.0001)^{t/2}
+$$
+
+مُنفّذ كدالة أسية قائمة على البحث في `tick_math::get_sqrt_price_at_tick`.
+
+## السيولة كوحدة أساسية
+
+داخل نطاق `[sqrt_a, sqrt_b]` (حيث `sqrt_a < sqrt_b`)، موضع بـ **سيولة `L`** يتعيّن على مبالغ الرموز كما يلي. دع `sqrt_c = sqrt_price_x64` يكون السعر الحالي للمجموعة.
+
+| الحالة | `amount0` | `amount1` |
+|------|-----------|-----------|
+| `sqrt_c <= sqrt_a` (سعر المجموعة أقل من النطاق) | `L · (sqrt_b - sqrt_a) / (sqrt_a · sqrt_b)` | `0` |
+| `sqrt_a < sqrt_c < sqrt_b` (داخل النطاق) | `L · (sqrt_b - sqrt_c) / (sqrt_c · sqrt_b)` | `L · (sqrt_c - sqrt_a)` |
+| `sqrt_c >= sqrt_b` (سعر المجموعة فوق النطاق) | `0` | `L · (sqrt_b - sqrt_a)` |
+
+تأتي جميع الهويات الثلاث من الثابت `x = L / sqrt_p` و `y = L · sqrt_p` الذي تحققه السيولة المركزة داخل نطاق.
+
+عادةً يريد المدمجون العكس: بمعرفة إيداع `amount0` / `amount1`، احسب أقصى `L` يناسب النطاق. تقوم دالة SDK `LiquidityMath.getLiquidityFromTokenAmounts` بهذا. الصيغة للحالة داخل النطاق:
+
+$$
+L_0 = \text{amount0} \cdot \frac{\text{sqrt\_c} \cdot \text{sqrt\_b}}{\text{sqrt\_b} - \text{sqrt\_c}},
+\qquad
+L_1 = \frac{\text{amount1}}{\text{sqrt\_c} - \text{sqrt\_a}},
+\qquad
+L = \min(L_0, L_1)
+$$
+
+أيهما يقيد الجانب يحدد النسبة المستهلكة فعلاً؛ قد يكون للجانب الآخر بقايا.
+
+## خطوة المبادلة أحادية التك
+
+تتقدم المبادلة في **خطوات**. تستهلك كل خطوة إما (أ) كل المدخلات المتاحة داخل نطاق التك الحالي دون عبور تك، أو (ب) تحرك السعر بالضبط إلى التك المهيأ التالي.
+
+بمعرفة الحالة الحالية `(sqrt_c, L)` ومبادلة **صعوداً** (token0 داخل، token1 خارج، `sqrt_price` يزداد)، المسافة إلى التك المهيأ التالي هي `sqrt_t`. داخل هذا الفترة الجزئية، العلاقة بين المدخل والسعر هي:
+
+$$
+\Delta\text{amount0} = L \cdot \left( \frac{1}{\text{sqrt\_c}} - \frac{1}{\text{sqrt\_t}} \right)
+= \frac{L \cdot (\text{sqrt\_t} - \text{sqrt\_c})}{\text{sqrt\_c} \cdot \text{sqrt\_t}}
+$$
+
+و
+
+$$
+\Delta\text{amount1} = L \cdot (\text{sqrt\_t} - \text{sqrt\_c})
+$$
+
+يقوم البرنامج بأحد أمرين:
+
+- **هل يناسب المدخل بأكمله؟** إذا كان المدخل المتبقي (بعد الرسم) أقل من `Δamount0` للوصول إلى `sqrt_t`، حل من أجل `sqrt_c'` بدقة:
+
+  $$
+  \text{sqrt\_c}' = \frac{L \cdot \text{sqrt\_c}}{L + \Delta\text{input} \cdot \text{sqrt\_c}}
+  $$
+
+  (لمبادلة دقيقة-المدخل `token0 → token1`). تكتمل المبادلة في هذه الخطوة دون عبور تك.
+
+- **المدخل يتجاوز `Δamount0`؟** عيّن `sqrt_c' = sqrt_t`، عبر التك (طبّق `liquidity_net`)، قلل المدخل المتبقي بـ `Δamount0`، زد المخرج بـ `Δamount1`، وكرّر.
+
+للاتجاه المعاكس (`token1 → token0`، السعر ينخفض)، تحتوي الصيغ على `sqrt_c` و `sqrt_t` مبدّلان والعكس في الفتحة الأخرى.
+
+تعيش تطبيق Rust الكامل في `raydium-clmm/programs/amm/src/libraries/swap_math.rs`. تطابق المنطق هناك لـ Uniswap v3 `SwapMath.computeSwapStep` بالضبط.
+
+## الرسوم على كل خطوة
+
+تؤخذ رسوم التجارة من مبلغ **المدخل** في كل خطوة، نفس الاصطلاح CPMM:
+
+```
+step_fee_amount  = ceil(step_input * trade_fee_rate / 1_000_000)
+step_net_input   = step_input - step_fee_amount
+protocol_portion = floor(step_fee_amount * protocol_fee_rate / 1_000_000)
+fund_portion     = floor(step_fee_amount * fund_fee_rate     / 1_000_000)
+lp_portion       = step_fee_amount - protocol_portion - fund_portion
+```
+
+يتم تقسيم حصة LP عبر السيولة المهيأة حالياً بتحديث مجموع نمو الرسوم العام:
+
+$$
+\text{fee\_growth\_global}_{\text{in}} \mathrel{+}= \text{lp\_portion} \cdot \frac{2^{64}}{L}
+$$
+
+— أي أنه يُقاس بـ *رسوم لكل وحدة سيولة*، Q64.64، بحيث يقرأ موضع بحجم `L_i` الذي بقي داخل النطاق عبر هذه المبادلة لاحقاً `L_i · Δfee_growth_global / 2^{64}` رموز مستحقة.
+
+تتراكم حصص البروتوكول والصندوق على `PoolState.protocol_fees_token_{0,1}` و `PoolState.fund_fees_token_{0,1}` على التوالي، مطابقة تماماً لـ CPMM. يتم جرفها بواسطة `CollectProtocolFee` / `CollectFundFee`.
+
+## نمو الرسوم خارج وداخل
+
+الجزء الصعب من محاسبة رسوم CLMM: يجني موضع رسوماً فقط بينما يكون سعر المجموعة **داخل** نطاقه. تتتبع المجموعة الرسوم التراكمية عام؛ يحتاج الموضع إلى معرفة الرسوم التراكمية *أثناء داخل نطاقه المحدد*.
+
+الحل هو مراكم **قائم على التك**. يخزّن كل تك:
+
+```
+fee_growth_outside_0_x64
+fee_growth_outside_1_x64
+```
+
+عند لحظة تهيئة التك:
+
+- إذا كان سعر المجموعة **فوق** هذا التك (`tick_current >= this_tick`)، `fee_growth_outside = fee_growth_global`. (كل ما تم كسبه حتى الآن هو "خارج" — أي أدناه — هذا التك، نسبةً للسعر الحالي.)
+- وإلا `fee_growth_outside = 0`.
+
+عندما يعبر السعر تك، يقلب البرنامج `fee_growth_outside` لهذا التك:
+
+$$
+\text{fee\_growth\_outside} \gets \text{fee\_growth\_global} - \text{fee\_growth\_outside}
+$$
+
+الثابت الذي يحافظ عليه هذا: لأي تك `t`، `fee_growth_outside(t)` يساوي الرسوم التي تراكمت بينما كان `tick_current` على الجانب المقابل من `t`.
+
+**نمو الرسوم داخل نطاق `[tick_lower, tick_upper]`** يُشتق بعد ذلك:
+
+```
+if tick_current >= tick_upper:
+    fee_growth_below = fee_growth_outside(tick_lower)
+    fee_growth_above = fee_growth_global - fee_growth_outside(tick_upper)
+elif tick_current >= tick_lower:
+    fee_growth_below = fee_growth_outside(tick_lower)
+    fee_growth_above = fee_growth_outside(tick_upper)
+else:
+    fee_growth_below = fee_growth_global - fee_growth_outside(tick_lower)
+    fee_growth_above = fee_growth_outside(tick_upper)
+
+fee_growth_inside = fee_growth_global - fee_growth_below - fee_growth_above
+```
+
+هذه صيغة نمو الرسوم Uniswap-v3، بلا تغيير.
+
+## ما يخزنه موضع وما يقرأه
+
+يخزّن `PersonalPositionState` قيم `fee_growth_inside_0_last_x64` و `fee_growth_inside_1_last_x64`: قيم `fee_growth_inside` في آخر مرة تم فيها لمس الموضع.
+
+عند أي لمس لاحق (زيادة، تقليل، جمع)، البرنامج:
+
+1. يحسب `fee_growth_inside_{0,1}_x64` الحالي باستخدام الصيغة أعلاه.
+2. يحسب `Δ = fee_growth_inside_now − fee_growth_inside_last` (طرح معياري على u128).
+3. يضيف `Δ × position.liquidity / 2^{64}` إلى `tokens_fees_owed_{0,1}`.
+4. يحدّث `fee_growth_inside_last` للقيمة الجديدة.
+
+تنتقل الرموز فعلياً خارج الخزائن فقط عند `CollectFees` / `DecreaseLiquidity`، ضد `tokens_fees_owed`.
+
+## المكافآت
+
+تستخدم كل من تدفقات المكافآت الثلاثة للمجموعة نفس آلية نمو-داخل، في مجموعها الخاص `reward_growth_global_x64`. وقت الانبعاث:
+
+$$
+\text{reward\_growth\_global} \mathrel{+}= \text{emission\_per\_second} \cdot \Delta t \cdot \frac{2^{64}}{L}
+$$
+
+— الانبعاثات تتناسب عكسياً مع السيولة النشطة، لذا مجموعة أكثر كثافة تدفع لكل موضع أقل نسبياً في الثانية، لكن على مواضع أكثر إجمالاً. المكافأة المستحقة لكل موضع هي
+
+$$
+\text{reward\_owed} = (\text{reward\_growth\_inside}_{\text{now}} - \text{reward\_growth\_inside}_{\text{last}}) \cdot L / 2^{64}
+$$
+
+ويتم المطالبة بها عبر `CollectReward`. انظر [`/ar/products/clmm/fees`](/ar/products/clmm/fees).
+
+## مثال عملي: مبادلة دقيقة-المدخل
+
+افترض:
+
+- `tick_spacing = 60`
+- `sqrt_price_x64 = 1 × 2^{64}` — السعر = 1.0، إذاً `tick_current = 0`.
+- السيولة النشطة `L = 1_000_000 × 2^{64}`.
+- التك المهيأ التالي أعلاه: `t = 60` (sqrt_price_b ≈ `1.003004 × 2^{64}`).
+- معدل رسم التجارة: 500 (0.05%).
+
+المستخدم: `SwapBaseInput` دقيق-المدخل 1,000 token0.
+
+الخطوة 1 — الرسوم:
+
+```
+trade_fee       = ceil(1000 * 500 / 1_000_000)  = 1
+step_net_input  = 999
+```
+
+الخطوة 2 — هل 999 يناسب داخل نطاق التك الحالي؟
+
+```
+Δ للتك التالي (amount0):
+  L · (sqrt_t - sqrt_c) / (sqrt_c * sqrt_t)
+  ≈ 1_000_000 · (1.003004 − 1) / (1 · 1.003004)
+  ≈ 2995.5 token0
+```
+
+`999 < 2995.5`، إذاً المدخل بأكمله يناسب دون عبور التك.
+
+الخطوة 3 — السعر الجديد:
+
+```
+sqrt_c' = L · sqrt_c / (L + Δin · sqrt_c)
+        = 1_000_000 · 1 / (1_000_000 + 999 · 1)
+        ≈ 0.999001
+```
+
+أي `sqrt_c'` أقل قليلاً من `sqrt_c`. لاحظ أن الصيغة أعلاه هي لمبادلة `token1 → token0`. المثال هنا هو `token0 → token1`، الذي يدفع السعر **صعوداً**، ليس هبوطاً — لذا نستخدم الصيغة المقابلة لـ `token0 in`:
+
+```
+sqrt_c' = sqrt_c + Δin / L
+        = 1 + 999 / 1_000_000
+        = 1.000999
+```
+
+(هذا يطابق اتجاه المبادلة المتوقع لـ `token0 → token1`: `sqrt_c` يرتفع مع السعر.)
+
+الخطوة 4 — المخرج:
+
+```
+Δout token1 = L · (sqrt_c' − sqrt_c)
+            = 1_000_000 · 0.000999
+            = 999.00
+```
+
+بعد المحاسبة للتقريب، يستقبل المستخدم ≈ 999 token1. يتم تقسيم الرسم (1 token0) بين LP والبروتوكول والصندوق بـ `trade_fee_rate × protocol_fee_rate / 1e6` (ومماثل للصندوق)؛ تتدفق حصة LP إلى `fee_growth_global_0_x64`.
+
+## مطابقة أوامر الحد أثناء المبادلة
+
+عندما تعبر خطوة المبادلة تك يحمل أوامر حد مفتوحة، تستهلك تلك الأوامر مدخل المبادلة **قبل** منحنى LP، بسعر التك بالضبط. المطابقة FIFO داخل التك بـ `order_phase` cohort.
+
+### الحالة لكل cohort على `TickState`
+
+```
+order_phase                  : u64    معرّف cohort رتيب
+orders_amount                : u64    إجمالي الرمز المدخل في الـ cohort الحالي (الأحدث)
+part_filled_orders_remaining : u64    المدخل المتبقي من الـ cohort الذي تملأه المبادلة حالياً
+unfilled_ratio_x64           : u128   نسبة الملء Q64.64 للـ cohort المملوء جزئياً
+```
+
+يوجد تخطيط ثنائي cohort لأن أوامر جديدة قد تُفتح على تك *بينما* cohort أقدم لا يزال يُملأ. الأوامر المفتوحة حديثاً تنضم إلى `orders_amount` وترث `order_phase` التالي؛ لا يمكنها الملء حتى يتم استهلاك الـ cohort السابق بالكامل.
+
+### خطوة المطابقة
+
+شبه-كود للمطابقة التي تحدث عند كل عبور تك أثناء المبادلة:
+
+```
+fn match_limit_orders_at_tick(tick, swap_input_remaining, sqrt_p):
+    # 1. حاول ملء الـ cohort المملوء جزئياً أولاً.
+    if tick.part_filled_orders_remaining > 0:
+        consume = min(tick.part_filled_orders_remaining, swap_input_remaining)
+        # حدّث نسبة الملء لهذا الـ cohort.
+        tick.unfilled_ratio_x64 *= (1 - consume / tick.part_filled_orders_remaining)
+        tick.part_filled_orders_remaining -= consume
+        swap_input_remaining -= consume
+        if tick.part_filled_orders_remaining == 0:
+            tick.unfilled_ratio_x64 = 0
+        if swap_input_remaining == 0: return
+
+    # 2. ارفع الـ cohort النشط.
+    if tick.orders_amount > 0:
+        tick.part_filled_orders_remaining = tick.orders_amount
+        tick.orders_amount = 0
+        tick.order_phase += 1
+        tick.unfilled_ratio_x64 = ONE_X64
+        # تكرار مع الـ cohort المرفوع للتو.
+        return match_limit_orders_at_tick(tick, swap_input_remaining, sqrt_p)
+
+    return  # التك ليس لديه المزيد من أوامر الحد
+```
+
+رموز المخرج الذاهبة لأصحاب أوامر الحد **لم** تُنقل لكل مبادلة. تجلس بشكل افتراضي في خزانة مخرج المجموعة حتى يستدعي صاحب الأمر `SettleLimitOrder` (أو `DecreaseLimitOrder`). تتتبع المجموعة ببساطة كم من الـ cohort مملوء الآن عبر `unfilled_ratio_x64`. يخزّن كل `LimitOrderState` صورته الخاصة `(order_phase, unfilled_ratio_x64)` عند وقت الفتح، إذاً يختزل التسوية إلى:
+
+```
+filled_amount  = total_amount × (1 − tick_now.unfilled_ratio_x64 / order.unfilled_ratio_x64)
+                if tick_now.order_phase > order.order_phase
+                else 0
+output_amount  = price_at(tick_index) × filled_amount   # معدل للاتجاه
+```
+
+هذه التسوية O(1) هي كل النقطة من تصميم الـ cohort — يمكن لـ tick ملء أوامر غير مقيدة دون كل أمر غاز.
+
+### التفاعل مع منحنى LP
+
+في خطوة مبادلة، تحدث مطابقة أوامر الحد **عند** التك (صفر `Δsqrt_price`)؛ استهلاك منحنى LP يحدث **بين** التكات. الترتيب إذاً:
+
+1. عبر التك `t_cross` (طبّق تغيير LP `liquidity_net` أولاً، لأن هذا كيف يفعل Uniswap-V3).
+2. املأ أي أوامر حد جالسة عند `t_cross`.
+3. تابع على منحنى LP للتك المهيأ التالي أو استنزاف `swap_input`.
+
+أوامر الحد بالتالي تعطي التجار *سيولة فعالة أكثر* بسعر التك بالضبط (تأثير تحسين السعر)، بتكلفة LPs لا يكسب رسوماً على تلك الحصة من حجم المبادلة — حصة أمر الحد من التجارة خالية من الرسوم لراكب المبادلة، منذ أن يتصرف واضع أمر الحد كصانع. الرسم الديناميكي-الرسم الإضافي (إذا كان مُفعّلاً) لا يزال ينطبق على حصة LP من نفس المبادلة.
+
+## اشتقاق الرسم الديناميكي
+
+تحمل `PoolState.dynamic_fee_info` حالة التقلب. تحسب كل خطوة مبادلة معدل الرسم لكل خطوة كـ:
+
+$$
+\text{fee\_rate}_{\text{total}} = \text{trade\_fee\_rate}_{\text{config}} +
+\underbrace{\frac{\text{dynamic\_fee\_control} \cdot (\text{vol\_acc} \cdot \text{tick\_spacing})^2}
+{D_{\text{ctrl}} \cdot S_{\text{vol}}^2}}_{\text{رسم إضافي ديناميكي}}
+$$
+
+حيث:
+
+- $D_{\text{ctrl}} = 100{,}000$ — `DYNAMIC_FEE_CONTROL_DENOMINATOR`
+- $S_{\text{vol}} = 10{,}000$ — `VOLATILITY_ACCUMULATOR_SCALE`
+- `vol_acc` هو مراكم لكل مبادلة بعد قاعدة التحديث أدناه
+- `tick_spacing` من `PoolState.tick_spacing`
+
+النتيجة مشبوكة عند $100{,}000 / 10^6 = 10\%$.
+
+### تحديث المراكم
+
+يتم تطبيق قاعدتين لكل مبادلة، بالترتيب:
+
+**التحلل.** الطابق المرجعي يتحلل بناءً على الوقت منذ آخر تحديث:
+
+$$
+\text{vol\_ref} = \begin{cases}
+0 & \text{إذا } \Delta t > \text{decay\_period} \\
+\text{vol\_acc}_{\text{prev}} \cdot \dfrac{\text{reduction\_factor}}{10{,}000} & \text{إذا } \text{filter\_period} < \Delta t \le \text{decay\_period} \\
+\text{vol\_ref}_{\text{prev}} & \text{إذا } \Delta t \le \text{filter\_period}
+\end{cases}
+$$
+
+**التراكم.** المراكم الجديد هو المرجع زائد مسافة التك المقطوعة منذ مؤشر المرجع السابق:
+
+$$
+\text{vol\_acc} = \min\left(
+    \text{vol\_ref} + \left| t_{\text{ref}} - t_{\text{now}} \right| \cdot S_{\text{vol}},
+    \text{max\_vol\_acc}
+\right)
+$$
+
+`tick_spacing_index_reference` ($t_{\text{ref}}$) بوحدات التك-المسافة، ليس التكات الخام: $t_{\text{ref}} = \lfloor \text{tick\_current} / \text{tick\_spacing} \rfloor$.
+
+### لماذا مكافئ في مسافة التك
+
+تربيع المراكم يعني أن الرسم يرتفع كـ *مربع* كم بعيداً السعر قد يسير بعيداً عن نقطة المرجع. من الناحية العملية هذا يطابق تحجيم التباين للسعر تحت ضغط المشي العشوائي: حركة تك 2× تعني 4× التقلب الضمني، لذا تفرض 4× الرسم الإضافي. معامل `dynamic_fee_control` يعايّر المستوى المطلق.
+
+نافذة `filter_period` تمنع التذبذبات الجزئية الصغيرة (على سبيل المثال، MEV bots) من الإضرار بالمراكم. نافذة `decay_period` تمنع قمة نشطة واحدة من فرض رسوم إلى الأبد بعد هدوء السوق.
+
+## متانة عددية
+
+- جميع المنتجات الوسيطة تمر عبر حسابي `u128` أو `u256`-على شكل. يستخدم CLMM مساعدي `U128Sqrt` ونمط `FullMath::mulDiv` مباشرة من Uniswap v3.
+- تقريب القسمة يُختار لكل خطوة لفرض الثابت `k' ≥ k` محلياً. `SwapBaseInput` يقرّب المخرج **نزولاً**؛ `SwapBaseOutput` يقرّب المدخل **صعوداً**.
+- عبور التكات التي تسقط `PoolState.liquidity` إلى صفر مسموح به (السعر يمكنه أن يسير عبر "حفرة سيولة") لكن المبادلة ببساطة تتقدم إلى التك المهيأ التالي دون استهلاك المدخل، بلا رسم.
+- حماية الفيض: `sqrt_price_x64` يُحفظ في النطاق الشامل `[MIN_SQRT_PRICE_X64, MAX_SQRT_PRICE_X64]` المقابل لـ `[MIN_TICK, MAX_TICK]`. مبادلة ستدفع ماضية أي حد ترجع مع `SqrtPriceLimitOverflow`.
+
+## إلى أين بعد
+
+- [`/ar/products/clmm/ticks-and-positions`](/ar/products/clmm/ticks-and-positions) لكيفية المشاركة خريطة التك في المشي.
+- [`/ar/products/clmm/fees`](/ar/products/clmm/fees) لجانب الرسم/المكافآت من الرياضيات بالتفصيل.
+- [`/ar/algorithms/clmm-math`](/ar/algorithms/clmm-math) للاشتقاقات خلف `L = sqrt(x · y)` وصيغ النطاق-مقابل-السيولة.
+
+المصادر:
+
+- [`raydium-io/raydium-clmm` — `libraries/swap_math.rs`, `libraries/tick_math.rs`](https://github.com/raydium-io/raydium-clmm)
+- ورقة عمل "Uniswap v3 Core"، §6–7

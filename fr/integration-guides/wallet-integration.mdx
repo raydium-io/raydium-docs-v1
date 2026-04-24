@@ -1,0 +1,213 @@
+---
+title: "Intégration portefeuille"
+description: "Affichage des positions Raydium, parts de pool, mises en farm et récompenses en attente dans une interface de portefeuille — motifs de détection, simulation pour aperçu de transaction et spécificités d'affichage Token-2022."
+---
+
+<Info>
+  **Cette page est traduite automatiquement par IA. La version anglaise fait foi.**
+
+  [Voir la version anglaise →](/integration-guides/wallet-integration)
+</Info>
+
+<Info>
+  Les portefeuilles intégrant Raydium doivent généralement répondre à quatre questions par utilisateur : dans quels pools cet utilisateur détient-il du LP ? quelles positions (NFT CLMM) détient-il ? dans quelles farms est-il engagé ? quelle est la valeur totale ? Cette page documente chaque point.
+</Info>
+
+## Détection des positions Raydium
+
+### Jetons LP classiques (CPMM, AMM v4)
+
+Ils ressemblent à n'importe quel autre jeton SPL : le compte de tokens ATA de l'utilisateur détient un solde. Un portefeuille les affiche par défaut comme un jeton ordinaire. Pour les révéler comme une position Raydium LP :
+
+1. Énumérez les comptes de tokens de l'utilisateur : `connection.getParsedTokenAccountsByOwner(user, { programId: TOKEN_PROGRAM_ID })`.
+2. Pour chaque mint, vérifiez la liste de mints de Raydium : `GET https://api-v3.raydium.io/pools/info/lps?lps=<LP_MINT>,...` (jusqu'à ~50 mints LP par appel).
+3. Pour les mints correspondants, l'API retourne la référence du pool. Utilisez-la pour calculer la valeur de la position en jetons :
+
+```
+token_a_owned = user_lp_balance * poolReserves.A / lpMint.supply
+token_b_owned = user_lp_balance * poolReserves.B / lpMint.supply
+usd_value     = token_a_owned * priceA_usd + token_b_owned * priceB_usd
+```
+
+Affichez à la fois le solde LP et les montants déballés — les utilisateurs raisonnent en jetons sous-jacents, pas en unités LP.
+
+### NFT de positions CLMM
+
+Les positions CLMM sont des NFT. Le `PersonalPositionState` PDA de chaque position est dérivé du mint du NFT. Pour détecter :
+
+1. Énumérez les NFT de l'utilisateur. Pour les NFT Metaplex hérités : filtrez les comptes de tokens pour ceux avec une offre de 1 et 0 décimales.
+2. Pour chaque mint NFT, essayez de dériver le PDA PersonalPositionState :
+
+```ts
+import { CLMM_PROGRAM_ID } from "@raydium-io/raydium-sdk-v2";
+
+const [positionPda] = PublicKey.findProgramAddressSync(
+  [Buffer.from("position"), nftMint.toBuffer()],
+  CLMM_PROGRAM_ID,
+);
+
+const accountInfo = await connection.getAccountInfo(positionPda);
+if (!accountInfo || !accountInfo.owner.equals(CLMM_PROGRAM_ID)) return null;
+// C'est une position CLMM Raydium — décodez.
+```
+
+3. Décodez via `raydium.clmm.getPositionInfo({ positionPda })` pour obtenir :
+   - `poolId` → récupérez le pool pour résoudre les mints
+   - `tickLower`, `tickUpper` → affichez la plage
+   - `liquidity`, `tokensOwedA/B` → calculez la valeur de la position + frais en attente
+   - `rewardInfos` → récompenses par flux en attente
+
+4. Pour les NFT de positions émis sous Token-2022 (`OpenPositionWithToken22Nft`), le programme du mint NFT est Token-2022 plutôt que SPL Token. Énumérez les deux lors de l'analyse.
+
+### Mises en farm
+
+Farm v3 / v5 / v6 ont chacun un PDA de registre par utilisateur. Dérivations :
+
+```ts
+// Essayez les trois versions de farm pour chacune des interactions possibles de l'utilisateur.
+// Approche la moins coûteuse : demandez d'abord à l'API, qui a indexé toutes les positions de l'utilisateur.
+
+const r = await fetch(
+  `https://api-v3.raydium.io/positions/staking?wallet=${user.toBase58()}`
+).then(r => r.json());
+
+for (const s of r.data.stakings) {
+  // s.farmId, s.stakedAmount, s.pendingRewards[], s.poolApr, ...
+}
+```
+
+Pour les portefeuilles qui préfèrent une détection entièrement on-chain : itérez les PDA `UserLedger` possibles en hachant l'utilisateur avec une liste organisée de « probables » farm IDs. L'énumération exhaustive de tous les farm IDs est impraticable (des milliers existent) ; utilisez l'API.
+
+## Calcul de la valeur de position
+
+### LP CPMM / AMM v4
+
+```ts
+const poolInfo = await raydium.<type>.getPoolInfoFromRpc({ poolId });
+const myShare  = userLpBalance / poolInfo.lpMint.supply;
+const tokensA  = BigInt(poolInfo.mintAmountA) * BigInt(userLpBalance)
+                / BigInt(poolInfo.lpMint.supply);
+const tokensB  = BigInt(poolInfo.mintAmountB) * BigInt(userLpBalance)
+                / BigInt(poolInfo.lpMint.supply);
+```
+
+Puis multipliez chacun par le prix USD du mint (depuis `raydium.token` ou un oracle de prix).
+
+### Position CLMM
+
+```ts
+const position = await raydium.clmm.getPositionInfo({ positionPda });
+const pool     = await raydium.clmm.getPoolInfoFromRpc({ poolId: position.poolId });
+
+const { amountA, amountB } = PoolUtils.getAmountsFromLiquidity({
+  sqrtPriceX64:  pool.sqrtPriceX64,
+  tickLower:     position.tickLower,
+  tickUpper:     position.tickUpper,
+  liquidity:     position.liquidity,
+  slippage:      0,  // pour l'affichage, pas de slippage
+});
+
+// Frais en attente — affichez séparément comme « non collectés »
+const fees = {
+  A: position.tokenFeesOwedA,
+  B: position.tokenFeesOwedB,
+};
+
+// Récompenses en attente — un pool CLMM a 0–3 flux de récompenses.
+const rewards = position.rewardInfos.map(r => ({
+  mint:          r.rewardMint,
+  rewardAmount:  r.rewardAmountOwed,
+}));
+```
+
+Rendu comme :
+
+- Valeur de liquidité (prix actuel)
+- Frais non collectés
+- Récompenses en attente par flux
+- Plage : `[tickLower_price, tickUpper_price]` avec une barre visuelle montrant si le prix actuel est dans la plage
+
+### Mise en farm
+
+```ts
+// La réponse de l'API inclut déjà les récompenses en attente ; utilisez-la directement.
+const apr       = stakingFarm.apr;               // %, annualisé
+const staked    = stakingFarm.stakedAmount;      // plus petites unités du mint de staking
+const rewards   = stakingFarm.pendingRewards;    // tableau de { mint, amount }
+```
+
+Pour un calcul on-chain, reproduisez la comptabilité de la farm :
+
+```
+pending_reward_i = user.deposited
+                 * farm.reward_per_share_x64[i] / 2^64
+                 - user.reward_debts[i]
+```
+
+Assurez-vous de rafraîchir `reward_per_share_x64` avec la formule de mise à jour lazy avant le calcul (temps écoulé × taux d'émission ÷ total_staked).
+
+## Simulation de transaction pour aperçu
+
+Avant qu'un utilisateur signe, les portefeuilles prévisualisent généralement les changements de solde. Utilisez `simulateTransaction` :
+
+```ts
+const sim = await connection.simulateTransaction(tx, {
+  sigVerify: false,
+  commitment: "confirmed",
+  accounts: {
+    encoding: "base64",
+    addresses: [userTokenAtaA, userTokenAtaB, userLpAta].map(a => a.toBase58()),
+  },
+});
+
+// Décodez le solde de chaque compte retourné et comparez avec les soldes pré-tx.
+for (const [i, acctData] of sim.value.accounts!.entries()) {
+  const newBalance = decodeTokenAccount(acctData!.data[0]).amount;
+  // comparez avec le solde pré-tx, affichez Δ
+}
+```
+
+Le paramètre `accounts` demande au validateur de retourner l'état du compte après simulation pour les adresses listées. Beaucoup plus précis que d'essayer de prédire le changement de solde uniquement à partir de la forme de l'instruction.
+
+### Pièges de simulation
+
+- **Les swaps CLMM ont besoin de tableaux de tick valides.** Si la taille d'entrée de l'utilisateur traverserait un tableau de tick non initialisé, la simulation revient (comme l'exécution). Surfacez cela clairement dans l'interface.
+- **Frais de priorité.** La simulation s'exécute sans les instructions de budget de calcul appliquées. Pour une grande transaction qui dépasserait le défaut 200k CU, la simulation échoue mais l'exécution réelle avec une limite CU explicite réussit. Définissez toujours la limite CU sur la tx simulée aussi.
+- **Blockhash frais.** La simulation utilise le blockhash actuel ; si la signature prend >60s la tx devient invalide. Re-simulez si l'utilisateur hésite.
+
+## Affichage Token-2022
+
+Les jetons du programme Token-2022 doivent être étiquetés comme tels dans la liste de jetons du portefeuille, car ils présentent des surfaces de risque différentes :
+
+- **Mints avec frais de transfert** : affichez les `transferFeeBasisPoints` actuels comme « Frais de transfert : X% » à côté du solde. Avertissez à la réception — les utilisateurs pourraient ne pas réaliser qu'ils recevront moins que ce que l'expéditeur a envoyé.
+- **Mints avec transfert-hook** : surfacez l'ID du programme hook. Un hook malveillant peut bloquer les transferts sortants ; les utilisateurs doivent vérifier que le hook est celui qu'ils attendent.
+- **Mints non transférables** : affichez « Non-transférable » et désactivez swap/envoi. Il s'agit généralement de jetons soulbound ou de justificatifs d'identité.
+- **Mints porteurs d'intérêt** : le solde de l'interface utilisateur dérivé de `TokenAccount.amount` ne reflète **pas** les intérêts courus. Utilisez `amountToUiAmount` de `@solana/spl-token` (qui applique le facteur d'échelle) pour la valeur affichée.
+
+## Affichage APR de farm
+
+L'APR affiché aux utilisateurs doit combiner tous les flux de récompenses actifs, convertis en USD et annualisés :
+
+```ts
+let apr = 0;
+for (const r of farm.rewardInfos) {
+  if (r.rewardState !== 1) continue;   // ignorez non-actif
+  const annualRewardTokens = Number(r.emissionPerSecond) * 86400 * 365 / 1e<decimals>;
+  const annualRewardValue  = annualRewardTokens * priceUsd(r.rewardMint);
+  const tvlValue           = Number(farm.totalStaked) * priceUsd(farm.stakingMint) / 1e<decimals>;
+  apr += annualRewardValue / tvlValue;
+}
+```
+
+Affichez comme `APR : X.Y%`. Si le mint de staking est un jeton LP, calculez également l'APR des frais de base du LP sous-jacent et étiquetez la somme comme « APR total » ou « APR + frais ».
+
+## Pointeurs
+
+- [`products/clmm/ticks-and-positions`](/fr/products/clmm/ticks-and-positions) — dérivation de valeur de position.
+- [`products/farm-staking/accounts`](/fr/products/farm-staking/accounts) — champs d'état de farm.
+- [`algorithms/token-2022-transfer-fees`](/fr/algorithms/token-2022-transfer-fees) — sémantique d'affichage pour les jetons avec frais de transfert.
+
+Sources :
+
+- Raydium SDK v2 — assistants position/farm.
+- Points de terminaison de position d'utilisateur sur `api-v3.raydium.io`.

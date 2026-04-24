@@ -1,0 +1,241 @@
+---
+title: "LaunchLab ベスティング"
+description: "ロックされたトークン、クリフと線形アンロックスケジュール、受益者ごとの VestingRecord アカウント、クリエイターとプラットフォームが卒業後に予約供給を配布するために使用する create / claim 命令。"
+---
+
+<Info>
+  **このページは AI による自動翻訳です。すべての内容は英語版を正とします。**
+
+  [英語版を表示 →](/products/launchlab/vesting)
+</Info>
+
+<Info>
+  ベスティングは LaunchLab ローンチで **オプション** です。`Initialize` 時に `vesting_param.total_locked_amount = 0` に設定すると、以下のセクションは適用されません。有効にされると、スケジュールはローンチの存続期間中固定されます。クリフとアンロック期間は遡及的に変更することはできません。
+</Info>
+
+## ベスティングの理由
+
+ボンディングカーブは募資中に `base_supply_graduation` トークンを販売し、卒業後のプールに残りをシードします。ベスティングは供給から追加のスライスを取り出し、設定可能なクリフ期間ロックしてから、1 つ以上の受益者に線形リリースします。通常、クリエイターのチーム、アドバイザー、またはプラットフォームパートナーです。
+
+実際の使用例：
+
+- **チーム配分。** クリエイターが供給の 5% をファウンディングチームに予約し、6 ヶ月ロックして、その後 12 ヶ月で線形アンロック。
+- **プラットフォーム配分。** ローンチプラットフォームは `CreatePlatformVestingAccount` を通じて、同じスケジュールで、リストする各トークンのスライスを受け取ります。
+- **アドバイザー / 協力者グラント。** 複数の受益者がそれぞれの `VestingRecord` アカウントを持ち、各自が独立してクレームされた量を追跡します。
+
+ロックされたトークンはカーブに入らず、卒業 LP の一部ではありません。各受益者が `ClaimVestedToken` を呼び出すまで、プールの `base_vault` に休止状態で保持されます。
+
+## スケジュール形状
+
+ローンチのベスティングは 3 つの数字で説明され、`Initialize` 時に 1 回記録されます：
+
+| フィールド | 型 | 意味 |
+|----------|-----|------|
+| `total_locked_amount` | `u64` | すべての受益者（クリエイター + プラットフォーム）にロックされたすべての基本トークンの合計。バインディング `GlobalConfig` から `total_locked_amount <= supply * max_lock_rate / 1_000_000` を満たす必要があります。 |
+| `cliff_period` | `u64` (秒) | 募資終了後、トークンがアンロックされ始めるまでの待機時間。 |
+| `unlock_period` | `u64` (秒) | クリフ後の線形アンロックウィンドウの期間。`0` はすべてがクリフの終了時に即座にアンロックされることを意味します。 |
+
+これら 3 つの値は `PoolState.vesting_schedule`（`VestingSchedule` 構造体）とオンチェーン `start_time` に保持されます。募資が正常に終了する時点（卒業条件が最初に満たされる時点）で、プログラムは `block_time + cliff_period` として記録します。
+
+```rust
+// states/pool.rs
+pub struct VestingSchedule {
+    pub total_locked_amount:     u64,
+    pub cliff_period:            u64,
+    pub unlock_period:           u64,
+    pub start_time:              u64,   // プログラムが募資終了時に設定
+    pub allocated_share_amount:  u64,   // ベスティングレコードへの配分の累積合計
+}
+```
+
+`allocated_share_amount` は `CreateVestingAccount` / `CreatePlatformVestingAccount` を通じて `VestingRecord` アカウントに既に割り当てられた総額です。これは `total_locked_amount` を超えてはいけません。クリエイターが過剰配分した場合、次の `CreateVestingAccount` 呼び出しは `InvalidTotalLockedAmount` で戻ります。
+
+## 線形アンロック公式
+
+募資が終了した後、プログラムは各 `VestingRecord` の累積アンロック額を次のように計算します：
+
+```
+elapsed         = min(now, start_time + unlock_period) − start_time
+unlocked_amount = token_share_amount × elapsed / unlock_period
+```
+
+`unlock_period == 0` の場合、全体の `token_share_amount` は `start_time` で 1 段階でクレーム可能になります。それ以外は、曲線は `start_time` の 0 から `start_time + unlock_period` の `token_share_amount` への直線で、その後 `token_share_amount` でキャップされます。
+
+各 `ClaimVestedToken` 呼び出しで転送される額は、新しく再計算された累積アンロック額とレコード上の実行中の `claimed_amount` フィールドの間のデルタです。
+
+```
+delta_amount    = unlocked_amount − vesting_record.claimed_amount
+vesting_record.claimed_amount = unlocked_amount
+```
+
+`start_time` の前のクレームは `VestingNotStarted` で戻ります。`start_time + unlock_period` の後のクレームは全体の残りを決済します。
+
+## アカウントレイアウト
+
+### `VestingSchedule`
+
+`PoolState` にインラインで保持されます。[`accounts`](/ja/products/launchlab/accounts) を参照してください。
+
+### `VestingRecord`
+
+受益者ごとのレコード。PDA は以下として派生されます：
+
+```
+seeds = [
+  b"pool_vesting",
+  pool_state.key(),
+  beneficiary.key(),
+]
+program = LaunchLab program
+```
+
+```rust
+// states/vesting.rs
+#[account]
+pub struct VestingRecord {
+    pub epoch:               u64,         // recent_epoch トラッカー
+    pub pool:                Pubkey,      // PoolState への逆ポインタ
+    pub beneficiary:         Pubkey,      // ClaimVestedToken を呼び出せるユーザー
+    pub claimed_amount:      u64,         // 累積クレーム額
+    pub token_share_amount:  u64,         // この受益者に配分される総額
+    pub padding:             [u64; 8],
+}
+```
+
+受益者はローンチごとに **1 つ** の `VestingRecord` しか持つことができません。同じローンチの同じ受益者に再度配分するとリバートされます（PDA が既に存在するため）。
+
+## 命令
+
+### `CreateVestingAccount`
+
+クリエイターのみ。プールの `total_locked_amount` のスライスを新しい受益者に配分し、新しい `VestingRecord` PDA を初期化します。
+
+**引数**
+
+```
+share_amount: u64    // この受益者に割り当てるトークン
+```
+
+**アカウント**
+
+| # | 名前 | W | S | 注記 |
+|---|------|---|---|------|
+| 1 | `creator` | W | S | `pool_state.creator` に等しい必要があります。新規アカウントの家賃を支払います。 |
+| 2 | `beneficiary` | W |   | 後でアンロックされたトークンを受け取ります。公開鍵はここにロックされ、変更できません。 |
+| 3 | `pool_state` | W |   | `vesting_schedule.allocated_share_amount` をバンプするために変更されます。 |
+| 4 | `vesting_record` | W |   | `init`; PDA `[b"pool_vesting", pool_state, beneficiary]`。 |
+| 5 | `system_program` |   |   | アカウント作成に必須。 |
+
+**前提条件**
+
+- `share_amount > 0`。
+- `pool_state.vesting_schedule.allocated_share_amount + share_amount <= total_locked_amount`。
+- `beneficiary` 公開鍵にはこのプール用の既存 `VestingRecord` がありません。
+
+**事後条件**
+
+- `vesting_record` は `token_share_amount = share_amount`、`claimed_amount = 0` で初期化されます。
+- `pool_state.vesting_schedule.allocated_share_amount += share_amount`。
+
+**一般的なエラー** — `InvalidTotalLockedAmount`、`InvalidInput`。
+
+### `CreatePlatformVestingAccount`
+
+`CreateVestingAccount` のプラットフォーム管理者バリアント。プラットフォームのベスティングウォレット（`PlatformConfig.platform_vesting_wallet` に保存）が受益者で、シェアは `PlatformConfig.platform_vesting_scale` によって制限されます。
+
+署名者は `platform_config.platform_vesting_wallet` に等しい必要があります。その他のアカウントは `CreateVestingAccount` をミラーします。プラットフォームが、リストする各ローンチで固定ベスティングシェアを受け取ることに契約した場合に使用します。
+
+### `ClaimVestedToken`
+
+受益者のみ。新しくアンロックされたトークンをプールの `base_vault` から受益者の ATA に転送します。
+
+**引数**
+
+なし（プログラムはスケジュールからクレーム額を計算します）。
+
+**アカウント**
+
+| # | 名前 | W | S | 注記 |
+|---|------|---|---|------|
+| 1 | `beneficiary` | W | S | `vesting_record.beneficiary` に等しい必要があります。 |
+| 2 | `authority` |   |   | PDA `[b"vault_auth_seed"]`; ボルト転送に署名します。 |
+| 3 | `pool_state` | W |   | スケジュールの再検証が必要な場合のみ変更されます。 |
+| 4 | `vesting_record` | W |   | `claimed_amount` が更新されます。 |
+| 5 | `base_vault` | W |   | プールの基本トークンボルト; デビット。 |
+| 6 | `beneficiary_ata` | W |   | アンロックされたトークンを受け取ります; `init_if_needed`。 |
+| 7 | `base_mint` |   |   | プールの基本ミント。 |
+| 8 | `token_program` |   |   | SPL Token または Token-2022 プログラム。 |
+| 9 | `associated_token_program` |   |   | 必要な場合は ATA 作成用。 |
+| 10 | `system_program` |   |   | アカウント作成に必須。 |
+
+**前提条件**
+
+- `block_time >= pool_state.vesting_schedule.start_time`（そうでなければ `VestingNotStarted`）。
+- `pool_state.status == PoolStatus::Migrated` — 卒業が既に発生している必要があります。卒業前に呼び出すとリバートされます。
+- アンロック額のデルタが 0 より大きい。無操作呼び出し（計算されたデルタが 0）はリバートされます。
+
+**事後条件**
+
+- `vesting_record.claimed_amount` は新しい累積アンロック額に進みます。
+- `delta_amount` の基本トークンが `beneficiary_ata` に転送されます。
+
+**一般的なエラー** — `VestingNotStarted`、`NoAssetsToCollect`、`MathOverflow`。
+
+## 実例
+
+ローンチが以下を設定します：
+
+- `supply = 1_000_000_000`
+- `total_locked_amount = 100_000_000`（供給の 10%）
+- `cliff_period = 180 * 86400`（180 日）
+- `unlock_period = 365 * 86400`（クリフ後 1 年線形）
+
+クリエイターは `Initialize` の直後に 2 つの `VestingRecord` アカウントを割り当てます：
+
+- 受益者 A（チーム）: `share_amount = 70_000_000`
+- 受益者 B（アドバイザー）: `share_amount = 30_000_000`
+
+`allocated_share_amount = 100_000_000`、`total_locked_amount` に等しい — さらなる配分は不可能です。
+
+募資は `2027-01-01T00:00Z` に完了します。プログラムは `start_time = 2027-01-01 + 180 日 = 2027-06-30` を設定します。
+
+`2027-09-30`（`start_time` の 90 日後）、受益者 A が `ClaimVestedToken` を呼び出します：
+
+```
+elapsed         = min(now, start_time + 365·86400) − start_time
+                = 90 · 86400
+unlocked_amount = 70_000_000 × (90 / 365) ≈ 17_260_274
+delta_amount    = 17_260_274 − 0 = 17_260_274
+```
+
+A のウォレットは 17.26M の基本トークンを受け取ります。`vesting_record.claimed_amount` は 17_260_274 に進みます。
+
+6 ヶ月後（`2028-03-31`、`start_time` の 270 日後）、A が再度クレームします：
+
+```
+unlocked_amount = 70_000_000 × (270 / 365) ≈ 51_780_822
+delta_amount    = 51_780_822 − 17_260_274 = 34_520_548
+```
+
+A はさらに 34.52M トークンを受け取ります。`2028-06-30`（`unlock_period` の終了）の後、次のクレームは残り約 18.22M を転送し、`claimed_amount == token_share_amount` のままにします。
+
+## エッジケース
+
+- **受益者が鍵を失う。** `VestingRecord.beneficiary` の公開鍵は、`ClaimVestedToken` を呼び出せる唯一の署名者です。回復パスはありません。回復が重要な場合は、受益者をマルチシグに設定してください。
+- **Token-2022 転送手数料。** 基本ミントが転送手数料拡張を持つ Token-2022 ミントの場合、受益者は `delta_amount − transfer_fee` を受け取り、全デルタではありません。プールのボルトはまだ転送された総額を記録します — 差額はミントの保留中手数料アカウントに累積されます。
+- **プール未卒業。** 卒業前に `ClaimVestedToken` を呼び出すとリバートされます。ベスティング時間は募資が実際に完了したときのみ開始されます。中止されたローンチ（`start_time` を設定しない）は、ロックされたトークンをボルト内に到達不可能なままにします。
+- **過剰配分の試み。** プログラムは `CreateVestingAccount` のすべてで `allocated_share_amount <= total_locked_amount` を強制します。`total_locked_amount` の未配分のままの残り（ある場合）は **失われます** — ローンチが卒業すると、それらのトークンは永遠にボルト内に留まります。そうしたい場合を除き、全額を配分してください。
+
+## ポインタ
+
+- [`products/launchlab/accounts`](/ja/products/launchlab/accounts) — `VestingSchedule` を含む完全な `PoolState` レイアウト。
+- [`products/launchlab/instructions`](/ja/products/launchlab/instructions) — 卒業ライフサイクル。
+- [`products/launchlab/platform-config`](/ja/products/launchlab/platform-config) — プラットフォーム配分用の `platform_vesting_scale` セマンティクス。
+- [`products/launchlab/global-config`](/ja/products/launchlab/global-config) — `total_locked_amount` を制限する `max_lock_rate` 上限。
+
+ソース：
+
+- `raydium-launch/programs/launchpad/src/states/vesting.rs` — `VestingRecord`。
+- `raydium-launch/programs/launchpad/src/states/pool.rs` — `VestingSchedule`、`VestingParams`、`is_vesting_started`、`vesting_end_time`。
+- `raydium-launch/programs/launchpad/src/instructions/create_vesting_account.rs`。
+- `raydium-launch/programs/launchpad/src/instructions/claim_vested_token.rs`。

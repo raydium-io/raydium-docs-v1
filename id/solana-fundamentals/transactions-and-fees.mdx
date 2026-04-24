@@ -1,0 +1,278 @@
+---
+title: "Transaksi dan biaya"
+description: "Bagaimana struktur transaksi Solana, batasan-batasan yang berlaku, dan dua kategori biaya yang berbeda — biaya jaringan Solana dan biaya protokol Raydium — yang dibayarkan dalam swap tipikal."
+---
+
+<Info>
+  **Halaman ini diterjemahkan secara otomatis oleh AI. Versi bahasa Inggris adalah acuan resmi.**
+
+  [Lihat versi bahasa Inggris →](/solana-fundamentals/transactions-and-fees)
+</Info>
+
+Transaksi Solana adalah daftar instruksi yang dieksekusi secara atomik. Memahami struktur transaksi — instruksi, akun, penandatangan, budget komputasi — adalah prasyarat untuk membangun, men-debug, atau mengoptimalkan apa pun dengan Raydium. Halaman ini mencakup struktur tersebut, batasan-batasan yang membatasinya, dan bagaimana dua kategori biaya (biaya jaringan Solana, biaya protokol Raydium) terkumpul dalam swap nyata.
+
+## Anatomi transaksi
+
+Transaksi Solana memiliki tiga komponen inti:
+
+- **Message**: daftar instruksi terurut, akun yang dirujuk, dan blockhash terbaru.
+- **Signatures**: satu per penandatangan, membuktikan transaksi telah diotorisasi.
+- **Recent blockhash**: membuktikan transaksi baru; transaksi dengan blockhash lama (>150 slot) ditolak.
+
+### Instruksi
+
+Instruksi menentukan:
+
+- `program_id` — program yang akan dipanggil.
+- `accounts` — akun (dan flag writable/signer) yang dapat disentuh program.
+- `data` — byte opak yang diinterpretasi oleh program.
+
+Transaksi tunggal dapat berisi beberapa instruksi. Mereka dieksekusi secara berurutan; jika ada yang gagal, semua instruksi sebelumnya dipulihkan (atomik).
+
+Transaksi swap Raydium tipikal mencakup:
+
+1. `ComputeBudget::SetComputeUnitLimit` — naikkan batas CU default.
+2. `ComputeBudget::SetComputeUnitPrice` — atur biaya prioritas.
+3. Opsional `CreateAssociatedTokenAccount` — buat ATA output jika pengguna belum memilikinya.
+4. `Raydium::SwapBaseInput` — jalankan swap.
+5. Opsional `CloseAccount` — tutup ATA wrapped-SOL.
+
+SDK mengemas instruksi ini secara otomatis melalui `raydium.trade.swap()`.
+
+## Akun dalam transaksi
+
+Setiap akun yang disentuh oleh instruksi apa pun dalam transaksi harus terdaftar dalam kunci akun transaksi. Setiap akun ditandai:
+
+- **Signer / non-signer**: harus pemilik akun menandatangani transaksi?
+- **Writable / read-only**: dapat transaksi memodifikasi akun?
+
+Runtime memberlakukan flag ini: program yang mencoba menulis ke akun non-writable gagal, dan runtime menolak transaksi yang kehilangan penandatangan yang diperlukan.
+
+Untuk swap CPMM, daftar akun memiliki ~13 entri (lihat [`solana-fundamentals/account-model`](/id/solana-fundamentals/account-model)). Swap CLMM dengan beberapa cross tick array dapat memiliki 20+.
+
+## Batas ukuran transaksi
+
+Solana membatasi transaksi pada **1232 byte** termasuk signature, message, dan header. Ini adalah hambatan paling umum untuk transaksi kompleks — CLMM Raydium dengan routing multi-hop secara teratur mendorong batas ini.
+
+Rincian swap Raydium tipikal ~1000-byte:
+
+| Komponen | Ukuran |
+|-----------|--------|
+| Signature | 64 B |
+| Signature count | 1 B |
+| Message header | 3 B |
+| Blockhash | 32 B |
+| Account keys (13 × 32 B) | 416 B |
+| Instructions (4 × ~100-150 B) | 400–600 B |
+| **Total** | ~900–1100 B |
+
+### Address Lookup Tables (ALTs)
+
+ALT memungkinkan transaksi merujuk akun dengan indeks 1-byte ke dalam tabel yang diterbitkan daripada pubkey 32-byte penuh. Ini mengompresi transaksi secara drastis:
+
+- Transaksi merujuk 20 akun secara langsung: ~640 B pubkey.
+- Transaksi yang sama menggunakan ALT: ~20 B indeks + referensi ALT.
+
+Raydium mempertahankan ALT untuk path swap CPMM/CLMM di mainnet. SDK menggunakannya secara otomatis. Agregator yang membangun rute multi-hop sangat bergantung padanya.
+
+```ts
+import { VersionedTransaction } from "@solana/web3.js";
+
+// SDK membangun v0 (versioned) tx dengan referensi ALT
+const { transaction } = await raydium.trade.swap({ /* ... */ });
+// transaction adalah VersionedTransaction, bukan legacy Transaction.
+```
+
+## Budget komputasi
+
+Setiap transaksi memiliki **budget compute unit (CU)**. Melampaui batas menghentikan eksekusi dan gagal transaksi.
+
+- **Default**: 200.000 CU per transaksi.
+- **Maximum**: 1.400.000 CU per transaksi (dinaikkan melalui `ComputeBudget::SetComputeUnitLimit`).
+- **Per-block ceiling**: 48M CU per blok (level protokol).
+
+Konsumsi CU Raydium tipikal (lihat [`integration-guides/priority-fee-tuning`](/id/integration-guides/priority-fee-tuning) untuk tabel lengkap):
+
+| Instruksi | CU |
+|-------------|-----|
+| CPMM swap | ~140.000 |
+| CLMM swap (no tick crossings) | ~170.000 |
+| CLMM swap (4 tick crossings) | ~320.000 |
+| Farm v6 stake | ~130.000 |
+| CPMM pool creation | ~250.000 |
+
+Selalu atur batas CU eksplisit melalui `ComputeBudget`; jika tidak, Anda mendapatkan default 200k, yang terlalu rendah untuk sebagian besar instruksi Raydium.
+
+```ts
+import { ComputeBudgetProgram } from "@solana/web3.js";
+
+tx.add(
+  ComputeBudgetProgram.setComputeUnitLimit({ units: 300_000 }),
+);
+```
+
+Jika Anda menetapkan batas CU terlalu rendah, transaksi gagal saat mencapai batas; jika terlalu tinggi, Anda berisiko diprioritaskan lebih rendah saat kemacetan (dan, tergantung pada model harga, Anda membayar komputasi yang tidak pernah Anda gunakan).
+
+## Biaya prioritas
+
+Di luar biaya transaksi dasar (5000 lamport per signature), validator semakin memprioritaskan transaksi yang membayar **biaya prioritas**: tip per-CU dalam microlamport.
+
+```
+priority_fee = compute_unit_price (micro-lamports) × compute_unit_limit
+```
+
+Contoh: 10.000 µL/CU × 300.000 CU = 3.000.000 µL = 0,003 SOL.
+
+Biaya prioritas bersifat lokal — hanya mempengaruhi urutan dalam blok; tidak meningkatkan peluang Anda dimasukkan vs. tidak. Menetapkan biaya prioritas yang wajar sangat penting saat kemacetan.
+
+```ts
+tx.add(
+  ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 10_000 }),
+);
+```
+
+Lihat [`integration-guides/priority-fee-tuning`](/id/integration-guides/priority-fee-tuning) untuk cara mengukurnya secara dinamis.
+
+## Batas jumlah instruksi dan jumlah akun
+
+Selain batas total 1232-byte:
+
+- **Max akun per transaksi**: 128.
+- **Max akun per instruksi (CPI)**: 64.
+- **Max instruksi per transaksi**: tidak ada batas keras, hanya dibatasi oleh batas ukuran.
+- **Max CPI depth**: 4 (program dapat memanggil program lain, yang dapat memanggil program lain, 4 level dalam).
+
+Swap CLMM Raydium yang melintasi beberapa tick array dapat mendorong keras terhadap batas akun — swap tunggal menyentuh pool, vault input/output, ATA input/output, beberapa tick array, kemungkinan akun ekstra program transfer-hook, ditambah referensi mandatory compute budget / system / token program. Desain yang menggabungkan Raydium melalui CPI (mis., auto-compounder) perlu memperhitungkan hal ini.
+
+## Kategori biaya dalam swap Raydium
+
+Transaksi swap pengguna membayar biaya dalam dua kategori:
+
+### Biaya jaringan Solana
+
+Dibayarkan kepada validator dalam SOL.
+
+- **Biaya signature dasar**: 5000 lamport per signature. Hampir selalu 1 signature = 0,000005 SOL.
+- **Biaya prioritas**: CU-price × CU-limit dalam microlamport. Bervariasi dengan kemacetan; lihat [`integration-guides/priority-fee-tuning`](/id/integration-guides/priority-fee-tuning).
+
+Biaya ini pergi ke validator, tidak terkait dengan Raydium, dan dikenakan bahkan untuk transaksi yang gagal (kecuali dalam beberapa kasus edge biaya prioritas).
+
+### Biaya protokol Raydium
+
+Dipotong dari jumlah swap.
+
+- **Biaya swap**: persentase dari input (CPMM 0,25% tipikal, CLMM 0,01%–1% per tier). Dibagi antara LP dan tujuan protokol. Lihat [`ray/protocol-fees`](/id/ray/protocol-fees).
+
+Biaya ini internal untuk akuntansi Raydium — pengguna melihatnya sebagai jumlah output yang lebih kecil daripada yang akan dihasilkan pool tanpa biaya.
+
+### Contoh: \$1000 USDC → SOL via CPMM 0,25% tier
+
+| Kategori biaya | Jumlah | Ke |
+|--------------|--------|---------|
+| Biaya signature dasar | 0,000005 SOL (~\$0,0007) | Validator |
+| Biaya prioritas (10k µL × 300k CU) | 0,003 SOL (~\$0,45) | Validator |
+| Biaya swap CPMM (0,25%) | \$2,50 | LP + protokol |
+| **Total biaya pengguna** | ~\$2,95 | |
+
+Slippage (price impact + pergerakan pasar) bukan biaya tetapi mempengaruhi hasil akhir yang sama.
+
+## Transaksi versioned
+
+Solana memiliki dua format transaksi:
+
+- **Legacy**: format asli, tidak ada dukungan ALT.
+- **v0 (Versioned)**: mendukung ALT, dapat diperluas ke versi masa depan.
+
+Semua tooling Solana modern menggunakan v0. Raydium SDK mengeluarkan transaksi v0 secara default.
+
+```ts
+// Membangun tx v0 secara langsung
+import { VersionedTransaction, TransactionMessage } from "@solana/web3.js";
+
+const msg = new TransactionMessage({
+  payerKey:        owner.publicKey,
+  recentBlockhash: blockhash,
+  instructions:    [ /* ... */ ],
+}).compileToV0Message([lookupTableAccount]);
+
+const tx = new VersionedTransaction(msg);
+tx.sign([owner]);
+```
+
+## Kesegaran blockhash
+
+Transaksi harus menyertakan blockhash dari dalam ~150 slot terakhir (~60 detik). Di luar jendela itu, validator menolaknya.
+
+Untuk loop retry, ambil blockhash segar di setiap retry:
+
+```ts
+async function sendWithRetry(tx, maxRetries = 3) {
+  for (let i = 0; i < maxRetries; i++) {
+    const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash();
+    tx.message.recentBlockhash = blockhash;
+    tx.sign([owner]);
+    try {
+      return await connection.sendRawTransaction(tx.serialize());
+    } catch (e) {
+      if (i === maxRetries - 1) throw e;
+    }
+  }
+}
+```
+
+Lihat [`integration-guides/priority-fee-tuning`](/id/integration-guides/priority-fee-tuning) untuk pola retry-with-escalating-fees lengkap.
+
+## Eksekusi paralel
+
+Solana mengeksekusi transaksi non-konflik secara paralel pada validator multi-core. Dua transaksi berkonflik jika keduanya menulis akun yang sama.
+
+Implikasi untuk Raydium:
+
+- Dua swap di pool yang sama tidak dapat dieksekusi secara paralel — keduanya menulis state pool.
+- Swap di Pool A dan swap di Pool B dieksekusi secara paralel jika daftar akun tidak tumpang tindih.
+- Transaksi read-only tidak pernah memblokir penulis pada akun yang sama (read-only bersamaan dengan dirinya sendiri tetapi bukan dengan penulisan).
+
+Inilah sebabnya mengapa Solana dapat mempertahankan throughput DEX tinggi meskipun serialisasi single-pool.
+
+## Tingkat konfirmasi transaksi
+
+Saat mengirimkan transaksi, Anda memilih tingkat konfirmasi:
+
+| Level | Tunggu | Finalitas |
+|-------|------|----------|
+| `processed` | ~400 ms | Tidak finalized; dapat rollback |
+| `confirmed` | ~1 s | Supermajority voted |
+| `finalized` | ~13 s | Supermajority rooted |
+
+Untuk UX swap, `confirmed` adalah standar. Untuk operasi menangani nilai besar (pembuatan pool, top-up reward), `finalized` lebih aman.
+
+```ts
+await connection.sendAndConfirmTransaction(tx, [owner], {
+  commitment: "confirmed",
+});
+```
+
+## Simulasi
+
+Solana mendukung simulasi transaksi sebelum mengirimkan:
+
+```ts
+const sim = await connection.simulateTransaction(tx);
+console.log(sim.value.logs);
+console.log(sim.value.unitsConsumed);
+```
+
+Raydium SDK menggunakan simulasi secara internal saat menghitung `getBestSwapInfo` untuk memverifikasi rute yang dipilih benar-benar berhasil. Simulasi bukan gratis — mengonsumsi kapasitas RPC — tetapi menangkap kesalahan sebelum membayarnya.
+
+## Penunjuk
+
+- [`solana-fundamentals/account-model`](/id/solana-fundamentals/account-model) — akun dalam transaksi.
+- [`solana-fundamentals/pdas-and-cpis`](/id/solana-fundamentals/pdas-and-cpis) — bagaimana program memanggil satu sama lain.
+- [`integration-guides/priority-fee-tuning`](/id/integration-guides/priority-fee-tuning) — mengukur batas CU dan biaya prioritas.
+- [`ray/protocol-fees`](/id/ray/protocol-fees) — struktur biaya protokol Raydium.
+
+Sumber:
+
+- [Solana Transaction docs](https://docs.solana.com/developing/programming-model/transactions).
+- [Address Lookup Tables proposal](https://docs.solana.com/developing/lookup-tables).
+- [Compute budget documentation](https://docs.solana.com/developing/programming-model/runtime).

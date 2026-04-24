@@ -1,0 +1,281 @@
+---
+title: "SPL Token and Token-2022"
+description: "The two token standards Raydium operates on — the legacy SPL Token program and the extensions-enabled Token-2022 program. What each is, how they differ, and which Raydium products support which."
+---
+
+<Info>
+  Every tradable asset on Solana — including every Raydium pool's base and quote assets — is a token minted by one of two programs: the legacy **SPL Token** program or its successor, **Token-2022**. They are separate programs at separate addresses, with different account layouts and extension semantics. Raydium supports both, but not everywhere: CPMM, CLMM, and Farm v6 accept Token-2022 mints; AMM v4 does not. Understanding the split is essential before integrating with any pool.
+</Info>
+
+## The two programs
+
+| | SPL Token | Token-2022 |
+|--|-----------|------------|
+| Program ID | `TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA` | `TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb` |
+| Launched | 2020 | 2022 |
+| Account size (token account) | 165 B | 165 B + extensions (variable) |
+| Extensions | No | Yes — 17+ official extensions |
+| Legacy compatibility | Full | Opt-in per mint |
+
+Both are maintained by the Solana Labs team (now Anza) and live under the `solana-program-library` repo.
+
+## Why two programs?
+
+SPL Token was frozen for forward compatibility — its bytecode is effectively immutable, making a clean baseline for the entire ecosystem. As use cases grew (stablecoins wanting transfer fees, institutional mints needing freeze authorities with nuance, NFTs needing metadata pointers), the Solana team introduced **Token-2022** as a separate, extensible program rather than upgrading SPL Token. This preserves existing integrations and lets each mint opt into exactly the extensions it needs.
+
+Token-2022 is a strict superset in functionality, not in address space: the two programs coexist, and a mint at a given address belongs to exactly one of them.
+
+## Account structure
+
+### Mint account
+
+Defines a token's identity.
+
+SPL Token mint (82 bytes):
+
+```
+u32   mint_authority_option
+Pubkey mint_authority
+u64   supply
+u8    decimals
+bool  is_initialized
+u32   freeze_authority_option
+Pubkey freeze_authority
+```
+
+Token-2022 mint: same base layout, plus zero or more **extension TLV** (type-length-value) records appended after the base.
+
+### Token account
+
+Holds a balance of a specific mint for a specific owner.
+
+SPL Token account (165 bytes):
+
+```
+Pubkey mint
+Pubkey owner
+u64    amount
+u32    delegate_option
+Pubkey delegate
+u8     state         // initialized, frozen
+u32    is_native_option
+u64    is_native
+u64    delegated_amount
+u32    close_authority_option
+Pubkey close_authority
+```
+
+Token-2022 account: same base, plus extension TLV records if any extensions are active.
+
+## Token-2022 extensions
+
+Extensions are modular features that can be attached to mints or accounts. Each extension is a separate TLV record. The key ones for Raydium:
+
+### Transfer fee
+
+The mint can charge a percentage fee on every transfer. Fee goes to a configured withdraw authority. Supported by Raydium CPMM and CLMM via `SwapV2` — the program accounts for the fee when computing exchange rates, so the pool math stays coherent.
+
+```rust
+let extension = TransferFeeConfig {
+    transfer_fee_config_authority,
+    withdraw_withheld_authority,
+    withheld_amount: 0,
+    older_transfer_fee: ...,
+    newer_transfer_fee: ...,
+};
+```
+
+### Transfer hook
+
+The mint points to a program that the runtime invokes on every transfer. The hook program can reject the transfer or perform side effects (update a compliance state, log, etc.). Raydium CPMM/CLMM invoke the hook via `SwapV2` — the transaction includes the hook program and any extra accounts it needs.
+
+### Interest-bearing
+
+The on-chain balance accrues interest at a configured rate. Display-only (balances appear higher over time) rather than actual mint; the underlying supply is unchanged.
+
+### Mint close authority
+
+Allows the mint to be closed once supply reaches zero.
+
+### Permanent delegate
+
+A designated wallet can transfer or burn tokens from any account unconditionally. **Raydium blocks pool creation for mints with this extension** — it's incompatible with the invariant that pool reserves can't be seized.
+
+### Non-transferable
+
+Tokens cannot be moved from the account they're minted into. **Raydium blocks pool creation** — an untradable asset can't be an LP pool's base or quote.
+
+### Default account state
+
+New token accounts for this mint are frozen by default and must be unfrozen by the freeze authority. Usable but rare.
+
+### Confidential transfer
+
+Balance and transfer amounts are encrypted. Raydium does not support confidential transfer mints (pool math requires cleartext balances).
+
+### Metadata pointer + token metadata
+
+Replaces Metaplex metadata for Token-2022 mints. Supported for Raydium pool listings.
+
+### Group / Member pointer
+
+Declares a mint as belonging to a group (e.g., an NFT collection). Informational; Raydium uses this for display.
+
+See the [official Token-2022 extensions page](https://spl.solana.com/token-2022/extensions) for the full list.
+
+## Which Raydium products support what
+
+| Product | SPL Token | Token-2022 | Notes |
+|---------|-----------|------------|-------|
+| AMM v4 | Yes | No | OpenBook integration requires SPL Token |
+| CPMM | Yes | Yes | Requires `SwapV2` for Token-2022 pools |
+| CLMM | Yes | Yes | Requires `SwapV2` for Token-2022 pools |
+| Farm v6 | Yes | Yes | Supported for both stake mint and reward mints |
+| LaunchLab | Yes | Yes | Graduated CPMM pools inherit Token-2022 support |
+
+Mint eligibility for Raydium pools — all extensions allowed unless listed:
+
+- **Blocked**: non-transferable, permanent delegate, confidential transfer, default account state (in rejected configurations).
+- **Allowed with caveats** (LP must accept risk): transfer fee, transfer hook, freeze authority active.
+- **Fully allowed**: interest-bearing, metadata pointer, group pointer, mint close authority.
+
+The `getPoolInfoFromRpc` response includes the mint's extension flags — clients should check before LPing.
+
+## Token account standards
+
+### Associated Token Account (ATA)
+
+Both programs share the **Associated Token Account** convention: a PDA derived from `[owner, programId, mint]` via the Associated Token Program (`ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL`). Almost every user token account on Solana is an ATA.
+
+```ts
+import { getAssociatedTokenAddressSync } from "@solana/spl-token";
+
+// SPL Token
+const ata = getAssociatedTokenAddressSync(mint, owner);
+
+// Token-2022
+const ata22 = getAssociatedTokenAddressSync(
+  mint,
+  owner,
+  false,               // allowOwnerOffCurve
+  TOKEN_2022_PROGRAM_ID,
+);
+```
+
+The ATA program creates accounts owned by the appropriate token program based on which program owns the mint.
+
+### Non-ATA token accounts
+
+A wallet can have multiple token accounts for a single mint; ATA is just the convention. Pool vaults, for instance, are not ATAs — they're PDAs of the pool program, holding the pool's reserves.
+
+## Detecting which program a mint belongs to
+
+Every mint's account has an `owner` field pointing to either SPL Token or Token-2022:
+
+```ts
+const mintInfo = await connection.getAccountInfo(mintPubkey);
+if (mintInfo.owner.equals(TOKEN_PROGRAM_ID)) {
+  console.log("SPL Token mint");
+} else if (mintInfo.owner.equals(TOKEN_2022_PROGRAM_ID)) {
+  console.log("Token-2022 mint");
+}
+```
+
+The Raydium SDK handles this detection automatically — `getPoolInfoFromRpc` returns the appropriate `programId` per token so clients can construct correct ATAs.
+
+## Swap instructions by program
+
+Raydium's CPMM and CLMM each have two swap instructions:
+
+| Instruction | Supported mints |
+|-------------|-----------------|
+| `Swap` / `SwapBaseInput` (legacy) | SPL Token only |
+| `SwapV2` / `SwapBaseInputV2` | Both SPL Token and Token-2022 |
+
+`SwapV2` takes additional accounts: mint accounts for both sides, the token program for each side (since they may differ), and — for transfer-hook mints — the hook program and its required accounts.
+
+Clients should always use `SwapV2` when at least one side is Token-2022; `SwapV2` also works for SPL-only pools, but the legacy `Swap` is cheaper in compute.
+
+The SDK picks the right variant automatically.
+
+## Migrating an SPL Token project to Token-2022
+
+Token-2022 is not a drop-in replacement at the mint level — a mint at address X is either SPL or Token-2022, and that's fixed at creation. To "migrate" you must:
+
+1. Create a new mint under Token-2022 with the extensions you want.
+2. Provide a swap/wrap mechanism for holders of the old SPL mint to exchange for the new one.
+3. Update all LP pools, farms, and integrations to reference the new mint.
+
+This is heavy. Most projects launched under SPL stay under SPL unless a specific extension need forces the move.
+
+## Worked example: creating a Token-2022 mint with transfer fee
+
+```ts
+import {
+  Connection, Keypair, SystemProgram, Transaction, sendAndConfirmTransaction,
+} from "@solana/web3.js";
+import {
+  TOKEN_2022_PROGRAM_ID, ExtensionType, createInitializeMintInstruction,
+  getMintLen, createInitializeTransferFeeConfigInstruction,
+} from "@solana/spl-token";
+
+const connection = new Connection("https://api.mainnet-beta.solana.com");
+const payer      = Keypair.generate();
+const mint       = Keypair.generate();
+
+const extensions    = [ExtensionType.TransferFeeConfig];
+const mintLen       = getMintLen(extensions);
+const rentLamports  = await connection.getMinimumBalanceForRentExemption(mintLen);
+
+const tx = new Transaction().add(
+  SystemProgram.createAccount({
+    fromPubkey:       payer.publicKey,
+    newAccountPubkey: mint.publicKey,
+    space:            mintLen,
+    lamports:         rentLamports,
+    programId:        TOKEN_2022_PROGRAM_ID,
+  }),
+  createInitializeTransferFeeConfigInstruction(
+    mint.publicKey,
+    payer.publicKey,                  // transfer fee authority
+    payer.publicKey,                  // withdraw-withheld authority
+    50,                               // 50 bps = 0.5%
+    BigInt(1_000_000),                // max fee per transfer (smallest units)
+    TOKEN_2022_PROGRAM_ID,
+  ),
+  createInitializeMintInstruction(
+    mint.publicKey,
+    9,                                // decimals
+    payer.publicKey,                  // mint authority
+    null,                             // freeze authority
+    TOKEN_2022_PROGRAM_ID,
+  ),
+);
+
+await sendAndConfirmTransaction(connection, tx, [payer, mint]);
+```
+
+This mint can be LPed into a Raydium CPMM pool; swappers will pay the 0.5% transfer fee on top of the pool's swap fee.
+
+## Security considerations
+
+Before LPing into or swapping through a Token-2022 mint:
+
+- **Check `freeze_authority`**. If non-null and held by a centralized party, they can freeze your ATA (and arguably the pool vault).
+- **Check `transfer_hook`**. The hook program can block transfers arbitrarily — DYOR on the hook's source.
+- **Check `transfer_fee`**. Account for the fee in expected swap output.
+- **Check `permanent_delegate` and `non_transferable`**. Raydium's program rejects these, but verify if building a custom integration.
+
+See [`security/oracle-and-token-risks`](/security/oracle-and-token-risks) for the full risk-acceptance framework.
+
+## Pointers
+
+- [`solana-fundamentals/account-model`](/solana-fundamentals/account-model) — the general account model.
+- [`reference/token-2022-support`](/reference/token-2022-support) — Token-2022 specifics for CPMM and CLMM.
+- [`security/oracle-and-token-risks`](/security/oracle-and-token-risks) — risks from malicious mint extensions.
+
+Sources:
+
+- [SPL Token docs](https://spl.solana.com/token).
+- [Token-2022 docs](https://spl.solana.com/token-2022) — full extension list.
+- [Associated Token Account](https://spl.solana.com/associated-token-account).

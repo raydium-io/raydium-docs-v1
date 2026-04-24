@@ -1,0 +1,202 @@
+---
+title: "Integrasi agregator"
+description: "Cara menemukan pool Raydium, memberikan penawaran lintas CPMM / CLMM / AMM v4, dan merutekan swap atomik melalui set program yang tepat. Ditulis untuk agregator DEX dan UI swap dompet."
+---
+
+<Info>
+  **Halaman ini diterjemahkan secara otomatis oleh AI. Versi bahasa Inggris adalah acuan resmi.**
+
+  [Lihat versi bahasa Inggris →](/integration-guides/aggregator)
+</Info>
+
+<Info>
+  Tugas agregator adalah memberikan pengguna harga terbaik di seluruh banyak pool, dengan kemungkinan membagi input tunggal di beberapa rute pool, dan menjalankannya secara atomik. Halaman ini mendokumentasikan bagian spesifik Raydium dari pekerjaan itu: penemuan, penawaran, dan perakitan transaksi.
+</Info>
+
+## Penemuan
+
+### Inventaris pool
+
+Anda memerlukan daftar lengkap pool Raydium yang aktif untuk setiap produk. Tiga opsi:
+
+1. **REST API** (paling sederhana): `GET https://api-v3.raydium.io/pools/info/list?poolType=all&pageSize=1000&page=1` mengembalikan pool dalam batch 1000. Pagisasi hingga Anda memilikinya semua. Cache selama 1–5 menit.
+2. **Pemindaian on-chain**: `getProgramAccounts` pada ID program CPMM, CLMM, dan AMM v4, disaring oleh discriminator akun status. Menghasilkan ~setiap pool aktif dengan ~10 detik waktu RPC. Berguna ketika API sedang down atau rate-limited.
+3. **Hibrida**: gunakan API sebagai sumber utama; jalankan pemindaian on-chain harian sebagai pemeriksaan akal sehat. Tim berkomitmen untuk menjaga API komprehensif, tetapi pool yang dibuat melalui CPI langsung (tanpa frontend) kadang dapat tertinggal.
+
+### Pencarian pasangan mint
+
+Untuk pasangan `(mintA, mintB)` tertentu, gunakan `GET /pools/info/mint?mint1=...&mint2=...&poolType=all&sort=liquidity`. Mengembalikan setiap pool pada tingkat biaya dan tipe produk apa pun. Hingga ~10 hasil per pasangan adalah umum pada mint yang banyak lalu lintas; urutkan berdasarkan TVL dan ambil beberapa teratas untuk perutean.
+
+## Penawaran
+
+Matematika penawaran berbeda per produk. Gunakan fungsi matematika murni SDK sehingga Anda tidak perlu mengimplementasikan ulang:
+
+```ts
+// CPMM
+const cpmmQuote = raydium.cpmm.computeAmountOut({
+  poolInfo: cpmmPool,
+  amountIn,
+  mintIn,
+  mintOut,
+  slippage: 0,        // compute exact expected; layer slippage at route level
+});
+
+// CLMM — crosses ticks; deterministic but more expensive.
+// `computeAmountOutFormat` is the canonical helper exposed via `PoolUtils` in
+// raydium-sdk-v2: the `*Format` suffix signals that it returns the output
+// pre-shaped for transaction building (including `remainingAccounts` for tick arrays).
+const { output: clmmOut, remainingAccounts } = PoolUtils.computeAmountOutFormat({
+  poolInfo:  clmmPool,
+  poolState: clmmPoolState,
+  tickArrayCache,
+  amountIn,
+  tokenIn:   mintIn,
+  slippage:  0,
+});
+
+// AMM v4
+const ammV4Quote = raydium.liquidity.computeAmountOut({
+  poolInfo: ammV4Pool,
+  amountIn,
+  mintIn: mintIn,
+  mintOut: mintOut,
+  slippage: 0,
+});
+```
+
+Hasil untuk ketiga: `{ amountOut, fee, priceImpact, minAmountOut }`. Untuk perbandingan agregator, gunakan `amountOut` (pra-slippage).
+
+### Kesegaran cache
+
+Status pool cepat ketinggalan zaman. Target kesegaran yang disarankan:
+
+| Tipe pool | Frekuensi pengambilan ulang | Alasan |
+|-----------|---------------------|-----|
+| CPMM dengan `<$100k` TVL | `<10s` | Reserve bergerak pada setiap perdagangan. |
+| CPMM dengan `>$10M` TVL | 30–60 detik | Reserve dominan; perdagangan kecil adalah noise. |
+| CLMM | `<30s` | Batas tick; perdagangan besar tunggal dapat mengonfigurasi ulang likuiditas. |
+| AMM v4 | `<30s` | Gerakan sisi OpenBook tidak tertangkap di vault. |
+
+Untuk agregator yang mengambil penawaran dengan latensi interaktif, berlangganan pembaruan akun WebSocket (`accountSubscribe`) pada setiap status pool yang relevan. Itu membalik model dari polling ke push.
+
+### Penyesuaian Token-2022
+
+Jika ada mint dalam rute yang memiliki biaya transfer Token-2022, matematika penawaran harus menyesuaikan masukan dan keluaran per [`algorithms/token-2022-transfer-fees`](/id/algorithms/token-2022-transfer-fees). SDK menangani ini jika `poolInfo.mintA.extensions.transferFeeConfig` sudah diisi. Konfirmasi dengan melihat field `.extensions` sebelum mempercayai penawaran.
+
+## Perutean
+
+### Rute pool tunggal
+
+Sebagian besar rute adalah pool tunggal. Pilih pool yang `amountOut`-nya tertinggi. Jika beberapa sama, tie-break berdasarkan tingkat biaya (lebih rendah lebih baik), kemudian berdasarkan TVL (lebih banyak lebih aman).
+
+### Perutean terpisah
+
+Untuk perdagangan besar di mana satu pool memiliki >5% dampak harga, pisahkan di seluruh pool. Algoritma serakah sederhana:
+
+```
+remaining = amountIn
+routes    = []
+while remaining > 0:
+    best_pool, best_size = argmax over pools of:
+        marginal_out_per_in(pool, current_size_toward_pool + epsilon)
+    size = min(remaining, best_pool.max_size_at_target_impact)
+    routes.append((best_pool, size))
+    remaining -= size
+```
+
+Ini menghasilkan vektor perutean `[(pool_A, 0.6), (pool_B, 0.3), (pool_C, 0.1)]` yang meminimalkan dampak agregat. Solusi optimasi cembung yang tepat (misalnya menyamakan harga marginal di seluruh pool) berada dalam ~1% dari hasil serakah dalam praktik.
+
+### Rute multi-hop
+
+`USDC → RAY → SOL` melalui dua pool terpisah adalah umum ketika tidak ada pool langsung `USDC-SOL` yang memberikan penawaran bagus (jarang). Terapkan batas slippage per-hop; setiap hop memberlakukan `minAmountOut` miliknya sendiri. Lihat [`algorithms/slippage-and-price-impact`](/id/algorithms/slippage-and-price-impact).
+
+Multi-hop di seluruh pool yang sama (misalnya dua hop CLMM pada `SOL-USDC`) selalu suboptimal vs single hop — jangan buat rute seperti itu.
+
+## Perakitan transaksi
+
+### Single-hop, single-pool
+
+Gunakan `raydium.trade.swap` SDK secara langsung:
+
+```ts
+const { execute } = await raydium.trade.swap({
+  poolKeys:        poolInfo,
+  amountIn,
+  amountOut:       quote.minAmountOut,
+  fixedSide:       "in",
+  inputMint:       mintIn,
+  txVersion:       TxVersion.V0,
+  computeBudgetConfig: {
+    units:         250_000,
+    microLamports: priorityFee,
+  },
+});
+```
+
+### Terpisah dan multi-hop
+
+Susun ATA + instruksi secara manual. Pola:
+
+```
+[1] ComputeBudget set_compute_unit_limit
+[2] ComputeBudget set_compute_unit_price
+[3] createATA (jika diperlukan, sekali per mint yang tidak dipegang pengguna)
+[4..N] SwapInstruction untuk setiap (pool, size) dalam rute
+[N+1] CloseAccount (jika Anda membungkus/membuka bungkus SOL)
+```
+
+Semua dalam satu transaksi untuk atomisitas. Untuk split 3-pool pada V0 dengan tabel pencarian alamat, ini biasanya muat dalam ~1100 byte. Untuk 4+ pool, batas ukuran transaksi memaksa multi-tx atau konsolidasi di mint hub.
+
+### Atomisitas
+
+Agregator harus menjamin atomisitas: baik rute penuh mendarat atau tidak satupun. Instruksi swap Raydium revert pada `ExceededSlippage`, sehingga rute multi-pool di mana satu hop gagal menyebabkan seluruh transaksi revert. Gratis.
+
+Satu-satunya pengecualian: jika rute Anda melewati Raydium + DEX pihak ketiga, pastikan DEX itu juga memiliki model revert-on-slippage. Beberapa program mengabaikan batas slippage (jarang).
+
+## Jebakan
+
+### 1. Penawaran basi
+
+Antara pengguna melihat "Anda menerima 125.43 RAY" dan transaksi mendarat, reserve dapat bergeser. Ambil ulang status pool segera sebelum pengajuan; re-quote; jika penawaran baru >1% lebih buruk, jeda dan konfirmasi ulang dengan pengguna.
+
+### 2. Daftar hitam pool
+
+Beberapa pool Raydium adalah token scam dengan biaya transfer ditetapkan ke 99% atau dengan ekstensi tidak dapat ditransfer. REST API menandai ini (lihat field `tags`); lewati pool apa pun yang ditandai `scam` atau `honeypot`. Menjalankan pemeriksaan keamanan Anda sendiri di atas tag Raydium adalah bijaksana.
+
+### 3. Persyaratan status observasi pada CLMM
+
+CLMM `SwapV2` memerlukan akun `observation_state`. SDK mengisinya untuk Anda; instruksi yang dibangun tangan sering lupa, yang menyebabkan program revert dengan `AccountNotFound`. Selalu sertakan.
+
+### 4. Tabel pencarian alamat
+
+Raydium mempertahankan tabel pencarian publik untuk akun yang paling sering digunakan (mint utama, ID program, AmmConfigs). Agregator harus menggunakan ini — menghemat ~100 byte per transaksi dan memungkinkan rute yang lebih besar untuk muat di V0. Menarik alamat LUT:
+
+```ts
+const raydiumLUTs = await raydium.getRaydiumLutAddresses();
+```
+
+### 5. Penanganan kemacetan
+
+Selama jendela volume tinggi, transaksi dapat duduk di mempool selama beberapa blok. Retry agresif pada TX expiry (bukan pada revert — revert bersifat deterministik) direkomendasikan. Opsi `sendAndConfirm` SDK melakukan retry dasar; agregator produksi melapisi logika mereka sendiri (bundle Jito, broadcast multi-RPC) di atas.
+
+## Daftar periksa
+
+Sebelum go-live, verifikasi:
+
+- [ ] Penemuan pool mencakup CPMM + CLMM + AMM v4 secara komprehensif.
+- [ ] Penawaran cocok dengan penawaran UI Raydium sendiri dalam 1 basis poin pada beberapa perdagangan uji.
+- [ ] Perutean terpisah dimulai untuk perdagangan >5% dampak pada pool tunggal apa pun.
+- [ ] Biaya prioritas diukur terhadap biaya program pool baru-baru ini (lihat [`integration-guides/priority-fee-tuning`](/id/integration-guides/priority-fee-tuning)).
+- [ ] Biaya transfer Token-2022 dihitung dan ditampilkan kepada pengguna.
+- [ ] Transaksi revert dengan bersih ketika slippage terlampaui.
+- [ ] Logika retry membedakan tx expiry (retry) dari revert (jangan retry).
+
+## Penunjuk
+
+- [`integration-guides/routing-and-mev`](/id/integration-guides/routing-and-mev) — ketahanan sandwich, bundle.
+- [`integration-guides/priority-fee-tuning`](/id/integration-guides/priority-fee-tuning) — instruksi budget komputasi sizing.
+- [`sdk-api/rest-api`](/id/sdk-api/rest-api) — endpoint daftar pool.
+
+Sumber:
+
+- [Modul Raydium SDK v2 `trade`](https://github.com/raydium-io/raydium-sdk-V2)

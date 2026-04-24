@@ -1,0 +1,103 @@
+---
+title: "Farm / Staking overview"
+description: "How Raydium's farm program distributes reward tokens to stakers — the per-share accounting, the farm-version generations (v3, v5, v6), and how farms relate to but are distinct from the AMM / CLMM pools they sit alongside."
+---
+
+## What a farm is
+
+A **farm** is a standalone on-chain program that distributes one or more **reward mints** to accounts that stake a **staking mint**. The staking mint is almost always an LP token issued by CPMM, AMM v4, or a legacy pair pool, but single-asset farms (staking SOL, RAY, or a project token directly) are supported and used for a small number of long-running programs.
+
+Key properties:
+
+- **Emission-based, not fee-based.** Unlike CLMM's built-in reward streams, farm rewards are not tied to swap volume or pool activity. A farm's budget is deposited up front by the creator and emits at a constant per-second rate until it runs out.
+- **Independent of the pool.** The pool does not know the farm exists. Moving LP between wallets does not notify the farm; a user must actively `Withdraw` from the farm first. Likewise, `Withdraw` from the pool does not withdraw from the farm.
+- **Per-user, per-reward ledger.** Each staker has a `UserStake` (or "Ledger") account per farm that tracks their staked amount and their snapshot of the reward-per-share counter for each of the farm's reward streams.
+- **Multi-reward.** Farm v5 supports up to 2 rewards; v6 supports up to 5. Each reward has its own vault, per-second rate, start time, and end time.
+
+## The three live versions
+
+Raydium has shipped three farm program versions. All are live, and each carries its own PDA scheme and instruction set. Integrators should treat them as three distinct programs that share a conceptual model.
+
+| Version | Program ID location | Max rewards | Notable differences |
+|---------|---------------------|-------------|----------------------|
+| **v3** | see [`reference/program-addresses`](/reference/program-addresses) | 1 | Earliest schema. Oldest farms (RAY-USDC, SOL-USDC) still route through here. |
+| **v5** | see [`reference/program-addresses`](/reference/program-addresses) | 2 | Added second reward slot and `AddReward`-style top-ups. |
+| **v6** | see [`reference/program-addresses`](/reference/program-addresses) | 5 | Current version. Expanded slots, cleaner admin, supports CLMM-position farming via a v6-specific adapter (rare in practice). |
+
+The SDK exposes `raydium.farm` as a single facade — version is inferred from the farm account's owner. When building on-chain integrations you must dispatch manually.
+
+## Reward-per-share accounting
+
+The farm program uses the standard "master-chef" pattern seen across DeFi yield contracts:
+
+```
+reward_per_share := total_rewards_distributed_by_stream / total_staked
+pending(user)    := user.staked × (reward_per_share − user.reward_debt)
+```
+
+- **`reward_per_share`** is stored on the farm account as a fixed-point counter (Q64.64 in v5+, Q56.8 in v3). It only grows.
+- **`user.reward_debt`** is the snapshot of `reward_per_share` at the user's last interaction. It is not a debt the user owes; it is an offset used to compute future accruals.
+- On `Deposit` and `Withdraw`, the farm first settles pending rewards (crediting `user.pending_reward` or sending directly to the user's ATA, depending on version), then updates `user.reward_debt` to the current counter.
+- On `Harvest`, the farm pays out `pending_reward` and snapshots `reward_debt` again.
+
+The per-second emission rate enters the accounting via a lazy update:
+
+```
+elapsed        := min(now, reward.end_time) − reward.last_update_time
+new_emissions  := reward.per_second × elapsed
+if total_staked > 0:
+    reward_per_share += new_emissions / total_staked
+reward.last_update_time := now
+```
+
+Lazy: no instruction is emitted "every second." The counter is refreshed every time anyone touches the farm (`Deposit`, `Withdraw`, `Harvest`, admin update). Farms with no activity accrue a growing gap that is closed on the next interaction.
+
+## Staking mint vs reward mint
+
+**The staking mint is held in escrow, not burned.** When a user stakes 100 LP, the farm moves 100 LP from the user's ATA into the farm's staking vault. On `Withdraw`, the farm moves 100 LP back. The farm never calls the pool.
+
+**Reward mints are paid out from vaults pre-funded by the creator.** When a creator spins up a farm, they deposit the full reward budget (say, 1,000,000 RAY + 500,000 USDC) into the two reward vaults. The farm program does not mint new tokens; it simply distributes what is in the vault over the stream's duration. If the vault is drained before `end_time`, emissions halt.
+
+## Emission schedules
+
+Each reward stream has three time parameters:
+
+- **`start_time`** — the UNIX timestamp at which emissions begin. Before this, no accrual.
+- **`end_time`** — the timestamp at which emissions stop. After this, `reward_per_share` no longer grows from this stream.
+- **`per_second`** — the emission rate while `start_time ≤ now < end_time`.
+
+A reward can be extended (push `end_time` forward, top up the vault) via `AddReward` / `SetRewards` on v5 / v6. It can be restarted after `end_time` via `RestartRewards`. It cannot be shortened without admin cooperation.
+
+## What farms are not
+
+- **Not a fee distributor.** CPMM and CLMM collect trade fees directly into pool state. Farms do not touch pool fees. The only path from pool fees to a token holder is LP-redemption or CLMM's `CollectFee`.
+- **Not automatic.** LP must be explicitly staked to earn farm rewards. LP holders who leave their tokens in their wallet earn nothing from the farm.
+- **Not fungible.** Each `UserStake` account is tied to one `(farm, user)` pair. You cannot transfer your stake to another wallet without unstaking first.
+- **Not compatible with CLMM positions directly.** Farm v6 introduced a CLMM adapter, but in practice CLMM pools use their own built-in reward streams (see [`products/clmm/fees`](/products/clmm/fees)) rather than farm emissions.
+
+## When farms are the right tool
+
+Use a farm when you want to:
+
+- Incentivize LP for one of your project's CPMM or AMM v4 pools with an external token (your project token, a partner's token, etc.).
+- Run a staking program on a single-asset mint (classic "stake RAY, earn RAY") without deploying your own contract.
+- Layer additional rewards on top of an existing pool without needing admin access to that pool.
+
+Use CLMM's built-in reward streams instead when your pool is CLMM. They have identical economics but participate in the position's fee-growth-inside accounting (in-range positions earn pro rata, out-of-range positions do not) and do not require users to move their position NFT.
+
+## Chapter contents
+
+- [`accounts`](/products/farm-staking/accounts) — full on-chain state layout per version.
+- [`instructions`](/products/farm-staking/instructions) — every farm instruction with its account list and pre/postconditions.
+- [`code-demos`](/products/farm-staking/code-demos) — TypeScript examples for staking, harvesting, and creating a new farm.
+
+## Where to go next
+
+- [`products/clmm/fees`](/products/clmm/fees) — compare farm emissions to CLMM's built-in reward model.
+- [`reference/program-addresses`](/reference/program-addresses) — the three farm program IDs.
+- [`protocol-overview/versions-and-migration`](/protocol-overview/versions-and-migration) — when to use each farm version.
+
+Sources:
+
+- Farm v6 IDL bundled in the SDK: [`raydium-io/raydium-sdk-V2`](https://github.com/raydium-io/raydium-sdk-V2) under `src/raydium/farm/`.
+- [Raydium SDK v2 `Farm` module](https://github.com/raydium-io/raydium-sdk-V2)

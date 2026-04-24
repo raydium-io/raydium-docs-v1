@@ -1,0 +1,241 @@
+---
+title: "Вестинг LaunchLab"
+description: "Заблокированные токены, cliff и линейный график разблокировки, аккаунт VestingRecord для каждого получателя и инструкции create/claim, которые используют создатели и платформы для распределения зарезервированного предложения после выпуска."
+---
+
+<Info>
+  **Эта страница переведена с помощью ИИ. За эталон принимается английская версия.**
+
+  [Открыть английскую версию →](/products/launchlab/vesting)
+</Info>
+
+<Info>
+  Вестинг **опционален** при запуске LaunchLab. Установите `vesting_param.total_locked_amount = 0` при инициализации, и раздел ниже не применяется. После активации график фиксируется на весь жизненный цикл запуска; cliff и периоды разблокировки не могут быть изменены задним числом.
+</Info>
+
+## Зачем нужен вестинг
+
+Bonding curve продаёт `base_supply_graduation` токенов во время сбора средств и засевает постградуальный пул оставшимся количеством. Вестинг выделяет дополнительную часть предложения, блокирует её на настраиваемый cliff, а затем линейно высвобождает её одному или нескольким получателям — обычно команде создателя, советникам или партнёрам платформы.
+
+Практические варианты использования:
+
+- **Распределение команде.** Создатель резервирует, скажем, 5% предложения для основной команды, заблокированное на 6 месяцев и разблокировавшееся линейно в течение следующих 12 месяцев.
+- **Распределение платформе.** Платформа запуска получает часть каждого токена, который она перечисляет, по той же схеме, через `CreatePlatformVestingAccount`.
+- **Гранты советникам и участникам.** Несколько получателей с собственными аккаунтами `VestingRecord`, каждый отслеживающий свою заявленную сумму независимо.
+
+Заблокированные токены никогда не входят в кривую и не входят в постградуальный LP. Они остаются неактивными в `base_vault` пула до тех пор, пока каждый получатель не вызовет `ClaimVestedToken`.
+
+## Форма графика
+
+Вестинг для запуска описывается тремя числами, записанными один раз во время инициализации:
+
+| Поле | Тип | Смысл |
+|------|-----|-------|
+| `total_locked_amount` | `u64` | Сумма всех базовых токенов, заблокированных для всех получателей (создатель + платформа). Должна удовлетворять `total_locked_amount <= supply * max_lock_rate / 1_000_000` из `GlobalConfig`. |
+| `cliff_period` | `u64` (секунды) | Время ожидания после окончания сбора средств, прежде чем любые токены будут разблокированы. |
+| `unlock_period` | `u64` (секунды) | Длительность окна линейной разблокировки после cliff. `0` означает, что всё разблокируется мгновенно в конце cliff. |
+
+Эти три значения находятся на `PoolState.vesting_schedule` (структура `VestingSchedule`) плюс on-chain `start_time`, который программа записывает как `block_time + cliff_period` в момент, когда сбор средств успешно заканчивается (когда условия выпуска впервые выполняются).
+
+```rust
+// states/pool.rs
+pub struct VestingSchedule {
+    pub total_locked_amount:     u64,
+    pub cliff_period:            u64,
+    pub unlock_period:           u64,
+    pub start_time:              u64,   // set by the program at fundraising end
+    pub allocated_share_amount:  u64,   // running sum of allocations to vesting records
+}
+```
+
+`allocated_share_amount` — это общая сумма, уже назначенная аккаунтам `VestingRecord` через `CreateVestingAccount` / `CreatePlatformVestingAccount`. Она никогда не должна превышать `total_locked_amount`. Если создатель переалоцирует, следующий вызов `CreateVestingAccount` вернёт ошибку `InvalidTotalLockedAmount`.
+
+## Формула линейной разблокировки
+
+После окончания сбора средств программа вычисляет совокупную разблокированную сумму для каждого `VestingRecord` как:
+
+```
+elapsed         = min(now, start_time + unlock_period) − start_time
+unlocked_amount = token_share_amount × elapsed / unlock_period
+```
+
+Если `unlock_period == 0`, весь `token_share_amount` становится требуемым в один шаг в `start_time`. В противном случае кривая представляет собой прямую линию от 0 в `start_time` до `token_share_amount` в `start_time + unlock_period`, ограниченную `token_share_amount` впоследствии.
+
+Сумма, переведённая при каждом вызове `ClaimVestedToken`, — это разница между вновь рассчитанной совокупной разблокированной суммой и текущим полем `claimed_amount` в записи.
+
+```
+delta_amount    = unlocked_amount − vesting_record.claimed_amount
+vesting_record.claimed_amount = unlocked_amount
+```
+
+Попытка получения до `start_time` вернёт ошибку `VestingNotStarted`. Получение после `start_time + unlock_period` выплатит полный остаток.
+
+## Схемы аккаунтов
+
+### `VestingSchedule`
+
+Находится inline на `PoolState`. См. [`accounts`](/ru/products/launchlab/accounts).
+
+### `VestingRecord`
+
+Запись для каждого получателя. PDA получен как:
+
+```
+seeds = [
+  b"pool_vesting",
+  pool_state.key(),
+  beneficiary.key(),
+]
+program = LaunchLab program
+```
+
+```rust
+// states/vesting.rs
+#[account]
+pub struct VestingRecord {
+    pub epoch:               u64,         // recent_epoch tracker
+    pub pool:                Pubkey,      // back-pointer to PoolState
+    pub beneficiary:         Pubkey,      // who can call ClaimVestedToken
+    pub claimed_amount:      u64,         // cumulative claimed
+    pub token_share_amount:  u64,         // total allocated to this beneficiary
+    pub padding:             [u64; 8],
+}
+```
+
+Получатель может иметь только **один** `VestingRecord` для каждого запуска. Алоцирование снова одному и тому же получателю при одном запуске вернёт ошибку, так как PDA уже существует.
+
+## Инструкции
+
+### `CreateVestingAccount`
+
+Только создатель. Выделяет часть `total_locked_amount` пула новому получателю путём инициализации свежего PDA `VestingRecord`.
+
+**Аргументы**
+
+```
+share_amount: u64    // токены для назначения этому получателю
+```
+
+**Аккаунты**
+
+| # | Имя | W | S | Примечания |
+|---|-----|---|---|-----------|
+| 1 | `creator` | W | S | Должен равняться `pool_state.creator`; оплачивает аренду для нового аккаунта. |
+| 2 | `beneficiary` | W |   | Позже получает разблокированные токены. Pubkey заблокирован здесь — не может быть изменён. |
+| 3 | `pool_state` | W |   | Мутируется для увеличения `vesting_schedule.allocated_share_amount`. |
+| 4 | `vesting_record` | W |   | `init`; PDA `[b"pool_vesting", pool_state, beneficiary]`. |
+| 5 | `system_program` |   |   | Требуется для создания аккаунта. |
+
+**Предусловия**
+
+- `share_amount > 0`.
+- `pool_state.vesting_schedule.allocated_share_amount + share_amount <= total_locked_amount`.
+- Pubkey `beneficiary` не имеет существующего `VestingRecord` для этого пула.
+
+**Постусловия**
+
+- `vesting_record` инициализирован с `token_share_amount = share_amount`, `claimed_amount = 0`.
+- `pool_state.vesting_schedule.allocated_share_amount += share_amount`.
+
+**Общие ошибки** — `InvalidTotalLockedAmount`, `InvalidInput`.
+
+### `CreatePlatformVestingAccount`
+
+Вариант `CreateVestingAccount` для администратора платформы. Кошелёк вестинга платформы (хранящийся на `PlatformConfig.platform_vesting_wallet`) является получателем, а доля ограничена `PlatformConfig.platform_vesting_scale`.
+
+Подписавший должен равняться `platform_config.platform_vesting_wallet`. Другие аккаунты зеркалируют `CreateVestingAccount`. Используйте это, когда платформа контрактует получать фиксированную долю вестинга при каждом запуске, который она перечисляет.
+
+### `ClaimVestedToken`
+
+Только получатель. Переводит любые вновь разблокированные токены из `base_vault` пула на ATA получателя.
+
+**Аргументы**
+
+Нет (программа вычисляет сумму претензии из графика).
+
+**Аккаунты**
+
+| # | Имя | W | S | Примечания |
+|---|-----|---|---|-----------|
+| 1 | `beneficiary` | W | S | Должен равняться `vesting_record.beneficiary`. |
+| 2 | `authority` |   |   | PDA `[b"vault_auth_seed"]`; подписывает перевод из хранилища. |
+| 3 | `pool_state` | W |   | Мутируется только если график нуждается в переподтверждении. |
+| 4 | `vesting_record` | W |   | `claimed_amount` обновляется. |
+| 5 | `base_vault` | W |   | Хранилище базового токена пула; дебетуется. |
+| 6 | `beneficiary_ata` | W |   | Получает разблокированные токены; `init_if_needed`. |
+| 7 | `base_mint` |   |   | Базовый mint пула. |
+| 8 | `token_program` |   |   | Программа SPL Token или Token-2022. |
+| 9 | `associated_token_program` |   |   | Для создания ATA при необходимости. |
+| 10 | `system_program` |   |   | Требуется для создания аккаунта. |
+
+**Предусловия**
+
+- `block_time >= pool_state.vesting_schedule.start_time` (иначе `VestingNotStarted`).
+- `pool_state.status == PoolStatus::Migrated` — выпуск должен был уже произойти. Вызов перед выпуском вернёт ошибку.
+- Дельта разблокированной суммы больше нуля. Холостой вызов (рассчитанная дельта 0) вернёт ошибку.
+
+**Постусловия**
+
+- `vesting_record.claimed_amount` переходит в новую совокупную разблокированную сумму.
+- `delta_amount` базового токена переводится на `beneficiary_ata`.
+
+**Общие ошибки** — `VestingNotStarted`, `NoAssetsToCollect`, `MathOverflow`.
+
+## Практический пример
+
+Запуск устанавливает:
+
+- `supply = 1_000_000_000`
+- `total_locked_amount = 100_000_000` (10% предложения)
+- `cliff_period = 180 * 86400` (180 дней)
+- `unlock_period = 365 * 86400` (1 год линейно после cliff)
+
+Создатель выделяет два аккаунта `VestingRecord` сразу же после инициализации:
+
+- Получатель A (команда): `share_amount = 70_000_000`
+- Получатель B (советник): `share_amount = 30_000_000`
+
+`allocated_share_amount = 100_000_000`, равно `total_locked_amount` — дальнейшие алокации невозможны.
+
+Сбор средств завершается на `2027-01-01T00:00Z`. Программа устанавливает `start_time = 2027-01-01 + 180 дней = 2027-06-30`.
+
+На `2027-09-30` (90 дней после `start_time`), получатель A вызывает `ClaimVestedToken`:
+
+```
+elapsed         = min(now, start_time + 365·86400) − start_time
+                = 90 · 86400
+unlocked_amount = 70_000_000 × (90 / 365) ≈ 17_260_274
+delta_amount    = 17_260_274 − 0 = 17_260_274
+```
+
+Кошелёк A получает 17,26 млн базовых токенов. `vesting_record.claimed_amount` переходит к 17_260_274.
+
+Шесть месяцев спустя (`2028-03-31`, 270 дней после `start_time`), A получает снова:
+
+```
+unlocked_amount = 70_000_000 × (270 / 365) ≈ 51_780_822
+delta_amount    = 51_780_822 − 17_260_274 = 34_520_548
+```
+
+A получает ещё 34,52 млн токенов. После `2028-06-30` (конец `unlock_period`), следующий вызов передаёт оставшиеся ~18,22 млн и оставляет `claimed_amount == token_share_amount`.
+
+## Граничные случаи
+
+- **Получатель потеряет ключ.** Pubkey на `VestingRecord.beneficiary` — единственный подписавший, который может вызвать `ClaimVestedToken`. Пути восстановления нет. Установите получателя на multisig, если восстановление важно.
+- **Комиссии за передачу Token-2022.** Если базовый mint — это mint Token-2022 с расширением комиссии за передачу, получатель получает `delta_amount − transfer_fee`, а не полную дельту. Хранилище пула всё ещё записывает валовую переданную сумму — разница начисляется на счёт удержанных комиссий mint.
+- **Пул не выпущен.** Вызов `ClaimVestedToken` перед выпуском вернёт ошибку. Часы вестинга начинают работать только когда сбор средств действительно завершится; отменённый запуск (который никогда не устанавливает `start_time`) оставляет заблокированные токены недостижимыми в хранилище.
+- **Попытки переалокации.** Программа устанавливает `allocated_share_amount <= total_locked_amount` при каждом `CreateVestingAccount`. Остаток (если есть) из `total_locked_amount`, оставшийся неалоцированным, **теряется** — эти токены остаются в хранилище навсегда после выпуска пула. Алоцируйте полную сумму, если это не намеренно.
+
+## Ссылки
+
+- [`products/launchlab/accounts`](/ru/products/launchlab/accounts) — полная схема `PoolState` включая `VestingSchedule`.
+- [`products/launchlab/instructions`](/ru/products/launchlab/instructions) — жизненный цикл выпуска.
+- [`products/launchlab/platform-config`](/ru/products/launchlab/platform-config) — семантика `platform_vesting_scale` для алокаций платформе.
+- [`products/launchlab/global-config`](/ru/products/launchlab/global-config) — потолок `max_lock_rate`, ограничивающий `total_locked_amount`.
+
+Источники:
+
+- `raydium-launch/programs/launchpad/src/states/vesting.rs` — `VestingRecord`.
+- `raydium-launch/programs/launchpad/src/states/pool.rs` — `VestingSchedule`, `VestingParams`, `is_vesting_started`, `vesting_end_time`.
+- `raydium-launch/programs/launchpad/src/instructions/create_vesting_account.rs`.
+- `raydium-launch/programs/launchpad/src/instructions/claim_vested_token.rs`.

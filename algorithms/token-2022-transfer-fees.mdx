@@ -1,0 +1,173 @@
+---
+title: "Token-2022 transfer fees in swaps"
+description: "How Token-2022's transfer-fee extension changes the pre/post-swap amount accounting, which Raydium products support it, and the edge cases integrators need to handle (asymmetric fees, fee updates, max-fee caps, non-transferable extensions)."
+---
+
+<Info>
+  Support matrix: **CPMM** supports Token-2022 fully, including transfer-fee mints. **CLMM** supports Token-2022 with transfer fees via explicit `SwapV2` accounts. **AMM v4** does not support Token-2022 at all. **LaunchLab** does not support Token-2022 for the base mint (it creates classic SPL mints). **Farm v6** supports Token-2022 on both staking and reward mints.
+</Info>
+
+## What a transfer fee is
+
+Token-2022 is the second SPL Token program (`TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA` → `TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb`). Among its extensions, the **transfer-fee** extension makes every `TransferChecked` on a token mint deduct a fee from the transferred amount. The fee routes to a recipient designated by the mint authority and can be updated by the authority (within bounds).
+
+A mint with transfer fee has two relevant parameters:
+
+- **`transfer_fee_basis_points`** — the rate (e.g. 100 = 1%).
+- **`maximum_fee`** — an absolute cap per transfer (so whales moving huge amounts don't pay unbounded fees).
+
+A mint can have **two** active transfer-fee configurations at once: the "newer" one (in effect now) and the "older" one (being scheduled out). This is the "epoch transition" design — transfer fee changes take effect across an epoch boundary to avoid surprising in-flight transactions.
+
+## Why this matters for swaps
+
+A pool's vaults hold actual balances. When a user calls a Raydium swap:
+
+1. User sends `amount_in` to the pool vault. If the **in-mint** has a transfer fee, the vault receives `amount_in − fee_in`, not `amount_in`.
+2. The swap math operates on the vault-received amount.
+3. The pool sends `amount_out` to the user's ATA. If the **out-mint** has a transfer fee, the user receives `amount_out − fee_out`, not `amount_out`.
+
+If the swap program is naive and uses the raw `amount_in` argument, the invariant check fails because the vault got less than the program thinks. Conversely, if it computes `amount_out` without subtracting the outbound transfer fee, the user sees a shortfall and blames the program.
+
+Raydium CPMM and CLMM (via `SwapV2`) handle this by:
+
+- **Pre-swap**: computing `in_after_fee = amount_in − transfer_fee_on(amount_in, in_mint)`, and using `in_after_fee` in the curve math.
+- **Post-swap**: computing `out_gross = amount_out_from_curve`, sending `out_gross` to the user via `TransferChecked` which the Token-2022 program will itself reduce by the transfer fee.
+
+The user's `minAmountOut` slippage bound is checked against `out_gross` (what the pool sends), **not** against what the user receives. This is how every major Solana DEX handles Token-2022, and it matters because:
+
+- If the pool checked post-fee, a fee-update between quote and execution would cause the trade to revert.
+- Checking pre-fee pins the failure to the quote's own quality, not to the user's out-of-band fee changes.
+
+UIs should subtract the expected Token-2022 transfer fee when showing "You receive" to the user.
+
+## Computing the Token-2022 fee
+
+The SPL Token-2022 program exposes a deterministic helper. In Rust:
+
+```rust
+use spl_token_2022::extension::transfer_fee::TransferFeeConfig;
+use spl_token_2022::extension::StateWithExtensions;
+
+let mint_data = ...;
+let state = StateWithExtensions::<Mint>::unpack(&mint_data)?;
+let config = state.get_extension::<TransferFeeConfig>()?;
+
+let epoch = Clock::get()?.epoch;
+let fee_bp = config.get_epoch_fee(epoch).transfer_fee_basis_points;
+let max_fee = u64::from(config.get_epoch_fee(epoch).maximum_fee);
+
+let fee = (amount as u128 * fee_bp as u128 / 10_000).min(max_fee as u128) as u64;
+```
+
+In TypeScript (via `@solana/spl-token`):
+
+```ts
+import { getTransferFeeConfig, getTransferFeeAmount } from "@solana/spl-token";
+
+const config = getTransferFeeConfig(mintAccount);
+const currentEpochFee = config.olderTransferFee.epoch <= currentEpoch
+  ? config.newerTransferFee
+  : config.olderTransferFee;
+
+const rate   = currentEpochFee.transferFeeBasisPoints;
+const maxFee = currentEpochFee.maximumFee;
+const fee    = Math.min(Math.floor(amount * rate / 10_000), Number(maxFee));
+```
+
+## Adjusted swap formulas (CPMM, exact-input)
+
+Let `f_pool` be the pool fee rate, `f_in` the in-mint transfer fee rate, `max_in` its max cap, `f_out` the out-mint transfer fee rate, `max_out` its max cap.
+
+```
+transfer_fee_in  = min(amount_in · f_in / 10_000, max_in)
+vault_received   = amount_in − transfer_fee_in
+
+pool_fee         = ceil(vault_received · f_pool / 1_000_000)
+amount_after     = vault_received − pool_fee
+amount_out_gross = y · amount_after / (x + amount_after)
+
+transfer_fee_out = min(amount_out_gross · f_out / 10_000, max_out)
+user_receives    = amount_out_gross − transfer_fee_out
+```
+
+Slippage check: `amount_out_gross ≥ min_amount_out` (not `user_receives ≥ min_amount_out`). The user's `minAmountOut` is set by the SDK to `expected_gross · (1 − slippage)` — keep the bound on the "sent" side, not the "received" side.
+
+## Adjusted formulas (CPMM, exact-output)
+
+The SDK iterates to find `amount_in` such that `user_receives = amount_out_exact`:
+
+```
+# user wants to receive amount_out_exact after transfer fee
+amount_out_gross = amount_out_exact + transfer_fee_out_for(amount_out_exact)
+
+# then solve CPMM exact-output for amount_after:
+amount_after     = ceil(x · amount_out_gross / (y − amount_out_gross))
+
+# then add pool fee:
+vault_received   = ceil(amount_after · 1_000_000 / (1_000_000 − f_pool))
+
+# then add in transfer fee:
+amount_in = ceil(vault_received · 10_000 / (10_000 − f_in))
+# (or iterate — see fee-cap edge case below)
+```
+
+The `max_in` / `max_out` caps make the computation non-linear because once the cap is hit the fee stops growing. The SDK's `computeAmountIn` / `computeAmountOut` handle this by iterating if the naive formula would push past the cap.
+
+## Edge cases
+
+### Asymmetric fees (one side has a fee, the other does not)
+
+Common in practice. The formulas above already handle this — if one side has `f_in = 0`, the relevant terms collapse. There is no special case in the program.
+
+### Fee updates mid-swap
+
+If the mint's transfer fee changes between quote time and execution time, the swap will either land with slightly worse economics (user bears the difference within the slippage tolerance) or revert (the gross output drops below `minAmountOut`). Slippage bounds absorb this; no additional protection is needed.
+
+### Maximum-fee cap
+
+Once the trade is large enough to hit `maximum_fee`, the fee saturates and further growth is zero. This makes the effective rate asymptotic to zero for very large trades, which can cause odd pricing curves on deeply illiquid markets. The SDK's `computeAmountOut` accounts for this.
+
+### Non-transferable extension
+
+Some Token-2022 mints use the `NonTransferable` extension, which rejects all `Transfer` calls except to and from the mint authority. Such mints **cannot** be used in a Raydium pool at all. `CreatePool` rejects them at init.
+
+### Interest-bearing mints
+
+Token-2022 also supports an `InterestBearingConfig` extension that makes balances appear to grow over time. Raydium's pools read raw vault balances (which ignore the interest accrual), so on a pool with an interest-bearing mint, LPs capture the accrued interest as a pure gift whenever they redeem (the vault balance grew faster than the LP supply representation). Integrators should treat this as a non-issue but document it for the LP side.
+
+### Transfer hooks
+
+Token-2022's `TransferHook` extension allows arbitrary CPI on every transfer. Raydium CPMM supports these — the swap instruction forwards the hook accounts — but it adds CU overhead and requires the hook to be well-behaved. CLMM `SwapV2` also supports hooks. AMM v4 does not support Token-2022 at all, so the question does not arise.
+
+## Worked example
+
+CPMM pool, `x = 1_000_000 USDY, y = 1_000_000 USDC`, pool fee 0.25%.
+
+- USDY has a 1% transfer fee, `max_fee = 10_000` (0.01 USDY with 6 decimals).
+- USDC has no transfer fee.
+
+User swaps `amount_in = 1_000 USDY` for USDC (exact-input).
+
+```
+transfer_fee_in = min(1_000 · 100 / 10_000, 10_000)  = 10     // 1%, well under cap
+vault_received  = 1_000 − 10 = 990
+
+pool_fee        = ceil(990 · 2_500 / 1_000_000)  = 3    // 0.25%
+amount_after    = 990 − 3 = 987
+
+amount_out_gross = 1_000_000 · 987 / (1_000_000 + 987) = 986_027 / ...  ≈ 985.97
+```
+
+≈ 985.97 USDC. No outbound transfer fee, so the user receives 985.97 USDC.
+
+## Pointers
+
+- [`products/cpmm/overview`](/products/cpmm/overview) — CPMM Token-2022 support.
+- [`products/clmm/instructions`](/products/clmm/instructions) — `SwapV2` vs `Swap` for Token-2022 routing.
+- [`solana-fundamentals/spl-token-and-token-2022`](/solana-fundamentals/spl-token-and-token-2022) — the general Token-2022 extension model.
+
+Sources:
+
+- [SPL Token-2022 transfer-fee extension docs](https://spl.solana.com/token-2022/extensions#transfer-fees)
+- Raydium CPMM program source (`SwapBaseInput` / `SwapBaseOutput` Token-2022 handling).
+- Raydium CLMM program source (`SwapV2`).

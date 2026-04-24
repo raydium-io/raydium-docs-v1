@@ -1,0 +1,158 @@
+---
+title: "Slippage dan dampak harga"
+description: "Definisi presisi slippage vs dampak harga, cara SDK Raydium mengukur minAmountOut dan maxAmountIn, perbedaan antar jenis AMM, dan pertimbangan MEV untuk routing produksi."
+---
+
+<Info>
+  **Halaman ini diterjemahkan secara otomatis oleh AI. Versi bahasa Inggris adalah acuan resmi.**
+
+  [Lihat versi bahasa Inggris →](/algorithms/slippage-and-price-impact)
+</Info>
+
+## Dua konsep yang berbeda
+
+**Dampak harga** dan **slippage** sering dikacaukan dalam UI tetapi mengacu pada hal yang berbeda.
+
+- **Dampak harga** adalah properti deterministik dari perdagangan terhadap kondisi pool tertentu. Mengingat `(Δin, reserves)`, dampak harga dapat sepenuhnya dihitung sebelum perdagangan diajukan.
+
+- **Slippage** adalah perbedaan yang terealisasi antara harga yang Anda *harapkan* saat waktu kutipan dan harga yang Anda *dapatkan* saat eksekusi. Ini adalah fungsi latensi, transaksi bersamaan, dan urutan inklusi blok — bukan dari matematika pool.
+
+Kutipan 1% terhadap pool yang sehadar kosong memiliki slippage 0% jika mendarat di blok berikutnya; 1% itu adalah dampak harga. Kutipan yang sama mendarat 0,2% lebih buruk jika perdagangan lain mengenai pool terlebih dahulu — 0,2% tambahan itu adalah slippage.
+
+## Definisi formal
+
+### Dampak harga
+
+```
+p_before = pool.spot_price()
+p_after  = pool.spot_price_if_trade(Δin) diterapkan
+impact   = (p_before − p_after) / p_before       // dapat bertanda
+```
+
+Untuk CPMM: `impact ≈ 2 · Δin / reserve_in` untuk perdagangan kecil. Untuk CLMM: tergantung pada berapa banyak tick yang dilintasi perdagangan; sering flat dalam rentang tick saat ini, melompat di setiap persilangan tick.
+
+### Slippage yang terealisasi
+
+```
+quoted_out = amount_out dihitung pada waktu kutipan
+actual_out = amount_out diamati di on-chain
+slippage   = (quoted_out − actual_out) / quoted_out
+```
+
+Slippage selalu non-negatif (atau nol), dengan asumsi kutipan jujur. Nilai negatif akan berarti Anda mendapat *lebih* dari yang dikutip — mungkin jika kondisi pool bergerak menguntungkan Anda antara kutipan dan eksekusi.
+
+## Mengukur `minAmountOut` dan `maxAmountIn`
+
+Setiap swap Raydium mengambil batas perlindungan slippage:
+
+- `SwapBaseInput(amount_in, min_amount_out)` — input yang tepat, batas bawah output.
+- `SwapBaseOutput(max_amount_in, amount_out)` — output yang tepat, batas atas input.
+
+SDK menghitung ini sebagai:
+
+```ts
+const computed = raydium.<pool_type>.computeAmountOut({
+  poolInfo,
+  amountIn,
+  mintIn,
+  mintOut,
+  slippage: 0.005,     // 0.5% toleransi
+});
+
+// computed.amountOut         — kutipan "yang diharapkan"
+// computed.minAmountOut      — amountOut × (1 − slippage), digunakan sebagai batas on-chain
+// computed.priceImpact       — deterministik, hanya kondisi pool
+// computed.fee               — total biaya yang dikenakan (semua komponen dijumlahkan)
+```
+
+Toleransi slippage adalah **buffer di sekitar dampak harga**, bukan dampak harga itu sendiri. Toleransi 0,5% berarti "terima paling buruk 0,5% dari kutipan saya" — terlepas dari apakah dampak harga itu 0,01% (perdagangan kecil) atau 2% (perdagangan besar). Untuk perdagangan dengan dampak harga 2% dengan toleransi 0,5%, `minAmountOut` adalah `2,5%` di bawah spot pra-perdagangan — pada dasarnya jumlah dampak dan toleransi.
+
+## Toleransi slippage yang direkomendasikan
+
+Tidak ada angka yang benar tunggal; batas yang tepat tergantung pada:
+
+1. **Stabilitas pasangan.** Pool stablecoin-stablecoin dapat aman menggunakan 0,1%. Pool pasangan meme volatil sering memerlukan 3–5% hanya untuk mendarat dengan andal.
+2. **Ukuran perdagangan.** Perdagangan yang lebih besar memiliki dampak harga yang lebih besar, sehingga toleransi perlu diskalakan dengannya untuk menghindari pembalikan. Default auto-slippage SDK berkisar pada `max(0.5%, 2 × price_impact)` karena alasan ini.
+3. **Latensi inklusi blok.** Transaksi yang tinggal di mempool selama beberapa blok terbuka untuk lebih banyak perdagangan bersamaan. Bundle Jito dan biaya prioritas mengurangi ini.
+
+Aturan praktis (default UI Raydium):
+
+| Jenis pasangan | Toleransi default |
+|-----------|-------------------|
+| Stable-stable (USDC-USDT, USDC-USDS) | 0,1% |
+| Stable-major (USDC-SOL, USDC-BTC) | 0,5% |
+| Major-major (SOL-BTC, SOL-ETH) | 1% |
+| Volatil (token meme, long-tail tidak likuid) | 3–5% |
+
+## Perbedaan antar jenis AMM
+
+### CPMM
+
+Dampak harga halus dan berkelanjutan (bentuk tertutup `2 · Δin / reserve_in`). Toleransi slippage diskalakan secara linear dengan ukuran perdagangan.
+
+### AMM v4
+
+Matematika kurva yang sama dengan CPMM, tetapi "reserve efektif" mencakup pesanan limit yang diposting OpenBook pool. Dalam praktiknya ini berarti:
+
+- Kutipan dari saldo vault mentah *meremehkan* reserve dan oleh karena itu *melebih-lebihkan* dampak.
+- SDK mengambil `AmmInfo` dan menjumlahkan `vault + on_book.free + on_book.locked` untuk mendapatkan angka yang tepat.
+- Kondisi OpenBook usang (crank terblokir) dapat menyebabkan dampak yang dikutip menyimpang dari kenyataan on-chain. Agregator secara rutin pre-crank (permissionless `MonitorStep`) sebelum perdagangan AMM-v4 besar.
+
+### CLMM
+
+Dampak harga adalah **piecewise**. Dalam rentang tick saat ini, dampak kira-kira linear dalam `Δin / L`. Melewati batas tick dapat mengubah `L` secara diskrit, menyebabkan lompatan mendadak dalam harga marjinal. Perdagangan yang melewati beberapa tick yang jarang dihuni dapat memiliki dampak jauh lebih besar daripada yang disarankan aturan `2 · Δin / reserve`.
+
+Kutipan CLMM SDK mengulangi langkah swap secara deterministik untuk mengembalikan `amountOut` yang diharapkan dengan tepat, jadi `minAmountOut = amountOut · (1 − slippage)` adalah benar. Tetapi nilai pengembalian **priceImpact** harus ditafsirkan sebagai "spread antara spot pra-perdagangan dan spot pasca-perdagangan", yang pada CLMM dapat jauh lebih besar daripada slippage efektif swap untuk pengguna yang hanya peduli dengan `amount_out`.
+
+### Kurva LaunchLab
+
+Mirip dengan CPMM tetapi dengan kurva asimetris (kuadratik atau virtual-reserves). Dampak tumbuh lebih cepat untuk pembeli akhir saat kurva menanjak menuju kelulusan. UI pre-buyer harus memperingatkan ketika pembelian diharapkan mendorong kurva lebih dari ~5% dari `quote_reserve_target` dalam satu transaksi.
+
+## Pertimbangan MEV
+
+Di Solana, ekstraksi MEV terhadap swap sebagian besar berbentuk **sandwich attacks**: bot menempatkan transaksi back-run yang berdagang setelah milik Anda, ditambah front-run yang berdagang sebelumnya, keduanya pada slot yang sama. Perdagangan Anda terisi dengan harga lebih buruk daripada yang terjadi tanpa sandwich; back-run menangkap perbedaannya.
+
+Mitigasi:
+
+1. **`minAmountOut` ketat.** Batas slippage agresif menyebabkan transaksi korban untuk pembalikan jika disandwich berat, melindungi dana (tetapi membuang gas). Di Solana ini adalah praktik standar — penolakan murah.
+2. **Bundle Jito.** Mengirimkan melalui Jito dengan tip bundel menutup perantara dari pengurutan ulang tx Anda. Bundle mendarat sebagai blok atomik.
+3. **Biaya prioritas.** Biaya prioritas tinggi meningkatkan kemungkinan perdagangan Anda mendarat di blok pemimpin saat ini sebelum sandwicher dapat bereaksi. Kurang robust daripada bundle, lebih standar.
+4. **RPC pribadi.** Mengirimkan melalui RPC pribadi (atau melalui endpoint langsung validator) mengurangi jendela selama mana mempool sandwicher dapat mengamati transaksi Anda.
+
+SDK Raydium tidak membundel; integrator biasanya melapisi Jito di atas. Lihat [`integration-guides/routing-and-mev`](/id/integration-guides/routing-and-mev) untuk pola.
+
+## Slippage untuk rute multi-hop
+
+Ketika swap merutekan melalui beberapa pool (mis. `USDC → SOL → RAY`), toleransi slippage harus diterapkan per-hop, bukan hanya end-to-end:
+
+```ts
+// Buruk: 0.5% diterapkan di akhir saja, jadi setiap hop menengah yang meluncur gagal hop berikutnya.
+const finalMin = finalAmount * (1 - 0.005);
+
+// Lebih baik: setiap hop memberlakukan batas sendiri.
+const hop1Min  = hop1Amount * (1 - 0.005);
+const hop2Min  = hop2Amount * (1 - 0.005);
+// End-to-end ini lebih ketat (majemuk), tetapi atomik — jika salah satu hop menurun, tx kembali lebih awal.
+```
+
+Router SDK menerapkan batas per-hop secara otomatis saat Anda memanggil `raydium.trade.swap`. Untuk router khusus, replikasi polanya.
+
+## Pelaporan kepada pengguna
+
+Aturan praktis untuk UI swap yang baik:
+
+- Tampilkan **keduanya** dampak harga yang diharapkan dan toleransi slippage secara terpisah.
+- Soroti ketika dampak harga melebihi ~2% — peringatan "dampak tinggi".
+- Soroti ketika dampak harga melebihi toleransi — transaksi hampir pasti akan kembali.
+- Untuk pasangan volatil, tawarkan "mode slippage tinggi" yang melonggarkan batas dan menampilkan peringatan yang lebih kuat.
+
+## Penunjuk
+
+- [`products/cpmm/math`](/id/products/cpmm/math), [`products/amm-v4/math`](/id/products/amm-v4/math), [`products/clmm/math`](/id/products/clmm/math) — derivasi dampak per jenis pool.
+- [`integration-guides/routing-and-mev`](/id/integration-guides/routing-and-mev) — routing multi-hop + pertahanan MEV.
+- [`integration-guides/priority-fee-tuning`](/id/integration-guides/priority-fee-tuning) — pengukuran biaya prioritas untuk mengurangi slippage.
+
+Sumber:
+
+- Implementasi slippage / dampak SDK Raydium v2.
+- Flashbots / Jito pada Solana MEV.

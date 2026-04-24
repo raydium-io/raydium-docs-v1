@@ -1,0 +1,267 @@
+---
+title: "Инструкции для Farm / Staking"
+description: "CreateFarm, Deposit, Withdraw, Harvest, AddReward / SetRewards / RestartRewards, WithdrawReward — полный набор инструкций для farm v3, v5 и v6."
+---
+
+<Info>
+  **Эта страница переведена с помощью ИИ. За эталон принимается английская версия.**
+
+  [Открыть английскую версию →](/products/farm-staking/instructions)
+</Info>
+
+<Info>
+  Инструкции farm привязаны к версии. Инструкция `Deposit` для v6 не работает на v5 farm, и наоборот. SDK выбирает версию по владельцу программы farm; при вызове через CPI с цепи вы должны заранее указать правильный program ID.
+</Info>
+
+## Таблица инструкций
+
+| Действие | v3 | v5 | v6 |
+|---------|----|----|----|
+| Создать farm | `CreateFarm` | `CreateFarm` | `CreateFarm` |
+| Добавить пользовательский учёт (может быть неявным) | `CreateUserLedger` | `CreateAssociatedLedger` | Неявно в `Deposit` |
+| Заблокировать | `Deposit` | `Deposit` | `Deposit` |
+| Разблокировать | `Withdraw` | `Withdraw` | `Withdraw` |
+| Получить награды только | N/A (используйте `Deposit 0`) | N/A (используйте `Deposit 0`) | `Harvest` |
+| Добавить поток награды после создания | N/A | `AddReward` | `AddReward` |
+| Редактировать существующий поток награды | N/A | `SetRewards` | `SetRewards` |
+| Перезапустить награду после end_time | N/A | `RestartRewards` | `RestartRewards` |
+| Вывести невостребованный бюджет (администратор) | N/A | `WithdrawReward` | `WithdrawReward` |
+
+На v3 и v5 рекомендуемый способ получить награды без изменения стейка — вызвать `Deposit` с параметром `amount = 0`. Программа обработает это как чистое урегулирование. В v6 добавлена явная инструкция `Harvest` для ясности.
+
+SDK скрывает все эти детали за `raydium.farm.deposit({ ... })` и т. д. В разделах ниже описаны списки счетов для интеграторов, которым нужно строить инструкции вручную (агрегаторы, мониторинг, расширения SDK).
+
+## `CreateFarm` (v6)
+
+Создать новый v6 farm.
+
+**Параметры**
+
+```
+reward_info_count: u8               // количество потоков награды при создании (1..=5)
+reward_infos: [
+  {
+    open_time:            u64,
+    end_time:             u64,
+    emission_per_second_x64: u128,   // Q64.64
+    mint:                 Pubkey,    // токен награды
+    token_program:        Pubkey,    // SPL или Token-2022
+  }
+]
+```
+
+**Счета** (сокращённо, для `reward_info_count = 1`)
+
+| № | Имя | W | S | Примечания |
+|---|-----|---|---|-----------|
+| 1 | `creator` | W | S | Оплачивает аренду, владеет farm. |
+| 2 | `farm_state` | W |   | Новый счёт `FarmState`. |
+| 3 | `farm_authority` |   |   | PDA `[farm_id]`. |
+| 4 | `staking_mint` |   |   | |
+| 5 | `staking_vault` | W |   | Создаётся как ATA authority или PDA vault. |
+| 6 | `staking_token_program` |   |   | |
+| 7 | `reward_mint` |   |   | |
+| 8 | `reward_vault` | W |   | Получит начальный бюджет. |
+| 9 | `reward_token_program` |   |   | |
+| 10 | `reward_sender_ata` | W |   | ATA создателя на токен награды; опустошается инструкцией. |
+| 11 | `system_program` |   |   | |
+| 12 | `token_program` |   |   | |
+| 13 | `associated_token_program` |   |   | |
+| 14 | `rent` |   |   | |
+
+**Предусловия**
+
+- `open_time > now`, `end_time > open_time`.
+- ATA создателя содержит как минимум `emission_per_second_x64 × (end_time − open_time) / 2^64` токенов награды.
+- `staking_mint` не имеет freeze authority, или она отключена.
+
+**Постусловия**
+
+- `FarmState` инициализирован, `total_staked = 0`.
+- Хранилище награды пополнено полным бюджетом потока.
+- ATA награды создателя опустошен на эту сумму.
+
+## `Deposit` (v6)
+
+Заблокировать `amount` токенов staking mint.
+
+**Параметры**
+
+```
+amount: u64
+```
+
+**Счета**
+
+| № | Имя | W | S |
+|---|-----|---|---|
+| 1 | `user` | W | S |
+| 2 | `user_ledger` | W |   |
+| 3 | `farm_state` | W |   |
+| 4 | `farm_authority` |   |   |
+| 5 | `staking_vault` | W |   |
+| 6 | `user_staking_ata` | W |   |
+| 7..(7+n) | `reward_vault_{i}` | W |   |
+| ... | `user_reward_ata_{i}` | W |   |
+| last−2 | `system_program` |   |   |
+| last−1 | `token_program` |   |   |
+| last | `associated_token_program` |   |   |
+
+Если `user_ledger` не существует, SDK добавляет `CreateAccount`-подобную инструкцию; программа v6 также может лениво создать его с учётом счёта system program. Паттерн оставшихся счетов: для каждого активного потока награды добавьте `(reward_vault, user_reward_ata)`, чтобы урегулирование могло выплатить вознаграждение.
+
+**Эффект**
+
+1. Обновить `reward_per_share_x64[i]` для каждого активного потока награды, используя формулу ленивого обновления.
+2. Вычислить `pending_i = user_ledger.deposited × reward_per_share_x64[i] / 2^64 − user_ledger.reward_debts[i]`.
+3. Передать `pending_i` из `reward_vault_{i}` в `user_reward_ata_{i}`.
+4. Передать `amount` токенов staking mint из `user_staking_ata` в `staking_vault`.
+5. Обновить `user_ledger.deposited += amount` и пересчитать `reward_debts[i]`.
+6. Обновить `farm_state.total_staked += amount`.
+
+**Предусловия**
+
+- `amount > 0` для истинного стейка (v6 запрещает `amount = 0` — используйте `Harvest` для получения только награды).
+- `user_staking_ata` содержит как минимум `amount`.
+- Каждое хранилище активной награды содержит как минимум причитающееся этому пользователю.
+
+## `Withdraw` (v6)
+
+Разблокировать `amount`.
+
+**Параметры**
+
+```
+amount: u64
+```
+
+**Счета** — идентичны `Deposit`.
+
+**Эффект** — то же урегулирование, что и `Deposit`, затем передать токены staking mint обратно пользователю: `staking_vault → user_staking_ata`. Оба значения `total_staked` и `user_ledger.deposited` уменьшаются.
+
+**Предусловия**
+
+- `amount ≤ user_ledger.deposited`.
+- Farm не на паузе.
+
+## `Harvest` (v6)
+
+Получить накопленные награды без изменения стейка.
+
+**Параметры** — отсутствуют.
+
+**Счета** — аналогичны `Deposit`, без движения со стороны staking.
+
+**Эффект** — обновить `reward_per_share_x64[i]`, выплатить `pending_i`, пересчитать `reward_debts[i]`. Без изменений `total_staked` и `deposited`.
+
+## `AddReward` (v5/v6)
+
+Добавить новый поток награды к существующему farm со свободным слотом.
+
+**Параметры**
+
+```
+reward_info: {
+  open_time:            u64,
+  end_time:             u64,
+  emission_per_second_x64: u128,
+  mint:                 Pubkey,
+  token_program:        Pubkey,
+}
+```
+
+**Предусловия**
+
+- Существует свободный слот (`reward_info_count < 5` на v6, `< 2` на v5).
+- `open_time ≥ now` (может быть в будущем), или `open_time < now` допускается только если версия программы это разрешает — v6 да, v5 нет.
+
+**Постусловия**
+
+- Новый поток инициализирован на индексе `reward_info_count`, `reward_info_count++`.
+- Хранилище награды пополнено полным бюджетом потока из ATA вызывающего.
+
+**Частая ошибка** — `RewardAlreadyExists` если mint совпадает с существующим слотом.
+
+## `SetRewards` (v5/v6)
+
+Расширить или пополнить существующий поток награды. Невозможно изменить mint; невозможно сократить `end_time`; невозможно снизить `emission_per_second_x64` при запущенном потоке.
+
+**Параметры**
+
+```
+reward_index:         u8
+new_open_time:        u64,
+new_end_time:         u64,
+new_emission_per_second_x64: u128,
+```
+
+**Предусловия**
+
+- Поток всё ещё работает (`reward_state == 1`).
+- `new_end_time ≥ current end_time`.
+- Требуемый дополнительный бюджет `(new_emission × new_duration − already_emissioned)` присутствует в ATA отправителя и передаётся в хранилище награды этой инструкцией.
+
+На v5 эквивалентный вызов — `SetRewards` с меньшим набором параметров (нет изменений за секунду для запущенных потоков).
+
+## `RestartRewards` (v5/v6)
+
+Перезапустить поток после того, как его `end_time` прошёл. По сути то же самое, что `AddReward` для mint, который уже имеет слот.
+
+**Параметры** — идентичная форма `AddReward` для этого индекса.
+
+**Предусловия**
+
+- `reward_state == 2` (завершён).
+- Вызывающий — `reward_sender` слота (v6) или `owner` farm (v5).
+
+## `WithdrawReward` (v5/v6)
+
+Администратору вывести невостребованный остаток хранилища награды после завершения потока и того, как все стейкеры получили возможность собрать награды.
+
+**Параметры**
+
+```
+reward_index: u8
+```
+
+**Предусловия**
+
+- Поток завершён (`reward_state == 2`).
+- `reward_total_emissioned == reward_claimed + vault_balance` (ничего не задолжено).
+
+**Эффект** — перемещает остаток в `reward_sender_ata`. Программа не предотвращает вывод, пока стейкеры всё ещё имеют накопленные претензии; администратор должен сначала собрать награды от имени отставших стейкеров (или позволить им собрать). Если вывести рано, пользователи потеряют доступ к невостребованным наградам. **Не вызывайте это рано.**
+
+## Особенности v5
+
+- `Deposit` / `Withdraw` имеют ту же форму, что v6, но используют до 2 слотов награды, и `reward_per_share` — это `u128` (fixed-point с другим radix).
+- `CreateAssociatedLedger` — обязательный отдельный вызов перед первым `Deposit`; v6 объединил его.
+- `AddReward` доступна, `Harvest` нет (используйте `Deposit 0`).
+
+## Особенности v3
+
+- Один поток награды. Нет `AddReward`, нет второго слота.
+- `Deposit 0` — единственный способ получить награды.
+- `CreateUserLedger` должен быть вызван перед первым `Deposit`.
+
+## Матрица изменения состояния
+
+| Инструкция | `total_staked` | `user.deposited` | `reward_per_share` | Хранилища награды |
+|-------------|----------------|------------------|---------------------|----------------|
+| `CreateFarm` | 0 | — | 0 | финансируется создателем |
+| `Deposit(n)` | +n | +n | обновлена | −pending (выплачена) |
+| `Withdraw(n)` | −n | −n | обновлена | −pending |
+| `Harvest` | — | — | обновлена | −pending |
+| `AddReward` | — | — | — | +новый бюджет |
+| `SetRewards` | — | — | — | +дельта бюджета |
+| `RestartRewards` | — | — | — | +бюджет |
+| `WithdrawReward` | — | — | — | −остаток |
+
+## Что дальше
+
+- [`products/farm-staking/code-demos`](/ru/products/farm-staking/code-demos) — примеры на TypeScript.
+- [`products/farm-staking/accounts`](/ru/products/farm-staking/accounts) — макеты `FarmState` / `UserLedger` / `UserStake`.
+- [`reference/error-codes`](/ru/reference/error-codes) — перечень ошибок farm.
+
+Источники:
+
+- [Raydium SDK v2 `Farm` module](https://github.com/raydium-io/raydium-sdk-V2)
+- Raydium farm program source (v3 / v5 / v6)

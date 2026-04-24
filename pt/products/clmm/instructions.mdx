@@ -1,0 +1,556 @@
+---
+title: "Instruções do CLMM"
+description: "Referência completa de instruções do CLMM: ciclo de vida do pool, gerenciamento de posições, swap e fluxos de recompensas."
+---
+
+<Info>
+  **Esta página foi traduzida automaticamente por IA. A versão em inglês é a fonte oficial.**
+
+  [Ver versão em inglês →](/products/clmm/instructions)
+</Info>
+
+<Info>
+  Esta página complementa [`products/clmm/accounts`](/pt/products/clmm/accounts) (o que são as contas) e [`products/clmm/math`](/pt/products/clmm/math) (como funciona a matemática). É a referência definitiva para argumentos e ordenação de contas; os layouts de bytes específicos vêm do IDL.
+</Info>
+
+## Inventário de instruções
+
+| Grupo | Instrução | Observações |
+|-------|-----------|-------------|
+| Admin | `CreateAmmConfig` | Define um novo nível de taxa. |
+| Admin | `UpdateAmmConfig` | Altera as taxas de um nível existente. |
+| Admin | `UpdatePoolStatus` | Pausa/retoma operações em um pool. |
+| Admin | `CreateSupportMintAssociated` | Adiciona uma configuração de extensão de mint Token-2022 à lista de permissões para uso em pools CLMM. |
+| Admin | `CreateOperationAccount` | Inicializa a conta de operação em nível de programa (uma única vez). |
+| Admin | `UpdateOperationAccount` | Modifica a whitelist da conta de operação. |
+| Admin | `CreateDynamicFeeConfig` | Cria um conjunto de parâmetros de taxa dinâmica reutilizável sob um índice u16. |
+| Admin | `UpdateDynamicFeeConfig` | Modifica um `DynamicFeeConfig` existente. Pools que já capturaram o snapshot não são afetados. |
+| Pool | `CreatePool` | Inicializa um pool CLMM vinculado a um `AmmConfig`. Caminho de taxa padrão FromInput. Coexiste com `CreateCustomizablePool`. |
+| Pool | `CreateCustomizablePool` | Recomendado para novos pools. Mesmo formato que `CreatePool`, com `collect_fee_on` e uma flag opcional `enable_dynamic_fee`. |
+| Posição | `OpenPosition` / `OpenPositionV2` / `OpenPositionWithToken22Nft` | Cria um NFT de posição. `OpenPositionV2` substitui a V1 (layout de conta mais recente com o slot de extensão de bitmap); `OpenPositionWithToken22Nft` emite o NFT de posição como Token-2022 em vez de SPL Token. Novo código deve usar V2 ou a variante Token-2022. |
+| Posição | `IncreaseLiquidity` / `IncreaseLiquidityV2` | Adiciona liquidez a uma posição existente. |
+| Posição | `DecreaseLiquidity` / `DecreaseLiquidityV2` | Remove liquidez; coleta as taxas devidas. |
+| Posição | `ClosePosition` | Queima o NFT e fecha o `PersonalPositionState`. |
+| Posição | `CloseProtocolPosition` | Varredura exclusiva do admin para PDAs legados `ProtocolPositionState`. O programa atual não cria nem lê `ProtocolPositionState` — esta instrução existe apenas para recuperar rent em contas criadas por versões mais antigas do programa. |
+| Swap | `Swap` / `SwapV2` | Swap com liquidez constante. Ambas as variantes aplicam taxa dinâmica, roteamento de taxa unilateral e correspondência de ordens limitadas; a única diferença é que `SwapV2` aceita mints Token-2022 (a variante V1 exige que ambos os vaults sejam SPL Token clássico). |
+| Swap | `SwapRouterBaseIn` | Multi-hop, usado pelo roteador. |
+| Ordem limitada | `OpenLimitOrder` | Coloca uma ordem de venda em um tick. Os tokens não preenchidos ficam no tick; o mecanismo de correspondência os preenche à medida que o preço cruza. |
+| Ordem limitada | `IncreaseLimitOrder` | Aumenta uma ordem aberta existente. |
+| Ordem limitada | `DecreaseLimitOrder` | Reduz ou cancela uma ordem aberta; paga o saldo não preenchido mais qualquer saída já liquidada. |
+| Ordem limitada | `SettleLimitOrder` | Envia tokens de saída preenchidos ao dono da ordem. Pode ser chamado pelo dono ou pelo keeper operacional. |
+| Ordem limitada | `CloseLimitOrder` | Fecha uma conta de ordem totalmente consumida. O rent sempre retorna ao `owner` da ordem. Pode ser chamado pelo dono ou pelo keeper. |
+| Taxas | `CollectProtocolFee` | Varredura admin das taxas de protocolo. |
+| Taxas | `CollectFundFee` | Varredura admin das taxas de fundo. |
+| Recompensas | `InitializeReward` | Anexa um novo fluxo de recompensa a um pool. |
+| Recompensas | `SetRewardParams` | Altera a taxa de emissão/término de uma recompensa existente. |
+| Recompensas | `UpdateRewardInfos` | Liquida o crescimento de recompensas até o momento atual (chamado por qualquer swap/alteração de posição). |
+| Recompensas | `TransferRewardOwner` | Transfere a autoridade que pode configurar ou recarregar um fluxo de recompensa. |
+| Recompensas | `CollectRemainingRewards` | Após o `end_time` de um fluxo de recompensa, envia de volta ao financiador quaisquer tokens não alocados. |
+| Utilitário | `InitTickArray` | Inicializa uma conta de tick-array (frequentemente agrupada com `OpenPosition`). |
+
+A maioria das instruções exclusivas de admin (`CreateAmmConfig`, `UpdateAmmConfig`, `UpdatePoolStatus`, `CreateSupportMintAssociated`, `CreateOperationAccount`, `UpdateOperationAccount`, `CloseProtocolPosition`) é controlada pela chave pública `admin` embutida no programa. As instruções de admin de fluxo de recompensa (`TransferRewardOwner`, `CollectRemainingRewards`) são controladas pelo financiador da recompensa, não pelo admin do programa.
+
+O sufixo V2 significa "suporta Token-2022 em vaults/NFT e exige o slot de extensão de bitmap". O SDK usa V2 por padrão para novos pools.
+
+## `CreatePool`
+
+**Argumentos**
+
+```
+sqrt_price_x64: u128           // preço inicial
+open_time:      u64            // swaps rejeitados antes deste horário
+```
+
+**Contas (resumido)**
+
+| # | Nome | W | S | Observações |
+|---|------|---|---|-------------|
+| 1 | `pool_creator` | W | S | |
+| 2 | `amm_config` |   |   | Nível de taxa escolhido. |
+| 3 | `pool_state` | W |   | `init` aqui. |
+| 4 | `token_mint_0` |   |   | Ordenado. |
+| 5 | `token_mint_1` |   |   | |
+| 6 | `token_vault_0` | W |   | `init` aqui, pertencente ao PDA de autoridade do pool. |
+| 7 | `token_vault_1` | W |   | |
+| 8 | `observation_state` | W |   | `init` aqui. |
+| 9 | `tick_array_bitmap_extension` | W |   | `init` aqui (V2). |
+| 10 | `token_program` |   |   | |
+| 11 | `token_program_2022` |   |   | |
+| 12 | `system_program`, `rent` |   |   | |
+
+**Pré-condições**
+
+- `token_mint_0 < token_mint_1` por ordem de bytes.
+- `amm_config.disable_create_pool == false`.
+- Os mints não são rejeitados pela lista de permissões de extensão Token-2022.
+
+**Pós-condições**
+
+- `pool_state.sqrt_price_x64 = sqrt_price_x64`, `tick_current = floor(log_{1.0001}(price))`.
+- `pool_state.liquidity = 0` (nenhuma posição ainda).
+- `pool_state.fee_on = FromInput` (padrão legado).
+- `pool_state.dynamic_fee_info` é zerado (taxa dinâmica desativada).
+
+## `CreateCustomizablePool`
+
+Recomendado para novos pools. Tem o mesmo efeito que `CreatePool`, com adição do modo de coleta de taxa por pool e uma opção de taxa dinâmica.
+
+**Argumentos**
+
+```rust
+pub struct CreateCustomizableParams {
+    pub sqrt_price_x64:    u128,
+    pub collect_fee_on:    CollectFeeOn,   // FromInput | Token0Only | Token1Only
+    pub enable_dynamic_fee: bool,
+}
+```
+
+**Contas (resumido)** — mesmas que `CreatePool`, acrescidas de, quando `enable_dynamic_fee = true`:
+
+| # | Nome | W | S | Observações |
+|---|------|---|---|-------------|
+| N | `dynamic_fee_config` |   |   | A configuração compartilhada da qual fazer snapshot. Deve já existir. |
+
+**Pré-condições** — mesmas que `CreatePool`. Se `enable_dynamic_fee = false`, `dynamic_fee_config` é ignorado.
+
+**Pós-condições**
+
+- `pool_state.fee_on` definido para a variante `CollectFeeOn` escolhida.
+- Se a taxa dinâmica foi habilitada: `pool_state.dynamic_fee_info` é inicializado a partir do `DynamicFeeConfig` fornecido (cinco parâmetros de calibração copiados; campos de estado zerados).
+- Caso contrário: `pool_state.dynamic_fee_info` é zerado (= taxa dinâmica inativa permanentemente para este pool).
+
+`fee_on` e o bit de habilitação de taxa dinâmica são definidos **apenas** na criação do pool. Não há atualização in-place — pools criados via `CreatePool` legado não podem adquirir taxa dinâmica ou taxa unilateral retroativamente. Novas implantações devem usar esta instrução por padrão.
+
+## `OpenPositionV2` / `OpenPositionWithToken22Nft`
+
+Cria uma nova posição dentro de um pool existente.
+
+**Argumentos**
+
+```
+tick_lower_index: i32
+tick_upper_index: i32
+tick_array_lower_start_index: i32
+tick_array_upper_start_index: i32
+liquidity:  u128              // L desejado (ou 0 para usar os valores abaixo)
+amount_0_max: u64
+amount_1_max: u64
+with_metadata: bool           // gravar metadados do NFT (Metaplex)
+base_flag: Option<bool>       // true = ajustar ao amount0; false = ajustar ao amount1
+```
+
+**Contas (resumido)**
+
+| # | Nome | W | S |
+|---|------|---|---|
+| 1 | `payer` | W | S |
+| 2 | `position_nft_owner` |   |   |
+| 3 | `position_nft_mint` | W | S (keypair) |
+| 4 | `position_nft_account` | W |   | ATA do dono para o NFT. |
+| 5 | `metadata_account` | W |   | Metaplex (opcional, se `with_metadata`). |
+| 6 | `pool_state` | W |   |
+| 7 | `protocol_position` |   |   |   |
+| 8 | `tick_array_lower` | W |   | Criado se não inicializado. |
+| 9 | `tick_array_upper` | W |   | Idem. |
+| 10 | `personal_position` | W |   | Criado aqui. |
+| 11 | `token_account_0`, `token_account_1` | W |   | ATAs de origem do usuário. |
+| 12 | `token_vault_0`, `token_vault_1` | W |   | |
+| 13 | `rent`, `system_program`, `token_program` |   |   | |
+| 14 | `associated_token_program` |   |   | |
+| 15 | `metadata_program` |   |   | Opcional. |
+| 16 | `token_program_2022` |   |   | V2. |
+| 17 | `vault_0_mint`, `vault_1_mint` |   |   | V2. |
+| 18 | `tick_array_bitmap_extension` | W |   | V2 (se acionado). |
+
+**Matemática** — consulte [`products/clmm/math`](/pt/products/clmm/math). A partir de `base_flag`, o programa resolve `liquidity` ou `(amount_0_max, amount_1_max)` no `L` real e nos valores reais de tokens consumidos.
+
+**Pré-condições**
+
+- `tick_lower < tick_upper`, ambos múltiplos de `pool.tick_spacing`, dentro de `[MIN_TICK, MAX_TICK]`.
+- Tick arrays necessários passados e inicializados (ou criados aqui via CPI `InitTickArray` na transação).
+- O usuário tem pelo menos `amount_0_max` e `amount_1_max` nas ATAs de origem.
+
+**Pós-condições**
+
+- `personal_position` existe, `liquidity` definido, `fee_growth_inside_last` com snapshot capturado.
+- Entradas de tick-array em `tick_lower` e `tick_upper` atualizadas (`liquidity_gross += L`, `liquidity_net ± L`, snapshots de crescimento de taxa mantidos).
+- `pool_state.liquidity += L` se a posição estiver no intervalo (`tick_lower ≤ tick_current < tick_upper`).
+
+**Erros comuns** — `InvalidTickIndex`, `NotApproved`, `ZeroAmountSpecified`, `TransactionTooLarge` (se houver tick arrays demais).
+
+## `IncreaseLiquidityV2`
+
+Adiciona liquidez a uma posição já aberta.
+
+**Argumentos**
+
+```
+liquidity: u128
+amount_0_max: u64
+amount_1_max: u64
+base_flag: Option<bool>
+```
+
+**Contas** — semelhante a `OpenPosition`, sem o mint do NFT (a posição já existe; o NFT é passado como a ATA do dono que contém 1 token).
+
+**Efeito**
+
+- Transfere `amount_0_actual` / `amount_1_actual` do usuário para os vaults.
+- Incrementa `personal_position.liquidity` e `pool_state.liquidity` (se estiver no intervalo), além dos valores `liquidity_gross` / `liquidity_net` dos ticks extremos.
+- **Coleta taxas e recompensas devidas desde o último toque** e as credita em `tokens_fees_owed_{0,1}` / `reward_amount_owed`. Esses valores são pagos apenas em `DecreaseLiquidity` ou `CollectReward`, não no aumento.
+
+## `DecreaseLiquidityV2`
+
+Remove liquidez de uma posição.
+
+**Argumentos**
+
+```
+liquidity: u128
+amount_0_min: u64
+amount_1_min: u64
+```
+
+**Contas** — mesmo formato que `IncreaseLiquidity`.
+
+**Efeito**
+
+- Calcula `(amount_0, amount_1)` para o `L` removido com base no `sqrt_price_x64` atual.
+- Liquida as taxas/recompensas acumuladas desde o último toque, da mesma forma que `IncreaseLiquidity`.
+- Transfere `amount_0 + fees_owed_0` e `amount_1 + fees_owed_1` dos vaults para o usuário.
+- Decrementa os contadores de liquidez; se o novo `personal_position.liquidity == 0`, a posição é elegível para `ClosePosition`.
+
+**Slippage** — `amount_0_min` e `amount_1_min` são os mínimos aceitos pelo usuário, líquidos das taxas de transferência Token-2022 no lado de saída.
+
+## `ClosePosition`
+
+Queima o NFT de posição e fecha o `PersonalPositionState`.
+
+**Pré-condições**
+
+- `personal_position.liquidity == 0`.
+- `tokens_fees_owed_{0,1} == 0`.
+- Todos os contadores de recompensa `reward_amount_owed == 0`.
+
+(Ou seja, colete tudo e reduza para zero primeiro.)
+
+**Efeito**
+
+- Queima o NFT.
+- Fecha a conta do mint do NFT e a conta `personal_position`, devolvendo o rent ao `payer`.
+
+## `SwapV2`
+
+Percorre a curva de liquidez; entrada exata *ou* saída exata, dependendo de `is_base_input`.
+
+**Argumentos**
+
+```
+amount: u64                  // entrada se is_base_input=true, saída caso contrário
+other_amount_threshold: u64  // mínimo de saída ou máximo de entrada
+sqrt_price_limit_x64: u128   // limite rígido; 0 ⇒ sem limite
+is_base_input: bool
+```
+
+**Contas (resumido)**
+
+| # | Nome | W | S | Observações |
+|---|------|---|---|-------------|
+| 1 | `payer` |   | S | |
+| 2 | `amm_config` |   |   | |
+| 3 | `pool_state` | W |   | |
+| 4 | `input_token_account` | W |   | |
+| 5 | `output_token_account` | W |   | |
+| 6 | `input_vault` | W |   | |
+| 7 | `output_vault` | W |   | |
+| 8 | `observation_state` | W |   | |
+| 9 | `token_program` |   |   | |
+| 10 | `token_program_2022` |   |   | V2. |
+| 11 | `memo_program` |   |   | V2 (obrigatório para alguns caminhos Token-2022). |
+| 12 | `input_vault_mint`, `output_vault_mint` |   |   | V2. |
+| 13 | `tick_array_bitmap_extension` (opcional) | W |   | Se o swap avançar para a extensão. |
+| 14+ | `tick_array` (restantes) | W |   | Arrays suficientes para cobrir o intervalo esperado do percurso. |
+
+Os chamadores passam uma lista ordenada de tick arrays cobrindo o percurso esperado do swap; o programa usa quantos forem necessários. O SDK calcula essa lista via `PoolUtils.computeAmountOutFormat` ou o endpoint de cotação da API.
+
+**Pré-condições**
+
+- `pool_state.status` permite swap.
+- `now >= open_time`.
+- `sqrt_price_limit_x64` está no lado correto de `sqrt_price_x64` para a direção escolhida.
+
+**Erros comuns** — `ExceededSlippage`, `SqrtPriceLimitOverflow`, `TickArrayNotFound`, `LiquidityInsufficient`.
+
+**O que `SwapV2` faz internamente e que os chamadores devem saber** (versão pós-2025):
+
+1. **Sobretaxa dinâmica** — se `pool.dynamic_fee_info` for diferente de zero, o programa atualiza o acumulador de volatilidade usando a distância de tick percorrida desde o último swap (com as regras de filtro/decaimento de [`products/clmm/fees`](/pt/products/clmm/fees)) e adiciona um `dynamic_fee_component` sobre `AmmConfig.trade_fee_rate`. A taxa total é limitada a 10% (`MAX_FEE_RATE_NUMERATOR / 1_000_000`).
+2. **Correspondência de ordens limitadas** — quando o percurso de preço cruza um tick que contém ordens limitadas abertas, o programa preenche primeiro a liquidez disponível de ordens limitadas naquele tick (FIFO por `order_phase`), e depois continua ao longo da curva de liquidez do LP. Os valores preenchidos atualizam `tick.unfilled_ratio_x64` e `tick.part_filled_orders_remaining` para liquidação posterior; as próprias ordens permanecem pendentes até que o dono chame `SettleLimitOrder`.
+3. **Roteamento de taxa unilateral** — quando `pool.fee_on = Token0Only` ou `Token1Only`, o passo de swap ainda calcula a mesma negociação entrada-saída; a taxa é então roteada para o lado configurado. Para direções em que o lado de taxa configurado é a saída, a taxa é deduzida da saída do swap (o usuário recebe `out − fee`); para direções em que é a entrada, o comportamento é igual ao `FromInput`. Veja `is_fee_on_input(zero_for_one)` e `is_fee_on_token0(zero_for_one)` em `PoolState`.
+
+`Swap` (V1) implementa a mesma taxa dinâmica, roteamento de taxa unilateral e correspondência de ordens limitadas que `SwapV2`; a única funcionalidade ausente é o suporte a Token-2022 — ambos os vaults precisam ser SPL Token clássico. Pools com qualquer mint Token-2022 devem ser negociados via `SwapV2`. O agregador e o SDK já preferem V2 para cada etapa CLMM, de modo que os chamadores não precisam verificar o tipo de mint.
+
+## `OpenLimitOrder`
+
+Coloca uma ordem de venda em um tick específico. A ordem fica em uma fila FIFO por tick e é preenchida à medida que o preço passa.
+
+**Argumentos**
+
+```
+nonce_index:    u8       // índice de conta nonce escolhido pelo usuário (0..255 por carteira)
+zero_for_one:   bool     // true: vende token0 por token1; false: vende token1 por token0
+tick_index:     i32      // deve ser múltiplo de pool.tick_spacing
+amount:         u64      // quantidade do token de entrada
+```
+
+**Contas (resumido)**
+
+| # | Nome | W | S | Observações |
+|---|------|---|---|-------------|
+| 1 | `payer` | W | S | Dono da ordem; paga o rent. |
+| 2 | `pool_state` | W |   | |
+| 3 | `tick_array` | W |   | O tick array que contém `tick_index`. |
+| 4 | `limit_order_nonce` | W |   | PDA. `init_if_needed` — criado na primeira ordem do usuário sob este `nonce_index`. |
+| 5 | `limit_order` | W |   | PDA. `init` aqui. |
+| 6 | `input_token_account` | W |   | ATA de entrada do usuário. |
+| 7 | `input_vault` | W |   | Vault de entrada do pool. |
+| 8 | `input_vault_mint` |   |   | Tratamento de taxa Token-2022. |
+| 9 | `input_token_program` |   |   | SPL ou Token-2022. |
+| 10 | `system_program`, `rent` |   |   | |
+
+**Pré-condições**
+
+- `tick_index % pool.tick_spacing == 0` e dentro de `[MIN_TICK, MAX_TICK]`.
+- `tick_index` está no **lado correto de `pool.tick_current`** para a direção escolhida (vender token0 → tick deve estar acima do atual, e vice-versa). Vender em um tick já cruzado seria correspondido imediatamente e é rejeitado.
+- `pool_state.status` permite a operação de ordem limitada (bit 5).
+
+**Pós-condições**
+
+- `limit_order` existe, com snapshot de `tick.order_phase` e `tick.unfilled_ratio_x64` no momento da abertura.
+- `tick.orders_amount += amount` (no coorte atual).
+- `limit_order_nonce.order_nonce += 1`.
+- Evento `OpenLimitOrderEvent` emitido.
+
+**Erros comuns** — `InvalidLimitOrderAmount` (zero ou abaixo do mínimo do pool), `InvalidTickIndex` (fora de `[MIN_TICK, MAX_TICK]` ou no lado errado de `tick_current` para a direção escolhida), `TickAndSpacingNotMatch` (`tick_index % pool.tick_spacing != 0`), `OrderPhaseSaturated`.
+
+## `IncreaseLimitOrder`
+
+Aumenta uma ordem aberta existente. Só pode ser chamado pelo `owner` da ordem.
+
+**Argumentos**
+
+```
+amount: u64    // quantidade adicional do token de entrada
+```
+
+**Contas** — semelhante a `OpenLimitOrder`, sem a conta nonce; o PDA `limit_order` é passado diretamente.
+
+**Pré-condições**
+
+- `limit_order.owner == signer`.
+- A ordem ainda está no mesmo coorte (`tick.order_phase == limit_order.order_phase`). Se o coorte já começou a ser preenchido, a ordem está parcialmente liquidada — o chamador deve chamar `DecreaseLimitOrder` ou `SettleLimitOrder` primeiro para avançar.
+
+**Efeito**
+
+- Transfere `amount` da ATA do dono para `input_vault`.
+- `limit_order.total_amount += amount`; `tick.orders_amount += amount`.
+
+## `DecreaseLimitOrder`
+
+Reduz ou cancela completamente uma ordem aberta. Devolve o saldo não preenchido ao dono, mais qualquer saída já liquidada por preenchimentos parciais anteriores.
+
+**Argumentos**
+
+```
+amount:     u64    // quantidade do token de entrada a retirar (máx = saldo não preenchido)
+amount_min: u64    // piso de slippage na retirada do lado de entrada
+```
+
+**Contas** — ambos os lados de token de entrada e saída:
+
+| # | Nome | W | S |
+|---|------|---|---|
+| 1 | `owner` |   | S |
+| 2 | `pool_state` | W |   |
+| 3 | `tick_array` | W |   |
+| 4 | `limit_order` | W |   |
+| 5 | `input_token_account` | W |   |
+| 6 | `output_token_account` | W |   |
+| 7 | `input_vault` | W |   |
+| 8 | `output_vault` | W |   |
+| 9 | `input_vault_mint`, `output_vault_mint` |   |   |
+| 10 | `token_program`, `token_program_2022` |   |   |
+
+**Efeito**
+
+- Recalcula o valor preenchido da ordem a partir do `unfilled_ratio_x64` do coorte desde a abertura.
+- Envia a saída preenchida para `output_token_account`.
+- Envia `amount` da entrada não preenchida de volta para `input_token_account`.
+- Atualiza `limit_order` conforme necessário. Se o novo saldo não preenchido for zero, o programa fecha a conta e devolve o rent ao `owner`.
+
+## `SettleLimitOrder`
+
+Envia tokens de saída preenchidos ao dono sem alterar o saldo não preenchido da ordem. Útil quando keepers `auto_withdraw` querem pagar preenchimentos parciais de longa duração em parcelas.
+
+**Chamador** — o `owner` da ordem ou o `limit_order_admin` do programa (uma carteira operacional off-chain que executa um loop de keeper automatizado). O keeper não tem outra autoridade — não pode movimentar fundos de usuários além de enviar a saída preenchida para a ATA de `owner` da ordem.
+
+**Contas**
+
+| # | Nome | W | S |
+|---|------|---|---|
+| 1 | `signer` |   | S | owner *ou* `limit_order_admin` |
+| 2 | `pool_state` |   |   | |
+| 3 | `tick_array` |   |   | |
+| 4 | `limit_order` | W |   | |
+| 5 | `output_token_account` | W |   | ATA de saída do dono. |
+| 6 | `output_vault` | W |   | Vault de saída do pool. |
+| 7 | `output_vault_mint` |   |   | |
+| 8 | `output_token_program` |   |   | |
+
+**Efeito**
+
+- Calcula a saída acumulada devida usando `(limit_order.unfilled_ratio_x64, tick.unfilled_ratio_x64)`.
+- Transfere o delta para `output_token_account`.
+- Atualiza `limit_order.settled_output`.
+- **Não** fecha a ordem; ela continua aberta para qualquer entrada restante.
+
+## `CloseLimitOrder`
+
+Fecha uma conta de ordem totalmente consumida. O rent é sempre devolvido ao `limit_order.owner`, independentemente de quem assina.
+
+**Chamador** — o `owner` ou o `limit_order_admin`.
+
+**Pré-condições**
+
+- A ordem tem saldo não preenchido zero (seja porque `amount == total_amount` foi preenchido e liquidado, seja porque o dono reduziu anteriormente a ordem para zero e não a fechou).
+
+**Efeito**
+
+- Fecha `limit_order`; o rent é enviado para `limit_order.owner`.
+
+## `CreateDynamicFeeConfig` (admin)
+
+Cria um conjunto de parâmetros reutilizável sob um índice u16.
+
+**Argumentos**
+
+```
+index:                       u16
+filter_period:               u16   // segundos; ex: 30
+decay_period:                u16   // segundos; ex: 600. Deve ser > filter_period
+reduction_factor:            u16   // 1..10_000; ex: 5_000 = 50% de retenção por janela de decaimento
+dynamic_fee_control:         u32   // 1..100_000; ganho na curva de volatilidade para taxa
+max_volatility_accumulator:  u32   // limite máximo
+```
+
+**Contas**
+
+| # | Nome | W | S | Observações |
+|---|------|---|---|-------------|
+| 1 | `owner` | W | S | Chave pública admin embutida. |
+| 2 | `dynamic_fee_config` | W |   | PDA, `init` aqui. |
+| 3 | `system_program` |   |   | |
+
+**Erros comuns** — `InvalidDynamicFeeConfigParams` se `decay_period <= filter_period` ou qualquer campo com valor 0 estiver fora dos limites.
+
+## `UpdateDynamicFeeConfig` (admin)
+
+Modifica um `DynamicFeeConfig` existente. Pools que já capturaram o snapshot da configuração no momento da criação **não** são atualizados retroativamente; apenas pools recém-criados que referenciem esta configuração receberão os novos valores.
+
+**Argumentos** — os mesmos cinco campos de calibração que `CreateDynamicFeeConfig` (`filter_period`, `decay_period`, `reduction_factor`, `dynamic_fee_control`, `max_volatility_accumulator`); o `index` é fixado na criação e não é repassado aqui.
+
+## `CollectProtocolFee` / `CollectFundFee`
+
+Formato idêntico ao `CollectProtocolFee` / `CollectFundFee` do CPMM. O assinante deve corresponder a `AmmConfig.owner` / `AmmConfig.fund_owner`. Varre as taxas de protocolo/fundo acumuladas dos vaults do pool para um destinatário e zera os campos `PoolState.protocol_fees_*` / `fund_fees_*` correspondentes.
+
+## `InitializeReward`
+
+Adiciona um novo fluxo de recompensa a um pool. Até 3 fluxos podem estar ativos simultaneamente.
+
+**Argumentos**
+
+```
+open_time:     u64
+end_time:      u64
+emissions_per_second_x64: u128   // Q64.64
+```
+
+**Contas**
+
+| # | Nome | W | S |
+|---|------|---|---|
+| 1 | `reward_funder` | W | S |
+| 2 | `funder_token_account` | W |   |
+| 3 | `amm_config` |   |   |
+| 4 | `pool_state` | W |   |
+| 5 | `operation_state` |   |   | PDA de estado de operação CLMM que controla a criação de recompensas. |
+| 6 | `reward_token_mint` |   |   |
+| 7 | `reward_token_vault` | W |   | `init` aqui. |
+| 8 | `reward_token_program` |   |   |
+| 9 | `system_program`, `rent` |   |   |
+
+**Pré-condições**
+
+- Menos de 3 fluxos ativos no pool no momento.
+- O financiador deposita `total_emission = emissions_per_second × (end_time − open_time)` de token de recompensa no vault como parte desta instrução.
+- Mint de recompensa na whitelist conforme `operation_state`.
+
+## `SetRewardParams`
+
+Estende, recarrega ou altera a taxa de emissão de um fluxo de recompensa existente. Normalmente chamado pelo criador do pool ou pelo multisig da Raydium. As restrições vivem on-chain: geralmente é possível estender `end_time` ou aumentar as emissões, mas não reduzi-las retroativamente. Verifique a lista de donos de `operation_state`.
+
+## `UpdateRewardInfos`
+
+Pura contabilidade — liquida `reward_growth_global_x64` até o momento atual multiplicando `emissions_per_second × Δt / liquidity`. Chamada internamente por todas as instruções que tocam liquidez. Exposta como instrução autônoma porque agentes externos (UIs, cranks) às vezes querem acioná-la diretamente.
+
+## `CollectReward`
+
+O dono da posição reivindica os tokens de recompensa devidos.
+
+**Contas**
+
+| # | Nome | W | S |
+|---|------|---|---|
+| 1 | `nft_owner` |   | S |
+| 2 | `nft_account` |   |   | ATA do dono que contém o NFT de posição. |
+| 3 | `personal_position` | W |   |
+| 4 | `pool_state` | W |   |
+| 5 | `protocol_position` |   |   |   |
+| 6 | `reward_token_vault` | W |   |
+| 7 | `recipient_token_account` | W |   |
+| 8 | `token_program` |   |   |
+| 9 | `token_program_2022` |   |   |
+
+**Efeito**
+
+- Liquida o crescimento de recompensas (mesmo padrão das taxas).
+- Transfere o valor devido para a ATA destinatária e zera `reward_amount_owed[i]`.
+
+## Matriz de mudanças de estado
+
+| Instrução | `pool.liquidity` | `pool.fee_growth_global` | `pool.reward_growth_global` | `personal_position.liquidity` | Tick array |
+|-----------|------------------|--------------------------|------------------------------|-------------------------------|------------|
+| `CreatePool` | 0 | 0 | — | — | — |
+| `OpenPosition` | + se no intervalo | — | — | novo | adiciona liquidity_gross/net |
+| `IncreaseLiquidity` | + se no intervalo | liquida devidos | liquida devidos | + | ajusta |
+| `DecreaseLiquidity` | − se no intervalo | liquida devidos | liquida devidos | − | ajusta |
+| `ClosePosition` | — | — | — | destruído | — |
+| `SwapV2` | ± nos cruzamentos | + | — | — | cruza e inverte exterior; corresponde coortes de ordem limitada |
+| `OpenLimitOrder` | — | — | — | — | `orders_amount += amount` no tick alvo |
+| `IncreaseLimitOrder` | — | — | — | — | `orders_amount += amount` |
+| `DecreaseLimitOrder` | — | — | — | — | `orders_amount -=`, pode fechar coorte |
+| `SettleLimitOrder` | — | — | — | — | — (somente leitura no tick) |
+| `CloseLimitOrder` | — | — | — | — | — |
+| `CreateCustomizablePool` | 0 | 0 | — | — | — |
+| `UpdateRewardInfos` | — | — | + | — | — |
+| `CollectReward` | — | — | liquida devidos | — | — |
+
+## Próximos passos
+
+- [`products/clmm/code-demos`](/pt/products/clmm/code-demos) — exemplos TypeScript executáveis.
+- [`products/clmm/fees`](/pt/products/clmm/fees) — detalhes sobre acúmulo de taxas e recompensas.
+- [`reference/error-codes`](/pt/reference/error-codes) — tabela completa de erros Anchor do CLMM.
+
+Fontes:
+
+- [`raydium-io/raydium-clmm` — `programs/amm/src/instructions`](https://github.com/raydium-io/raydium-clmm)
+- Raydium SDK v2 — `@raydium-io/raydium-sdk-v2`

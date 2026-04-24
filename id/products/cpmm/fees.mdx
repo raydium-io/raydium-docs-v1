@@ -1,0 +1,264 @@
+---
+title: "Biaya CPMM"
+description: "Cara CPMM mengenakan biaya perdagangan dan biaya kreator terpisah, membagi biaya perdagangan antara LP, perbendaharaan protokol, dan multisig dana, serta siapa yang mengumpulkan apa dan kapan."
+---
+
+<Info>
+  **Halaman ini diterjemahkan secara otomatis oleh AI. Versi bahasa Inggris adalah acuan resmi.**
+
+  [Lihat versi bahasa Inggris →](/products/cpmm/fees)
+</Info>
+
+## Dua biaya independen, empat tujuan
+
+CPMM mengenakan **dua biaya dengan tarif terpisah** pada setiap swap:
+
+1. **Biaya perdagangan** — dikenakan pada `AmmConfig.trade_fee_rate` dan dibagi antara tiga tujuan:
+   - **Bagian LP** — tetap di dalam vault dan menambah `k`. Diklaim secara implisit dengan membakar token LP.
+   - **Bagian protokol** — terakumulasi ke `PoolState.protocol_fees_token*`; dikumpulkan oleh `protocol_owner` melalui `CollectProtocolFee`.
+   - **Bagian dana** — terakumulasi ke `PoolState.fund_fees_token*`; dikumpulkan oleh `fund_owner` melalui `CollectFundFee`.
+2. **Biaya kreator** (opsional, per-pool) — dikenakan pada `AmmConfig.creator_fee_rate` **secara independen** dari biaya perdagangan, terakumulasi ke `PoolState.creator_fees_token*`, dikumpulkan oleh `pool_state.pool_creator` melalui `CollectCreatorFee`. Aktif hanya ketika pool dibuat dengan `enable_creator_fee = true`.
+
+Biaya kreator **bukan** bagian dari biaya perdagangan. Kedua tarif ditambahkan bersama ketika biaya diambil pada input swap, tetapi masing-masing tetap menjadi bucket-nya sendiri — bagian protokol dan dana selalu berasal dari `trade_fee` saja, tidak pernah dari `creator_fee`. Pool dengan `creator_fee_rate = 1000` (0,10%) dan `trade_fee_rate = 2500` (0,25%) mengenakan biaya gabungan 0,35% dari input pada swap dengan creator-fee-on-input, yang mana kreator mempertahankan 0,10% dan bucket biaya perdagangan mendapatkan 0,25%.
+
+Tarif biaya perdagangan (`trade_fee_rate`, `protocol_fee_rate`, `fund_fee_rate`) dan `creator_fee_rate` semuanya berada pada `AmmConfig`. Flag `enable_creator_fee` per-pool dan mode `creator_fee_on` (sisi perdagangan tempat biaya kreator diambil) berada pada `PoolState`. Lihat [`products/cpmm/accounts`](/id/products/cpmm/accounts).
+
+## Tarif dan satuan
+
+Semua tarif adalah `u64` yang dinyatakan dalam satuan `1 / FEE_RATE_DENOMINATOR` di mana `FEE_RATE_DENOMINATOR = 1_000_000`.
+
+- **`trade_fee_rate`** adalah fraksi dari **volume swap**. `2500` ⇒ 0,25% dari sisi yang relevan (input atau output, tergantung `creator_fee_on` — lihat "Sisi perdagangan tempat biaya diambil" di bawah).
+- **`creator_fee_rate`** adalah fraksi dari **volume swap**, diambil **secara terpisah** dari biaya perdagangan. `1000` ⇒ 0,10% dari sisi yang relevan.
+- **`protocol_fee_rate`** dan **`fund_fee_rate`** adalah fraksi dari **biaya perdagangan**, bukan dari volume. `120_000` ⇒ 12% dari biaya perdagangan.
+
+Parameter default untuk `AmmConfig[index=0]` (pool 0,25% "standar") di mainnet, sebagai referensi:
+
+| Field | Nilai | Persentase Efektif |
+|-------|-------|-------------------|
+| `trade_fee_rate` | `2500` | 0,25% dari volume (bucket biaya perdagangan) |
+| `protocol_fee_rate` | `120000` | 12% dari biaya perdagangan ≈ **0,030% dari volume** |
+| `fund_fee_rate` | `40000` | 4% dari biaya perdagangan ≈ **0,010% dari volume** |
+| `creator_fee_rate` | `0` (default) | 0% (bucket terpisah) |
+| → bagian LP efektif | | **0,210% dari volume** |
+
+Jadi pada swap \$1.000 melawan `AmmConfig[0]` dengan `enable_creator_fee = false`: biaya perdagangan total \$2,50, di mana \$2,10 tetap bersama LP, \$0,30 ke protokol, \$0,10 ke dana. Bucket kreator adalah 0 karena biaya kreator dinonaktifkan.
+
+Jika pool yang sama memiliki `enable_creator_fee = true` dan `creator_fee_rate = 1000` (0,10%), pengguna membayar tambahan \$1,00 ke bucket kreator — diambil dari sisi perdagangan yang sama yang dikonfigurasi oleh `creator_fee_on` — untuk total biaya \$3,50. Bucket biaya perdagangan dan pembagian protokol/dana-nya tidak berubah.
+
+Konfirmasi nilai mainnet saat ini terhadap `GET https://api-v3.raydium.io/main/cpmm-config` — tarif dapat diubah admin dan harus dibaca segar daripada dikodekan.
+
+## Pembagian, dalam kode
+
+```rust
+// Paraphrased from raydium-cp-swap/programs/cp-swap/src/curve/{calculator,fees}.rs.
+// The actual code branches on `is_creator_fee_on_input`; both branches preserve the
+// invariant that creator_fee is its own rate, never a slice of trade_fee.
+
+const FEE_RATE_DENOMINATOR_VALUE: u64 = 1_000_000;
+
+pub struct FeeBreakdown {
+    pub amount_in_after_fees: u64,    // input minus all fees taken on the input side
+    pub amount_out_after_fees: u64,   // output minus any creator fee taken on the output side
+    pub trade_fee:    u64,            // → split into LP / protocol / fund buckets below
+    pub protocol_fee: u64,            // share of trade_fee
+    pub fund_fee:     u64,            // share of trade_fee
+    pub creator_fee:  u64,            // independent bucket (input or output side)
+}
+
+fn take_fees_on_input(
+    amount_in: u64,
+    trade_rate: u64,
+    creator_rate: u64,
+    protocol_rate: u64,
+    fund_rate: u64,
+) -> (u64 /* trade_fee */, u64 /* creator_fee */, u64 /* amount_in_after_fees */) {
+    // The two rates are added so we round once on the combined fee, then split
+    // proportionally — this is purely a rounding/efficiency trick. The split
+    // honours the rates exactly: creator_fee/trade_fee == creator_rate/trade_rate.
+    let total_fee = ((amount_in as u128) * ((trade_rate + creator_rate) as u128))
+        .div_ceil(FEE_RATE_DENOMINATOR_VALUE as u128) as u64;
+
+    let creator_fee = ((total_fee as u128) * (creator_rate as u128)
+                       / ((trade_rate + creator_rate) as u128)) as u64;
+    let trade_fee   = total_fee - creator_fee;
+
+    (trade_fee, creator_fee, amount_in - total_fee)
+}
+
+fn take_creator_fee_on_output(amount_out_swapped: u64, creator_rate: u64) -> (u64, u64) {
+    // When creator_fee_on routes the creator fee to the output side,
+    // trade_fee is taken on input as a single rate, and creator_fee
+    // is computed against the curve output.
+    let creator_fee = ((amount_out_swapped as u128) * (creator_rate as u128))
+        .div_ceil(FEE_RATE_DENOMINATOR_VALUE as u128) as u64;
+    (amount_out_swapped - creator_fee, creator_fee)
+}
+
+fn split_trade_fee(
+    trade_fee: u64,
+    protocol_rate: u64,
+    fund_rate: u64,
+) -> (u64 /* protocol_fee */, u64 /* fund_fee */) {
+    let protocol_fee = (trade_fee as u128 * protocol_rate as u128
+                        / FEE_RATE_DENOMINATOR_VALUE as u128) as u64;
+    let fund_fee     = (trade_fee as u128 * fund_rate as u128
+                        / FEE_RATE_DENOMINATOR_VALUE as u128) as u64;
+    (protocol_fee, fund_fee)
+}
+```
+
+Catatan:
+
+- Biaya total pada input dibulatkan **ke atas** sehingga pool tidak pernah meremehkan biaya.
+- Sub-pembagian dari `trade_fee` (protokol, dana) dibulatkan **ke bawah** sehingga jumlahnya tidak pernah melebihi `trade_fee`; sisanya adalah bagian LP.
+- `lp_share = trade_fee − protocol_fee − fund_fee` (creator_fee **tidak** dikurangkan di sini karena itu adalah bucket-nya sendiri).
+- Biaya kreator diambil dari input atau output tergantung `PoolState.creator_fee_on` (lihat bagian selanjutnya). Tarif tetap sama dalam kedua kasus.
+
+## Sisi perdagangan tempat biaya diambil
+
+CPMM memiliki pengaturan per-pool `creator_fee_on` (`BothToken` / `OnlyToken0` / `OnlyToken1`) yang menentukan apakah biaya kreator diambil dari sisi **input** atau sisi **output** dari swap tertentu. Helper runtime `is_creator_fee_on_input(direction)` menyederhanakan hal itu menjadi boolean per swap:
+
+| `creator_fee_on` | Swap `0 → 1` | Swap `1 → 0` |
+|------------------|---------------|---------------|
+| `BothToken` (`0`) | sisi input | sisi input |
+| `OnlyToken0` (`1`) | sisi input | sisi output |
+| `OnlyToken1` (`2`) | sisi output | sisi input |
+
+Ketika biaya kreator berada di sisi **input**, baik biaya perdagangan maupun biaya kreator dikurangkan dari `amount_in` sebelum kurva berjalan. Matemat kutipan: ambil `trade_rate + creator_rate` gabungan dari input.
+
+Ketika biaya kreator berada di sisi **output**, hanya biaya perdagangan yang dikurangkan dari `amount_in`; kurva menghasilkan output tanpa biaya, kemudian biaya kreator dikurangkan dari output itu. Matemat kutipan: ambil `trade_rate` dari input; ambil `creator_rate` dari output.
+
+Biaya perdagangan itu sendiri selalu diambil dari sisi input (pola standar Uniswap-V2). Hanya biaya kreator yang dapat mendarat di output.
+
+## Cara biaya "terakumulasi" berinteraksi dengan kurva
+
+Subtilitas penting: **biaya protokol, dana, dan kreator tetap secara fisik di vault** hingga instruksi `Collect*` masing-masing dipanggil. Tetapi biaya tersebut dikecualikan dari pandangan kurva terhadap saldo vault.
+
+Gambaran konkret setelah satu swap:
+
+```
+raw_vault_0_balance = getTokenAccountBalance(vault_0).amount
+                    = lp_entitled + protocol_fees_token0
+                      + fund_fees_token0 + creator_fees_token0
+
+curve_x = raw_vault_0_balance − (protocol_fees_token0
+                                  + fund_fees_token0
+                                  + creator_fees_token0)
+```
+
+Program menggunakan `curve_x` (dan `curve_y` analog) ketika memberlakukan `k' ≥ k`. Inilah cara biaya non-LP mencapai tujuan mereka **tanpa** menambah bagian LP dari pool.
+
+Konsekuensi yang harus Anda desain:
+
+- **Mengutip dari saldo mentah adalah salah.** Jika Anda membangun kutipan dari `getTokenAccountBalance`, Anda akan secara konsisten melebih-lebihkan harga yang akan dihormati pool. Selalu kurangkan biaya terakumulasi, atau simulasikan melalui `SwapBaseInput` / API.
+- **`CollectProtocolFee` tidak menggerakkan harga.** Ini memindahkan token keluar dari vault *dan* menolkan counter `protocol_fees_token*`, jadi `curve_x` dan `curve_y` tidak berubah.
+- **Biaya LP tidak terakumulasi ke counter.** Biaya tersebut implisit dalam saldo vault. Hak LP untuk biaya LP terakumulasi dijalankan dengan membakar token LP (yaitu, melalui `Withdraw`) — tidak ada `CollectLpFee`.
+
+## Interaksi dengan biaya transfer Token-2022
+
+Biaya transfer Token-2022 diterapkan oleh **mint**, bukan oleh CPMM. Mereka bertindak pada setiap transfer token — swap, setoran, penarikan, dan penyapuan `Collect*`. Matemat biaya perdagangan CPMM dihitung terhadap jumlah yang **benar-benar mendarat di vault**, yaitu, bersih dari biaya transfer mint input (jika ada).
+
+Jadi dalam kasus terburuk pengguna membayar tiga pajak terpisah pada swap input-exact:
+
+1. Biaya transfer mint input pada `amount_in` (ke otoritas biaya mint).
+2. Biaya `trade_fee` pool pada sisa (dibagi per di atas).
+3. Biaya transfer mint output pada `amount_out` (ke otoritas biaya mint).
+
+Kutipan SDK memperhitungkan ketiga-tiganya sehingga `minimum_amount_out` dinyatakan dalam apa yang benar-benar diterima pengguna. Jika Anda menulis kutipan Anda sendiri, cerminkan perilaku itu, atau pemeriksaan slippage Anda akan secara sistematis terlalu murah hati.
+
+Lihat [`algorithms/token-2022-transfer-fees`](/id/algorithms/token-2022-transfer-fees) untuk derivasi terperinci.
+
+## Biaya kreator
+
+Biaya kreator bersifat opsional dan per-pool. **Tarif** berada pada `AmmConfig.creator_fee_rate`; **flag aktifkan** dan **sisi** (`creator_fee_on`) berada pada `PoolState`:
+
+- **Diaktifkan saat pembuatan pool.** `Initialize` menetapkan `enable_creator_fee = false` secara default; pool yang dibuat melalui `InitializeWithPermission` (digunakan oleh kelulusan LaunchLab dan jalur terhubung lainnya) dapat melewatkan `enable_creator_fee = true` dan memilih `creator_fee_on`.
+- **Tarif dibagikan dengan tier biaya.** Tarif itu sendiri adalah `AmmConfig.creator_fee_rate`, nilai yang sama di seluruh setiap pool yang terikat ke konfigurasi itu. Setiap pool kemudian memutuskan apakah akan mengenakan tarif itu (`enable_creator_fee`) dan sisi swap mana untuk mengenakan tarif itu (`creator_fee_on`). Ketika `enable_creator_fee = false`, tarif kreator efektif pool adalah nol terlepas dari nilai konfigurasi (lihat `PoolState::adjust_creator_fee_rate` dalam sumber).
+- **Independen dari biaya perdagangan.** Biaya kreator tidak pernah mengurangi bagian LP / protokol / dana — itu adalah tarif-nya sendiri, diterapkan secara terpisah, terakumulasi dalam counter-nya sendiri.
+- **Dikumpulkan melalui `CollectCreatorFee`**, ditandatangani oleh `PoolState.pool_creator`.
+- **Tidak dapat diaktifkan kembali atau dialihkan rute setelah pembuatan.** Pool yang diinisialisasi dengan `enable_creator_fee = false` tidak akan pernah mengenakan biaya kreator; satu yang diinisialisasi dengan `creator_fee_on` tertentu tidak dapat berpindah sisi.
+
+Biaya kreator adalah mekanisme di balik pola "Burn & Earn" Raydium: token LP dikunci di bawah program [LP Lock](/id/reference/program-addresses) jadi kreator tidak dapat menarik likuiditas, tetapi masih dapat mengklaim `CollectCreatorFee` tanpa batas.
+
+## Alur operasional pengumpulan
+
+| Penanda Tangan | Instruksi | Counter Sumber Dinolkan | Jarak Waktu Tipikal |
+|--------|-------------|------------------------|-----------------|
+| `amm_config.protocol_owner` | `CollectProtocolFee` | `protocol_fees_token{0,1}` | Mingguan atau programatik |
+| `amm_config.fund_owner` | `CollectFundFee` | `fund_fees_token{0,1}` | Mingguan atau programatik |
+| `pool_state.pool_creator` | `CollectCreatorFee` | `creator_fees_token{0,1}` | Kapan saja |
+
+Pemilik protokol dan dana adalah multisig Raydium di mainnet; lihat [`security/admin-and-multisig`](/id/security/admin-and-multisig). Penanda tangan kreator adalah akun yang menjalankan `Initialize`.
+
+## Mengubah tier biaya
+
+Tarif biaya dapat diubah oleh admin melalui `UpdateAmmConfig` (lihat [`products/cpmm/instructions`](/id/products/cpmm/instructions)). Perubahan berlaku pada **swap berikutnya** untuk setiap pool yang terikat pada `AmmConfig` itu — tidak ada migrasi, karena pool memuat konfigurasi setiap swap.
+
+Apa yang tidak dapat dilakukan admin:
+
+- Pindahkan pool dari satu `AmmConfig` ke yang lain.
+- Harga kembali biaya yang sudah terakumulasi secara retroaktif.
+- Kumpulkan biaya tanpa penanda tangan `protocol_owner` / `fund_owner`.
+
+## Membaca biaya dari pool yang berjalan
+
+```ts
+// Off-chain: current accrued fees in each bucket
+const pool = await connection.getAccountInfo(poolStatePda);
+const decoded = PoolState.decode(pool.data);
+console.log(
+  "Protocol accrued:",
+  decoded.protocolFeesToken0.toString(),
+  decoded.protocolFeesToken1.toString(),
+);
+console.log(
+  "Fund accrued:",
+  decoded.fundFeesToken0.toString(),
+  decoded.fundFeesToken1.toString(),
+);
+console.log(
+  "Creator accrued:",
+  decoded.creatorFeesToken0.toString(),
+  decoded.creatorFeesToken1.toString(),
+);
+
+// Off-chain: effective rates today.
+// trade_fee_rate, creator_fee_rate are fractions of volume (denominator 1e6).
+// protocol_fee_rate, fund_fee_rate are fractions of the *trade fee* (same denominator).
+const config = await fetch("https://api-v3.raydium.io/main/cpmm-config")
+  .then((r) => r.json());
+const tier = config.data.find((t) => t.index === decoded.ammConfigIndex);
+
+const tradeFeeOfVolume   = tier.tradeFeeRate / 1_000_000;
+const protocolOfTradeFee = tier.protocolFeeRate / 1_000_000;
+const fundOfTradeFee     = tier.fundFeeRate / 1_000_000;
+const lpOfTradeFee       = 1 - protocolOfTradeFee - fundOfTradeFee;
+
+console.log("LP fee effective:",       (tradeFeeOfVolume * lpOfTradeFee * 100).toFixed(4), "%");
+console.log("Protocol fee effective:", (tradeFeeOfVolume * protocolOfTradeFee * 100).toFixed(4), "%");
+console.log("Fund fee effective:",     (tradeFeeOfVolume * fundOfTradeFee * 100).toFixed(4), "%");
+console.log(
+  "Creator fee effective:",
+  decoded.enableCreatorFee
+    ? ((tier.creatorFeeRate / 1_000_000) * 100).toFixed(4) + " %"
+    : "0 % (disabled on this pool)",
+);
+```
+
+## Perbandingan dengan CLMM dan AMM v4
+
+Lihat [`reference/fee-comparison`](/id/reference/fee-comparison) untuk matriks berdampingan. Ringkasan:
+
+- **AMM v4** menggunakan biaya perdagangan tetap 0,25% dengan pembagian LP/protokol yang berbeda dan tidak ada biaya dana.
+- **CLMM** biaya per-tier tick-spacing, terakumulasi per-posisi (bukan per-pool), dan diklaim melalui `DecreaseLiquidity` atau `CollectFees`.
+
+## Ke mana selanjutnya
+
+- [`products/cpmm/math`](/id/products/cpmm/math) — tempat pengurangan biaya perdagangan terhubung ke dalam kurva.
+- [`products/cpmm/instructions`](/id/products/cpmm/instructions) — daftar akun instruksi `Collect*`.
+- [`algorithms/token-2022-transfer-fees`](/id/algorithms/token-2022-transfer-fees) — cara menggabungkan biaya perdagangan pool dengan biaya transfer mint dengan benar.
+
+Sumber:
+
+- [`raydium-io/raydium-cp-swap` — `states/config.rs`, `states/pool.rs`, `states/curve.rs`](https://github.com/raydium-io/raydium-cp-swap)
+- [Raydium API — `GET /main/cpmm-config`](https://api-v3.raydium.io/main/cpmm-config)

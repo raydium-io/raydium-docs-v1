@@ -1,0 +1,161 @@
+---
+title: "路由數學"
+description: "路由器本身不執行定價計算；每個跳躍都由其池程序的曲線負責定價。多跳滑點會複合；CLMM 跳躍使用 limit_prices。"
+---
+
+<Info>
+  **本頁內容由 AI 自動翻譯，所有內容以英文版本為準。**
+
+  [查看英文版 →](/products/routing/math)
+</Info>
+
+## 路由器不執行計算
+
+路由程序 **不實施任何定價邏輯**。它是一個純編排器：接收路由、將帳戶傳遞給子程序，並鏈接代幣流。
+
+每個跳躍按其自己的池程序曲線進行定價：
+
+- **AMM v4 跳躍：** 使用常數乘積公式（`x · y = k`）與 OpenBook 混合定價。見 [`products/amm-v4/math`](/zh-Hant/products/amm-v4/math)。
+- **CPMM 跳躍：** 使用常數乘積公式與可配置的費用層級。見 [`products/cpmm/math`](/zh-Hant/products/cpmm/math)。
+- **CLMM 跳躍：** 使用集中流動性 tick 數學。見 [`algorithms/clmm-math`](/zh-Hant/algorithms/clmm-math)。
+- **穩定幣跳躍：** 使用穩定交換曲線處理同類資產。見 [`products/stable/math`](/zh-Hant/products/stable/math)。
+
+路由器的唯一涉及是：
+
+1. 通過 CPI 調用每個池的交換指令。
+2. 收集輸出金額。
+3. 將其作為輸入金額傳遞給下一個跳躍。
+4. 根據調用者的滑點限制檢查最終輸出。
+
+## 滑點複合
+
+在多跳路由上，每個跳躍的滑點會複合。第一跳的小滑點在第二跳變成更大的滑點，因為進入第二跳的交易量已經減少。
+
+**範例：**
+
+```
+路由：USDC → SOL → STEP
+
+池 1（USDC / SOL）：
+  輸入：1000 USDC
+  滑點：1%（現貨會給 0.5 SOL，但你得到 0.495 SOL）
+  輸出：0.495 SOL
+
+池 2（SOL / STEP）：
+  輸入：0.495 SOL（已減少）
+  滑點：1%（現貨會給 495 STEP，但你得到 490 STEP）
+  輸出：490 STEP
+
+USDC → STEP 的總有效滑點：1.99%，不是 1% + 1% = 2%。
+```
+
+當你提供 `minimum_amount_out` 時，路由器根據此全局限制檢查你的最終輸出。每個跳躍也根據其本地費用結構檢查其自己的交換，但路由器不會中途重新報價——你必須預先計算路由並烘焙足夠的滑點容限。
+
+## CLMM 跳躍與 limit_prices
+
+對於進入 CLMM 池的每個跳躍，路由器檢查池的當前 `sqrt_price_x64` 是否在指定的邊界內。邊界作為稱為 `limit_prices` 的 `VecDeque<u128>` 傳遞：
+
+- 路由中每個 CLMM 跳躍一個 `sqrt_price_x64`。
+- `sqrt_price_x64` 是 CLMM 使用的基於 tick 的價格表示。見 [`algorithms/clmm-math`](/zh-Hant/algorithms/clmm-math) 以獲得定義。
+- 路由器強制執行：
+
+```
+  sqrt_price_lower <= pool.sqrt_price_x64 <= sqrt_price_upper
+```
+
+對於每個 CLMM 跳躍，如果價格超出邊界，則拒絕交換。
+
+### 指令變體與 limit_prices
+
+- **`SwapBaseInWithUserAccount`、`SwapBaseOutWithUserAccount`（舊版本，標籤 0 和 1）：** `limit_prices` VecDeque **必需**。如果任何跳躍是 CLMM 池，空隊列會被錯誤拒絕。你必須按順序為每個 CLMM 跳躍提供一個價格。
+
+- **`SwapBaseIn`、`SwapBaseOut`（當前版本，標籤 8 和 9）：** `limit_prices` VecDeque **可選**。空隊列會被靜默忽略；不執行價格檢查。新代碼應使用這些。
+
+### 構建 limit_prices
+
+對於具有 M 個 CLMM 跳躍的路由，隊列應包含恰好 M 個條目。按跳躍順序排列它們：
+
+```
+limit_prices = [
+  sqrt_price_for_first_clmm_hop,
+  sqrt_price_for_second_clmm_hop,
+  ...
+]
+```
+
+### 何時檢查 limit_prices
+
+`sqrt_price_x64` 是池當前價格的快照。當交換執行時，它不斷變化。你應該：
+
+1. 從鏈上獲取池的當前狀態。
+2. 計算可接受的邊界（例如，當前價格的 ±0.5%）。
+3. 將這些邊界編碼到 `limit_prices` 中。
+4. 在你的路由器指令中包括邊界。
+
+如果在交易落地之前池的價格超出你的邊界漂移，路由器將拒絕它。
+
+## 費用處理
+
+每個池根據其配置收取自己的費用：
+
+- **AMM v4：** 0.25%（固定）分配給 LP、協議和基金。
+- **CPMM：** 根據 `AmmConfig` 可配置（預設 0.25%，分配因層級而異）。
+- **CLMM：** 根據池可配置，從輸入金額中扣除。
+- **穩定幣：** 與 AMM v4 類似，0.25% 分配。
+
+路由器 **自己不收取費用**。所有費用處理都委託給每個子池。來自跳躍 N 的輸出已經扣除了該跳躍的費用。
+
+見個別池的費用文件：
+
+- [`products/amm-v4/fees`](/zh-Hant/products/amm-v4/fees)
+- [`products/cpmm/fees`](/zh-Hant/products/cpmm/fees)
+- [`products/clmm/fees`](/zh-Hant/products/clmm/fees)（如果可用）
+- [`products/stable/fees`](/zh-Hant/products/stable/fees)（如果可用）
+
+## 多跳會計範例
+
+假設你通過兩個常數乘積池路由 USDC → SOL → STEP，每個都有 0.25% 費用：
+
+```
+輸入：1000 USDC
+池 1（USDC/SOL）：
+  扣除的費用：ceil(1000 * 0.25%) = 2.5 USDC
+  曲線淨輸入：997.5 USDC
+  曲線輸出（滑點前）：0.5 SOL
+  滑點邊際：假設 1%，所以你得到 ~0.495 SOL
+
+池 2（SOL/STEP）：
+  輸入：0.495 SOL
+  扣除的費用：ceil(0.495 * 0.25%) ≈ 0.001 SOL
+  曲線淨輸入：0.494 SOL
+  曲線輸出：~494 STEP
+  滑點邊際：1%，所以你得到 ~489 STEP
+
+最終輸出：~489 STEP
+```
+
+路由器驗證：
+
+```
+489 >= minimum_amount_out  // 由調用者指定
+```
+
+如果為假，整個路由原子性失敗。
+
+## 精度考量
+
+與所有 Solana 程序一樣，路由器使用整數算術：
+
+- 所有金額都是 `u64`（lamports 或代幣最小單位）。
+- 曲線計算在需要時使用 `u128` 中間值以避免溢出。
+- 舍入約定取決於子程序。路由器不重新舍入。
+
+如果跳躍由於極端價格比率（例如在 1B:1 池上交換 1 lamport）而產生零金額，路由器將該零傳播到下一個跳躍，下一個跳躍可能將其拒絕為不足。見各個池的錯誤代碼。
+
+## 後續內容
+
+- [`products/amm-v4/math`](/zh-Hant/products/amm-v4/math) — 常數乘積數學。
+- [`products/cpmm/math`](/zh-Hant/products/cpmm/math) — CPMM 常數乘積與 Token-2022。
+- [`algorithms/clmm-math`](/zh-Hant/algorithms/clmm-math) — 集中流動性定價。
+- [`products/stable/math`](/zh-Hant/products/stable/math) — 穩定交換曲線。
+- [`products/routing/code-demos`](/zh-Hant/products/routing/code-demos) — 路由前報價的範例。

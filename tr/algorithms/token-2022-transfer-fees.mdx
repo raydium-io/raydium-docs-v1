@@ -1,0 +1,179 @@
+---
+title: "Swaplarda Token-2022 transfer ücretleri"
+description: "Token-2022'nin transfer-fee uzantısının swap öncesi/sonrası tutar muhasebesi nasıl değiştirdiği, hangi Raydium ürünleri desteklediği ve entegratörlerin ele alması gereken edge case'ler (asimetrik ücretler, ücret güncellemeleri, maksimum ücret kapakları, transferilemez uzantılar)."
+---
+
+<Info>
+  **Bu sayfa yapay zekâ tarafından otomatik olarak çevrilmiştir. İngilizce sürüm esas alınır.**
+
+  [İngilizce sürümü görüntüle →](/algorithms/token-2022-transfer-fees)
+</Info>
+
+<Info>
+  Destek matrisi: **CPMM**, Token-2022'yi tamamen destekler; transfer-fee mint'leri de dahil. **CLMM**, Token-2022'yi açık `SwapV2` hesapları aracılığıyla transfer ücretleriyle destekler. **AMM v4**, Token-2022'yi hiç desteklemez. **LaunchLab**, taban mint için Token-2022'yi desteklemez (klasik SPL mint'leri oluşturur). **Farm v6**, staking ve reward mint'lerinde Token-2022'yi destekler.
+</Info>
+
+## Transfer ücreti nedir
+
+Token-2022, ikinci SPL Token programıdır (`TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA` → `TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb`). Uzantıları arasında **transfer-fee** uzantısı, bir token mint'inde her `TransferChecked` işleminden aktarılan tutardan bir ücret keser. Ücret, mint otoritesi tarafından atanan bir alıcıya yönlendirilir ve otorite tarafından güncellenebilir (sınırlar içinde).
+
+Transfer ücreti olan bir mint'in iki önemli parametresi vardır:
+
+- **`transfer_fee_basis_points`** — oran (örn. 100 = %1).
+- **`maximum_fee`** — transfer başına mutlak cap (böylece çok büyük miktarları hareket ettiren whale'ler sınırsız ücret ödemez).
+
+Bir mint'in aynı anda **iki** aktif transfer-fee konfigürasyonu olabilir: "daha yeni" olan (şu anda geçerli) ve "daha eski" olan (planlanmış olarak feshediliyor). Bu "epoch geçişi" tasarımıdır — transfer ücreti değişiklikleri, uçakta olan işlemleri şaşırtmamak için bir epoch sınırında yürürlüğe girer.
+
+## Swaplar için bu neden önemli
+
+Bir pool'un vault'ları gerçek bakiyeleri tutar. Bir kullanıcı bir Raydium swap'ı çağırdığında:
+
+1. Kullanıcı pool vault'una `amount_in` gönderir. **In-mint**'in transfer ücreti varsa, vault `amount_in − fee_in` alır, `amount_in` değil.
+2. Swap matematiği vault tarafından alınan tutarla çalışır.
+3. Pool, kullanıcının ATA'sına `amount_out` gönderir. **Out-mint**'in transfer ücreti varsa, kullanıcı `amount_out − fee_out` alır, `amount_out` değil.
+
+Swap programı naif olursa ve ham `amount_in` argümanını kullanırsa, değişmezlik kontrolü başarısız olur; çünkü vault program'ın düşündüğünden daha az aldı. Tersine, `amount_out` hesaplanırken giden transfer ücreti düşülmezse, kullanıcı bir açık görür ve programı suçlar.
+
+Raydium CPMM ve CLMM (`SwapV2` aracılığıyla) bunu şöyle yapar:
+
+- **Swap öncesi**: `in_after_fee = amount_in − transfer_fee_on(amount_in, in_mint)` hesaplar ve `in_after_fee`'yi eğri matematiğinde kullanır.
+- **Swap sonrası**: `out_gross = amount_out_from_curve` hesaplar, `out_gross`'ı kullanıcıya `TransferChecked` aracılığıyla gönderir; Token-2022 programı bunu transfer ücreti ile azaltır.
+
+Kullanıcının `minAmountOut` slippage sınırı `out_gross`'a (pool'un gönderdiği şey) karşı kontrol edilir, kullanıcının aldığı şeye karşı **değil**. Bu, her büyük Solana DEX'inin Token-2022'yi nasıl ele aldığıdır ve önemlidir; çünkü:
+
+- Eğer pool ücret sonrasını kontrol etse, fiyatlandırma ile yürütme arasında bir ücret güncellemesi ticareti geri çevirirdi.
+- Ücret öncesi kontrol etmek, başarısızlığı fiyatlandırmanın kendi kalitesine kenetler; kullanıcının band dışı ücret değişikliklerine değil.
+
+UI'ler, kullanıcıya "Alacağınız" gösterirken beklenen Token-2022 transfer ücretini çıkarmalıdır.
+
+## Token-2022 ücretini hesaplama
+
+SPL Token-2022 programı belirlenimci bir helper sunar. Rust'ta:
+
+```rust
+use spl_token_2022::extension::transfer_fee::TransferFeeConfig;
+use spl_token_2022::extension::StateWithExtensions;
+
+let mint_data = ...;
+let state = StateWithExtensions::<Mint>::unpack(&mint_data)?;
+let config = state.get_extension::<TransferFeeConfig>()?;
+
+let epoch = Clock::get()?.epoch;
+let fee_bp = config.get_epoch_fee(epoch).transfer_fee_basis_points;
+let max_fee = u64::from(config.get_epoch_fee(epoch).maximum_fee);
+
+let fee = (amount as u128 * fee_bp as u128 / 10_000).min(max_fee as u128) as u64;
+```
+
+TypeScript'te (`@solana/spl-token` aracılığıyla):
+
+```ts
+import { getTransferFeeConfig, getTransferFeeAmount } from "@solana/spl-token";
+
+const config = getTransferFeeConfig(mintAccount);
+const currentEpochFee = config.olderTransferFee.epoch <= currentEpoch
+  ? config.newerTransferFee
+  : config.olderTransferFee;
+
+const rate   = currentEpochFee.transferFeeBasisPoints;
+const maxFee = currentEpochFee.maximumFee;
+const fee    = Math.min(Math.floor(amount * rate / 10_000), Number(maxFee));
+```
+
+## Ayarlanmış swap formülleri (CPMM, tam giriş)
+
+`f_pool`'u pool ücret oranı, `f_in`'i in-mint transfer ücreti oranı, `max_in`'i maksimum cap'i, `f_out`'u out-mint transfer ücreti oranı, `max_out`'u maksimum cap'i olarak belirleyin.
+
+```
+transfer_fee_in  = min(amount_in · f_in / 10_000, max_in)
+vault_received   = amount_in − transfer_fee_in
+
+pool_fee         = ceil(vault_received · f_pool / 1_000_000)
+amount_after     = vault_received − pool_fee
+amount_out_gross = y · amount_after / (x + amount_after)
+
+transfer_fee_out = min(amount_out_gross · f_out / 10_000, max_out)
+user_receives    = amount_out_gross − transfer_fee_out
+```
+
+Slippage kontrolü: `amount_out_gross ≥ min_amount_out` (`user_receives ≥ min_amount_out` değil). Kullanıcının `minAmountOut`'u SDK tarafından `expected_gross · (1 − slippage)` olarak ayarlanır — sınırı "alınan" tarafında tutun, "alınan" tarafında değil.
+
+## Ayarlanmış formüller (CPMM, tam çıkış)
+
+SDK, `user_receives = amount_out_exact` olacak şekilde `amount_in` bulmak için yineleme yapar:
+
+```
+# kullanıcı transfer ücreti sonrası amount_out_exact almak istiyor
+amount_out_gross = amount_out_exact + transfer_fee_out_for(amount_out_exact)
+
+# sonra CPMM tam çıkış için amount_after'ı çöz:
+amount_after     = ceil(x · amount_out_gross / (y − amount_out_gross))
+
+# sonra pool ücreti ekle:
+vault_received   = ceil(amount_after · 1_000_000 / (1_000_000 − f_pool))
+
+# sonra in transfer ücreti ekle:
+amount_in = ceil(vault_received · 10_000 / (10_000 − f_in))
+# (ya da yinele — aşağıdaki ücret-cap edge case'e bak)
+```
+
+`max_in` / `max_out` cap'leri hesaplamayı doğrusal olmayan kılar; çünkü cap'e çarptığında ücret büyümeyi durdurur. SDK'nın `computeAmountIn` / `computeAmountOut` bunu, naif formül cap'in ötesine iterse yineleme yaparak ele alır.
+
+## Edge case'ler
+
+### Asimetrik ücretler (bir tarafın ücreti var, diğerinin yok)
+
+Pratikte yaygın. Yukarıdaki formüller bunu zaten ele alır — eğer bir tarafın `f_in = 0` varsa, ilgili terimler çöker. Programda özel bir durum yoktur.
+
+### Swap sırasında ücret güncellemeleri
+
+Fiyatlandırma zamanı ile yürütme zamanı arasında mint'in transfer ücreti değişirse, swap ya hafif daha kötü ekonomiler ile iner (kullanıcı slippage toleransı içinde farkı taşır) ya da geri döner (`minAmountOut` altına gross çıkış düşer). Slippage sınırları bunu emebilir; ek koruma gerekmez.
+
+### Maksimum-ücret cap'i
+
+Ticaret, `maximum_fee`'ye çarpmaya yeterince büyük olduğunda, ücret doymuş olur ve daha fazla büyüme sıfırdır. Bu, çok büyük ticaretierdeki etkili oranı asimptotik olarak sıfıra yapar; bu da derin likit olmayan pazarlarda garip fiyatlandırma eğrileri yaratabilir. SDK'nın `computeAmountOut` bunu hesaba katarak ele alır.
+
+### Transferilemez uzantı
+
+Bazı Token-2022 mint'leri, `NonTransferable` uzantısını kullanır; bu, mint otoritesi dışında ve dışından tüm `Transfer` çağrılarını reddeder. Bu tür mint'ler **hiçbir şekilde** bir Raydium pool'unda kullanılamaz. `CreatePool` başlangıçta onları reddeder.
+
+### Faiz getiren mint'ler
+
+Token-2022 ayrıca balansların zaman içinde büyüyebileceğini sağlayan `InterestBearingConfig` uzantısını destekler. Raydium'un pool'ları ham vault bakiyelerini okur (faiz tahakkukunu yok sayar); bu nedenle faiz getiren bir mint'li bir pool'da, LP'ler geri alma sırasında tahakkuk eden faizi saf bir hediye olarak yakalar (vault bakiyesi LP arz temsilinden daha hızlı büyüdü). Entegratörler bunu sorun olmayan olarak ele almalı ama LP tarafı için belge haline getirmelidir.
+
+### Transfer hook'ları
+
+Token-2022'nin `TransferHook` uzantısı, her aktarımda keyfi CPI sağlar. Raydium CPMM bunu destekler — swap komutu hook hesaplarını iletir — ama CU yükü ekler ve hook'un iyi davranmasını gerektirir. CLMM `SwapV2` de hook'ları destekler. AMM v4, Token-2022'yi hiç desteklemez; bu yüzden soru ortaya çıkmaz.
+
+## Çalışılmış örnek
+
+CPMM pool'u, `x = 1_000_000 USDY, y = 1_000_000 USDC`, pool ücreti %0,25.
+
+- USDY'nin %1 transfer ücreti vardır; `max_fee = 10_000` (6 ondalak ile 0,01 USDY).
+- USDC'nin transfer ücreti yoktur.
+
+Kullanıcı `amount_in = 1_000 USDY`'i USDC için takas eder (tam giriş).
+
+```
+transfer_fee_in = min(1_000 · 100 / 10_000, 10_000)  = 10     // %1, cap'in altında iyi
+vault_received  = 1_000 − 10 = 990
+
+pool_fee        = ceil(990 · 2_500 / 1_000_000)  = 3    // %0,25
+amount_after    = 990 − 3 = 987
+
+amount_out_gross = 1_000_000 · 987 / (1_000_000 + 987) = 986_027 / ...  ≈ 985.97
+```
+
+≈ 985.97 USDC. Giden transfer ücreti yok; kullanıcı 985.97 USDC alır.
+
+## İşaretçiler
+
+- [`products/cpmm/overview`](/tr/products/cpmm/overview) — CPMM Token-2022 desteği.
+- [`products/clmm/instructions`](/tr/products/clmm/instructions) — Token-2022 yönlendirmesi için `SwapV2` vs `Swap`.
+- [`solana-fundamentals/spl-token-and-token-2022`](/tr/solana-fundamentals/spl-token-and-token-2022) — genel Token-2022 uzantı modeli.
+
+Kaynaklar:
+
+- [SPL Token-2022 transfer-fee uzantısı belgeleri](https://spl.solana.com/token-2022/extensions#transfer-fees)
+- Raydium CPMM program kaynağı (`SwapBaseInput` / `SwapBaseOutput` Token-2022 işleme).
+- Raydium CLMM program kaynağı (`SwapV2`).

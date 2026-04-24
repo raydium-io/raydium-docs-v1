@@ -1,0 +1,224 @@
+---
+title: "Routing dan MEV"
+description: "Split routing di seluruh produk Raydium, pola tahan sandwich, integrasi bundle Jito, dan trade-off antara jalur submisi private-mempool dan public-mempool."
+---
+
+<Info>
+  **Halaman ini diterjemahkan secara otomatis oleh AI. Versi bahasa Inggris adalah acuan resmi.**
+
+  [Lihat versi bahasa Inggris →](/integration-guides/routing-and-mev)
+</Info>
+
+<Info>
+  "MEV" di Solana tidak identik dengan MEV yang didorong mempool di Ethereum. Pemimpin blok melihat paket transaksi saat tiba, bukan sebagai mempool terurut; front-running terjadi melalui pengurutan ulang di sisi pemimpin atau pencari bersama-lokasi, dan serangan sandwich dijalankan oleh bot yang mengamati status pool dan berlomba dengan transaksi Anda menggunakan biaya lebih tinggi. Mitigasi yang dilakukan berbeda sesuai dengan itu.
+</Info>
+
+## Primer split routing
+
+"Split routing" berarti memecah satu swap logis di seluruh beberapa pool sehingga harga marginal menyamakan — output yang sama dengan menukar setiap potongan pada harga pool-nya sendiri. Ini mengurangi dampak harga efektif ketika satu pool cukup dangkal relatif terhadap ukuran perdagangan.
+
+Pernyataan masalah: diberikan pool `P_1, ..., P_n` dengan fungsi `f_i(x)` yang memetakan input `x` ke output, temukan split `x_1 + ... + x_n = X` yang memaksimalkan `Σ f_i(x_i)`. Karena setiap `f_i` cekung, optimum memenuhi `f'_1(x_1) = f'_2(x_2) = ... = f'_n(x_n)` (harga marginal yang sama).
+
+### Implementasi greedy
+
+Pendekatan sederhana yang mencapai ~1% dari optimal dalam praktik:
+
+```
+remaining = X
+routes    = []
+step      = X / 1000     // slice size
+while remaining > 0:
+    best_pool = argmax over i of f'_i(current_x_i + step)
+    x_i += step
+    routes.append((best_pool, step))
+    remaining -= step
+```
+
+`step` yang lebih halus → lebih dekat ke optimal, lebih banyak iterasi. Dalam praktik 100–500 potongan adalah sweet spot yang wajar.
+
+### Implementasi optimisasi konveks
+
+Untuk agregator tingkat produksi, selesaikan optimisasi secara langsung. Setiap pool memiliki bentuk tertutup `f'_i(x)`:
+
+- **Constant-product (CPMM / AMM v4)**: `f'(x) = y * R_y / (R_x + x)^2` di mana `R_x, R_y` adalah cadangan dan `y = R_x * R_y / (R_x + x) - R_y` ... (derivasi lebih sederhana: harga marginal adalah `R_y / (R_x + x)`, jadi split untuk menyamakan harga marginal adalah pencarian 1D).
+- **CLMM**: smooth bertingkat — dalam satu tick, `f'(x)` adalah fungsi rasional dari `sqrt_price`; di seluruh tick, berubah secara diskrit. Split dengan pemecah langkah kecil atau anggap setiap tick yang berdekatan sebagai "pool"-nya sendiri.
+
+Output dari split routing adalah vektor `[(pool_1, x_1), (pool_2, x_2), ...]` yang langkah perakitan transaksi Anda ubah menjadi urutan instruksi swap.
+
+### Kapan split routing membantu
+
+| Ukuran perdagangan vs TVL | Split membantu? |
+|-------------------|--------------|
+| `<0.1%` | Tidak — single-pool mendominasi |
+| 0.1–1% | Marginal |
+| 1–5% | Ya, 10–50 bps perbaikan |
+| `>5%` | Ya, perbaikan besar |
+
+Jika Anda menjalankan swap in-UI dompet untuk pengguna ritel yang melakukan `<$10k` di pool yang dalam, jangan repot membagi — overhead gas melebihi perbaikan. Untuk agregator yang mengoreksi aliran institusional, selalu bagi.
+
+## Rute multi-hop
+
+Ketika tidak ada pool langsung, atau dampak pool langsung sangat besar, lompat melalui perantara:
+
+```
+tokenA → tokenHub → tokenB
+```
+
+Hub umum: USDC, SOL, RAY. Setiap lompatan memiliki:
+
+- Batasan slippage-nya sendiri (lebih rendah pada lompatan langsung; per-hop pada multi-hop).
+- Biaya-nya sendiri dibayar.
+- Dampak harga-nya sendiri.
+
+Dampak total menggabungkan: `(1 - impact_1) * (1 - impact_2)`. Dampak 1% dua kali adalah 1.99% total, bukan 2%.
+
+**Jangan pernah lompat melalui pool yang sama dua kali.** Pergi `A → B → A → B` melalui CLMM yang sama hanya membakar biaya dan slippage. Agregator harus memfilter rute seperti itu pada generasi. (Catatan: ini *bersepeda pasangan yang sama*, bukan multi-hop secara umum — routing `A → USDC → B` melalui pool berbeda adalah pola standar dan bermanfaat yang direkomendasikan di atas.)
+
+**Per-hop vs minimum end-to-end.** Dengan komposisi CPI ([`integration-guides/cpi-integration`](/id/integration-guides/cpi-integration)), Anda dapat mengatur `minimum_amount_out` setiap hop ke 0 dan memberlakukan minimum end-to-end tunggal di proxy Anda. Tanpa CPI, setiap hop memberlakukan minimumnya sendiri, yang memerlukan perhitungan batas menengah yang wajar — biasanya `quote_i * (1 - slippage_bps/10000)` per hop.
+
+## Serangan sandwich
+
+### Mekanisme
+
+Bot mengamati aliran gossip transaksi. Ketika melihat swap Anda:
+
+1. Front-run: bot membeli token yang sama *sebelum* Anda, mendorong harga pool naik.
+2. Transaksi korban: Anda swap pada harga yang lebih buruk.
+3. Back-run: bot menjual ke harga yang meningkat, menangkap spread.
+
+Bot membayar biaya prioritas untuk kedua transaksinya; keuntungan adalah delta sandwich dikurangi dua kali biaya prioritas. Menguntungkan hanya di pool di mana perdagangan Anda menggerakkan harga secara bermakna.
+
+### Mitigasi
+
+**Slippage ketat.** Jika output minimum Anda adalah 0.5% di bawah quote, sandwich yang menggerakkan harga lebih dari 0.5% mengembalikan Anda tetapi perdagangan pra-bot masih dijalankan dengan harga lama Anda. Mereka kehilangan uang. Bot sandwich menargetkan slippage lebar (≥1–2%); slippage sub-0.3% sebagian besar kebal.
+
+**Submisi private-mempool (Jito).** Kirimkan transaksi Anda sebagai bagian dari bundle Jito. Bundle tidak muncul di aliran gossip publik; bot tidak dapat melihat perdagangan sedang berlangsung dan front-run. Trade-off: bundle memerlukan tip sisi validator, dan tidak setiap pemimpin diaktifkan Jito (meskipun mayoritas).
+
+**Ukuran perdagangan lebih kecil.** Bagi perdagangan di seluruh beberapa transaksi sehingga tidak ada transaksi tunggal yang menggerakkan harga cukup untuk menjadi target sandwich yang menguntungkan. Meningkatkan total biaya gas.
+
+**Randomisasi waktu.** Kirimkan selama waktu volume rendah jika memungkinkan. Tidak tersedia untuk swap pengguna interaktif tetapi dapat dilakukan untuk aliran bot terjadwal.
+
+Pool CLMM Raydium biasanya melihat aktivitas sandwich lebih sedikit daripada CPMM karena struktur likuiditas single-tick berarti perdagangan kecil tidak menggerakkan harga sama sekali (mereka tetap berada dalam tick). Pool CLMM yang dalam adalah tempat paling tahan sandwich secara organik.
+
+## Bundle Jito
+
+Jito adalah klien validator Solana yang dimodifikasi yang menerima **bundle** — kelompok transaksi terurut yang mendarat secara atomik. Bot menggunakan Jito untuk ekstraksi MEV; pengguna biasa menggunakan Jito untuk perlindungan dari bot yang sama.
+
+### Cara kerja bundle
+
+- Hubungkan ke endpoint blok engine Jito (misalnya `https://mainnet.block-engine.jito.wtf`).
+- Kirimkan bundle 1–5 transaksi ditambah tip ke salah satu akun tip Jito.
+- Jika pemimpin saat ini menjalankan Jito, bundle Anda dipertimbangkan. Pemenang lelang untuk slot ini (bundle dengan tip-per-CU tertinggi) mendarat; yang lain jatuh.
+
+### Mengukur tip
+
+Ukuran tip mengikuti distribusi bundle terbaru. Jito menerbitkan persentil real-time:
+
+```ts
+const tipRes = await fetch("https://worker.jito.wtf/api/v1/bundles/tip_floor");
+const tips   = await tipRes.json();
+// { ema_landed_tips_25th_percentile, 50th, 75th, 95th, 99th }
+
+// Swap yang menghadap pengguna pada hari normal — persentil ke-50 baik-baik saja.
+const tipSol = tips.ema_landed_tips_50th_percentile_lamports / 1e9;
+
+// Perdagangan bot sensitif terhadap waktu selama kemacetan — persentil ke-75–95.
+```
+
+Rentang tipikal: 0.0001–0.001 SOL untuk swap non-mendesak pengguna; 0.01–0.1 SOL selama kemacetan untuk bot prioritas tinggi.
+
+### Membangun bundle
+
+```ts
+import { SearcherClient } from "jito-ts";
+
+const client = new SearcherClient("https://mainnet.block-engine.jito.wtf");
+
+const tipIx = SystemProgram.transfer({
+  fromPubkey: user.publicKey,
+  toPubkey:   JITO_TIP_ACCOUNTS[Math.floor(Math.random() * 8)],  // 8 tip accts
+  lamports:   tipLamports,
+});
+
+const tx1 = new VersionedTransaction(...);  // the swap
+tx1.sign([user]);
+
+const bundleUuid = await client.sendBundle([tx1], tipLamports);
+// Optionally: await confirmation via client.getBundleStatuses([bundleUuid])
+```
+
+Jebakan:
+
+- **Tip harus dalam bundle.** Sertakan `SystemProgram.transfer` ke akun tip Jito sebagai instruksi di dalam salah satu transaksi bundle (biasanya yang terakhir). Transaksi tip terpisah yang bukan bagian dari bundle diabaikan.
+- **Pemimpin tidak diaktifkan Jito.** ~75% pemimpin menjalankan Jito; ~25% tidak. Bundle yang dikirim ketika pemimpin non-Jito memegang slot dijatuhkan. Klien akan coba lagi secara otomatis.
+- **Kedaluwarsa.** Bundle menggunakan model expiry blockhash yang sama dengan transaksi reguler. Rakitkan dan kirimkan dengan cepat; jendela ~60d.
+
+### Bundle vs biaya prioritas
+
+Biaya prioritas menyuap pemimpin untuk memasukkan transaksi Anda lebih cepat. Bundle Jito juga menyembunyikan transaksi dari mempool publik. Gunakan biaya prioritas untuk urgensi; gunakan bundle untuk perlindungan sandwich. Sabuk dan bretele: gunakan keduanya pada swap pengguna bernilai tinggi.
+
+Lihat [`integration-guides/priority-fee-tuning`](/id/integration-guides/priority-fee-tuning) untuk mengukur biaya prioritas.
+
+## MEV-share / RPC terlindungi kembali
+
+Beberapa penyedia RPC menawarkan endpoint "MEV-share" atau "revert-protected" yang secara internal merutekan transaksi Anda melalui bundle Jito atau jalur pribadi setara:
+
+- **Helius** — koneksi stakeholder dengan dukungan bundle.
+- **QuickNode** — endpoint "Revert Protect"; secara otomatis membentuk bundle di sekitar transaksi yang dikirimkan.
+- **Triton** — tingkat aliran pribadi.
+
+Menggunakan salah satu dari ini adalah jalur paling sederhana bagi proyek yang tidak ingin mengelola logika bundle sendiri. Trade-off: internal yang tidak jelas; Anda mempercayai konstruksi bundle penyedia.
+
+## Penanganan kemacetan
+
+Selama jendela volume tinggi (peluncuran mainnet, pendaftaran besar, reli berkelanjutan), antrian paket pemimpin penuh. Gejala:
+
+- Transaksi tetap tidak dikonfirmasi selama 60+ detik, kemudian kedaluwarsa dengan "blockhash tidak ditemukan".
+- Biaya prioritas yang bekerja kemarin tidak cukup hari ini.
+- Simulasi berhasil tetapi eksekusi tidak pernah mendarat.
+
+Strategi:
+
+1. **Coba lagi secara agresif saat kedaluwarsa.** Pada `TransactionExpiredBlockheightExceeded`, bangun kembali dengan blockhash segar dan kirim ulang. Jangan coba lagi saat reverted — reverts bersifat deterministik.
+2. **Siaran multi-RPC.** Kirimkan transaksi yang sama ke beberapa RPC secara paralel; mana pun yang mencapai pemimpin terlebih dahulu menang.
+3. **Ramping biaya prioritas.** Mulai dengan persentil ke-50; jika upaya pertama kedaluwarsa, coba lagi pada ke-75, kemudian ke-95.
+4. **Bundle Jito sebagai fallback.** Pemimpin Jito cenderung kurang kemacetan karena mesin blok mengurutkan bundle berdasarkan tip-per-CU; bundle tip-tinggi mendapat prioritas.
+5. **Simulasikan lebih sedikit.** Dalam kemacetan, simulasikan sekali di depan; jangan simulasikan ulang pada coba lagi karena status pool akan bergeser. Re-simulasi selama kemacetan sering gagal secara palsu.
+
+## Pertimbangan MEV per produk
+
+**CPMM.** Sangat sandwichable di pool TVL rendah. Kurva constant-product memperkuat bahkan perdagangan pra-bot kecil. Rekomendasikan bundle Jito untuk perdagangan CPMM apa pun >0.5% dari TVL pool.
+
+**CLMM.** Kurang sandwichable di pool dalam karena perdagangan dalam-tick tidak menggerakkan harga. Tetapi perdagangan cross-tick benar-benar melakukannya; sandwich yang menargetkan tick crossing adalah pola yang diketahui. Slippage ketat (`<0.3%`) adalah pertahanan terbaik.
+
+**AMM v4 + OpenBook.** Pengisian buku pesanan OpenBook dijalankan melalui transaksi yang sama, jadi bot sandwich yang tidak tahu status buku pesanan meremehkan dampak harga dan sering gagal. Tempat organik MEV rendah untuk alasan ini.
+
+**LaunchLab.** Selama fase bonding-curve awal, front-running merajalela pada peluncuran yang dipuji. Kurva bergerak cepat dan slippage lebar. Bundle Jito sangat disarankan. Setelah kelulusan, CPMM yang dihasilkan mengikuti dinamika CPMM normal.
+
+**Farms.** Operasi panen dan stake bukan swap dan tidak dapat di-sandwich. Tidak ada penanganan khusus yang diperlukan.
+
+## Daftar periksa
+
+Untuk agregator produksi / UI swap dompet:
+
+- [ ] Default slippage ≤0.5% pada pasangan normal; pengguna dapat mengganti.
+- [ ] Submisi bundle Jito diaktifkan secara default untuk swap >\$1k nilai USD.
+- [ ] Biaya prioritas bersumber dari estimasi langsung (bukan hard-code).
+- [ ] Logika coba lagi membedakan reverted (jangan coba lagi) dari kedaluwarsa (coba lagi dengan blockhash baru).
+- [ ] Rute multi-hop menetapkan minimum per-hop, bukan end-to-end.
+- [ ] Split routing aktif untuk perdagangan >1% dari TVL pool tunggal apa pun.
+- [ ] Kesegaran pool: ambil ulang status segera sebelum submisi; kutip ulang jika basi.
+- [ ] Tahan sandwich di pool dangkal: baik Jito-only, atau tolak jika slippage >1%.
+
+## Penunjuk
+
+- [`integration-guides/aggregator`](/id/integration-guides/aggregator) — penemuan pool, penawaran, perakitan transaksi.
+- [`integration-guides/priority-fee-tuning`](/id/integration-guides/priority-fee-tuning) — pengukuran CU dan biaya prioritas.
+- [`integration-guides/cpi-integration`](/id/integration-guides/cpi-integration) — komposisi multi-hop gerbang slippage tunggal.
+- [`algorithms/slippage-and-price-impact`](/id/algorithms/slippage-and-price-impact) — definisi formal.
+
+Sumber:
+
+- [Jito docs](https://docs.jito.wtf)
+- [Solana validator docs on priority fees](https://docs.solana.com/transaction_fees)
+- [jito-ts](https://github.com/jito-labs/jito-ts) — klien bundle TypeScript.

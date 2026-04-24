@@ -1,0 +1,260 @@
+---
+title: "Rust CPI"
+description: "다른 솔라나 프로그램에서 Raydium 프로그램 호출 — 계정 목록 구성, 서명자 시드, 컴퓨트 예산, CPMM, CLMM, farm v6, LaunchLab의 에러 전파 패턴. AMM v4는 Anchor 크레이트가 없어서 별도로 다룹니다."
+---
+
+<Info>
+  **이 페이지는 AI 자동 번역입니다. 모든 내용은 영문판을 기준으로 합니다.**
+
+  [영문판 보기 →](/sdk-api/rust-cpi)
+</Info>
+
+<Info>
+  CPI("크로스프로그램 호출")는 한 솔라나 프로그램이 다른 프로그램을 호출하는 메커니즘입니다. Raydium의 Anchor 프로그램은 호출 지점을 타입화된 함수 호출처럼 보이게 하는 CPI 래퍼 크레이트를 함께 제공합니다. 계정 구조체에는 검증된 필드 이름과 `cpi::<ix>()` 헬퍼가 포함됩니다. 이 페이지는 일반적인 패턴을 다루고 있으며, 제품별 코드 예제는 각 제품 챕터의 code-demos 페이지를 참조하세요.
+</Info>
+
+## Cargo 의존성
+
+```toml
+[dependencies]
+anchor-lang            = "0.29"
+anchor-spl             = "0.29"
+raydium_cp_swap        = { git = "https://github.com/raydium-io/raydium-cp-swap", features = ["cpi"] }
+raydium_amm_v3         = { git = "https://github.com/raydium-io/raydium-clmm",    features = ["cpi"] }
+# AMM v4 and farm v6: no published Anchor CPI crate. See "AMM v4 / farm v6" below.
+```
+
+`cpi` 기능 플래그를 사용하면 크레이트가 전체 프로그램이 아닌 CPI 표면(계정 구조체 + 호출자)만 컴파일되므로 바이너리 크기를 작게 유지할 수 있습니다.
+
+CPI 계정 구조체를 end-to-end로 연결한 실제 예제는 [`raydium-io/raydium-cpi-example`](https://github.com/raydium-io/raydium-cpi-example) (AMM v4, CPMM, CLMM 포함)을 참조하세요.
+
+## 계정 목록 구성
+
+모든 Raydium CPI에는 호출 프로그램에 `Accounts` 구조체가 필요합니다. 필드는 프로그램의 명령어 계정 순서와 1:1로 일치하며, 필드 레벨 검증자를 포함합니다:
+
+```rust
+use anchor_lang::prelude::*;
+use anchor_spl::token::{Token, TokenAccount, Mint};
+
+#[derive(Accounts)]
+pub struct MyProxySwap<'info> {
+    #[account(mut)]
+    pub user: Signer<'info>,
+
+    /// CHECK: validated by CPMM
+    #[account(mut)]
+    pub pool_state: UncheckedAccount<'info>,
+
+    /// CHECK: ditto
+    pub amm_config: UncheckedAccount<'info>,
+
+    /// CHECK: ditto
+    pub pool_authority: UncheckedAccount<'info>,
+
+    #[account(mut)]
+    pub input_vault: Account<'info, TokenAccount>,
+    #[account(mut)]
+    pub output_vault: Account<'info, TokenAccount>,
+
+    pub input_mint: Account<'info, Mint>,
+    pub output_mint: Account<'info, Mint>,
+
+    #[account(mut)]
+    pub user_input_ata:  Account<'info, TokenAccount>,
+    #[account(mut)]
+    pub user_output_ata: Account<'info, TokenAccount>,
+
+    pub cpmm_program: Program<'info, raydium_cp_swap::program::RaydiumCpSwap>,
+    pub token_program: Program<'info, Token>,
+    pub token_program_2022: Program<'info, anchor_spl::token_2022::Token2022>,
+    /// CHECK: observation PDA
+    #[account(mut)]
+    pub observation_state: UncheckedAccount<'info>,
+}
+```
+
+Raydium 측의 계정 대부분은 `UncheckedAccount`입니다. 피호출자(Raydium)가 검증을 담당하기 때문입니다. 호출 프로그램은 자신이 소유한 계정만 엄격하게 검증합니다. 사용자 ATA, 자신의 PDA 등이 이에 해당합니다. `/// CHECK:` 주석은 Anchor의 누락된 검증 경고를 억제합니다.
+
+## CPI 호출 구성
+
+Anchor는 명령어당 하나의 헬퍼를 생성합니다:
+
+```rust
+use raydium_cp_swap::cpi::{self, accounts::Swap as CpmmSwap};
+
+pub fn my_proxy_swap(
+    ctx: Context<MyProxySwap>,
+    amount_in: u64,
+    minimum_amount_out: u64,
+) -> Result<()> {
+    let cpi_accounts = CpmmSwap {
+        payer:                ctx.accounts.user.to_account_info(),
+        authority:            ctx.accounts.user.to_account_info(),
+        amm_config:           ctx.accounts.amm_config.to_account_info(),
+        pool_state:           ctx.accounts.pool_state.to_account_info(),
+        input_token_account:  ctx.accounts.user_input_ata.to_account_info(),
+        output_token_account: ctx.accounts.user_output_ata.to_account_info(),
+        input_vault:          ctx.accounts.input_vault.to_account_info(),
+        output_vault:         ctx.accounts.output_vault.to_account_info(),
+        input_token_program:  ctx.accounts.token_program.to_account_info(),
+        output_token_program: ctx.accounts.token_program.to_account_info(),
+        input_token_mint:     ctx.accounts.input_mint.to_account_info(),
+        output_token_mint:    ctx.accounts.output_mint.to_account_info(),
+        observation_state:    ctx.accounts.observation_state.to_account_info(),
+    };
+    let cpi_ctx = CpiContext::new(
+        ctx.accounts.cpmm_program.to_account_info(),
+        cpi_accounts,
+    );
+
+    cpi::swap_base_input(cpi_ctx, amount_in, minimum_amount_out)?;
+    Ok(())
+}
+```
+
+`cpi::swap_base_input`은 IDL에서 생성되며, 인수 목록은 Anchor 명령어의 인수 목록을 미러링합니다.
+
+## 서명자 시드 (PDA 서명 CPI)
+
+프로그램이 PDA를 대신하여 CPI에 서명할 때(금고, 에스크로 등에서 일반적), `CpiContext::new_with_signer`를 사용합니다:
+
+```rust
+let bump         = ctx.accounts.my_authority_bump;
+let signer_seeds: &[&[&[u8]]] = &[&[b"my_authority", &[bump]]];
+
+let cpi_ctx = CpiContext::new_with_signer(
+    ctx.accounts.cpmm_program.to_account_info(),
+    cpi_accounts,
+    signer_seeds,
+);
+
+cpi::swap_base_input(cpi_ctx, amount_in, minimum_amount_out)?;
+```
+
+서명자 시드는 PDA의 유도와 일치해야 합니다. `authority`(또는 유사한 서명자 역할)로 전달된 계정의 경우, 솔라나 런타임은 PDA가 이 시드를 통해 서명하는지 확인합니다.
+
+## 남은 계정들
+
+일부 Raydium 명령어는 **남은 계정들**을 취합니다. 고정 계정 후 추가된 가변 길이 목록입니다. 정확한 예시:
+
+- **CLMM `SwapV2`**: 스왑이 통과할 수 있는 틱 배열에 해당하는 1-8개의 `TickArrayState` 계정을 추가합니다.
+- **Farm v6 `Deposit`**: 각 활성 보상 스트림에 대해 `(reward_vault, user_reward_ata)` 쌍을 추가합니다.
+
+Anchor의 CPI 헬퍼는 남은 계정을 타입 체크하지 않습니다. `.with_remaining_accounts(...)`을 통해 전달합니다:
+
+```rust
+let cpi_ctx = CpiContext::new(program, accounts)
+    .with_remaining_accounts(ctx.remaining_accounts.to_vec());
+```
+
+순서가 중요합니다. 수신자 프로그램은 전달한 순서대로 남은 계정을 반복합니다. CLMM의 경우, 틱 배열은 방향순으로 정렬되어야 합니다(스왑 방향의 첫 번째 배열이 먼저). farm v6의 경우, 보상 슬롯은 슬롯 인덱스 순서로 진행합니다.
+
+## 에러 전파
+
+Raydium의 프로그램은 자신의 에러 열거형을 반환합니다. Anchor는 이를 래핑합니다. 호출 프로그램은 `Err(ProgramError::Custom(code))`로 봅니다. 특정 에러를 처리하려면:
+
+```rust
+use raydium_cp_swap::error::ErrorCode as CpmmErr;
+
+match cpi::swap_base_input(cpi_ctx, amount_in, minimum_amount_out) {
+    Ok(_) => Ok(()),
+    Err(e) => {
+        msg!("CPMM swap failed: {:?}", e);
+        // Re-raise, or convert to your own error type.
+        Err(e)
+    }
+}
+```
+
+에러 코드 번호는 IDL 정책([`sdk-api/anchor-idl`](/ko/sdk-api/anchor-idl))에 따라 안정적입니다. 숫자 값과 비교하여 특정 코드에 대해 테스트할 수 있습니다.
+
+## 조합 CPI의 컴퓨트 예산
+
+각 CPI 프레임은 오버헤드가 있으며(호출 자체 약 1,500 CU), 피호출자의 CU 소비가 당신의 것 위에 쌓입니다. 프로그램 내부에서 CPMM 스왑을 호출하는 거래는 다음을 소비합니다:
+
+```
+your_program_cu
++ ~1_500       (CPI overhead)
++ ~150_000     (CPMM swap, SPL-token variant)
++ ~200_000     (if Token-2022 with transfer fee)
++ ~10_000      (observation update)
+```
+
+스택 라우팅(프로그램 → 애그리게이터 → CPMM + CLMM + farm 수확)의 경우 ≥500k CU로 예산을 설정합니다. 항상 거래에서 명시적인 `ComputeBudgetProgram::set_compute_unit_limit(...)` 명령어를 설정합니다. 기본 200k CU 제한은 조용히 소진됩니다.
+
+## AMM v4 — 수동 Instruction 구성
+
+AMM v4에는 Anchor 크레이트가 없습니다. `Instruction`을 수동으로 빌드합니다:
+
+```rust
+use anchor_lang::solana_program::program::invoke_signed;
+use anchor_lang::solana_program::instruction::{Instruction, AccountMeta};
+
+const AMM_V4_PROGRAM_ID: Pubkey = pubkey!("675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8");
+
+// SwapBaseIn discriminator is 9.
+let mut data = vec![9u8];
+data.extend_from_slice(&amount_in.to_le_bytes());
+data.extend_from_slice(&minimum_amount_out.to_le_bytes());
+
+let ix = Instruction {
+    program_id: AMM_V4_PROGRAM_ID,
+    accounts: vec![
+        AccountMeta::new_readonly(token_program_id, false),
+        AccountMeta::new(amm_id, false),
+        AccountMeta::new_readonly(amm_authority, false),
+        // ... remaining accounts per products/amm-v4/instructions ...
+    ],
+    data,
+};
+invoke_signed(&ix, &account_infos, signer_seeds)?;
+```
+
+전체 계정 목록은 [`products/amm-v4/code-demos`](/ko/products/amm-v4/code-demos)를 참조하세요.
+
+## Farm v6 — 보상 쌍 남은 계정들
+
+Farm v6의 `Deposit` / `Withdraw` / `Harvest`는 남은 계정의 `(reward_vault_i, user_reward_ata_i)` 쌍 패턴을 사용합니다. 정확한 순서:
+
+```
+remaining_accounts = [
+    reward_vault_0, user_reward_ata_0,
+    reward_vault_1, user_reward_ata_1,
+    ...
+]
+```
+
+**활성**(실행 중이거나 종료했지만 미청구)인 각 보상 슬롯당 한 쌍입니다. 사용되지 않은 슬롯은 생략합니다. 프로그램은 `farm_state.reward_infos[i].reward_state`에 따라 디스패치합니다.
+
+## CPI 흐름 테스트
+
+로컬 개발에서는 Raydium 프로그램을 테스트 검증자에서 사용할 수 있어야 합니다. 옵션:
+
+1. **프로그램 복제를 사용한 `anchor test`** — `Anchor.toml`에서:
+
+   ```toml
+   [test.validator]
+   clone = [
+     { address = "CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK" },  # CPMM
+     { address = "CLMM...program-id..." },                          # CLMM
+     { address = "farm-v6-program-id..." },                         # farm v6
+   ]
+   ```
+
+   이는 배포된 바이트코드를 메인넷에서 로컬 검증자로 끌어옵니다.
+
+2. **Devnet** — Raydium은 모든 프로그램을 메인넷과 동일한 프로그램 ID로 devnet에 배포합니다. `anchor test --provider.cluster devnet`을 실행하여 라이브 코드를 칩니다.
+
+3. **로컬 배포** — Raydium 저장소를 복제하고 `anchor deploy`를 로컬 검증자로 수행합니다. 테스트 주기 오버헤드를 추가하지만 디버깅을 위해 피호출자를 수정할 수 있습니다.
+
+## 포인터
+
+- [`products/cpmm/code-demos`](/ko/products/cpmm/code-demos), [`products/clmm/code-demos`](/ko/products/clmm/code-demos), [`products/amm-v4/code-demos`](/ko/products/amm-v4/code-demos), [`products/farm-staking/code-demos`](/ko/products/farm-staking/code-demos) — 제품별 CPI 예제.
+- [`sdk-api/anchor-idl`](/ko/sdk-api/anchor-idl) — IDL 검색 및 클라이언트 재생성.
+- [`integration-guides/cpi-integration`](/ko/integration-guides/cpi-integration) — 상위 레벨 패턴: 에스크로, 금고, 애그리게이터 구성.
+
+소스:
+
+- [raydium-cp-swap](https://github.com/raydium-io/raydium-cp-swap)
+- [raydium-clmm](https://github.com/raydium-io/raydium-clmm)
+- [Anchor CPI docs](https://www.anchor-lang.com/docs/cross-program-invocations)

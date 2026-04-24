@@ -1,0 +1,106 @@
+---
+title: "AMM v4 fees"
+description: "The 0.25% trade fee, its LP / protocol split, PnL generation from OpenBook fills, and how the admin sweeps accrued protocol fees."
+---
+
+## The one published tier
+
+Unlike CPMM and CLMM, AMM v4 has **no `AmmConfig` account**. Fees are stored directly on each pool's `AmmInfo.fees` struct and are fixed at pool creation. The defaults that cover essentially every live AMM v4 pool:
+
+| On-chain field | Default | Meaning |
+|----------------|---------|---------|
+| `swap_fee_numerator / swap_fee_denominator` | `25 / 10_000` | **Gross trade fee on AMM-path swaps: 0.25% of input volume.** |
+| `trade_fee_numerator / trade_fee_denominator` | `25 / 10_000` | Used by the OpenBook integration to compute fee-inclusive limit-order pricing. Same `0.25%` as `swap_fee` by default. |
+| `pnl_numerator / pnl_denominator` | `12 / 100` | **Protocol's share of the swap fee: 12%** — i.e. `0.25% × 12% = 0.03%` of volume. Accrues to `need_take_pnl_*` counters. |
+| `min_separate_numerator / min_separate_denominator` | `5 / 10_000` | Internal precision floor used by the fee-split rounding logic. |
+
+Note that `pnl_numerator / pnl_denominator` is a fraction **of the swap fee**, not of trade volume — a common misreading. The LP share is the complement (`88%` of the fee = `0.22%` of volume) and is implicit; there is no separate "LP share" numerator.
+
+A small number of early pools were created with different numerators; always read `AmmInfo.fees` before quoting.
+
+There is **no fund-fee** and **no creator-fee** line: these are CPMM/CLMM inventions that did not exist in AMM v4's original fee model.
+
+## How the split is computed
+
+On each swap, the pool charges the gross trade fee off the input amount, then apportions:
+
+```
+gross_fee   = ceil(amount_in * swap_fee_numerator / swap_fee_denominator)        // 0.25% of amount_in
+pnl_portion = gross_fee * pnl_numerator / pnl_denominator                        // 12% of gross_fee
+lp_portion  = gross_fee − pnl_portion                                            // 88% of gross_fee
+```
+
+- `lp_portion` is left in the vault and contributes to the next `k`. LPs capture it by redeeming LP tokens later.
+- `pnl_portion` increments `AmmInfo.state_data.need_take_pnl_coin` or `need_take_pnl_pc` depending on which side is the swap input.
+
+Same invariant-preserving trick as CPMM: the PnL amount physically sits in the vault but is subtracted from the reserves used in the curve, so `TakePnl` moves tokens out without shifting price.
+
+## PnL from OpenBook (historical)
+
+<Note>
+  **No longer accruing.** The OpenBook integration is deactivated, so the *second* PnL stream described in this section is no longer being generated. `total_pnl_{coin,pc}` counters on existing pools may carry historical values, but no new amounts are added. The 0.03% protocol-fee path (above) is unaffected and still active.
+</Note>
+
+Historically, AMM v4 had a *second* fee-like revenue stream: when its limit orders on OpenBook got filled, the pool could be on the taker side of the fill and earn or pay the market's maker/taker spread. These PnL events settled into the pool vaults during `MonitorStep` and the program credited them to `state_data.total_pnl_{coin,pc}` as informational counters.
+
+- When the pool's posted grid was correctly calibrated around the curve price, OpenBook fills tended to be **fee-positive** for the pool — the AMM was effectively market-making on OpenBook and earning maker rebates.
+- When OpenBook paused or the event queue filled, the pool could sit on stale orders that filled at disadvantageous prices, producing negative PnL. This operational coupling was one of the motivations for moving away from the hybrid design.
+
+This OpenBook PnL was **not** the same as the 0.03% protocol fee. OpenBook PnL inflated the pool reserves directly (benefiting LPs + protocol proportionally to the fee split), while the 0.03% protocol fee was tagged specifically for admin sweep. With the OpenBook side off, the only fee accrual today is the 0.25% on AMM swaps and its 22/3 split.
+
+## Collection
+
+The admin (Raydium multisig) calls `WithdrawPnl` / `TakePnl` to sweep `need_take_pnl_*` into the pool-level "PnL owner" accounts configured on the program's `AmmConfig` (a different, program-scoped config — not the per-pool CPMM-style AmmConfig). Sweeping:
+
+1. Settles any pending OpenBook fills first. *(No-op now that OpenBook is inactive.)*
+2. Transfers `need_take_pnl_coin` / `need_take_pnl_pc` from the pool vaults to the PnL destination.
+3. Zeroes the counters.
+
+The operation does not move the curve. LPs should not see any price change across a `TakePnl` call.
+
+## LP fee redemption
+
+There is no dedicated "collect LP fees" instruction. LP fees accumulate in the vaults and inflate `k` over time; LPs realize them by burning LP tokens via `Withdraw`. The value of an LP token grows monotonically as `(coin_reserve_effective, pc_reserve_effective)` grow.
+
+## Visualization: where 1,000 USDC of volume goes
+
+On a USDC-heavy swap of \$1,000 against a default-parameter pool:
+
+```
+Gross trade fee (0.25%):   $2.50
+  LP share   (0.22%):       $2.20   → stays in pool, raises k
+  PnL share  (0.03%):       $0.30   → need_take_pnl_pc, swept by TakePnl
+Remainder sent to user:   $997.50   (minus curve-driven price impact)
+```
+
+Compare to CPMM `AmmConfig[0]` (0.25% tier, no creator fee): LP gets \$2.10, protocol \$0.30, fund \$0.10. CPMM introduces the fund line by carving it out of what would have been LP's share in AMM v4's equivalent tier.
+
+## Comparison table
+
+| | AMM v4 | CPMM `index=0` | CLMM `index=2` |
+|---|---|---|---|
+| Trade fee | 0.25% | 0.25% | 0.25% |
+| LP | 0.22% | 0.21% | Varies by emissions |
+| Protocol | 0.03% | 0.03% | Per tier |
+| Fund | N/A | 0.01% | Per tier |
+| Creator (optional) | N/A | 0 by default | N/A |
+| Where fees sit | Pool vault + need_take_pnl_* | Pool vault + protocol_fees_* + fund_fees_* | Global + per-tick + per-position |
+
+Full matrix in [`reference/fee-comparison`](/reference/fee-comparison).
+
+## Integrator notes
+
+- **Quoting.** Fetch `AmmInfo` via the SDK or `api-v3.raydium.io/pools/info/ids`. Do **not** compute your own quote against raw vault balances — the OpenBook-escrowed amounts and the PnL exclusion both pull the effective reserves away from what `getTokenAccountBalance` shows.
+- **Stale fee parameters.** In principle `SetParams` could change `swap_fee_numerator`, but in practice the Raydium multisig has not changed defaults for any live pool. Still, always read from on-chain state rather than hardcoding.
+- **No rewards.** AMM v4 does not support on-pool reward emissions. Legacy ecosystem farms (Farm v3 / v5 / v6) are the staking-layer equivalent — see [`products/farm-staking`](/products/farm-staking).
+
+## Where to go next
+
+- [`products/amm-v4/math`](/products/amm-v4/math) — the trade-fee derivation inside the curve.
+- [`products/amm-v4/instructions`](/products/amm-v4/instructions) — `WithdrawPnl` / `SetParams` account lists.
+- [`reference/fee-comparison`](/reference/fee-comparison) — side-by-side matrix.
+
+Sources:
+
+- [Raydium AMM program — `raydium-io/raydium-amm`](https://github.com/raydium-io/raydium-amm)
+- On-chain AMM v4 fee-numerator/denominator fields (verified against mainnet `AmmInfo` accounts).

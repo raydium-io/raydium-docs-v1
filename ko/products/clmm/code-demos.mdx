@@ -1,0 +1,464 @@
+---
+title: "CLMM 코드 예제"
+description: "TypeScript 엔드투엔드 예제: CLMM 풀 생성, 원하는 가격 범위에서 포지션 열기, 유동성 조정, 스왑, 수수료 및 보상 수집."
+---
+
+<Info>
+  **이 페이지는 AI 자동 번역입니다. 모든 내용은 영문판을 기준으로 합니다.**
+
+  [영문판 보기 →](/products/clmm/code-demos)
+</Info>
+
+<Info>
+  **버전 안내.** 모든 예제는 Solana mainnet-beta 환경에서 `@raydium-io/raydium-sdk-v2@0.2.42-alpha`를 대상으로 하며, 2026년 4월에 검증되었습니다. Program ID는 SDK를 통해 [`reference/program-addresses`](/ko/reference/program-addresses)에서 가져옵니다.
+</Info>
+
+## 설정
+
+```bash
+npm install @raydium-io/raydium-sdk-v2 @solana/web3.js @solana/spl-token bn.js decimal.js
+```
+
+이 페이지의 모든 예제는 [`raydium-sdk-V2-demo/src/clmm`](https://github.com/raydium-io/raydium-sdk-V2-demo/tree/master/src/clmm)의 파일과 대응됩니다. 각 섹션 옆에 GitHub 링크가 있습니다. 부트스트랩은 데모 저장소의 `config.ts.template`([소스](https://github.com/raydium-io/raydium-sdk-V2-demo/blob/master/src/config.ts.template))을 따르며, 실질적인 통합에는 `disableFeatureCheck: true` 설정을 권장합니다.
+
+```ts
+import { Connection, Keypair, clusterApiUrl } from "@solana/web3.js";
+import { Raydium, TxVersion } from "@raydium-io/raydium-sdk-v2";
+import fs from "node:fs";
+
+const connection = new Connection(process.env.RPC_URL ?? clusterApiUrl("mainnet-beta"));
+const owner = Keypair.fromSecretKey(
+  new Uint8Array(JSON.parse(fs.readFileSync(process.env.KEYPAIR!, "utf8"))),
+);
+const raydium = await Raydium.load({
+  owner,
+  connection,
+  cluster: "mainnet",
+  disableFeatureCheck: true,
+  blockhashCommitment: "finalized",
+});
+export const txVersion = TxVersion.V0;
+```
+
+## CLMM 풀 생성
+
+소스: [`src/clmm/createPool.ts`](https://github.com/raydium-io/raydium-sdk-V2-demo/blob/master/src/clmm/createPool.ts)
+
+```ts
+import { PublicKey } from "@solana/web3.js";
+import { CLMM_PROGRAM_ID } from "@raydium-io/raydium-sdk-v2";
+import BN from "bn.js";
+import Decimal from "decimal.js";
+
+const mintA = await raydium.token.getTokenInfo(
+  new PublicKey("So11111111111111111111111111111111111111112"));   // wSOL
+const mintB = await raydium.token.getTokenInfo(
+  new PublicKey("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"));   // USDC
+
+const ammConfigs = await raydium.api.getClmmConfigs();
+const ammConfig  = ammConfigs.find((c) => c.index === 1)!;        // 0.05% tier
+
+const initialPrice = new Decimal(160);        // 160 USDC per SOL
+const { execute, extInfo } = await raydium.clmm.createPool({
+  programId: CLMM_PROGRAM_ID,
+  mint1:     mintA,
+  mint2:     mintB,
+  ammConfig,
+  initialPrice,
+  startTime: new BN(0),
+  txVersion: TxVersion.V0,
+});
+
+const { txId } = await execute({ sendAndConfirm: true });
+console.log("Pool:", extInfo.address.id.toBase58(), "tx:", txId);
+```
+
+SDK 동작 방식:
+
+- 파생 전에 바이트 순서 기준으로 `mint1`/`mint2`를 정렬합니다.
+- `sqrt_price_x64 = floor(sqrt(initialPrice × 10^(dB−dA)) × 2^64)`를 계산합니다.
+- `observation` 및 `tick_array_bitmap_extension` 계정을 생성합니다.
+- `ammConfig`에 정의된 풀 생성 수수료를 지불합니다.
+
+## 원하는 범위에서 포지션 열기
+
+소스: [`src/clmm/createPosition.ts`](https://github.com/raydium-io/raydium-sdk-V2-demo/blob/master/src/clmm/createPosition.ts)
+
+```ts
+import { PoolUtils, TickUtils } from "@raydium-io/raydium-sdk-v2";
+
+const poolId = new PublicKey("<POOL_ID>");
+const { poolInfo, poolKeys, rpcData } = await raydium.clmm.getPoolInfoFromRpc(poolId);
+
+// Choose a price range. Here: ±10% of current.
+const currentPrice = new Decimal(poolInfo.price);
+const lowerPrice   = currentPrice.mul(0.9);
+const upperPrice   = currentPrice.mul(1.1);
+
+// Snap to valid ticks for this pool's tick_spacing.
+const { tick: tickLower } = TickUtils.getPriceAndTick({
+  poolInfo, price: lowerPrice, baseIn: true,
+});
+const { tick: tickUpper } = TickUtils.getPriceAndTick({
+  poolInfo, price: upperPrice, baseIn: true,
+});
+
+// How much of each token to deposit.
+const inputAmount = new BN(10_000_000);  // 0.01 SOL
+const inputMint   = poolInfo.mintA.address;
+
+const res = PoolUtils.getLiquidityAmountOutFromAmountIn({
+  poolInfo,
+  slippage: 0.01,
+  inputA: true,
+  tickUpper,
+  tickLower,
+  amount: inputAmount,
+  add: true,
+  amountHasFee: true,
+  epochInfo: await raydium.fetchEpochInfo(),
+});
+
+const { execute } = await raydium.clmm.openPositionFromBase({
+  poolInfo,
+  poolKeys,
+  tickUpper,
+  tickLower,
+  base: "MintA",
+  ownerInfo: { useSOLBalance: true },
+  baseAmount: inputAmount,
+  otherAmountMax: res.amountSlippageB.amount,
+  txVersion: TxVersion.V0,
+});
+
+const { txId } = await execute({ sendAndConfirm: true });
+console.log("Position opened, tx:", txId);
+```
+
+SDK는 범위가 걸치는 틱 배열을 자동으로 계산하며, 초기화되지 않은 틱 배열이 있으면 `InitTickArray` 인스트럭션을 함께 묶어서 처리합니다.
+
+## 기존 포지션의 유동성 증가
+
+소스: [`src/clmm/increaseLiquidity.ts`](https://github.com/raydium-io/raydium-sdk-V2-demo/blob/master/src/clmm/increaseLiquidity.ts)
+
+```ts
+const positionNftMint = new PublicKey("<POSITION_NFT_MINT>");
+
+const positionAccount = await raydium.clmm.getPositionInfo({
+  nftMint: positionNftMint,
+});
+
+const { execute } = await raydium.clmm.increasePositionFromBase({
+  poolInfo,
+  poolKeys,
+  ownerPosition: positionAccount,
+  base: "MintA",
+  baseAmount: new BN(5_000_000),
+  otherAmountMax: new BN(1_000_000_000),
+  txVersion: TxVersion.V0,
+});
+
+await execute({ sendAndConfirm: true });
+```
+
+## 유동성 감소 (수수료 동시 수집)
+
+소스: [`src/clmm/decreaseLiquidity.ts`](https://github.com/raydium-io/raydium-sdk-V2-demo/blob/master/src/clmm/decreaseLiquidity.ts) 및 [`src/clmm/closePosition.ts`](https://github.com/raydium-io/raydium-sdk-V2-demo/blob/master/src/clmm/closePosition.ts)
+
+```ts
+const { execute } = await raydium.clmm.decreaseLiquidity({
+  poolInfo,
+  poolKeys,
+  ownerPosition: positionAccount,
+  liquidity: positionAccount.liquidity.divn(2),   // halve
+  amountMinA: new BN(0),
+  amountMinB: new BN(0),
+  closePosition: false,
+  txVersion: TxVersion.V0,
+});
+
+await execute({ sendAndConfirm: true });
+```
+
+**수수료만 수집**하려면 `liquidity = new BN(0)`으로 `decreaseLiquidity`를 호출하세요. 이 인스트럭션의 부수 효과로 `tokens_fees_owed_{0,1}`이 정산되고 출금됩니다.
+
+유동성과 수수료를 모두 0으로 만든 후 포지션을 완전히 닫으려면, 마지막 `decreaseLiquidity` 호출에 `closePosition: true`를 전달하세요. SDK가 `ClosePosition`을 추가하고 NFT를 소각합니다.
+
+## 보상 수집
+
+소스: [`src/clmm/harvestAllRewards.ts`](https://github.com/raydium-io/raydium-sdk-V2-demo/blob/master/src/clmm/harvestAllRewards.ts)
+
+```ts
+const { execute } = await raydium.clmm.harvestAllRewards({
+  ownerInfo: { useSOLBalance: true },
+  allPoolInfo: { [poolInfo.id]: poolInfo },
+  allPositions: { [poolInfo.id]: [positionAccount] },
+  txVersion: TxVersion.V0,
+});
+
+await execute({ sendAndConfirm: true });
+```
+
+`harvestAllRewards`는 전달된 모든 풀의 모든 포지션을 순회하며, `CollectReward`(및 필요한 `UpdateRewardInfos`) 인스트럭션을 일괄 처리합니다. 필요한 경우 여러 트랜잭션으로 자동 분할됩니다.
+
+## 스왑
+
+소스: [`src/clmm/swap.ts`](https://github.com/raydium-io/raydium-sdk-V2-demo/blob/master/src/clmm/swap.ts)
+
+```ts
+import { PoolUtils } from "@raydium-io/raydium-sdk-v2";
+
+const amountIn = new BN(10_000_000);
+const baseIn   = true;               // swap A (SOL) → B (USDC)
+const slippage = 0.005;
+
+const { minAmountOut, remainingAccounts, priceImpact } =
+  PoolUtils.computeAmountOutFormat({
+    poolInfo,
+    tickArrayCache: await raydium.clmm.fetchTickArrays({ poolInfo }),
+    amountIn,
+    tokenOut: poolInfo.mintB,
+    slippage,
+    epochInfo: await raydium.fetchEpochInfo(),
+  });
+
+const { execute } = await raydium.clmm.swap({
+  poolInfo,
+  poolKeys,
+  inputMint: new PublicKey(poolInfo.mintA.address),
+  amountIn,
+  amountOutMin: minAmountOut.amount,
+  observationId: poolKeys.observationId,
+  remainingAccounts,
+  txVersion: TxVersion.V0,
+});
+
+await execute({ sendAndConfirm: true });
+```
+
+`computeAmountOutFormat`은 온체인 프로그램과 동일한 로직으로 오프체인에서 틱 맵을 순회하며 다음을 반환합니다:
+
+- 예상 출력 수량
+- 슬리피지 적용 후 최소 출력 수량
+- 실제 스왑이 접근할 틱 배열 계정 목록 (`remainingAccounts`)
+
+시뮬레이션이 반환한 `remainingAccounts`를 반드시 전달하세요. 너무 적게 전달하면 스왑이 `TickArrayNotFound`로 중간에 실패하고, 오래된 값을 전달하면 컴퓨팅 파워가 낭비됩니다.
+
+## 커스터마이징 가능한 CLMM 풀 생성
+
+`createCustomizablePool`은 풀 생성 시점에 동적 수수료 및 단일 측면 수수료 토글을 노출하는 새로운 진입점입니다. `createPool`과 동일한 형태에 세 가지 항목이 추가됩니다:
+
+```ts
+import { CLMM_PROGRAM_ID, CollectFeeOn } from "@raydium-io/raydium-sdk-v2";
+
+const dynamicFeeConfigs = await raydium.api.getClmmDynamicConfigs();    // GET /main/clmm-dynamic-config
+const dynamicFeeConfig  = dynamicFeeConfigs.find((c) => c.index === 0); // pick a calibration tier
+
+const { execute, extInfo } = await raydium.clmm.createCustomizablePool({
+  programId: CLMM_PROGRAM_ID,
+  mint1:     mintA,
+  mint2:     mintB,
+  ammConfig,
+  initialPrice,
+  startTime: new BN(0),
+  // New fields:
+  collectFeeOn:        CollectFeeOn.Token1Only,   // 0 = FromInput, 1 = Token0Only, 2 = Token1Only
+  enableDynamicFee:    true,
+  dynamicFeeConfigId:  dynamicFeeConfig?.id,      // omit when enableDynamicFee is false
+  txVersion: TxVersion.V0,
+});
+
+await execute({ sendAndConfirm: true });
+console.log("Customizable pool:", extInfo.address.id.toBase58());
+```
+
+기본 수수료, 지정가 주문 없음, 동적 수수료 없음 경로에는 `createPool`을 계속 사용할 수 있습니다. 세 가지 새로운 옵션 중 하나라도 필요한 경우에는 `createCustomizablePool`을 사용하세요. 온체인 계정 목록은 [`products/clmm/instructions`](/ko/products/clmm/instructions)를 참고하세요.
+
+## 지정가 주문 (Limit Orders)
+
+지정가 주문은 사용자의 입력을 단일 틱에 예치하고, 스왑이 해당 틱을 지날 때 FIFO 방식으로 체결됩니다. 출력은 정산 시점에 소유자의 ATA로 전송되며, 체결을 위해 소유자가 온라인 상태일 필요는 없습니다.
+
+### 지정가 주문 열기
+
+```ts
+import { TickUtils } from "@raydium-io/raydium-sdk-v2";
+
+const limitConfigs = await raydium.api.getClmmLimitOrderConfigs(); // GET /main/clmm-limit-order-config
+const limitConfig  = limitConfigs.find((c) => c.poolId === poolInfo.id);
+
+// Limit price MUST be quantized to tick_spacing.
+const targetPrice = new Decimal(180);                              // sell SOL at 180 USDC
+const { tick: limitTick } = TickUtils.getPriceAndTick({
+  poolInfo, price: targetPrice, baseIn: true,
+});
+
+const { execute } = await raydium.clmm.openLimitOrder({
+  poolInfo,
+  poolKeys,
+  limitOrderConfig: limitConfig,
+  inputMint: poolInfo.mintA.address,         // selling SOL
+  inputAmount: new BN(50_000_000),           // 0.05 SOL
+  tick: limitTick,
+  txVersion: TxVersion.V0,
+});
+
+const { txId } = await execute({ sendAndConfirm: true });
+console.log("Limit order opened, tx:", txId);
+```
+
+SDK는 `(pool, owner, tick, nonce)`로부터 `LimitOrderState` PDA를 파생하고, (pool, owner) 단위의 `LimitOrderNonce`를 증가시키며, 해당 틱의 FIFO 코호트에 주문을 삽입합니다.
+
+### 열린 주문의 수량 증감
+
+```ts
+await raydium.clmm.increaseLimitOrder({
+  poolInfo,
+  poolKeys,
+  limitOrderId: <LIMIT_ORDER_PUBKEY>,
+  addAmount: new BN(20_000_000),
+  txVersion: TxVersion.V0,
+}).then((b) => b.execute({ sendAndConfirm: true }));
+
+await raydium.clmm.decreaseLimitOrder({
+  poolInfo,
+  poolKeys,
+  limitOrderId: <LIMIT_ORDER_PUBKEY>,
+  removeAmount: new BN(10_000_000),
+  txVersion: TxVersion.V0,
+}).then((b) => b.execute({ sendAndConfirm: true }));
+```
+
+`decreaseLimitOrder`는 주문의 **미체결** 부분에서만 제거할 수 있으며, 체결된 부분은 정산 전까지 잠겨 있습니다. 주문이 이미 완전히 체결된 경우 두 인스트럭션 모두 `InvalidOrderPhase`로 되돌아갑니다.
+
+### 체결된 주문 정산
+
+```ts
+await raydium.clmm.settleLimitOrder({
+  poolInfo,
+  poolKeys,
+  limitOrderId: <LIMIT_ORDER_PUBKEY>,
+  txVersion: TxVersion.V0,
+}).then((b) => b.execute({ sendAndConfirm: true }));
+```
+
+`settleLimitOrder`는 코호트 트래커를 기준으로 주문의 `unfilled_ratio_x64`를 읽고, 체결된 출력을 계산하여 소유자의 ATA로 전송합니다. 소유자가 직접 호출할 수도 있고, 오프체인 운영 키퍼인 `limit_order_admin`이 소유자를 대신해 호출할 수도 있습니다. 단, 출력은 항상 소유자에게 전송됩니다.
+
+완전히 정산된 주문을 닫아 렌트를 회수하려면 `closeLimitOrder`(단건) 또는 `closeAllLimitOrder`(일괄)를 사용하세요. 여러 주문을 한 번에 정산하려면 `settleAllLimitOrder`가 v0 트랜잭션에 가능한 한 많은 `SettleLimitOrder` 호출을 묶어 처리합니다.
+
+### 지갑의 활성 주문 조회 (오프체인)
+
+```ts
+// API helper. See api-reference/temp-api-v1.
+const active = await fetch(
+  `https://temp-api-v1.raydium.io/limit-order/order/list?wallet=<your-wallet-pubkey>`,
+).then((r) => r.json());
+```
+
+활성 주문 엔드포인트는 미체결 주문과 부분 체결 주문을 하나의 페이로드로 반환합니다(`totalAmount` / `filledAmount` / `pendingSettle`로 각 상태를 구분합니다). 종료된 주문 이력은 `/limit-order/history/order/list-by-user?wallet=…`(지갑별, `nextPageId`로 페이지네이션), 특정 주문의 전체 이벤트 로그는 `/limit-order/history/event/list-by-pda?pda=…`를 사용하세요.
+
+## Rust CPI 스켈레톤
+
+```rust
+use anchor_lang::prelude::*;
+use raydium_amm_v3::cpi;
+use raydium_amm_v3::program::AmmV3;
+use raydium_amm_v3::cpi::accounts::SwapV2;
+
+#[derive(Accounts)]
+pub struct ProxyClmmSwap<'info> {
+    #[account(mut)]
+    pub payer: Signer<'info>,
+    /// CHECK:
+    pub amm_config: UncheckedAccount<'info>,
+    #[account(mut)]
+    /// CHECK:
+    pub pool_state: UncheckedAccount<'info>,
+    #[account(mut)]
+    /// CHECK:
+    pub input_token_account: UncheckedAccount<'info>,
+    #[account(mut)]
+    /// CHECK:
+    pub output_token_account: UncheckedAccount<'info>,
+    #[account(mut)]
+    /// CHECK:
+    pub input_vault: UncheckedAccount<'info>,
+    #[account(mut)]
+    /// CHECK:
+    pub output_vault: UncheckedAccount<'info>,
+    #[account(mut)]
+    /// CHECK:
+    pub observation_state: UncheckedAccount<'info>,
+    /// CHECK:
+    pub token_program: UncheckedAccount<'info>,
+    /// CHECK:
+    pub token_program_2022: UncheckedAccount<'info>,
+    /// CHECK:
+    pub memo_program: UncheckedAccount<'info>,
+    /// CHECK:
+    pub input_vault_mint: UncheckedAccount<'info>,
+    /// CHECK:
+    pub output_vault_mint: UncheckedAccount<'info>,
+    pub clmm_program: Program<'info, AmmV3>,
+    // `remaining_accounts` carries the tick_array and bitmap_extension accounts.
+}
+
+pub fn proxy_swap(
+    ctx: Context<ProxyClmmSwap>,
+    amount: u64,
+    other_amount_threshold: u64,
+    sqrt_price_limit_x64: u128,
+    is_base_input: bool,
+) -> Result<()> {
+    let cpi_accounts = SwapV2 {
+        payer:                 ctx.accounts.payer.to_account_info(),
+        amm_config:            ctx.accounts.amm_config.to_account_info(),
+        pool_state:            ctx.accounts.pool_state.to_account_info(),
+        input_token_account:   ctx.accounts.input_token_account.to_account_info(),
+        output_token_account:  ctx.accounts.output_token_account.to_account_info(),
+        input_vault:           ctx.accounts.input_vault.to_account_info(),
+        output_vault:          ctx.accounts.output_vault.to_account_info(),
+        observation_state:     ctx.accounts.observation_state.to_account_info(),
+        token_program:         ctx.accounts.token_program.to_account_info(),
+        token_program_2022:    ctx.accounts.token_program_2022.to_account_info(),
+        memo_program:          ctx.accounts.memo_program.to_account_info(),
+        input_vault_mint:      ctx.accounts.input_vault_mint.to_account_info(),
+        output_vault_mint:     ctx.accounts.output_vault_mint.to_account_info(),
+    };
+    let cpi_ctx = CpiContext::new(ctx.accounts.clmm_program.to_account_info(), cpi_accounts)
+        .with_remaining_accounts(ctx.remaining_accounts.to_vec());
+    cpi::swap_v2(cpi_ctx, amount, other_amount_threshold, sqrt_price_limit_x64, is_base_input)
+}
+```
+
+`SwapV2`의 remaining account 순서:
+
+```
+[tick_array_bitmap_extension?, tick_array_0, tick_array_1, …]
+```
+
+스왑에 extension이 필요하지 않으면 생략하고, 필요한 경우 첫 번째 remaining account로 전달합니다.
+
+## 자주 발생하는 실수
+
+- **틱 간격에 맞지 않는 틱 엔드포인트** → `InvalidTickIndex`. 항상 `TickUtils.getPriceAndTick`으로 스냅하세요.
+- **`SwapV2`에 틱 배열을 충분히 공급하지 않음** → `TickArrayNotFound`. `computeAmountOutFormat`으로 전체 목록을 가져오세요.
+- **bitmap extension 없이 풀 레인지 포지션 열기** → extension PDA가 writable이어야 합니다. SDK가 자동으로 처리합니다.
+- **`sqrt_price_x64`와 `price`를 혼동** → 여기서의 혼동은 특히 큰 문제를 일으킵니다. 확실하지 않으면 SDK가 사람이 읽을 수 있는 가격으로부터 계산하도록 맡기세요.
+- **보상을 너무 자주 수집** → 수집마다 트랜잭션 비용이 발생합니다. `harvestAllRewards`로 여러 포지션을 일괄 처리하세요.
+- **렌트가 남아 있는 상태에서 NFT 소각** → `ClosePosition`은 NFT 민트와 ATA도 함께 닫습니다. 별도로 닫으면 프로그램이 되돌아갑니다.
+- **간격에 맞지 않는 틱에서 지정가 주문 열기** → `InvalidTickIndex`. 항상 `TickUtils.getPriceAndTick`으로 양자화하세요.
+- **완전히 체결된 주문에 `decreaseLimitOrder` 호출** → `InvalidOrderPhase`. 대신 `settleLimitOrder` 후 `closeLimitOrder`를 사용하세요.
+- **`enableDynamicFee: true`를 전달하면서 `dynamicFeeConfigId`를 누락** → `CreateCustomizablePool`이 `InvalidDynamicFeeConfigParams`로 실패합니다. 동적 수수료를 끄거나 `/main/clmm-dynamic-config`에서 설정을 선택하세요.
+
+## 다음 단계
+
+- [`sdk-api/typescript-sdk`](/ko/sdk-api/typescript-sdk) — 전체 SDK 인터페이스.
+- [`sdk-api/rest-api`](/ko/sdk-api/rest-api) — 견적 및 풀 메타데이터 엔드포인트.
+- [`user-flows/create-clmm-pool`](/ko/user-flows/create-clmm-pool) — 코드 없는 안내.
+- [`integration-guides/aggregator`](/ko/integration-guides/aggregator) — 경로의 일부로 CLMM 라우팅.
+
+참고 자료:
+
+- [Raydium SDK v2](https://github.com/raydium-io/raydium-sdk-V2)
+- [Raydium SDK v2 demos](https://github.com/raydium-io/raydium-sdk-V2-demo)
+- [`raydium-io/raydium-clmm`](https://github.com/raydium-io/raydium-clmm)

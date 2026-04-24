@@ -1,0 +1,388 @@
+---
+title: "CPMM instructions"
+description: "Every instruction on the CPMM program, with its arguments, account list, pre/post conditions, and the errors it can return."
+---
+
+<Info>
+  This page is the authoritative instruction reference. For code that actually composes these instructions, see [`products/cpmm/code-demos`](/products/cpmm/code-demos). For error-code meanings see [`reference/error-codes`](/reference/error-codes).
+</Info>
+
+## Instruction summary
+
+| Discriminator name | Who signs | What it does |
+|-------|-----------|--------------|
+| `Initialize` | pool creator | Create a new CPMM pool from two mints and an `AmmConfig`. Permissionless; anyone can call it. Hardcodes `enable_creator_fee = false` on the new pool. The `pool_state` account can be either the canonical PDA or a fresh random keypair (see Initialize accounts). |
+| `InitializeWithPermission` | payer + a holder of a `Permission` PDA | Permissioned variant of `Initialize`. The caller (`payer`) must own a `Permission` PDA derived from their own pubkey. Used by platforms that need gated pool creation (e.g. LaunchLab graduations). Lets the caller pin `creator_fee_on` (`BothToken` / `OnlyToken0` / `OnlyToken1`) and forces `enable_creator_fee = true` on the new pool. The `creator` field on `pool_state` is set to a separately-passed `creator` account, not the payer. Same canonical-PDA-or-random-keypair flexibility for `pool_state` as `Initialize`. |
+| `Deposit` | LP | Add liquidity in both tokens; receive LP tokens. |
+| `Withdraw` | LP | Burn LP tokens; receive both underlying tokens pro-rata. |
+| `SwapBaseInput` | swapper | Exact-input swap (`amount_in` in, ≥ `minimum_amount_out` out). |
+| `SwapBaseOutput` | swapper | Exact-output swap (≤ `maximum_amount_in` in, `amount_out` out). |
+| `CollectProtocolFee` | `protocol_owner` (from `AmmConfig`) | Sweep accrued protocol fees from vaults. |
+| `CollectFundFee` | `fund_owner` (from `AmmConfig`) | Sweep accrued fund fees from vaults. |
+| `CollectCreatorFee` | `pool_creator` | Sweep accrued creator fees (if creator fee was enabled). |
+| `UpdatePoolStatus` | `admin` | Pause / resume specific operations on a pool via a bitmask. |
+| `UpdateAmmConfig` | `admin` | Change fee rates or the protocol/fund owner on an `AmmConfig`. |
+| `CreateAmmConfig` | `admin` | Create a new fee tier (new `AmmConfig` account). |
+| `CreatePermissionPda` | `admin` | Mint a `Permission` PDA that allows a specific authority to call `InitializeWithPermission`. |
+| `ClosePermissionPda` | `admin` | Revoke a previously-issued `Permission` PDA. |
+
+Status bitmask: each pool's `status` is a `u8` where bit 0 = deposit disabled, bit 1 = withdraw disabled, bit 2 = swap disabled (`PoolStatusBitIndex { Deposit, Withdraw, Swap }` in the program). A clear bit means the operation is allowed; a set bit means it is paused. `UpdatePoolStatus` takes a raw `u8` and overwrites the existing value.
+
+The next sections go through each in detail. Account ordering follows the CPMM IDL; the SDK and the Rust client in `raydium-cp-swap/programs/cp-swap/src/instructions` match this order.
+
+## `Initialize`
+
+Create a new CPMM pool.
+
+**Arguments**
+
+```
+init_amount_0: u64
+init_amount_1: u64
+open_time:     u64   // Unix timestamp; swaps rejected before this
+```
+
+**Accounts** (W = writable, S = signer)
+
+| # | Name | W | S | Notes |
+|---|------|---|---|-------|
+| 1 | `creator` | W | S | Pays rent; recorded as `pool_state.pool_creator`. |
+| 2 | `amm_config` |   |   | The chosen fee tier. |
+| 3 | `authority` |   |   | CPMM global authority PDA. |
+| 4 | `pool_state` | W | S* | `init`ed here. **Either** the canonical PDA `["pool", amm_config, token_0_mint, token_1_mint]` **or** a fresh random keypair — when not the canonical PDA, the program requires `pool_state` to sign (`require_eq!(pool_account_info.is_signer, true)`). The random-keypair path lets a creator dodge front-running attempts on the canonical PDA. The downstream PDAs (`lp_mint`, `vaults`, `observation_state`) are derived from `pool_state.key()` either way. |
+| 5 | `token_0_mint` |   |   | Sorted: `token_0_mint < token_1_mint`. |
+| 6 | `token_1_mint` |   |   | |
+| 7 | `lp_mint` | W |   | `init`ed here. Authority set to `authority`. |
+| 8 | `creator_token_0` | W |   | Source ATA for `init_amount_0`. |
+| 9 | `creator_token_1` | W |   | Source ATA for `init_amount_1`. |
+| 10 | `creator_lp_token` | W |   | Destination for LP (created if missing). |
+| 11 | `token_0_vault` | W |   | `init`ed here. Owned by `authority`. |
+| 12 | `token_1_vault` | W |   | |
+| 13 | `create_pool_fee` | W |   | Destination ATA for the `create_pool_fee` paid by the creator. |
+| 14 | `observation_state` | W |   | `init`ed here. |
+| 15 | `token_program` |   |   | SPL Token (for LP mint). |
+| 16 | `token_0_program` |   |   | SPL Token or Token-2022. |
+| 17 | `token_1_program` |   |   | SPL Token or Token-2022. |
+| 18 | `associated_token_program` |   |   | |
+| 19 | `system_program` |   |   | |
+| 20 | `rent` |   |   | |
+
+`*` `pool_state` signs only on the random-keypair path; the canonical-PDA path runs without `pool_state` signing.
+
+**Preconditions**
+
+- Mints are sorted (`token_0_mint < token_1_mint` by byte order).
+- Neither mint uses an extension outside the CPMM allow-list (`TransferFeeConfig`, `MetadataPointer`, `TokenMetadata`, `InterestBearingConfig`, `ScaledUiAmount`) — see [`products/cpmm/accounts`](/products/cpmm/accounts#vaults-and-token-2022). A small per-mint allow-list inside the program bypasses the check for case-by-case onboarding.
+- `creator` has at least `init_amount_0` and `init_amount_1` in the respective ATAs.
+- `amm_config.disable_create_pool == false`.
+
+**Postconditions**
+
+- `pool_state` exists with `lp_supply = sqrt(init_amount_0 * init_amount_1) − LOCKED_LP`.
+- The LP starter of `LOCKED_LP` (`100` lamports of LP token) is permanently locked in the pool — `pool_state.lp_supply` records `liquidity − 100` while `100` LP units remain outside circulation, preventing the pool from being fully drained and dividing by zero.
+- `observation_state` is initialized; `observation_index = 0` and `pool_id = pool_state.key()`.
+- `create_pool_fee` lamports are transferred from the creator to the receiver and synced as native SOL (it is a wSOL ATA).
+- The pool's status bitmask is `0` (deposit / withdraw / swap all enabled).
+- `enable_creator_fee = false` and `creator_fee_on = BothToken`. `Initialize` does **not** support enabling the creator fee — that path is `InitializeWithPermission`.
+- `open_time` is bumped to `block_timestamp + 1` if the caller passed a value `<= block_timestamp`. Swaps are rejected before `open_time`; deposits and withdrawals work immediately.
+
+**Common errors** (full list in [`reference/error-codes`](/reference/error-codes))
+
+- `InvalidInput` — mints unsorted, or identical mints.
+- `NotSupportMint` — blocked Token-2022 extension.
+- `ExceededSlippage` — rarely; if `init_amount_0/1` result in zero LP due to decimals mismatch.
+
+## `Deposit`
+
+Add liquidity in both tokens proportional to the pool.
+
+**Arguments**
+
+```
+lp_token_amount:   u64   // how many LP tokens to mint to the LP
+maximum_token_0:   u64
+maximum_token_1:   u64
+```
+
+**Accounts**
+
+| # | Name | W | S |
+|---|------|---|---|
+| 1 | `owner` |   | S |
+| 2 | `authority` |   |   |
+| 3 | `pool_state` | W |   |
+| 4 | `owner_lp_token` | W |   |
+| 5 | `token_0_account` | W |   |
+| 6 | `token_1_account` | W |   |
+| 7 | `token_0_vault` | W |   |
+| 8 | `token_1_vault` | W |   |
+| 9 | `token_program` |   |   |
+| 10 | `token_program_2022` |   |   |
+| 11 | `vault_0_mint` |   |   |
+| 12 | `vault_1_mint` |   |   |
+| 13 | `lp_mint` | W |   |
+
+**Math**
+
+```
+needed_token_0 = ceil(lp_token_amount * vault_0 / lp_supply)
+needed_token_1 = ceil(lp_token_amount * vault_1 / lp_supply)
+require(needed_token_0 <= maximum_token_0, "ExceededSlippage")
+require(needed_token_1 <= maximum_token_1, "ExceededSlippage")
+```
+
+No change to `k`'s proportionality — both vaults and `lp_supply` scale by the same factor.
+
+**Postconditions**
+
+- `lp_supply += lp_token_amount`.
+- `vault_0 += needed_token_0` (net of any Token-2022 transfer fee on input).
+- `vault_1 += needed_token_1` (net of any Token-2022 transfer fee on input).
+
+**Common errors** — `ExceededSlippage`, `ZeroTradingTokens`, `InvalidStatus` if deposit is paused.
+
+## `Withdraw`
+
+Burn LP tokens and receive both underlying tokens pro-rata.
+
+**Arguments**
+
+```
+lp_token_amount:   u64
+minimum_token_0:   u64
+minimum_token_1:   u64
+```
+
+**Accounts**
+
+| # | Name | W | S |
+|---|------|---|---|
+| 1 | `owner` |   | S |
+| 2 | `authority` |   |   |
+| 3 | `pool_state` | W |   |
+| 4 | `owner_lp_token` | W |   |
+| 5 | `token_0_account` | W |   |
+| 6 | `token_1_account` | W |   |
+| 7 | `token_0_vault` | W |   |
+| 8 | `token_1_vault` | W |   |
+| 9 | `token_program` |   |   |
+| 10 | `token_program_2022` |   |   |
+| 11 | `vault_0_mint` |   |   |
+| 12 | `vault_1_mint` |   |   |
+| 13 | `lp_mint` | W |   |
+
+(Identical to `Deposit`; `lp_mint` is writable because the LP tokens are burned.)
+
+**Math**
+
+```
+out_token_0 = floor(lp_token_amount * vault_0 / lp_supply)
+out_token_1 = floor(lp_token_amount * vault_1 / lp_supply)
+require(out_token_0 >= minimum_token_0, "ExceededSlippage")
+require(out_token_1 >= minimum_token_1, "ExceededSlippage")
+```
+
+**Postconditions**
+
+- `lp_supply -= lp_token_amount`.
+- Vaults send `out_token_0` / `out_token_1` (gross; the user receives net of any Token-2022 transfer fee).
+
+## `SwapBaseInput`
+
+Exact-input swap.
+
+**Arguments**
+
+```
+amount_in:            u64
+minimum_amount_out:   u64
+```
+
+**Accounts**
+
+| # | Name | W | S |
+|---|------|---|---|
+| 1 | `payer` |   | S |
+| 2 | `authority` |   |   |
+| 3 | `amm_config` |   |   |
+| 4 | `pool_state` | W |   |
+| 5 | `input_token_account` | W |   |
+| 6 | `output_token_account` | W |   |
+| 7 | `input_vault` | W |   |
+| 8 | `output_vault` | W |   |
+| 9 | `input_token_program` |   |   |
+| 10 | `output_token_program` |   |   |
+| 11 | `input_token_mint` |   |   |
+| 12 | `output_token_mint` |   |   |
+| 13 | `observation_state` | W |   |
+
+The ordering **input → output** is by the user's direction, not by the pool's canonical `token_0 / token_1`. The program figures out which vault is which by matching mints.
+
+**Math** — see [`products/cpmm/math`](/products/cpmm/math).
+
+**Preconditions**
+
+- `open_time <= now`.
+- `pool_status` allows swap.
+- Neither mint paused or frozen for this authority.
+- `amount_in > 0`.
+
+**Common errors**
+
+- `ExceededSlippage` — `amount_out < minimum_amount_out`.
+- `ZeroTradingTokens` — the trade rounds to zero.
+- `NotApproved` — pool is paused for swaps via `UpdatePoolStatus`.
+- `InvalidInput` — mints do not match either of the pool's vault mints.
+
+## `SwapBaseOutput`
+
+Exact-output swap.
+
+**Arguments**
+
+```
+max_amount_in:  u64
+amount_out:     u64
+```
+
+**Accounts** — same as `SwapBaseInput`.
+
+**Math** — inverse curve with ceiling, see [`products/cpmm/math`](/products/cpmm/math).
+
+**Common errors** — `ExceededSlippage` (`gross_in > max_amount_in`), `ZeroTradingTokens`, `InvalidInput`, `NotApproved`.
+
+## `CollectProtocolFee`
+
+Sweep accrued protocol fees from the vaults to the protocol destination.
+
+**Arguments** — none.
+
+**Accounts**
+
+| # | Name | W | S |
+|---|------|---|---|
+| 1 | `owner` |   | S | Must match `amm_config.protocol_owner`. |
+| 2 | `authority` |   |   |
+| 3 | `pool_state` | W |   |
+| 4 | `amm_config` |   |   |
+| 5 | `token_0_vault` | W |   |
+| 6 | `token_1_vault` | W |   |
+| 7 | `vault_0_mint` |   |   |
+| 8 | `vault_1_mint` |   |   |
+| 9 | `recipient_token_0_account` | W |   |
+| 10 | `recipient_token_1_account` | W |   |
+| 11 | `token_program` |   |   |
+| 12 | `token_program_2022` |   |   |
+
+**Effect**
+
+```
+transfer pool_state.protocol_fees_token0 from vault_0 to recipient_0
+transfer pool_state.protocol_fees_token1 from vault_1 to recipient_1
+pool_state.protocol_fees_token0 = 0
+pool_state.protocol_fees_token1 = 0
+```
+
+No change to the curve's effective balances (accrued fees were already excluded).
+
+**Common error** — `NotApproved` if signer is not `protocol_owner`.
+
+## `CollectFundFee`
+
+Same shape as `CollectProtocolFee` but signed by `fund_owner` and zeroing the `fund_fees_*` counters.
+
+## `CollectCreatorFee`
+
+Same shape again, signed by `pool_state.pool_creator`. Only emits transfers if the pool was initialized with a non-zero creator-fee rate.
+
+## `UpdatePoolStatus`
+
+Pause or resume individual operations on a pool. The `status` field is a bitmask:
+
+| Bit | Flag | Effect when set |
+|-----|------|-----------------|
+| 0 | `DEPOSIT_DISABLED` | `Deposit` rejects with `NotApproved`. |
+| 1 | `WITHDRAW_DISABLED` | `Withdraw` rejects. |
+| 2 | `SWAP_DISABLED` | `SwapBaseInput` / `SwapBaseOutput` reject. |
+
+**Arguments**
+
+```
+status: u8      // new bitmask
+```
+
+**Accounts**
+
+| # | Name | W | S |
+|---|------|---|---|
+| 1 | `authority` |   | S | Must match the admin key on the CPMM program. |
+| 2 | `pool_state` | W |   |
+
+The admin key is the upgrade authority on the CPMM program — in practice, the Raydium multisig. See [`security/admin-and-multisig`](/security/admin-and-multisig).
+
+## `CreateAmmConfig`
+
+Create a new fee tier.
+
+**Arguments**
+
+```
+index:             u16
+trade_fee_rate:    u64
+protocol_fee_rate: u64
+fund_fee_rate:     u64
+create_pool_fee:   u64
+```
+
+**Accounts**
+
+| # | Name | W | S |
+|---|------|---|---|
+| 1 | `owner` | W | S | Admin. |
+| 2 | `amm_config` | W |   | `init`ed here. |
+| 3 | `system_program` |   |   |
+
+**Preconditions**
+
+- No existing `AmmConfig` with the same `index`.
+- `protocol_fee_rate + fund_fee_rate <= FEE_RATE_DENOMINATOR_VALUE`.
+
+## `UpdateAmmConfig`
+
+Change fee rates or ownership on an existing `AmmConfig`. Takes a `param: u8` (discriminator for which field to update) and a `value: u64`. The value semantics per param are in the source; commonly:
+
+- `param = 0` → `trade_fee_rate`
+- `param = 1` → `protocol_fee_rate`
+- `param = 2` → `fund_fee_rate`
+- `param = 3` → `new_protocol_owner` (pass `Pubkey` bytes as a reinterpret)
+- `param = 4` → `new_fund_owner`
+- `param = 5` → `create_pool_fee`
+- `param = 6` → `disable_create_pool`
+
+Changes are signed by the admin and affect **every pool bound to this `AmmConfig`** on the next swap. No migration; pools simply read the new values.
+
+## State-change matrix
+
+| Instruction | `lp_supply` | Vault balances | Accrued-fee fields | `observation` |
+|-------------|------------|---------------|-------------------|---------------|
+| `Initialize` | + init LP | + `init_amount_{0,1}` | 0 | init |
+| `InitializeWithPermission` | + init LP | + `init_amount_{0,1}` | 0 | init |
+| `Deposit` | + | + both | — | — |
+| `Withdraw` | − | − both | — | — |
+| `SwapBaseInput` | — | + in, − out | + `trade_fee` split into protocol/fund; + `creator_fee` if enabled | + (if interval elapsed) |
+| `SwapBaseOutput` | — | + in, − out | + `trade_fee` split into protocol/fund; + `creator_fee` if enabled | + (if interval elapsed) |
+| `CollectProtocolFee` | — | − (by protocol buckets) | `protocol_*` → 0 | — |
+| `CollectFundFee` | — | − (by fund buckets) | `fund_*` → 0 | — |
+| `CollectCreatorFee` | — | − (by creator buckets) | `creator_*` → 0 | — |
+| `UpdatePoolStatus` | — | — | — | — |
+
+## Where to go next
+
+- [`products/cpmm/code-demos`](/products/cpmm/code-demos) — runnable TypeScript samples for the above.
+- [`reference/error-codes`](/reference/error-codes) — the complete Anchor error table.
+- [`products/cpmm/fees`](/products/cpmm/fees) — the fee-accrual model that `CollectProtocolFee` / `CollectFundFee` / `CollectCreatorFee` drain.
+
+Sources:
+
+- [`raydium-io/raydium-cp-swap` — instructions](https://github.com/raydium-io/raydium-cp-swap/tree/master/programs/cp-swap/src/instructions)
+- [Raydium SDK v2 — `@raydium-io/raydium-sdk-v2`](https://github.com/raydium-io/raydium-sdk-V2)

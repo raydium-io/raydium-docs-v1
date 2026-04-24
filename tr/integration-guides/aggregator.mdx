@@ -1,0 +1,202 @@
+---
+title: "Agregator entegrasyonu"
+description: "Raydium havuzlarını keşfetme, CPMM / CLMM / AMM v4 genelinde fiyat teklifi alma ve atomik swapları doğru program setleri aracılığıyla yönlendirme. DEX agreagatörleri ve cüzdan swap arayüzleri için yazılmıştır."
+---
+
+<Info>
+  **Bu sayfa yapay zekâ tarafından otomatik olarak çevrilmiştir. İngilizce sürüm esas alınır.**
+
+  [İngilizce sürümü görüntüle →](/integration-guides/aggregator)
+</Info>
+
+<Info>
+  Bir agreagatörün görevi, kullanıcıya birçok havuz arasında mümkün olan en iyi fiyatı sunmak, tek bir girişi birden çok havuz rotasına bölmek ve bunu atomik olarak yürütmektir. Bu sayfa işin Raydium'a özgü parçalarını belgelendirir: keşif, fiyat teklifi ve işlem oluşturma.
+</Info>
+
+## Keşif
+
+### Havuz envanteri
+
+Her ürün için canlı Raydium havuzlarının tam listesine ihtiyacınız var. Üç seçenek vardır:
+
+1. **REST API** (en basit): `GET https://api-v3.raydium.io/pools/info/list?poolType=all&pageSize=1000&page=1` havuzları 1000 adımlar halinde döndürür. Hepsine sahip olana kadar sayfalandırın. 1–5 dakika için önbelleğe alın.
+2. **On-chain tarama**: `getProgramAccounts` işlemini CPMM, CLMM ve AMM v4 program kimliklerine karşı çalıştırın, durum hesabı ayrıştırıcısı tarafından filtrelenmiş. ~10 saniye RPC zamanıyla yaklaşık her canlı havuzu verir. API'nin kapalı olduğu veya hız sınırlandırılmış olduğu durumlarda yararlıdır.
+3. **Hibrit**: API'yi birincil kaynak olarak kullanın; günlük on-chain taramasını sağlama kontrolü olarak çalıştırın. Ekip API'nin kapsamlı kalmasını garantiler, ancak doğrudan CPI aracılığıyla oluşturulan havuzlar (ön uç yok) ara sıra gecikebilir.
+
+### Mint-çifti arama
+
+Belirli bir `(mintA, mintB)` çiftinin özel bir durumu için, `GET /pools/info/mint?mint1=...&mint2=...&poolType=all&sort=liquidity` kullanın. Her işlem ücreti seviyesi ve ürün türünde her havuzu döndürür. İyi trafiği gören mintlerde çift başına yaklaşık ~10 sonuç yaygındır; TVL'ye göre sıralayın ve yönlendirme için ilk birkaçını alın.
+
+## Fiyat teklifi
+
+Fiyat teklifi matematiği ürüne göre farklılık gösterir. Yeniden uygulamak zorunda kalmamanız için SDK'nın saf matematik işlevlerini kullanın:
+
+```ts
+// CPMM
+const cpmmQuote = raydium.cpmm.computeAmountOut({
+  poolInfo: cpmmPool,
+  amountIn,
+  mintIn,
+  mintOut,
+  slippage: 0,        // compute exact expected; layer slippage at route level
+});
+
+// CLMM — crosses ticks; deterministic but more expensive.
+// `computeAmountOutFormat` is the canonical helper exposed via `PoolUtils` in
+// raydium-sdk-v2: the `*Format` suffix signals that it returns the output
+// pre-shaped for transaction building (including `remainingAccounts` for tick arrays).
+const { output: clmmOut, remainingAccounts } = PoolUtils.computeAmountOutFormat({
+  poolInfo:  clmmPool,
+  poolState: clmmPoolState,
+  tickArrayCache,
+  amountIn,
+  tokenIn:   mintIn,
+  slippage:  0,
+});
+
+// AMM v4
+const ammV4Quote = raydium.liquidity.computeAmountOut({
+  poolInfo: ammV4Pool,
+  amountIn,
+  mintIn: mintIn,
+  mintOut: mintOut,
+  slippage: 0,
+});
+```
+
+Üçünün hepsi için döndürüler: `{ amountOut, fee, priceImpact, minAmountOut }`. Agreagatör karşılaştırması için `amountOut`'u kullanın (slippage öncesi).
+
+### Önbellek tazeliği
+
+Havuz durumu hızlı bir şekilde eski hale gelir. Önerilen tazelik hedefleri:
+
+| Havuz türü | Yeniden getirme sıklığı | Neden |
+|-----------|---------------------|-----|
+| `<$100k` TVL'li CPMM | `<10s` | Rezervler her işlemde hareket eder. |
+| `>$10M` TVL'li CPMM | 30–60s | Rezervler baskın; küçük işlemler gürültüdür. |
+| CLMM | `<30s` | Tick sınırları; tek bir büyük işlem likiditeyi yeniden konfigüre edebilir. |
+| AMM v4 | `<30s` | OpenBook tarafı hareketleri kasa içinde yakalanmaz. |
+
+İnteraktif gecikmeli teklifler alan bir agreagatör için, her ilgili havuz durumunda WebSocket hesabı güncellemelerine (`accountSubscribe`) abone olun. Bu, modeli yoklamadan itmeye çevirir.
+
+### Token-2022 ayarlamaları
+
+Rotadaki herhangi bir mint'in Token-2022 transfer ücreti varsa, fiyat teklifi matematik girişleri ve çıkışları [`algorithms/token-2022-transfer-fees`](/tr/algorithms/token-2022-transfer-fees) başına ayarlamalıdır. SDK, `poolInfo.mintA.extensions.transferFeeConfig` doldurulmuşsa bunu işler. Fiyat teklifine güvenmeden önce `.extensions` alanına bakarak onaylayın.
+
+## Yönlendirme
+
+### Tek havuz rotaları
+
+Çoğu rota tek havuzludur. `amountOut`'u en yüksek olan havuzu seçin. Birden fazla yakınsa, işlem ücreti katmanı (düşük daha iyi) ile sonra TVL'ye (daha fazla daha güvenli) göre bağ kırın.
+
+### Bölme yönlendirmesi
+
+Tek bir havuzda >%5 fiyat etkisinin olduğu büyük işlemler için havuzlar arasında bölün. Basit bir açgözlü algoritma:
+
+```
+remaining = amountIn
+routes    = []
+while remaining > 0:
+    best_pool, best_size = argmax over pools of:
+        marginal_out_per_in(pool, current_size_toward_pool + epsilon)
+    size = min(remaining, best_pool.max_size_at_target_impact)
+    routes.append((best_pool, size))
+    remaining -= size
+```
+
+Bu, toplam etkiyi en aza indiren bir yönlendirme vektörü `[(pool_A, 0.6), (pool_B, 0.3), (pool_C, 0.1)]` üretir. Uygun bir dışbükey optimizasyon çözümü (örn. havuzlar arasında marjinal fiyatları eşitleme), uygulamada açgözlü sonucun ~%1'i içindedir.
+
+### Çok atlamalı rotalar
+
+`USDC → RAY → SOL` aracılığıyla iki ayrı havuz, doğrudan `USDC-SOL` havuzunun iyi bir teklif vermediği durumlarda yaygındır (nadir). Atlamalı slippage sınırlarını uygulayın; her atlama kendi `minAmountOut`'u zorlar. Bkz. [`algorithms/slippage-and-price-impact`](/tr/algorithms/slippage-and-price-impact).
+
+Aynı havuz arasında çok atlamalı (örn. `SOL-USDC`'de iki CLMM atlama), tek atlama ile karşılaştırıldığında her zaman alt optimaldir — bu tür rotalar oluşturmayın.
+
+## İşlem oluşturma
+
+### Tek atlama, tek havuz
+
+SDK'nın `raydium.trade.swap`'ını doğrudan kullanın:
+
+```ts
+const { execute } = await raydium.trade.swap({
+  poolKeys:        poolInfo,
+  amountIn,
+  amountOut:       quote.minAmountOut,
+  fixedSide:       "in",
+  inputMint:       mintIn,
+  txVersion:       TxVersion.V0,
+  computeBudgetConfig: {
+    units:         250_000,
+    microLamports: priorityFee,
+  },
+});
+```
+
+### Bölme ve çok atlama
+
+ATA'ları + talimatları el ile oluşturun. Desen:
+
+```
+[1] ComputeBudget set_compute_unit_limit
+[2] ComputeBudget set_compute_unit_price
+[3] createATA (if needed, once per mint the user doesn't hold)
+[4..N] SwapInstruction for each (pool, size) in routes
+[N+1] CloseAccount (if you wrap/unwrap SOL)
+```
+
+Tümü atomiklik için bir işlem içinde. V0'da address lookup tabloları ile 3 havuzlu bölme için, bu tipik olarak ~1100 baytda sığar. 4+ havuz için, işlem boyutu sınırı ya çok işlemi ya da bir hub mint'te konsolidasyonu zorlar.
+
+### Atomiklik
+
+Agreagatörler atomikliği garantilamalıdır: tam rota iner veya hiçbiri enmez. Raydium'un swap talimatları `ExceededSlippage`'de geri dönerler, bu nedenle bir atlama başarısız olan çok havuzlu rota, tüm işlemin geri dönmesine neden olur. Bedavadır.
+
+Tek istisna: rotanız Raydium + üçüncü taraf DEX'ten geçerse, o DEX'in de revert-on-slippage modeline sahip olduğundan emin olun. Bazı programlar slippage sınırlarını yoksayar (nadir).
+
+## Tuzaklar
+
+### 1. Eski fiyat teklifleri
+
+Kullanıcı "125.43 RAY alacaksınız" görüp işlem iniş arasında rezervler kaymış olabilir. Gönderimden hemen önce havuz durumunu yeniden getirin; yeniden fiyat alın; yeni teklif %1'den kötüyse duraklatın ve kullanıcıdan yeniden onay isteyeceğim.
+
+### 2. Havuz kara listeleri
+
+Bazı Raydium havuzları, transfer ücretleri %99'a ayarlanmış veya aktarılamayan uzantıları olan dolandırıcı jetonlardır. REST API'si bunları etiketler (`tags` alanına bakın); `scam` veya `honeypot` olarak etiketlenen herhangi bir havuzu atlayın. Raydium'un etiketlerinin üzerine kendi güvenlik kontrollerini çalıştırmak ihtiyatlıdır.
+
+### 3. CLMM'de observation-state gereksinimi
+
+CLMM `SwapV2`, bir `observation_state` hesabı alır. SDK bunu sizin için doldurur; elle oluşturulan talimatlar genellikle unutur, bu da programın `AccountNotFound` ile geri dönmesine neden olur. Her zaman bunu ekleyin.
+
+### 4. Adres arama tabloları
+
+Raydium, en çok kullanılan hesapları (ana mintler, program kimlikleri, AmmConfigs) için genel arama tabloları tutar. Agreagatörler bunları tüketmelidir — işlem başına ~100 bayt tasarrufu sağlar ve daha büyük rotaların V0'da sığmasını sağlar. LUT adreslerini çekme:
+
+```ts
+const raydiumLUTs = await raydium.getRaydiumLutAddresses();
+```
+
+### 5. Tıkanıklığı ele alma
+
+Yüksek hacimli pencereler sırasında, işlemler mempool'da birden çok blok için oturabilir. TX süre sonu üzerine agresif yeniden deneme (geri dönüş üzerine değil — geri dönüşler deterministiktir) önerilir. SDK'nın `sendAndConfirm` seçeneği temel yeniden denemeler yapar; üretim agreagatörleri kendi mantığını (Jito paketleri, çok-RPC yayını) üzerine koyarlar.
+
+## Kontrol listesi
+
+Canlı gitmeden önce doğrulayın:
+
+- [ ] Havuz keşfi CPMM + CLMM + AMM v4'ü kapsamlı olarak kapsar.
+- [ ] Teklif, bir avuç test işlemi için Raydium'un kendi arayüzü teklifinin içinde 1 basis puan ile eşleşir.
+- [ ] Bölme yönlendirmesi, herhangi bir tek havuzda >%5 etkili işlemler için başlar.
+- [ ] Öncelik ücretleri, yakın havuz-program ücretlerine karşı boyutlandırılır (bkz. [`integration-guides/priority-fee-tuning`](/tr/integration-guides/priority-fee-tuning)).
+- [ ] Token-2022 transfer ücretleri hesaplanır ve kullanıcıya görüntülenir.
+- [ ] Slippage aşıldığında işlemler temiz bir şekilde geri döner.
+- [ ] Yeniden deneme mantığı tx süresi doluşu (yeniden dene) ile geri dönüşü ayırt eder (yeniden deneme).
+
+## İşaretçiler
+
+- [`integration-guides/routing-and-mev`](/tr/integration-guides/routing-and-mev) — sandwich direnci, paketler.
+- [`integration-guides/priority-fee-tuning`](/tr/integration-guides/priority-fee-tuning) — hesaplama bütçesi talimatlarını boyutlandırma.
+- [`sdk-api/rest-api`](/tr/sdk-api/rest-api) — havuz-liste uç noktaları.
+
+Kaynaklar:
+
+- [Raydium SDK v2 `trade` module](https://github.com/raydium-io/raydium-sdk-V2)

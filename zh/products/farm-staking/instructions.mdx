@@ -1,0 +1,267 @@
+---
+title: "Farm / Staking 指令"
+description: "CreateFarm、Deposit、Withdraw、Harvest、AddReward / SetRewards / RestartRewards、WithdrawReward — farm v3、v5 和 v6 的完整指令接口。"
+---
+
+<Info>
+  **本页内容由 AI 自动翻译，所有内容以英文版本为准。**
+
+  [查看英文版 →](/products/farm-staking/instructions)
+</Info>
+
+<Info>
+  Farm 指令是版本特定的。v6 上的 `Deposit` 无法在 v5 farm 上调用，反之亦然。SDK 通过读取 farm 的程序拥有者来分派指令；对于链上 CPI，你必须提前选择正确的程序 ID。
+</Info>
+
+## 指令清单
+
+| 目的 | v3 | v5 | v6 |
+|---------|----|----|----|
+| 创建 farm | `CreateFarm` | `CreateFarm` | `CreateFarm` |
+| 添加用户账本（可能隐式） | `CreateUserLedger` | `CreateAssociatedLedger` | `Deposit` 中隐式 |
+| 质押 | `Deposit` | `Deposit` | `Deposit` |
+| 解除质押 | `Withdraw` | `Withdraw` | `Withdraw` |
+| 仅领取奖励 | N/A（使用 `Deposit 0`） | N/A（使用 `Deposit 0`） | `Harvest` |
+| 创建后添加奖励流 | N/A | `AddReward` | `AddReward` |
+| 编辑现有奖励流 | N/A | `SetRewards` | `SetRewards` |
+| 在结束时间后重启奖励 | N/A | `RestartRewards` | `RestartRewards` |
+| 提取未领取的奖励预算（管理员） | N/A | `WithdrawReward` | `WithdrawReward` |
+
+在 v3 和 v5 上，在不改变质押的情况下领取奖励的标准方法是调用 `amount = 0` 的 `Deposit`。程序将其视为纯结算。v6 引入了显式 `Harvest` 以增加清晰度。
+
+SDK 在 `raydium.farm.deposit({ ... })` 等后面进行抽象。下面的章节为需要手动构建指令的集成商（聚合器、监控工具、SDK 扩展）记录了底层账户列表。
+
+## `CreateFarm` (v6)
+
+启动新的 v6 farm。
+
+**参数**
+
+```
+reward_info_count: u8               // 创建时的奖励流数量（1..=5）
+reward_infos: [
+  {
+    open_time:            u64,
+    end_time:             u64,
+    emission_per_second_x64: u128,   // Q64.64
+    mint:                 Pubkey,    // 奖励代币
+    token_program:        Pubkey,    // SPL 或 Token-2022
+  }
+]
+```
+
+**账户**（简化版，`reward_info_count = 1`）
+
+| # | 名称 | W | S | 说明 |
+|---|------|---|---|-------|
+| 1 | `creator` | W | S | 支付租金，拥有 farm。 |
+| 2 | `farm_state` | W |   | 新的 `FarmState` 账户。 |
+| 3 | `farm_authority` |   |   | PDA `[farm_id]`。 |
+| 4 | `staking_mint` |   |   | |
+| 5 | `staking_vault` | W |   | 创建为权限的 ATA 或 PDA 金库。 |
+| 6 | `staking_token_program` |   |   | |
+| 7 | `reward_mint` |   |   | |
+| 8 | `reward_vault` | W |   | 将接收初始预算。 |
+| 9 | `reward_token_program` |   |   | |
+| 10 | `reward_sender_ata` | W |   | 创建者在奖励代币上的 ATA；由此指令消耗。 |
+| 11 | `system_program` |   |   | |
+| 12 | `token_program` |   |   | |
+| 13 | `associated_token_program` |   |   | |
+| 14 | `rent` |   |   | |
+
+**前置条件**
+
+- `open_time > now`，`end_time > open_time`。
+- `creator` ATA 持有至少 `emission_per_second_x64 × (end_time − open_time) / 2^64` 的奖励代币。
+- `staking_mint` 没有冻结权限，或冻结权限已禁用。
+
+**后置条件**
+
+- `FarmState` 初始化，`total_staked = 0`。
+- 奖励金库使用完整流预算资金。
+- 创建者的奖励 ATA 被该金额消耗。
+
+## `Deposit` (v6)
+
+质押 `amount` 的质押代币。
+
+**参数**
+
+```
+amount: u64
+```
+
+**账户**
+
+| # | 名称 | W | S |
+|---|------|---|---|
+| 1 | `user` | W | S |
+| 2 | `user_ledger` | W |   |
+| 3 | `farm_state` | W |   |
+| 4 | `farm_authority` |   |   |
+| 5 | `staking_vault` | W |   |
+| 6 | `user_staking_ata` | W |   |
+| 7..(7+n) | `reward_vault_{i}` | W |   |
+| ... | `user_reward_ata_{i}` | W |   |
+| last−2 | `system_program` |   |   |
+| last−1 | `token_program` |   |   |
+| last | `associated_token_program` |   |   |
+
+如果 `user_ledger` 不存在，SDK 会在前面加一个 `CreateAccount` 风格的指令；v6 程序也可以在给定系统程序账户的情况下延迟创建。剩余账户模式：对于每个活跃奖励，追加 `(reward_vault, user_reward_ata)`，以便结算可以进行支付。
+
+**效果**
+
+1. 使用延迟更新公式刷新每个活跃奖励流的 `reward_per_share_x64[i]`。
+2. 计算 `pending_i = user_ledger.deposited × reward_per_share_x64[i] / 2^64 − user_ledger.reward_debts[i]`。
+3. 从 `reward_vault_{i}` 转账 `pending_i` 到 `user_reward_ata_{i}`。
+4. 从 `user_staking_ata` 转账 `amount` 质押代币到 `staking_vault`。
+5. 更新 `user_ledger.deposited += amount` 并重新快照 `reward_debts[i]`。
+6. 更新 `farm_state.total_staked += amount`。
+
+**前置条件**
+
+- `amount > 0` 用于真实质押（v6 禁止 `amount = 0` — 仅领取时使用 `Harvest`）。
+- `user_staking_ata` 持有至少 `amount`。
+- 每个活跃奖励金库持有至少欠此用户的待支付。
+
+## `Withdraw` (v6)
+
+解除质押 `amount`。
+
+**参数**
+
+```
+amount: u64
+```
+
+**账户** — 与 `Deposit` 相同。
+
+**效果** — 与 `Deposit` 相同的结算，然后将质押代币移回用户：`staking_vault → user_staking_ata`。`total_staked` 和 `user_ledger.deposited` 都减少。
+
+**前置条件**
+
+- `amount ≤ user_ledger.deposited`。
+- Farm 未暂停。
+
+## `Harvest` (v6)
+
+在不改变质押的情况下领取待支付奖励。
+
+**参数** — 无。
+
+**账户** — 与 `Deposit` 相同，质押端无移动。
+
+**效果** — 刷新 `reward_per_share_x64[i]`，支付 `pending_i`，重新快照 `reward_debts[i]`。`total_staked` 或 `deposited` 无变化。
+
+## `AddReward` (v5/v6)
+
+向具有未使用槽的现有 farm 添加新奖励流。
+
+**参数**
+
+```
+reward_info: {
+  open_time:            u64,
+  end_time:             u64,
+  emission_per_second_x64: u128,
+  mint:                 Pubkey,
+  token_program:        Pubkey,
+}
+```
+
+**前置条件**
+
+- 存在空闲槽（v6 上 `reward_info_count < 5`，v5 上 `< 2`）。
+- `open_time ≥ now`（可能在未来）或 `open_time < now` 仅在程序版本允许时允许 — v6 允许，v5 不允许。
+
+**后置条件**
+
+- 新流在索引 `reward_info_count` 处初始化，`reward_info_count++`。
+- 奖励金库由调用者 ATA 的完整流预算赋值。
+
+**常见错误** — 如果代币与现有槽冲突，则为 `RewardAlreadyExists`。
+
+## `SetRewards` (v5/v6)
+
+扩展或充值现有奖励流。不能更改代币；不能缩短 `end_time`；运行后不能降低 `emission_per_second_x64`。
+
+**参数**
+
+```
+reward_index:         u8
+new_open_time:        u64,
+new_end_time:         u64,
+new_emission_per_second_x64: u128,
+```
+
+**前置条件**
+
+- 流仍在运行（`reward_state == 1`）。
+- `new_end_time ≥ current end_time`。
+- 所需的额外预算 `(new_emission × new_duration − already_emissioned)` 存在于发送者的 ATA 中，并由指令转账到奖励金库。
+
+在 v5 上，等效调用是 `SetRewards`，参数集较小（运行流上无每秒更改）。
+
+## `RestartRewards` (v5/v6)
+
+在流的 `end_time` 已过后重启流。概念上与为已有槽的代币调用 `AddReward` 相同。
+
+**参数** — 与该索引的 `AddReward` 相同的形状。
+
+**前置条件**
+
+- `reward_state == 2`（已结束）。
+- 调用者是槽的 `reward_sender`（v6）或 farm `owner`（v5）。
+
+## `WithdrawReward` (v5/v6)
+
+流结束后未领取奖励金库余额的管理员扫除，所有质押者都有机会领取。
+
+**参数**
+
+```
+reward_index: u8
+```
+
+**前置条件**
+
+- 流已结束（`reward_state == 2`）。
+- `reward_total_emissioned == reward_claimed + vault_balance`（未欠任何东西）。
+
+**效果** — 将余额移至 `reward_sender_ata`。程序不会阻止在质押者仍有待支付索赔时提取；管理员应首先代表落后的质押者进行领取（或让他们领取）。如果你提前扫除，用户将失去对其未领取奖励的访问权限。**不要提前调用此指令。**
+
+## v5 变体
+
+- `Deposit` / `Withdraw` 的形状与 v6 相同，但最多使用 2 个奖励槽，`reward_per_share` 是 `u128`（具有不同基数的定点）。
+- `CreateAssociatedLedger` 是第一个 `Deposit` 前的必需单独调用；v6 合并了它。
+- `AddReward` 可用，`Harvest` 不可用（使用 `Deposit 0`）。
+
+## v3 变体
+
+- 单一奖励流。无 `AddReward`，无第二槽。
+- `Deposit 0` 是领取的唯一方式。
+- 第一个 `Deposit` 前必须调用 `CreateUserLedger`。
+
+## 状态变化矩阵
+
+| 指令 | `total_staked` | `user.deposited` | `reward_per_share` | 奖励金库 |
+|-------------|----------------|------------------|---------------------|----------------|
+| `CreateFarm` | 0 | — | 0 | 由创建者资金 |
+| `Deposit(n)` | +n | +n | 已刷新 | −待支付（已支付） |
+| `Withdraw(n)` | −n | −n | 已刷新 | −待支付 |
+| `Harvest` | — | — | 已刷新 | −待支付 |
+| `AddReward` | — | — | — | +新预算 |
+| `SetRewards` | — | — | — | +增量预算 |
+| `RestartRewards` | — | — | — | +预算 |
+| `WithdrawReward` | — | — | — | −余额 |
+
+## 后续阅读
+
+- [`products/farm-staking/code-demos`](/zh/products/farm-staking/code-demos) — TypeScript 示例。
+- [`products/farm-staking/accounts`](/zh/products/farm-staking/accounts) — `FarmState` / `UserLedger` / `UserStake` 布局。
+- [`reference/error-codes`](/zh/reference/error-codes) — farm 错误枚举。
+
+来源：
+
+- [Raydium SDK v2 `Farm` 模块](https://github.com/raydium-io/raydium-sdk-V2)
+- Raydium farm 程序源代码（v3 / v5 / v6）

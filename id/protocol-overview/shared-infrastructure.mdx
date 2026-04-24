@@ -1,0 +1,187 @@
+---
+title: "Infrastruktur bersama"
+description: "Primitif yang dibagikan setiap program Raydium — authority PDA, akun AmmConfig, pembagian biaya protokol/dana/kreator, akun observasi, dan permukaan REST API publik — didefinisikan sekali sehingga bab per-produk dapat dirujuk kembali ke sini."
+---
+
+<Info>
+  **Halaman ini diterjemahkan secara otomatis oleh AI. Versi bahasa Inggris adalah acuan resmi.**
+
+  [Lihat versi bahasa Inggris →](/protocol-overview/shared-infrastructure)
+</Info>
+
+<Info>
+  Program produk Raydium adalah kodebase independen, tetapi dirancang berdasarkan serangkaian konvensi bersama. Halaman ini adalah referensi kanonik untuk konvensi-konvensi tersebut. Bab per-produk menjelaskan bagaimana konvensi *diinstansiasi* dalam akun mereka; halaman ini menjelaskan konvensi itu sendiri.
+</Info>
+
+## Apa arti "bersama" di sini
+
+Tiga jenis pembagian berjalan melalui kodebase:
+
+- **Pembagian konvensi.** Setiap program menggunakan pola derivasi PDA yang sama, bentuk pembagian biaya yang sama, dan ide akun observasi yang sama — tetapi masing-masing mengimplementasikannya di program mereka sendiri dengan seed mereka sendiri.
+- **Pembagian akun.** Segelintir akun adalah *literal* rekaman yang sama di banyak pool (authority PDA global di CPMM, akun AmmConfig).
+- **Pembagian off-chain.** Satu REST API dan satu SDK TypeScript mendukung keempat program. Integrator berinteraksi dengan satu host HTTP dan satu paket NPM terlepas dari program mana yang mereka panggil.
+
+Lima primitif di bawah mencakup semua yang melintasi batas program.
+
+## 1. Authority PDA
+
+Setiap program Raydium memiliki tepat satu PDA yang memiliki vault token-nya. Pengguna tidak pernah memegang authority vault secara langsung — authority PDA adalah satu-satunya penandatangan yang dapat memindahkan dana keluar, dan ia hanya menandatangani ketika instruksi program yang valid memberitahunya.
+
+Polanya identik di semua produk; seed-nya berbeda:
+
+| Program | Seed Authority PDA | Catatan |
+|---------|---------------------|-------|
+| **AMM v4** | `[poolId]` | Authority per-pool. Bentuk yang sama dengan desain per-pool v4. |
+| **CPMM** | `[b"vault_and_lp_mint_auth_seed"]` | **Satu PDA tunggal yang dibagikan oleh semua pool CPMM.** Tanpa seed khusus pool. |
+| **CLMM** | `[b"pool_vault_and_lp_mint_auth_seed"]` | Satu PDA tunggal yang dibagikan di semua pool CLMM. |
+| **Farm v3 / v5 / v6** | `[farmId]` | Per-farm. PDA memiliki staking + reward vault untuk farm tersebut. |
+| **LaunchLab** | `[b"vault_auth", launchId]` | Per-launch. Memiliki vault base + quote sebelum kelulusan. |
+
+Beberapa hal mengikuti dari ini:
+
+- Untuk CPMM dan CLMM, authority PDA adalah **akun global** — setiap pool jenis itu menggunakannya. Jika Anda melakukan CPI ke CPMM, Anda membutuhkannya sekali, bukan per pool.
+- Untuk authority per-pool / per-farm, Anda menurunkan PDA dari pool/farm ID. SDK melakukan ini di `getPoolKeys` / `getFarmKeys`; jika Anda mengintegrasikan secara langsung, Anda menurunkan dengan `findProgramAddressSync`.
+- **Kepemilikan vault tidak dapat diubah.** Setelah akun token dibuat dengan authority PDA sebagai pemilik, hanya PDA itu — yang dipanggil oleh program — yang dapat mentransfer keluar. Tidak ada pengesampingan admin.
+
+Untuk seed yang tepat dan tata letak ATA per program, lihat [`products/cpmm/accounts`](/id/products/cpmm/accounts), [`products/clmm/accounts`](/id/products/clmm/accounts), [`products/amm-v4/accounts`](/id/products/amm-v4/accounts), [`products/farm-staking/accounts`](/id/products/farm-staking/accounts), [`products/launchlab/accounts`](/id/products/launchlab/accounts).
+
+## 2. Akun admin dan konfigurasi
+
+CPMM dan CLMM berbagi pola akun konfigurasi yang disebut **`AmmConfig`**: akun global kecil, diindeks oleh `u16`, menyimpan tingkat biaya dan tujuan admin yang berlaku untuk seluruh *tingkat biaya*. Pool mengikat ke konfigurasi saat pembuatan dan tidak pernah mengikat ulang.
+
+```rust
+// CPMM AmmConfig (disingkat — versi CLMM strukturnya mirip)
+pub struct AmmConfig {
+    pub bump: u8,
+    pub disable_create_pool: bool,        // gerbang pembuatan pool baru di tier ini
+    pub index: u16,                       // indeks tier
+    pub trade_fee_rate: u64,              // fraksi trade yang masuk biaya
+    pub protocol_fee_rate: u64,           // fraksi biaya trade ke protokol
+    pub fund_fee_rate: u64,               // fraksi biaya trade ke dana
+    pub create_pool_fee: u64,             // biaya pembuatan pool satu kali per-pool
+    pub protocol_owner: Pubkey,           // penandatangan untuk CollectProtocolFee
+    pub fund_owner: Pubkey,               // penandatangan untuk CollectFundFee
+    pub padding: [u64; 16],
+}
+```
+
+**Aturan jalan:**
+
+- **Tingkat biaya bersifat global.** Ketika pool berkata "ini adalah pool 0,25%", itu berarti mengikat ke AmmConfig yang `trade_fee_rate`-nya adalah 0,25% saat pembuatan. Tidak ada pengesampingan tarif per-pool.
+- **Konfigurasi dapat diubah tetapi pool tidak mengikuti.** Jika otoritas konfigurasi mengedit AmmConfig, setiap pool yang ada yang terikat ke konfigurasi itu segera mengambil tarif baru. Ini adalah fitur, bukan bug; ini adalah cara perubahan ekonomi tingkat protokol menyebar tanpa migrasi per-pool.
+- **`disable_create_pool` adalah tuas penghentian.** Ketika tingkat biaya dimatikan, multisig protokol menetapkan flag ini — pool yang ada terus bekerja tetapi tidak ada pool baru yang dapat memilih tier tersebut.
+- **`protocol_owner` / `fund_owner`** adalah *penandatangan* untuk panggilan pengumpulan biaya. Menetapkan mereka ke multisig adalah apa yang mengontrol penarikan biaya. Mereka BUKAN alamat tujuan biaya itu sendiri; itu adalah `protocol_fee_destination` / `fund_fee_destination` di akun yang sama.
+
+AMM v4 tidak memiliki `AmmConfig` — parameter biayanya per-pool, hardcoded saat pembuatan. Farm dan LaunchLab memiliki padanan mereka sendiri (`FarmConfig`, `LaunchConfig`) yang dijelaskan di bab masing-masing.
+
+Tabel lengkap siapa yang dapat mengubah apa ada di [`security/admin-and-multisig`](/id/security/admin-and-multisig). Pembagian biaya pengguna saat ini ada di [`ray/protocol-fees`](/id/ray/protocol-fees).
+
+## 3. Pembagian biaya protokol / dana / kreator
+
+Setiap biaya swap CPMM dan CLMM dibagi di hingga empat tujuan dalam perjalanan:
+
+```
+                         total biaya swap
+                              │
+              ┌───────────────┼───────────────┬──────────────┐
+              ▼               ▼               ▼              ▼
+        Sisi pool LP      Perbendaharaan   Multisig       Kreator
+        (meningkatkan k)   Protokol        Dana           (pool LaunchLab)
+```
+
+Secara mekanis:
+
+1. **Biaya perdagangan terakumulasi ke dalam pool.** Biaya dihapus dari sisi input swap dan *jumlah pasca-biaya* adalah apa yang dilihat oleh matematik produk konstan. Inilah artinya "LP menghasilkan biaya" — `k` naik dan begitu juga nilai token per-LP yang tersirat.
+2. **Porsi protokol/dana/kreator dikurangi dari akumulasi sisi-LP itu ke akun penghitung per-pool.** Mereka duduk di status pool (`protocol_fees_token{0,1}`, `fund_fees_token{0,1}`, dll.) sampai seseorang memanggil `CollectProtocolFee` / `CollectFundFee` / `CollectCreatorFee`. Mereka tidak meninggalkan vault pool sampai saat itu; dari perspektif swap mereka masih "di pool".
+3. **Pengumpulan memindahkannya keluar.** Penandatangan masing-masing (kunci `protocol_owner` / `fund_owner` pada AmmConfig, atau kreator peluncur untuk pool LaunchLab) memanggil instruksi pengumpulan dan program mentransfer dari vault pool ke ATA tujuan.
+
+Beberapa pengamatan yang penting:
+
+- **Persentase pembagian adalah dari biaya perdagangan, bukan dari perdagangan.** Biaya perdagangan 0,25% dengan saham protokol 12% berarti protokol mendapatkan `0,25% × 12% = 0,03%` dari perdagangan — bukan 12% dari perdagangan.
+- **Biaya kreator hanya ada di pool yang lulus LaunchLab.** Pool CPMM/CLMM standar memiliki pembagian 3-cara (LP / protokol / dana). LaunchLab menambahkan slot keempat yang diarahkan ke siapa pun yang meluncurkan token, dikonfigurasi pada `Initialize` dan tidak dapat diubah.
+- **AMM v4 hanya membagi dua cara**, hardcoded per-pool: LP dan protokol. Tidak ada slot dana, tidak ada slot kreator.
+- **Dana vs protokol** — keduanya adalah tujuan perbendaharaan protokol, tetapi mereka memiliki penandatangan yang berbeda dan kegunaan yang dimaksudkan berbeda. `protokol` secara historis mendanai operasi; `dana` adalah perbendaharaan jangka panjang. Pembagian antara keduanya adalah tunable itu sendiri.
+
+Tarif spesifik ada di [`reference/fee-comparison`](/id/reference/fee-comparison) dan [`ray/protocol-fees`](/id/ray/protocol-fees).
+
+## 4. Akun observasi (ring buffer TWAP)
+
+Baik CPMM maupun CLMM mempertahankan **akun observasi** per pool — ring buffer ukuran tetap dari sampel `(timestamp, cumulative_price)` yang dapat digunakan kontrak lain untuk menurunkan TWAP yang tahan manipulasi.
+
+```rust
+// CPMM ObservationState (disingkat)
+pub struct ObservationState {
+    pub initialized: bool,
+    pub observation_index: u16,            // slot berikutnya untuk ditimpa
+    pub pool_id: Pubkey,
+    pub observations: [Observation; OBSERVATION_NUM],
+    pub padding: [u64; 4],
+}
+
+pub struct Observation {
+    pub block_timestamp: u64,
+    pub cumulative_token_0_price_x32: u128,  // jumlah (harga × dt) sejak init
+    pub cumulative_token_1_price_x32: u128,
+}
+```
+
+Cara kerjanya:
+
+- **Setiap swap memanggil `update_observation`.** Program membaca harga saat ini, mengalikan dengan detik yang telah berlalu sejak observasi sebelumnya, dan menambahkannya ke penghitung kumulatif. Entri baru menimpa slot tertua (gaya ring-buffer).
+- **TWAP di atas jendela** = `(cumul[end] − cumul[start]) / (timestamp[end] − timestamp[start])`. Konsumen memilih dua observasi yang menangkung jendela yang diinginkan dan membagi.
+- **Raydium sendiri tidak menggunakan TWAP untuk penetapan harga.** Matematika AMM membaca cadangan spot secara langsung. Observasi adalah eksternalitas — Raydium membayar biaya penulisannya sehingga kontrak lain dapat membaca.
+- **AMM v4 tidak memiliki akun observasi.** Ini lebih lama dari desain ObservationState; integrator yang menginginkan TWAP v4 harus menghitung satu off-chain dari riwayat log.
+
+Detail tata letak dan matematika pengindeksan ada di [`products/cpmm/accounts`](/id/products/cpmm/accounts) dan [`products/clmm/accounts`](/id/products/clmm/accounts).
+
+## 5. REST API + SDK + IDL
+
+Permukaan off-chain adalah trio tunggal yang digunakan oleh setiap produk:
+
+- **REST API** — `https://api-v3.raydium.io`. Tampilan terindeks yang mostly-read dari semua status on-chain ditambah mesin kutipan. Satu host, satu skema.
+- **TypeScript SDK** — `@raydium-io/raydium-sdk-v2` di NPM. Membangun dan menandatangani transaksi untuk setiap program. Berbicara dengan API untuk kutipan/metadata, berbicara dengan Solana RPC untuk penyegaran status pra-tanda tangan.
+- **Registri IDL** — IDL Anchor untuk setiap program yang diterbitkan hidup di repositori [`raydium-idl`](https://github.com/raydium-io/raydium-idl) (satu JSON per program: CPMM, CLMM, LaunchLab). SDK TypeScript mengonsumsi IDL ini secara internal; klien Rust / Python hilir meregenerasi dari file yang sama.
+
+Batas antara mereka tajam:
+
+| Bagian | Membaca dari | Menulis ke | Toleransi basi |
+|-------|-----------|-----------|-----------------|
+| REST API | Indexer (parsing log chain) | — (read-only untuk integrator) | Beberapa detik |
+| SDK | API + RPC | Membangun transaksi; tidak disiarkan | Tidak ada — harus kembali mengambil status pra-tanda tangan |
+| IDL | Sumber program | — | Versi per upgrade program |
+
+Kesalahan umum adalah memberi makan output REST API langsung ke transaksi. Jangan — kembali ambil status pool/posisi yang relevan dari Solana RPC di slot yang Anda tanda tangani. SDK melakukan ini secara otomatis untuk alur pihak pertama; jika Anda melewati SDK, Anda harus melakukannya sendiri.
+
+Referensi lengkapnya ada di [`sdk-api/`](/id/sdk-api), dengan permukaan IDL khususnya di [`sdk-api/anchor-idl`](/id/sdk-api/anchor-idl).
+
+## 6. Indexer dan price feed
+
+REST API diberi makan oleh indexer Raydium sendiri, yang berlangganan log program dari armada Solana RPC dan menulis rekam denormalisasi ke penyimpanan SQL. Dua konsekuensi untuk integrator:
+
+- **Indexer adalah satu-satunya hal yang "tahu tentang" status lintas-program.** Memetakan pool CPMM ke padanan CLMM-nya, menghitung angka volume 24h di seluruh versi program, mengambil farm yang terkait dengan mint LP — semua itu adalah pekerjaan indexer. Program itu sendiri tidak melakukannya.
+- **Waktu henti indexer adalah waktu henti API.** Jika API mengembalikan data basi atau kosong, indexer adalah tersangka. Status on-chain tidak terpengaruh; integrator dengan RPC dan SDK mereka sendiri dapat terus bertransaksi.
+
+Price feed adalah masalah terpisah. API menerbitkan bidang `priceUsd` pada sebagian besar respons pool; ini dihitung off-chain dari snapshot tampilan pool indexer dan harga referensi yang dikutip (pool USDC sebagai pivot umum). Cukup baik untuk UI; tidak aman untuk digunakan sebagai oracle on-chain. Gunakan observasi TWAP untuk itu.
+
+## Apa yang tidak dibagikan
+
+Perlu dicantumkan secara eksplisit, karena pembaca baru sering menganggap lebih banyak pembagian daripada yang ada:
+
+- **Program tidak memanggil satu sama lain.** Swap CPMM tidak pernah CPI ke CLMM atau AMM v4. Satu-satunya program yang menggabungkan beberapa AMM adalah program AMM Routing — dan itu sendiri adalah tipis, hanya memancarkan CPI ke setiap AMM secara berurutan.
+- **Tidak ada otoritas upgrade bersama di semua program.** Setiap program on-chain memiliki kunci upgrade program sendiri (multisig 3/4 ditambah timelock 24j). Mereka tidak terhubung.
+- **Tidak ada status bersama antara farm dan AMM.** Farm tidak tahu mana LP yang dijual adalah dari pool CPMM, mint NFT posisi CLMM, atau token SPL yang tidak terkait. Program farm memperlakukan mint staking sebagai opak.
+- **Tidak ada ketergantungan oracle.** Penetapan harga adalah cadangan on-chain. Tidak ada fallback Pyth/Switchboard; AMM tidak memeriksa oracle sebelum clearing.
+
+## Penunjuk
+
+- [`protocol-overview/architecture`](/id/protocol-overview/architecture) — diagram kanonik yang menunjukkan bagaimana potongan-potongan ini menggabungkan.
+- [`protocol-overview/versions-and-migration`](/id/protocol-overview/versions-and-migration) — bagaimana konvensi berkembang di seluruh versi program.
+- [`security/admin-and-multisig`](/id/security/admin-and-multisig) — siapa yang mengontrol kunci di balik AmmConfigs.
+- [`reference/fee-comparison`](/id/reference/fee-comparison) — matriks tingkat biaya per produk.
+- [`reference/program-addresses`](/id/reference/program-addresses) — ID program kanonik.
+
+Sumber:
+
+- [Raydium SDK v2](https://github.com/raydium-io/raydium-sdk-V2) — sumber kebenaran untuk seed PDA, tata letak akun, dan definisi IDL.
+- [Registri IDL Raydium](https://github.com/raydium-io/raydium-idl) — IDL Anchor.
+- Halaman akun per-produk yang dikutip inline di atas.

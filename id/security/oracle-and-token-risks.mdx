@@ -1,0 +1,174 @@
+---
+title: "Risiko oracle dan token"
+description: "Cara Raydium menangani input oracle dan risiko spesifik yang diperkenalkan oleh ekstensi Token-2022 — freeze authority, transfer hook, permanent delegate, default-frozen — termasuk apa yang dilindungi program dan apa yang harus diterima pengguna."
+---
+
+<Info>
+  **Halaman ini diterjemahkan secara otomatis oleh AI. Versi bahasa Inggris adalah acuan resmi.**
+
+  [Lihat versi bahasa Inggris →](/security/oracle-and-token-risks)
+</Info>
+
+<Info>
+  Produk inti Raydium tidak bergantung pada oracle eksternal untuk penetapan harga — state pool *adalah* oracle-nya. Namun API dan SDK menggunakan oracle eksternal untuk penetapan harga USD yang ditampilkan kepada pengguna, dan mint Token-2022 memberikan kontrol yang lebih kaya dibanding SPL Token, beberapa di antaranya secara fundamental mengubah model kepercayaan dari sebuah pool. Halaman ini mendokumentasikan keduanya.
+</Info>
+
+## Oracle dalam Raydium
+
+### Internal: pool adalah oracle
+
+Untuk AMM v4, CPMM, dan CLMM, definisi protokol tentang "harga saat ini" diturunkan dari state pool saja:
+
+- AMM v4 / CPMM: `price = vaultB_balance / vaultA_balance` (mempertimbangkan desimal).
+- CLMM: `price = (sqrtPriceX64 / 2^64)^2 × 10^(decimalsA - decimalsB)`.
+
+Tidak ada oracle eksternal yang dikonsultasikan selama swap, deposit, atau withdrawal. Ini adalah bagian "trustless" dari desain AMM: jika matematika pool benar, manipulasi eksternal dari price feed tidak dapat merusak pool.
+
+### CLMM `ObservationState` sebagai oracle TWAP
+
+Pool CLMM mempertahankan akun `ObservationState` yang mencatat snapshot `sqrt_price` historis. Program lain dapat berkomposisi terhadap ini untuk menurunkan time-weighted average price yang tahan manipulasi:
+
+```rust
+// Sebuah TWAP yang disederhanakan: rata-rata dari (saat ini, N slot yang lalu).
+let obs_now  = load_observation(pool, Clock::slot());
+let obs_past = load_observation(pool, Clock::slot() - 300);  // ~2 min yang lalu
+let twap = (obs_now.price_cumulative - obs_past.price_cumulative)
+         / (obs_now.slot - obs_past.slot);
+```
+
+Ini adalah pola yang sama yang digunakan Uniswap V3. Manipulasi harga jangka pendek (paus mendorong pool secara sementara) tidak merusak TWAP karena dirata-ratakan selama ratusan slot.
+
+Program yang membutuhkan price feed yang lebih aman untuk mint CLMM (oracle likuidasi, pricing opsi, dll.) harus menggunakan TWAP ObservationState daripada harga instant.
+
+**Jangan gunakan harga instant CLMM untuk komposabilitas.** Satu swap besar dapat mendorong spot price 10%+ pada pool yang dangkal; TWAP melemahkan ini. Lihat [`products/clmm/accounts#observation-state`](/id/products/clmm/accounts) untuk tata letak data.
+
+### External: penetapan harga USD di frontend/API
+
+Frontend Raydium dan `api-v3.raydium.io` menampilkan nilai USD (TVL, fee APR, \$ volume). Ini berasal dari:
+
+- **Pyth** sebagai oracle utama untuk mint utama.
+- **Jupiter's aggregator price** sebagai fallback.
+- **Pool-derived price** untuk mint long-tail tanpa cakupan oracle eksternal.
+
+Tampilan USD bersifat murni kosmetik — operasi on-chain tidak pernah membaca Pyth, dan tidak ada pool math yang menggunakan USD. Jika Pyth berhenti menyediakan data untuk mint, UI menampilkan "—"; pool terus berfungsi.
+
+### Manipulasi oracle tidak berlaku untuk pool Raydium
+
+Karena state pool adalah oracle, tidak ada "oracle attack" dalam arti yang dimaksud literatur bug-bounty — tidak ada sumber data eksternal yang dapat dimanipulasi penyerang untuk dirusak. Serangan ekonomis pada state pool (manipulasi gaya flash-loan) tercakup dalam [`security/attack-vectors`](/id/security/attack-vectors).
+
+## Risiko ekstensi Token-2022
+
+SPL Token-2022 (alias "Token Extensions") menambahkan perilaku yang dapat dikonfigurasi ke mint melalui ekstensi. Beberapa ekstensi mengubah properti kepercayaan dari pool yang menyertakannya. Program Raydium menangani beberapa secara otomatis dan melindungi yang lain sebagai peringatan pengguna.
+
+### Transfer fee
+
+**Apa itu:** Fee yang dapat dikonfigurasi (persentase transfer, hingga batas `maximum_fee` dalam istilah absolut) yang dibayarkan oleh pengirim kepada mint authority pada setiap transfer.
+
+**Risiko:** Fee dapat diubah oleh fee-config authority mint. Jika Anda mendepositkan likuiditas ketika fee adalah 1%, dan authority menaikkannya menjadi 50%, swap berikutnya mengembalikan jauh lebih sedikit dari yang diharapkan.
+
+**Mitigasi dalam Raydium:** Pool membaca `transferFeeConfig` saat ini pada saat swap dan menyesuaikan matematika. Pool itu sendiri tidak rusak, tetapi pengguna melihat output yang lebih buruk. Fee authority juga dapat menjadwalkan perubahan fee yang tertunda; UI Raydium menandai pool dengan perubahan fee yang akan datang.
+
+**Risiko residual:** Jika malicious fee authority mengubah fee selama swap yang sedang berlangsung, `minimumAmountOut` Anda melindungi sisi negatif — tx di-revert. Jika Anda mempercayai penerbit mint, ini baik-baik saja; jika tidak, jangan LP.
+
+### Transfer hook
+
+**Apa itu:** Sebuah transfer menjalankan program terpisah (the "hook") untuk menjalankan validasi khusus atau side-effects.
+
+**Risiko:** Hook dapat memblokir transfer apa pun, termasuk transfer internal pool selama swap. Hook yang dapat di-upgrade dapat menjadi jahat nanti — apa yang aman pada saat deposit dapat menjadi tidak dapat ditukar pada saat withdrawal.
+
+**Mitigasi dalam Raydium:** Raydium mencantumkan ID program hook dalam state pool. Integrasi harus menampilkan ID program hook kepada pengguna sehingga mereka dapat memverifikasi itu adalah program yang diharapkan (non-upgradeable, audited).
+
+**Risiko residual:** Jika hook dapat di-upgrade dan authority-nya menjadi bermusuhan, pool dapat dibekukan. Raydium tidak memblokir pool dengan transfer hook, tetapi menandainya. LP ke pool transfer-hook hanya jika hook diverifikasi aman.
+
+### Freeze authority
+
+**Apa itu:** Freeze authority mint dapat membekukan akun token apa pun yang memegang mint tersebut, mencegah semua transfer.
+
+**Risiko:** Freeze authority dengan kemampuan untuk membekukan akun vault pool secara efektif menutup pool — pengguna tidak dapat withdraw, trader tidak dapat swap. Ini berlaku untuk SPL Token *dan* Token-2022; tidak baru dengan Token-2022, tetapi masih merupakan risiko.
+
+**Mitigasi dalam Raydium:** Tidak ada pada level program — freeze SPL Token tidak transparan ke pool. UI Raydium memperingatkan pada pool dengan mint yang dapat dibekukan. Pengguna yang mendepositkan harus memverifikasi freeze authority adalah null atau multisig yang mereka percayai (USDC memiliki freeze authority; itu adalah issuer Circle).
+
+**Risiko residual:** Terima bahwa mint yang dapat dibekukan dapat dibekukan. Mint utama (USDC, USDT, USDY) memiliki freeze authority yang dipegang oleh issuer dan digunakan hanya untuk kepatuhan regulasi; ini biasanya dapat diterima.
+
+### Permanent delegate
+
+**Apa itu:** Ekstensi Token-2022 yang menunjuk permanent delegate yang dapat mentransfer token dari pemegang apa pun tanpa persetujuan.
+
+**Risiko:** Permanent delegate dapat menguras vault pool kapan saja.
+
+**Mitigasi dalam Raydium:** CPMM dan CLMM **menolak untuk membuat pool** dengan mint yang memiliki permanent delegate. Inisialisasi di-revert. Tidak ada pool Raydium yang berjalan dengan mint permanent-delegate.
+
+**Risiko residual:** Nol (selama pemeriksaan benar, yang kedua audit verifikasi).
+
+### Non-transferable
+
+**Apa itu:** Mint yang tidak dapat ditransfer oleh pemegang.
+
+**Risiko:** Pool bergantung pada transferability untuk memindahkan token antara ATA pengguna dan vault pool. Mint non-transferable secara trivial merusak pool.
+
+**Mitigasi dalam Raydium:** Pembuatan pool di-revert pada mint non-transferable. Farm juga menolak mint staking non-transferable.
+
+### Default-frozen / close-authority / interest-bearing
+
+Ekstensi dampak lebih rendah yang ditangani oleh Raydium:
+
+- **Default-frozen**: akun token baru perlu dicairkan sebelum digunakan. Raydium menangani ini secara transparan pada pembuatan ATA.
+- **Close-authority**: authority yang ditunjuk dapat menutup akun token. Vault pool dimiliki oleh program-derived authority pool, jadi close-authority pada *mint* tidak berlaku pada vault.
+- **Interest-bearing**: saldo yang ditampilkan mengakumulasi bunga; `amount` tetap fixed tetapi `uiAmount` tumbuh. Pool math Raydium menggunakan `amount`, bukan bunga yang terakumulasi; tampilan disesuaikan secara terpisah.
+
+### Mint authority
+
+Bukan risiko khusus Token-2022, tetapi patut dicatat: jika mint mempertahankan mint authority, pemegang dapat menginflasi pasokan sesuai keinginan. Untuk token yang diluncurkan, ini mencairkan LP pada harga pool saat ini. LaunchLab menolak untuk membuat peluncuran kecuali mint authority adalah null.
+
+## Label risiko dalam UI
+
+Frontend Raydium melabeli setiap pool dengan tag risiko yang dapat diterapkan:
+
+- **TRANSFER_FEE** — non-zero transfer fee.
+- **TRANSFER_HOOK** — ekstensi transfer-hook aktif.
+- **FREEZE** — mint memiliki freeze authority.
+- **MINT** — mint memiliki mint authority (pasokan dapat menginflasi).
+- **CLOSE** — mint memiliki close authority.
+
+Agregator yang mengonsumsi API Raydium harus menampilkan label ini kepada pengguna.
+
+## Daftar periksa integrator
+
+Sebelum berkomposisi dengan pool Raydium:
+
+- [ ] Periksa ekstensi setiap mint melalui `getMint(mint, TOKEN_2022_PROGRAM_ID)`.
+- [ ] Lewati pool di mana mint apa pun memiliki permanent_delegate atau non_transferable (ini seharusnya tidak ada dalam Raydium, tetapi pertahanan berlapis).
+- [ ] Periksa freeze authority untuk kedua mint; null atau authority terpercaya saja.
+- [ ] Untuk pool transfer-hook, verifikasi ID program hook terhadap daftar putih.
+- [ ] Ukur eksposur terhadap skenario transfer-fee (bagaimana jika fee mencapai max?).
+- [ ] Gunakan CLMM TWAP (ObservationState) daripada spot price untuk pricing derivatif.
+
+## Pernyataan penerimaan risiko residual
+
+Program Raydium memberlakukan apa yang dapat diberlakukan pada level program:
+
+- Pembuatan pool menolak mint permanent-delegate / non-transferable.
+- Swap math menyesuaikan dengan benar untuk transfer fee saat ini.
+- ObservationState menyediakan oracle yang tahan manipulasi.
+
+Risiko residual yang harus diterima pengguna:
+
+- Freeze authority mint dapat membekukan pool.
+- Fee authority mint dapat menaikkan transfer fee (hingga batas `maximum_fee`) kapan saja.
+- Program transfer-hook dapat di-upgrade ke kode jahat.
+- Mint interest-bearing tingkat akrual dapat diubah.
+
+Pertahanan yang tepat adalah diligence pra-LP: jangan mendepositkan ke pool dengan mint yang memiliki authority terkonsentrasi yang tidak Anda percayai. Raydium tidak dapat memutuskan kepercayaan itu untuk Anda; Raydium hanya dapat menampilkan fakta relevan.
+
+## Penunjuk
+
+- [`algorithms/token-2022-transfer-fees`](/id/algorithms/token-2022-transfer-fees) — penyesuaian math untuk mint transfer-fee.
+- [`security/attack-vectors`](/id/security/attack-vectors) — cara risiko ini memanifestasikan sebagai serangan konkret.
+- [`integration-guides/wallet-integration`](/id/integration-guides/wallet-integration) — menampilkan label risiko Token-2022.
+- [`products/clmm/accounts`](/id/products/clmm/accounts) — tata letak ObservationState.
+
+Sumber:
+
+- [SPL Token-2022 extensions docs](https://spl.solana.com/token-2022/extensions).
+- Logika validasi inisialisasi pool: `src/raydium/cpmm/instrument.ts`, `src/raydium/clmm/instrument.ts`.
+- [Pyth](https://pyth.network) — oracle harga eksternal yang digunakan di frontend.

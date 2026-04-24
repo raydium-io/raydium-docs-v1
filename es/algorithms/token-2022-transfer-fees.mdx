@@ -1,0 +1,179 @@
+---
+title: "Comisiones de transferencia de Token-2022 en swaps"
+description: "Cómo la extensión transfer-fee de Token-2022 cambia la contabilidad de cantidad anterior/posterior al swap, qué productos de Raydium la soportan, y los casos límite que los integradores deben manejar (comisiones asimétricas, actualizaciones de comisiones, límites máximos de comisión, extensiones no transferibles)."
+---
+
+<Info>
+  **Esta página fue traducida automáticamente por IA. La versión en inglés es la fuente autorizada.**
+
+  [Ver versión en inglés →](/algorithms/token-2022-transfer-fees)
+</Info>
+
+<Info>
+  Matriz de compatibilidad: **CPMM** soporta Token-2022 completamente, incluidos mints con transfer-fee. **CLMM** soporta Token-2022 con transfer-fee mediante cuentas `SwapV2` explícitas. **AMM v4** no soporta Token-2022 en absoluto. **LaunchLab** no soporta Token-2022 para el mint base (crea mints SPL clásicos). **Farm v6** soporta Token-2022 en mints de depósito y recompensa.
+</Info>
+
+## Qué es una comisión de transferencia
+
+Token-2022 es el segundo programa SPL Token (`TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA` → `TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb`). Entre sus extensiones, la extensión **transfer-fee** deduce una comisión de la cantidad transferida en cada `TransferChecked` sobre un mint de token. La comisión se envía a un destinatario designado por la autoridad del mint y puede ser actualizada por la autoridad (dentro de límites).
+
+Un mint con transfer-fee tiene dos parámetros relevantes:
+
+- **`transfer_fee_basis_points`** — la tasa (p. ej. 100 = 1%).
+- **`maximum_fee`** — un límite absoluto por transferencia (para que usuarios que mueven cantidades enormes no paguen comisiones ilimitadas).
+
+Un mint puede tener **dos** configuraciones de transfer-fee activas simultáneamente: la "más nueva" (en efecto ahora) y la "más antigua" (siendo desactivada). Este es el diseño de "transición de época" — los cambios de comisión de transferencia entran en vigor en los límites de época para evitar sorpresas en transacciones en vuelo.
+
+## Por qué esto importa para los swaps
+
+Las bóvedas de un pool mantienen saldos reales. Cuando un usuario ejecuta un swap en Raydium:
+
+1. El usuario envía `amount_in` a la bóveda del pool. Si el **mint de entrada** tiene transfer-fee, la bóveda recibe `amount_in − fee_in`, no `amount_in`.
+2. La matemática del swap opera sobre la cantidad recibida por la bóveda.
+3. El pool envía `amount_out` al ATA del usuario. Si el **mint de salida** tiene transfer-fee, el usuario recibe `amount_out − fee_out`, no `amount_out`.
+
+Si el programa de swap es ingenuo y usa el argumento raw `amount_in`, la verificación de invariante falla porque la bóveda recibió menos de lo que el programa cree. Conversamente, si computa `amount_out` sin restar la comisión de transferencia saliente, el usuario verá un déficit y culpará al programa.
+
+Raydium CPMM y CLMM (vía `SwapV2`) manejan esto:
+
+- **Antes del swap**: computando `in_after_fee = amount_in − transfer_fee_on(amount_in, in_mint)`, y usando `in_after_fee` en la matemática de la curva.
+- **Después del swap**: computando `out_gross = amount_out_from_curve`, enviando `out_gross` al usuario vía `TransferChecked`, que el programa Token-2022 mismo reducirá por la comisión de transferencia.
+
+El límite de slippage `minAmountOut` del usuario se verifica contra `out_gross` (lo que envía el pool), **no** contra lo que el usuario recibe. Así es como cada DEX mayor en Solana maneja Token-2022, e importa porque:
+
+- Si el pool verificara post-comisión, una actualización de comisión entre cotización y ejecución causaría reversión del trade.
+- Verificar pre-comisión fija el fallo a la calidad de la propia cotización, no a cambios de comisión fuera de banda del usuario.
+
+Las UIs deben restar la comisión de transferencia Token-2022 esperada al mostrar "Recibirás" al usuario.
+
+## Computar la comisión Token-2022
+
+El programa SPL Token-2022 expone un asistente determinístico. En Rust:
+
+```rust
+use spl_token_2022::extension::transfer_fee::TransferFeeConfig;
+use spl_token_2022::extension::StateWithExtensions;
+
+let mint_data = ...;
+let state = StateWithExtensions::<Mint>::unpack(&mint_data)?;
+let config = state.get_extension::<TransferFeeConfig>()?;
+
+let epoch = Clock::get()?.epoch;
+let fee_bp = config.get_epoch_fee(epoch).transfer_fee_basis_points;
+let max_fee = u64::from(config.get_epoch_fee(epoch).maximum_fee);
+
+let fee = (amount as u128 * fee_bp as u128 / 10_000).min(max_fee as u128) as u64;
+```
+
+En TypeScript (vía `@solana/spl-token`):
+
+```ts
+import { getTransferFeeConfig, getTransferFeeAmount } from "@solana/spl-token";
+
+const config = getTransferFeeConfig(mintAccount);
+const currentEpochFee = config.olderTransferFee.epoch <= currentEpoch
+  ? config.newerTransferFee
+  : config.olderTransferFee;
+
+const rate   = currentEpochFee.transferFeeBasisPoints;
+const maxFee = currentEpochFee.maximumFee;
+const fee    = Math.min(Math.floor(amount * rate / 10_000), Number(maxFee));
+```
+
+## Fórmulas de swap ajustadas (CPMM, entrada exacta)
+
+Sea `f_pool` la tasa de comisión del pool, `f_in` la tasa de transfer-fee del mint de entrada, `max_in` su límite máximo, `f_out` la tasa de transfer-fee del mint de salida, `max_out` su límite máximo.
+
+```
+transfer_fee_in  = min(amount_in · f_in / 10_000, max_in)
+vault_received   = amount_in − transfer_fee_in
+
+pool_fee         = ceil(vault_received · f_pool / 1_000_000)
+amount_after     = vault_received − pool_fee
+amount_out_gross = y · amount_after / (x + amount_after)
+
+transfer_fee_out = min(amount_out_gross · f_out / 10_000, max_out)
+user_receives    = amount_out_gross − transfer_fee_out
+```
+
+Verificación de slippage: `amount_out_gross ≥ min_amount_out` (no `user_receives ≥ min_amount_out`). El `minAmountOut` del usuario es establecido por el SDK a `expected_gross · (1 − slippage)` — mantén el límite en el lado "enviado", no en el lado "recibido".
+
+## Fórmulas ajustadas (CPMM, salida exacta)
+
+El SDK itera para encontrar `amount_in` tal que `user_receives = amount_out_exact`:
+
+```
+# el usuario quiere recibir amount_out_exact después de transfer-fee
+amount_out_gross = amount_out_exact + transfer_fee_out_for(amount_out_exact)
+
+# luego resuelve CPMM salida exacta para amount_after:
+amount_after     = ceil(x · amount_out_gross / (y − amount_out_gross))
+
+# luego suma comisión del pool:
+vault_received   = ceil(amount_after · 1_000_000 / (1_000_000 − f_pool))
+
+# luego suma transfer-fee de entrada:
+amount_in = ceil(vault_received · 10_000 / (10_000 − f_in))
+# (o itera — ver caso límite de límite de comisión abajo)
+```
+
+Los límites `max_in` / `max_out` hacen la computación no lineal porque una vez que se alcanza el límite la comisión deja de crecer. El `computeAmountIn` / `computeAmountOut` del SDK manejan esto iterando si la fórmula ingenua empujaría más allá del límite.
+
+## Casos límite
+
+### Comisiones asimétricas (un lado tiene comisión, el otro no)
+
+Común en la práctica. Las fórmulas anteriores ya manejan esto — si un lado tiene `f_in = 0`, los términos relevantes colapsan. No hay caso especial en el programa.
+
+### Actualizaciones de comisión a mitad del swap
+
+Si la comisión de transferencia del mint cambia entre tiempo de cotización y tiempo de ejecución, el swap aterrizará con economía ligeramente peor (el usuario carga la diferencia dentro de la tolerancia de slippage) o se revertirá (la salida bruta cae por debajo de `minAmountOut`). Los límites de slippage absorben esto; no se necesita protección adicional.
+
+### Límite máximo de comisión
+
+Una vez que el trade es lo suficientemente grande para alcanzar `maximum_fee`, la comisión se satura y el crecimiento adicional es cero. Esto hace que la tasa efectiva sea asintótica a cero para trades muy grandes, lo que puede causar curvas de precios extrañas en mercados profundamente ilíquidos. El `computeAmountOut` del SDK da cuenta de esto.
+
+### Extensión no transferible
+
+Algunos mints Token-2022 usan la extensión `NonTransferable`, que rechaza todas las llamadas `Transfer` excepto hacia y desde la autoridad del mint. Tales mints **no pueden** usarse en un pool de Raydium en absoluto. `CreatePool` las rechaza en la inicialización.
+
+### Mints que generan interés
+
+Token-2022 también soporta una extensión `InterestBearingConfig` que hace que los saldos parezcan crecer en el tiempo. Los pools de Raydium leen saldos brutos de bóveda (que ignoran el acúmulo de interés), así que en un pool con un mint que genera interés, los LPs capturan el interés acumulado como un regalo puro siempre que canjean (el saldo de bóveda creció más rápido que la representación de suministro LP). Los integradores deben tratar esto como no problema pero documentarlo para el lado LP.
+
+### Transfer hooks
+
+La extensión `TransferHook` de Token-2022 permite CPI arbitrario en cada transferencia. Raydium CPMM soporta estos — la instrucción de swap reenvía las cuentas de hook — pero agrega sobrecarga de CU y requiere que el hook se comporte bien. CLMM `SwapV2` también soporta hooks. AMM v4 no soporta Token-2022 en absoluto, así que la pregunta no surge.
+
+## Ejemplo trabajado
+
+Pool CPMM, `x = 1_000_000 USDY, y = 1_000_000 USDC`, comisión de pool 0.25%.
+
+- USDY tiene transfer-fee de 1%, `max_fee = 10_000` (0.01 USDY con 6 decimales).
+- USDC no tiene transfer-fee.
+
+Usuario swapea `amount_in = 1_000 USDY` por USDC (entrada exacta).
+
+```
+transfer_fee_in = min(1_000 · 100 / 10_000, 10_000)  = 10     // 1%, bien bajo el límite
+vault_received  = 1_000 − 10 = 990
+
+pool_fee        = ceil(990 · 2_500 / 1_000_000)  = 3    // 0.25%
+amount_after    = 990 − 3 = 987
+
+amount_out_gross = 1_000_000 · 987 / (1_000_000 + 987) = 986_027 / ...  ≈ 985.97
+```
+
+≈ 985.97 USDC. Sin transfer-fee saliente, así que el usuario recibe 985.97 USDC.
+
+## Referencias
+
+- [`products/cpmm/overview`](/es/products/cpmm/overview) — soporte Token-2022 de CPMM.
+- [`products/clmm/instructions`](/es/products/clmm/instructions) — `SwapV2` vs `Swap` para enrutamiento Token-2022.
+- [`solana-fundamentals/spl-token-and-token-2022`](/es/solana-fundamentals/spl-token-and-token-2022) — el modelo de extensión Token-2022 general.
+
+Fuentes:
+
+- [Docs de extensión transfer-fee de SPL Token-2022](https://spl.solana.com/token-2022/extensions#transfer-fees)
+- Código fuente del programa Raydium CPMM (manejo Token-2022 de `SwapBaseInput` / `SwapBaseOutput`).
+- Código fuente del programa Raydium CLMM (`SwapV2`).

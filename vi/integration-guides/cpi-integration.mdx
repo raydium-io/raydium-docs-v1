@@ -1,0 +1,415 @@
+---
+title: "CPI từ một chương trình tuỳ chỉnh"
+description: "Các mẫu kết hợp cho các chương trình on-chain gọi Raydium — escrow, proxy aggregator, vault tự động gộp — với các ví dụ đầy đủ bao gồm xây dựng tài khoản, PDA signer, remaining accounts và quản lý compute budget."
+---
+
+<Info>
+  **Trang này được dịch tự động bằng AI. Phiên bản tiếng Anh là bản chính thức.**
+
+  [Xem bản tiếng Anh →](/integration-guides/cpi-integration)
+</Info>
+
+<Info>
+  [`sdk-api/rust-cpi`](/vi/sdk-api/rust-cpi) bao gồm các cơ chế cấp thấp để gọi từng chương trình Raydium. Trang này là phần đi kèm cấp cao hơn: *tại sao* bạn nên kết hợp Raydium vào chương trình riêng của mình, *mẫu nào* phù hợp với trường hợp sử dụng của bạn, và toàn bộ mã glue bạn cần từ đầu đến cuối.
+</Info>
+
+## Khi CPI là công cụ phù hợp
+
+Một chương trình tuỳ chỉnh có ý nghĩa khi giao dịch cần xảy ra nguyên tử với các thay đổi trạng thái on-chain khác mà chỉ chương trình của bạn mới có thể thực hiện. Các trường hợp phổ biến:
+
+- **Chương trình escrow / lệnh giới hạn** — người dùng gửi mint vào escrow của bạn, chương trình của bạn theo dõi điều kiện giá, và khi nó được kích hoạt, chương trình của bạn hoán đổi nguyên tử qua Raydium và ghi có tài khoản của người dùng.
+- **Proxy aggregator** — một hướng dẫn duy nhất định tuyến swap qua Raydium + một hoặc nhiều DEX khác, với tất cả các hop dưới một kiểm tra slippage duy nhất do chương trình của bạn sở hữu.
+- **Vault tự động gộp** — gửi LP hoặc farm stake vào vault của bạn, vault thu hoạch phần thưởng theo lịch biểu, cấp lại thanhkhoản, phát hành token chia sẻ.
+- **Vault chiến lược** — vị trí LP có đòn bẩy được cân bằng lại bằng cách hoán đổi qua CLMM; những người thanh lý đóng vị trí và hoán đổi tài sản thế chấp trong một giao dịch.
+- **Nền tảng khởi chạy token với vesting tuỳ chỉnh** — chương trình của bạn giữ token vesting và phát hành vào pool Raydium theo lịch biểu.
+
+Nếu bạn chỉ muốn gửi một swap từ mã off-chain, CPI quá phức tạp — sử dụng SDK. CPI chỉ đáng giá độ phức tạp của nó khi tính nguyên tử với trạng thái riêng của bạn là yêu cầu.
+
+## Các mẫu kết hợp
+
+### Mẫu 1: Proxy mỏng
+
+Chương trình của bạn đưa ra một hướng dẫn duy nhất để xác thực một số chính sách (ví dụ: các cặp mint được phê duyệt, chiết khấu phí cho người dùng được xác minh) và sau đó chuyển tiếp sang Raydium.
+
+```
+┌──────────────┐   user tx    ┌────────────────┐  CPI  ┌──────────┐
+│ user         │─────────────▶│ your program   │──────▶│ Raydium  │
+└──────────────┘              │  (validate)    │       │  (CPMM)  │
+                              └────────────────┘       └──────────┘
+```
+
+Trạng thái nằm trong ATA của người dùng. Chương trình của bạn không sở hữu bất kỳ token nào. Dấu chân tin tưởng tối thiểu.
+
+### Mẫu 2: Escrow
+
+Chương trình của bạn sở hữu một PDA giữ mint đầu vào của người dùng. Khi được kích hoạt, PDA ký một CPI tới Raydium để hoán đổi số dư riêng của nó.
+
+```
+           deposit                   trigger
+   user ───────────▶  PDA vault  ───────────────▶  Raydium swap
+                     (your prog)                    (signed by PDA)
+                                                            │
+                                                            ▼
+                                                    PDA vault (output mint)
+                                                            │
+                                                     withdraw ▼
+                                                         user
+```
+
+Chi tiết quan trọng: PDA ký qua `CpiContext::new_with_signer`. Xem [Signer seeds PDA](#pda-signer-seeds).
+
+### Mẫu 3: Kết hợp multi-hop
+
+Chương trình của bạn phát hành nhiều CPI trong một hướng dẫn duy nhất, thực thi một giới hạn slippage duy nhất trên tất cả chúng. Các hướng dẫn swap Raydium mỗi cái có `minimum_amount_out` riêng của nó, nhưng bạn đặt những cái đó thành 0 (hoặc một giới hạn sàn rất lỏng) và thực thi một mức tối thiểu chặt chẽ cho riêng bạn sau hop cuối cùng.
+
+```
+instruction:
+  CPI swap: tokenA → tokenB   (raydium, loose min)
+  CPI swap: tokenB → tokenC   (raydium / third-party, loose min)
+  CPI swap: tokenC → tokenD   (raydium, loose min)
+  require(user.tokenD_ata.amount - pre_balance >= user_min_out)
+```
+
+Điều này cung cấp cho bạn một cổng hoàn nguyên duy nhất cho toàn bộ tuyến đường. Chỉ sử dụng mẫu này khi bạn tin tưởng mỗi hop là an toàn về slippage; nếu không, hãy để mỗi hop thực thi mức tối thiểu của riêng nó.
+
+### Mẫu 4: Vault / chiến lược
+
+Chương trình của bạn giữ token LP hoặc farm stake trong PDA. Một người giám sát (hoặc người dùng) gọi `compound()`, điều này:
+
+1. Thu hoạch phần thưởng từ farm.
+2. Hoán đổi phần thưởng cho token pool (CPI vào CPMM hoặc CLMM).
+3. Gửi lại các khoản tiền thu được vào LP (một CPI khác).
+4. Stake LP mới (một CPI khác).
+
+Tất cả trong một giao dịch để NAV của vault di chuyển nguyên tử. Compute budget thường là 600k–1M CU; bảng tra cứu địa chỉ là bắt buộc.
+
+## Xây dựng danh sách tài khoản
+
+Struct `Accounts` của chương trình gọi phản chiếu thứ tự tài khoản của chương trình Raydium, nhưng hầu hết các tài khoản phía Raydium là `UncheckedAccount` vì Raydium tự xác thực chúng. Bạn chỉ thêm ràng buộc vào các tài khoản *bạn* sở hữu:
+
+```rust
+use anchor_lang::prelude::*;
+use anchor_spl::token::{Token, TokenAccount};
+
+#[derive(Accounts)]
+pub struct EscrowSwap<'info> {
+    /// The escrow PDA; holds input mint and signs the CPI.
+    #[account(
+        mut,
+        seeds = [b"escrow", user.key().as_ref()],
+        bump = escrow.bump,
+    )]
+    pub escrow: Account<'info, Escrow>,
+
+    #[account(mut)]
+    pub user: Signer<'info>,
+
+    // ----- Raydium-side accounts, mostly unchecked -----
+
+    /// CHECK: validated by CPMM
+    #[account(mut)] pub pool_state: UncheckedAccount<'info>,
+    /// CHECK: validated by CPMM
+    pub amm_config: UncheckedAccount<'info>,
+    /// CHECK: validated by CPMM
+    pub pool_authority: UncheckedAccount<'info>,
+    #[account(mut)] pub input_vault:  Account<'info, TokenAccount>,
+    #[account(mut)] pub output_vault: Account<'info, TokenAccount>,
+    /// CHECK: validated by CPMM
+    #[account(mut)] pub observation_state: UncheckedAccount<'info>,
+
+    /// Escrow's input ATA — owned by the escrow PDA.
+    #[account(
+        mut,
+        associated_token::mint = input_mint,
+        associated_token::authority = escrow,
+    )]
+    pub escrow_input_ata: Account<'info, TokenAccount>,
+
+    /// Escrow's output ATA.
+    #[account(
+        mut,
+        associated_token::mint = output_mint,
+        associated_token::authority = escrow,
+    )]
+    pub escrow_output_ata: Account<'info, TokenAccount>,
+
+    pub input_mint:  Account<'info, anchor_spl::token::Mint>,
+    pub output_mint: Account<'info, anchor_spl::token::Mint>,
+
+    pub cpmm_program:       Program<'info, raydium_cp_swap::program::RaydiumCpSwap>,
+    pub token_program:      Program<'info, Token>,
+    pub token_program_2022: Program<'info, anchor_spl::token_2022::Token2022>,
+}
+```
+
+Sự bất đối xứng — xác thực nghiêm ngặt trên các tài khoản của bạn, `UncheckedAccount` trên các tài khoản của Raydium — không phải là lười biếng. Người nhận xác thực của riêng họ; xác thực kép ở người gọi chỉ tiêu CU và có nguy c险mất đồng bộ khi Raydium gửi một trường bố cục struct mới.
+
+## Cuộc gọi CPI chính nó
+
+```rust
+use raydium_cp_swap::cpi::{self, accounts::Swap as CpmmSwap};
+
+pub fn escrow_swap(
+    ctx: Context<EscrowSwap>,
+    amount_in: u64,
+    minimum_amount_out: u64,
+) -> Result<()> {
+    let user_key = ctx.accounts.user.key();
+    let bump     = ctx.accounts.escrow.bump;
+    let seeds: &[&[u8]] = &[b"escrow", user_key.as_ref(), &[bump]];
+    let signer: &[&[&[u8]]] = &[seeds];
+
+    let cpi_accounts = CpmmSwap {
+        payer:                ctx.accounts.user.to_account_info(),
+        authority:            ctx.accounts.escrow.to_account_info(),
+        amm_config:           ctx.accounts.amm_config.to_account_info(),
+        pool_state:           ctx.accounts.pool_state.to_account_info(),
+        input_token_account:  ctx.accounts.escrow_input_ata.to_account_info(),
+        output_token_account: ctx.accounts.escrow_output_ata.to_account_info(),
+        input_vault:          ctx.accounts.input_vault.to_account_info(),
+        output_vault:         ctx.accounts.output_vault.to_account_info(),
+        input_token_program:  ctx.accounts.token_program.to_account_info(),
+        output_token_program: ctx.accounts.token_program.to_account_info(),
+        input_token_mint:     ctx.accounts.input_mint.to_account_info(),
+        output_token_mint:    ctx.accounts.output_mint.to_account_info(),
+        observation_state:    ctx.accounts.observation_state.to_account_info(),
+    };
+
+    let cpi_ctx = CpiContext::new_with_signer(
+        ctx.accounts.cpmm_program.to_account_info(),
+        cpi_accounts,
+        signer,
+    );
+
+    cpi::swap_base_input(cpi_ctx, amount_in, minimum_amount_out)?;
+    Ok(())
+}
+```
+
+### PDA signer seeds
+
+CPI chỉ thành công nếu PDA được chuyển làm `authority` phù hợp với dẫn xuất mà người gọi tuyên bố. Cả hai phải đồng ý về:
+
+1. Dãy byte seed (ở đây `[b"escrow", user.key().as_ref()]`).
+2. Bump.
+3. ID chương trình gọi (chương trình của bạn, không phải Raydium).
+
+Raydium không quan tâm `authority` là ai — nó chỉ quan tâm rằng chữ ký của `authority` bao gồm giao dịch và ATA đầu vào được sở hữu bởi authority đó. Xác thực xảy ra trong `anchor_spl::token::transfer`: trường `authority` của ATA phải bằng người ký.
+
+Lỗi phổ biến: chuyển `user` làm authority (và chuyển từ `escrow_input_ata` được sở hữu bởi PDA escrow). Chương trình SPL Token từ chối với `owner mismatch`. Luôn làm cho trường `authority` khớp với chủ sở hữu ATA.
+
+## Remaining accounts
+
+Một số hướng dẫn Raydium nhận một danh sách tài khoản có độ dài thay đổi được nối thêm sau những cái cố định — **remaining accounts**.
+
+- **CLMM `SwapV2`**: 1–8 tài khoản `TickArrayState` cho các mảng tick mà swap có thể duyệt, theo hướng swap.
+- **Farm v6 `Deposit` / `Harvest` / `Withdraw`**: các cặp `(reward_vault, user_reward_ata)`, một cặp cho mỗi slot phần thưởng trực tiếp.
+- **Token-2022 transfer-hook mints**: chương trình transfer-hook cộng với bất kỳ tài khoản nào mà hook cần.
+
+Các trợ giúp CPI Anchor không kiểm tra loại remaining accounts. Chuyển chúng qua:
+
+```rust
+let cpi_ctx = CpiContext::new_with_signer(program, accounts, signer)
+    .with_remaining_accounts(ctx.remaining_accounts.to_vec());
+```
+
+**Thứ tự có ý nghĩa.** Đối với CLMM:
+
+```
+remaining = [
+    tick_array_in_direction_0,    // first one crossed
+    tick_array_in_direction_1,
+    ...,
+]
+```
+
+Đối với harvest farm v6:
+
+```
+remaining = [
+    reward_vault_0, user_reward_ata_0,
+    reward_vault_1, user_reward_ata_1,
+    // omit any slot whose reward_state is Uninitialized
+]
+```
+
+Chương trình gọi của bạn phải chuyển lại các remaining accounts mà nó nhận được từ máy khách không thay đổi. Đừng cố gắng lọc hoặc sắp xếp lại chúng.
+
+## Compute budget cho các cuộc gọi kết hợp
+
+Một CPI chi phí ~1.500 CU cho chính frame gọi; sử dụng CU của callee chính nó xếp chồng lên trên. Rough budget cho mỗi CPI Raydium:
+
+| Call | CU (SPL Token) | CU (Token-2022) |
+|------|----------------|-----------------|
+| CPMM swap_base_input | ~150,000 | ~200,000 |
+| CLMM swap_v2 (single tick array) | ~180,000 | ~230,000 |
+| CLMM swap_v2 (crosses 2 ticks) | ~220,000 | ~270,000 |
+| Farm v6 deposit | ~120,000 | ~150,000 |
+| Farm v6 harvest (per reward slot) | +30,000 | +40,000 |
+| AMM v4 swap_base_in | ~140,000 | n/a |
+
+Thêm ~1.500 cho mỗi frame CPI và ~20.000 cho overhead chương trình riêng của bạn. Một auto-compounder làm `harvest → swap A → swap B → deposit LP → stake LP` dễ dàng đạt 700k CU.
+
+Luôn đặt một `ComputeBudgetProgram::set_compute_unit_limit` rõ ràng:
+
+```ts
+import { ComputeBudgetProgram } from "@solana/web3.js";
+
+const tx = new Transaction().add(
+  ComputeBudgetProgram.setComputeUnitLimit({ units: 900_000 }),
+  ComputeBudgetProgram.setComputeUnitPrice({ microLamports: priorityFeeMicroLamports }),
+  yourInstruction,
+);
+```
+
+Giới hạn 200k CU mặc định sẽ im lặng cạn kiệt rất lâu trước khi một cuộc gọi kết hợp hoàn thành.
+
+## Truyền lỗi
+
+Các chương trình Raydium trả về lỗi Anchor với mã lỗi ổn định. Chương trình gọi của bạn nhìn thấy chúng dưới dạng `Err(ProgramError::Custom(code))`. Bong theo mặc định:
+
+```rust
+cpi::swap_base_input(cpi_ctx, amount_in, minimum_amount_out)?;
+```
+
+Hoặc chặn các mã cụ thể:
+
+```rust
+use raydium_cp_swap::error::ErrorCode as CpmmErr;
+
+match cpi::swap_base_input(cpi_ctx, amount_in, minimum_amount_out) {
+    Ok(_) => {},
+    Err(err) if is_err(err, CpmmErr::ExceededSlippage) => {
+        // Your program might want to retry at a larger slippage, or unwind state.
+        return err!(YourErr::PoolTooVolatile);
+    }
+    Err(err) => return Err(err),
+}
+```
+
+Ánh xạ mã lỗi-to-meaning ổn định theo chính sách IDL ([`sdk-api/anchor-idl`](/vi/sdk-api/anchor-idl)); các mã mới nối thêm vào cuối, các mã hiện có không bao giờ thay đổi ý nghĩa.
+
+## Ví dụ đầy đủ được thực hiện: limit-order escrow
+
+Luồng:
+
+1. **`open_order`** — người dùng gửi `amount_in` của `input_mint` vào PDA escrow; ghi lại `min_amount_out` và hết hạn mục tiêu.
+2. **`execute_order`** — bất cứ ai (keeper) gọi với các tài khoản pool hiện tại. Chương trình kiểm tra báo giá hiện tại ≥ `min_amount_out`, sau đó CPI Raydium swap và giữ đầu ra trong escrow.
+3. **`claim`** — người dùng rút mint đầu ra từ escrow.
+
+```rust
+#[account]
+pub struct LimitOrder {
+    pub user:          Pubkey,
+    pub input_mint:    Pubkey,
+    pub output_mint:   Pubkey,
+    pub amount_in:     u64,
+    pub min_out:       u64,
+    pub expiry_unix:   i64,
+    pub state:         u8,    // 0 open, 1 filled, 2 cancelled, 3 expired
+    pub bump:          u8,
+}
+
+#[program]
+pub mod limit_orders {
+    use super::*;
+
+    pub fn execute_order(
+        ctx: Context<ExecuteOrder>,
+    ) -> Result<()> {
+        let order = &ctx.accounts.order;
+        require!(order.state == 0, OrderErr::NotOpen);
+        require!(Clock::get()?.unix_timestamp < order.expiry_unix, OrderErr::Expired);
+
+        let user_key = order.user;
+        let seeds: &[&[u8]] = &[b"order", user_key.as_ref(), &[order.bump]];
+        let signer: &[&[&[u8]]] = &[seeds];
+
+        let pre_out_balance = ctx.accounts.escrow_output_ata.amount;
+
+        let cpi_accounts = CpmmSwap {
+            payer:                ctx.accounts.keeper.to_account_info(),
+            authority:            ctx.accounts.order.to_account_info(),
+            amm_config:           ctx.accounts.amm_config.to_account_info(),
+            pool_state:           ctx.accounts.pool_state.to_account_info(),
+            input_token_account:  ctx.accounts.escrow_input_ata.to_account_info(),
+            output_token_account: ctx.accounts.escrow_output_ata.to_account_info(),
+            input_vault:          ctx.accounts.input_vault.to_account_info(),
+            output_vault:         ctx.accounts.output_vault.to_account_info(),
+            input_token_program:  ctx.accounts.token_program.to_account_info(),
+            output_token_program: ctx.accounts.token_program.to_account_info(),
+            input_token_mint:     ctx.accounts.input_mint.to_account_info(),
+            output_token_mint:    ctx.accounts.output_mint.to_account_info(),
+            observation_state:    ctx.accounts.observation_state.to_account_info(),
+        };
+
+        let cpi_ctx = CpiContext::new_with_signer(
+            ctx.accounts.cpmm_program.to_account_info(),
+            cpi_accounts,
+            signer,
+        );
+
+        // Let the escrow enforce the minimum — we trust Raydium's slippage, but we
+        // also re-check our own post-swap delta in case a future change ever relaxes it.
+        cpi::swap_base_input(cpi_ctx, order.amount_in, order.min_out)?;
+
+        ctx.accounts.escrow_output_ata.reload()?;
+        let delta = ctx.accounts.escrow_output_ata.amount
+            .checked_sub(pre_out_balance)
+            .ok_or(error!(OrderErr::AccountingError))?;
+        require!(delta >= order.min_out, OrderErr::InsufficientOutput);
+
+        let order = &mut ctx.accounts.order;
+        order.state = 1;
+        Ok(())
+    }
+}
+```
+
+Keeper trả phí giao dịch (họ nhận phí keeper ở nơi khác — không được hiển thị). PDA escrow ký CPI. Cả kiểm tra slippage phía Raydium *và* kiểm tra delta riêng của escrow đều thực thi sàn — bảo hiểm kép.
+
+## Kiểm tra
+
+Kéo các chương trình Raydium vào bộ xác thực cục bộ để kiểm tra tích hợp (từ `Anchor.toml`):
+
+```toml
+[test.validator]
+clone = [
+  { address = "CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK" }, # CPMM
+  { address = "CLMM...." },                                     # CLMM
+  { address = "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8" }, # AMM v4
+  { address = "FarmqiPv5eAj3j1GMdMCMUGXqPUvmquZtMy86QH6rzhG" }, # Farm v6
+]
+```
+
+Cũng sao chép các tài khoản trạng thái pool để các bài kiểm tra của bạn có thể thực tế thực thi swap; `anchor test` tìm nạp chúng từ mainnet tại khởi động. Xem [`sdk-api/rust-cpi`](/vi/sdk-api/rust-cpi#testing-a-cpi-flow).
+
+## Các cạm bẫy cụ thể cho kết hợp
+
+### Reentrancy
+
+Solana không có reentrancy thực sự — một CPI không thể gọi lại vào chương trình gốc trong cùng một lệnh gọi. Nhưng bạn vẫn có thể xây dựng mình thành một reentrancy logic: một CPI đọc trạng thái của bạn, sau đó mã của bạn đọc lại nó giả định CPI đã không thay đổi nó. Đối với Raydium, các CPI không chạm vào trạng thái của bạn, vì vậy đây là mối lo ngại ít hơn so với ví dụ các bối cảnh flash-loan. Nhưng nếu bạn kết hợp Raydium với giao thức cho vay, hãy lưu ý.
+
+### Sự trôi của tính mutability tài khoản
+
+Nếu chương trình của bạn chuyển một tài khoản là `mut` nhưng Raydium mong đợi nó chỉ đọc (hoặc ngược lại), runtime từ chối lệnh gọi với `InvalidAccountData`. Luôn kiểm tra tính mutability dự kiến của hướng dẫn Raydium trong IDL; `anchor_cp_swap::cpi::accounts::Swap` thực thi nó qua các loại trường của nó.
+
+### Trường chương trình Token-2022
+
+Token đầu vào và đầu ra có thể nằm dưới các chương trình token khác nhau — một SPL Token, một Token-2022. CPI có các trường `input_token_program` và `output_token_program` riêng vì lý do này. Luôn kiểm tra trường `owner` của mỗi mint và định tuyến chương trình chính xác vào mỗi slot.
+
+### Giao dịch đã phiên bản
+
+Một tx kết hợp thực hiện 2+ CPI Raydium cộng với tạo ATA hiếm khi vừa trong một giao dịch cũ (v0-without-LUT). Sử dụng V0 với bảng tra cứu địa chỉ; kéo LUT công khai của Raydium qua `raydium.getRaydiumLutAddresses()`.
+
+## Con trỏ
+
+- [`sdk-api/rust-cpi`](/vi/sdk-api/rust-cpi) — cơ chế CPI cấp thấp.
+- [`integration-guides/priority-fee-tuning`](/vi/integration-guides/priority-fee-tuning) — sizing compute budget.
+- [`products/cpmm/code-demos`](/vi/products/cpmm/code-demos), [`products/clmm/code-demos`](/vi/products/clmm/code-demos), [`products/farm-staking/code-demos`](/vi/products/farm-staking/code-demos) — các đoạn CPI cho từng sản phẩm.
+
+Nguồn:
+
+- [raydium-cp-swap CPI crate](https://github.com/raydium-io/raydium-cp-swap)
+- [raydium-clmm CPI crate](https://github.com/raydium-io/raydium-clmm)
+- [Anchor CPI docs](https://www.anchor-lang.com/docs/cross-program-invocations)

@@ -1,0 +1,218 @@
+---
+title: "Farm / Staking accounts"
+description: "FarmState, UserStake / Ledger, reward vaults, and the authority PDAs — layouts and PDA seeds for farm v3, v5, and v6."
+---
+
+<Info>
+  **Three programs, three schemas.** Farm v3, v5, and v6 are separate programs with separate state layouts. This page documents each side by side. In practice most new integrations target v6; v3 and v5 are read-only for most integrators (staking already happened there long ago and the pools are in wind-down).
+</Info>
+
+## Account inventory (per farm, any version)
+
+| Account | Owner | Purpose |
+|---------|-------|---------|
+| `FarmState` | Farm program (v3/v5/v6) | Root state: staking mint, total staked, reward streams. |
+| `farm_authority` | Farm program | PDA that owns the staking vault and the reward vaults. |
+| `staking_vault` | SPL Token | Holds staked LP (or whatever the staking mint is). |
+| `reward_vault_{i}` | SPL Token | Holds the undistributed budget for reward stream `i`. One per stream. |
+| `UserStake` (v3/v5) / `UserLedger` (v6) | Farm program | Per-`(farm, user)` ledger: staked amount + snapshot of reward-per-share per stream. |
+
+The SDK returns the full set on `raydium.farm.getFarmById`. For arbitrary third-party farms, the API endpoint `GET https://api-v3.raydium.io/main/farms/info?ids=<FARM_ID>` also returns them.
+
+## `FarmState` layout — v6
+
+v6 is the current version. Its account structure is the most general.
+
+```rust
+// programs/farm_v6/src/state/farm.rs (abridged)
+pub struct FarmState {
+    pub state: u64,                // bitfield: 0 = live, 1 = paused, ...
+    pub nonce: u64,                 // bump for farm_authority
+    pub creator: Pubkey,            // original creator (can add rewards / transfer admin)
+    pub staking_mint: Pubkey,
+    pub staking_vault: Pubkey,
+    pub staking_token_program: Pubkey, // SPL Token or Token-2022
+    pub lp_mint_decimals: u8,
+    pub reward_period_len: u64,     // minimum duration between SetRewards edits
+    pub reward_period_min: u64,
+    pub total_staked: u64,
+    pub reward_info_count: u8,
+    pub _reserved: [u8; ...],
+    pub reward_infos: [RewardInfo; 5], // up to 5 reward streams
+}
+
+pub struct RewardInfo {
+    pub reward_state: u8,           // 0 = unused, 1 = running, 2 = ended
+    pub open_time: u64,             // start_time
+    pub end_time: u64,
+    pub last_update_time: u64,
+    pub emission_per_second_x64: u128, // Q64.64 fixed-point rate
+    pub reward_total_emissioned: u64,   // sum of emissions so far
+    pub reward_claimed: u64,            // sum paid out to stakers
+    pub reward_vault: Pubkey,
+    pub reward_mint: Pubkey,
+    pub reward_sender: Pubkey,          // who deposited the budget; can top up
+    pub reward_token_program: Pubkey,   // SPL or Token-2022
+    pub reward_per_share_x64: u128,     // Q64.64 counter
+}
+```
+
+Integrator-facing fields:
+
+- **`staking_mint`, `staking_vault`** — what gets staked and where it sits.
+- **`total_staked`** — current total. Required to compute APR: `reward_per_second × 86400 / total_staked`.
+- **`reward_infos[i].emission_per_second_x64`** — the Q64.64 rate. Divide by `2^64` for the true per-second token count.
+- **`reward_infos[i].open_time` / `end_time`** — for UI "X days left" displays.
+- **`reward_infos[i].reward_per_share_x64`** — the counter the `UserLedger` debts off.
+
+## `FarmState` layout — v5
+
+```rust
+pub struct FarmStateV5 {
+    pub state: u64,
+    pub nonce: u64,
+    pub lp_vault: Pubkey,            // aka staking_vault
+    pub reward_vaults: [Pubkey; 2],
+    pub owner: Pubkey,
+    pub reward_mints: [Pubkey; 2],
+    pub reward_total_emissioned: [u64; 2],
+    pub reward_claimed: [u64; 2],
+    pub reward_per_second: [u64; 2],  // integer, not fixed-point
+    pub reward_open_time: [u64; 2],
+    pub reward_end_time: [u64; 2],
+    pub reward_per_share: [u128; 2],  // Q56.8 or similar; check program source
+    pub total_staked: u64,
+    pub last_slot: u64,               // v5 updates per-slot on mainnet
+    pub _reserved: [u8; 256],
+}
+```
+
+Differences from v6:
+
+- **Per-slot, not per-second.** v5's update loop runs on slots rather than on the wall clock. The SDK normalizes this into "per-second" for the UI but on-chain the unit is slots.
+- **Integer emission rate.** `reward_per_second` is `u64`. This caps the minimum expressible rate at 1 unit per second, which is too coarse for low-emission streams on 9-decimal mints. v6 fixed this with the Q64.64 rate.
+- **No `reward_sender`**. On v5 the owner is the implicit sender; only `owner` can top up.
+
+## `FarmState` layout — v3
+
+```rust
+pub struct FarmStateV3 {
+    pub state: u64,
+    pub nonce: u64,
+    pub lp_vault: Pubkey,
+    pub reward_vault: Pubkey,          // single reward
+    pub owner: Pubkey,
+    pub reward_mint: Pubkey,
+    pub reward_total_emissioned: u64,
+    pub reward_claimed: u64,
+    pub reward_per_slot: u64,
+    pub reward_per_share: u128,
+    pub total_staked: u64,
+    pub last_slot: u64,
+    pub _reserved: [u8; 256],
+}
+```
+
+Single-reward. Slot-based. The oldest program generation, kept alive for the RAY-USDC and SOL-USDC farms that predate v5.
+
+## `UserLedger` (v6) / `UserStake` (v5/v3)
+
+Per-user state, one account per `(farm, user)` pair. Seeded PDA:
+
+```ts
+// v6
+const [ledgerPda] = PublicKey.findProgramAddressSync(
+  [farmId.toBuffer(), user.toBuffer(), Buffer.from("user_stake_info_v2")],
+  FARM_V6_PROGRAM_ID,
+);
+
+// v5
+const [stakePda] = PublicKey.findProgramAddressSync(
+  [farmId.toBuffer(), user.toBuffer(), Buffer.from("user_stake_info")],
+  FARM_V5_PROGRAM_ID,
+);
+
+// v3
+const [stakePda] = PublicKey.findProgramAddressSync(
+  [farmId.toBuffer(), user.toBuffer(), Buffer.from("staker_info")],
+  FARM_V3_PROGRAM_ID,
+);
+```
+
+(Seed strings are the values actually used by the SDK; program versions have historically varied them. Verify against the v6 source for anything security-critical.)
+
+```rust
+// v6
+pub struct UserLedger {
+    pub version: u64,
+    pub farm_id: Pubkey,
+    pub owner: Pubkey,
+    pub deposited: u64,                          // current stake
+    pub reward_debts: [u128; 5],                 // snapshot of reward_per_share_x64 × deposited
+}
+```
+
+The per-stream debt is the accounting offset described in the overview:
+
+```
+pending_for_stream_i = deposited × reward_per_share_x64[i] / 2^64  − reward_debts[i]
+```
+
+After each `Deposit`, `Withdraw`, or `Harvest`, the debt is reset to the current `deposited × reward_per_share_x64[i] / 2^64`.
+
+## Authority PDAs
+
+```ts
+// v6
+const [farmAuthorityV6] = PublicKey.findProgramAddressSync(
+  [farmId.toBuffer()],
+  FARM_V6_PROGRAM_ID,
+);
+
+// v5
+const [farmAuthorityV5] = PublicKey.findProgramAddressSync(
+  [farmId.toBuffer()],
+  FARM_V5_PROGRAM_ID,
+);
+
+// v3
+const [farmAuthorityV3] = PublicKey.findProgramAddressSync(
+  [farmId.toBuffer()],
+  FARM_V3_PROGRAM_ID,
+);
+```
+
+All three versions derive the farm authority per-farm with a single seed. This PDA is the authority on the staking vault and on each reward vault. It signs every transfer the farm makes.
+
+## Vaults
+
+Staking and reward vaults are standard SPL Token accounts whose `owner` is the farm authority PDA. Addresses are stored on `FarmState` — do not re-derive; read from state. Freeze authorities must be disabled on the staking mint for v5/v6 (the program checks).
+
+Token-2022 notes:
+
+- **v3**: SPL Token only.
+- **v5**: SPL Token only.
+- **v6**: Supports Token-2022 on both staking and reward mints, gated on `staking_token_program` / `reward_token_program` fields. Transfer fees on Token-2022 reward mints are charged on emit (vault → user).
+
+## Observation and APR
+
+Farms do not store APR on-chain. To compute:
+
+```
+annualized_rewards_value_usd = reward_per_second × 86400 × 365 × reward_usd_price
+tvl_usd                     = total_staked / 10^decimals × staking_mint_usd_price
+apr                         = annualized_rewards_value_usd / tvl_usd
+```
+
+Consumers typically pull `staking_mint_usd_price` from the pool the LP belongs to (via `api-v3.raydium.io/pools/info/ids`) and `reward_usd_price` from any price oracle.
+
+## Where to go next
+
+- [`products/farm-staking/instructions`](/products/farm-staking/instructions) — per-version instruction reference.
+- [`products/farm-staking/code-demos`](/products/farm-staking/code-demos) — staking, harvesting, and creating farms via the SDK.
+- [`reference/program-addresses`](/reference/program-addresses) — all three program IDs.
+
+Sources:
+
+- [Raydium SDK v2 `Farm` module](https://github.com/raydium-io/raydium-sdk-V2)
+- Farm v6 program source is not currently published as a standalone repo; the IDL is bundled in the SDK at [`raydium-io/raydium-sdk-V2`](https://github.com/raydium-io/raydium-sdk-V2) under `src/raydium/farm/`.

@@ -1,0 +1,183 @@
+---
+title: "AMM v4 수학"
+description: "AMM v4의 수수료 규칙을 적용한 상수곱 불변식, 리저브-오더북 가격 변환, 대상 주문 그리드 구성, PnL 결제 단계."
+---
+
+<Info>
+  **이 페이지는 AI 자동 번역입니다. 모든 내용은 영문판을 기준으로 합니다.**
+
+  [영문판 보기 →](/products/amm-v4/math)
+</Info>
+
+## 불변식
+
+풀은 `coin_reserve × pc_reserve = k`를 유지합니다. 여기서:
+
+```
+coin_reserve = coin_vault_balance
+             + orders_posted_on_openbook.base
+             + pending_coin_fill_not_yet_settled
+pc_reserve   = pc_vault_balance
+             + orders_posted_on_openbook.quote
+             + pending_pc_fill_not_yet_settled
+             - accrued_pnl_pc
+```
+
+주목할 점 두 가지:
+
+1. 리저브는 **OpenBook에 체결된 수량**을 포함합니다. AMM의 지정가 주문은 오더북에서 손실되지 않고 단지 에스크로우되어 있을 뿐 유동성의 일부로 남아있습니다. 온체인 금고 잔액만으로 `k`를 계산하면 리저브를 과소평가하게 됩니다.
+2. PnL 누적액(`need_take_pnl_*`)을 차감하므로 관리자가 수수료를 회수할 때 곡선이 보존됩니다. CPMM의 `protocol_fees_*` 제외 원칙과 동일합니다.
+
+모든 `Swap*` 작업은 LP의 수수료 부분을 리저브에 다시 더한 후 `k' ≥ k`를 강제합니다.
+
+## 수수료 규칙
+
+AMM v4는 CPMM/CLMM의 `1/1_000_000` 규칙 대신 **비율 수수료**(분자/분모 쌍)를 사용합니다. 온체인 `Fees` 구조체는 ([프로그램 소스](https://github.com/raydium-io/raydium-amm/blob/master/program/src/state.rs)의 [`Fees::initialize`](https://github.com/raydium-io/raydium-amm/blob/master/program/src/state.rs) 참고) 다음과 같이 기본값이 설정됩니다:
+
+```
+Fees {
+  min_separate_numerator:    5,
+  min_separate_denominator:  10_000,   //  5/10_000 = 0.05%
+
+  trade_fee_numerator:      25,
+  trade_fee_denominator:    10_000,    // 25/10_000 = 0.25% — OpenBook 지정가 주문 가격 책정에 사용됨
+
+  pnl_numerator:            12,
+  pnl_denominator:          100,       // 12/100   = 12%   — 스왑 수수료의 프로토콜 분배액
+
+  swap_fee_numerator:       25,
+  swap_fee_denominator:     10_000,    // 25/10_000 = 0.25% — AMM 경로 스왑의 총 수수료
+}
+```
+
+해석 (공개된 메인넷 기본값):
+
+- **총 스왑 수수료:** `swap_fee = amount_in × 25 / 10_000 = 0.25%` (총 입력액 기준)
+- **프로토콜 분배액:** `pnl_numerator / pnl_denominator = 12 / 100 = 12%` **스왑 수수료 기준**이므로 거래량의 `0.25% × 12% = 0.03%`입니다. 이 부분은 PnL 카운터에 누적되고 `WithdrawPnl`로 회수됩니다.
+- **LP 분배액:** 스왑 수수료의 나머지 `88%`이므로 거래량의 `0.25% × 88% = 0.22%`입니다. 풀에 남아있고 `k`를 증가시킵니다.
+- **펀드 분배액 없음.** AMM v4는 CPMM/CLMM의 펀드 수수료 분할이 없습니다.
+
+`pnl_numerator / pnl_denominator`는 거래량이 아닌 **수수료의 비율**임에 주의하세요. 이는 흔한 오독입니다.
+
+`trade_fee_numerator / trade_fee_denominator` (역시 `25 / 10_000`)는 AMM의 지정가 주문 그리드에 대한 수수료 포함 가격을 계산할 때 OpenBook 통합에서 사용되는 별도의 필드입니다. 기본적으로 `swap_fee`와 같지만 다른 코드 경로에서 읽혀집니다.
+
+이러한 기본값의 편차는 드물지만 소수의 레거시 풀에 존재합니다. 인용하기 전에 항상 `AmmInfo.fees`에서 수수료를 읽으세요.
+
+## 직접 스왑 수학 (AMM 경로)
+
+가장 단순한 경우: 사용자가 OpenBook과의 상호작용 없이 풀의 금고에 대해 스왑합니다. 풀의 내부 리저브(온북 할당 포함)는 분모입니다.
+
+**SwapBaseIn (정확한 입력):**
+
+```
+amount_after_fee = amount_in − ceil(amount_in × swap_fee_numerator / swap_fee_denominator)
+amount_out = amount_after_fee × out_reserve
+           / (in_reserve + amount_after_fee)
+require(amount_out >= minimum_amount_out)
+```
+
+여기서 사용되는 리저브는 **유효** 리저브입니다. 역사적으로 이것은 `coin_vault_balance + coin_posted_on_openbook + ...`였습니다 (AMM의 금고 더하기 OpenBook 주문에 잠긴 토큰). **OpenBook 비활성화 이후로 온북 잔액은 0**이므로 유효 리저브는 원시 금고 잔액과 같습니다. OpenBook 측을 새로고침하는 데 사용된 `MonitorStep` / 암묵적 결제 경로는 더 이상 실제로 필요하지 않습니다.
+
+**SwapBaseOut (정확한 출력):**
+
+```
+amount_in_after_fee = ceil(in_reserve × amount_out / (out_reserve − amount_out))
+amount_in_gross     = ceil(amount_in_after_fee × swap_fee_denominator
+                            / (swap_fee_denominator − swap_fee_numerator))
+require(amount_in_gross <= maximum_amount_in)
+```
+
+## 오더북 상호작용 (역사적)
+
+<Note>
+  **더 이상 활성화되지 않음.** 이 섹션에서 설명하는 그리드 구성은 AMM v4가 원래 곡선을 OpenBook 마켓에 반영하는 방식을 나타냅니다. OpenBook 통합은 비활성화되었으며, 풀은 더 이상 OpenBook에 주문을 게시하거나 유지하지 않습니다. 아래 수학은 맥락을 위해 보존되어 있습니다. 온체인 `target_orders` / `amm_open_orders` 계정이 어떤 크기로 설정되었는지, 그리고 키퍼가 더 이상 이를 실행하지 않음에도 불구하고 프로그램이 왜 `MonitorStep` 관련 파라미터를 계속 검증하는지 설명합니다.
+</Note>
+
+사용자 스왑과는 별개로, AMM v4는 역사적으로 OpenBook 마켓에 **그리드**의 지정가 주문을 배치했습니다. 그리드는 `AmmInfo` 파라미터에서 계산되었습니다:
+
+- **`depth`** — 한쪽당 가격 수준의 개수.
+- **`amount_wave`** — 레벨당 기본 크기 단위.
+- **`min_size`**, **`coin_lot_size`**, **`pc_lot_size`** — OpenBook 마켓 제약.
+- **`state_data.swap_acc_coin_fee`**, **`swap_acc_pc_fee`** — 마지막 `TakePnl` 이후의 누적 수수료 카운터.
+
+프로그램은 현재 곡선 가격에서 일정한 비율 단계로 걸어서 레벨별 가격을 도출합니다:
+
+```
+price_level(k) = curve_price × (1.0001 ^ k)       # 개념적으로
+size_level(k)  = amount_wave × f(depth, k)        # depth로 테이퍼됨
+```
+
+정확한 가격과 크기는 `build_orders`에서 계산된 `target_orders`로 결정되고 각 `MonitorStep`에서 `amm_open_orders`와 비교됩니다. 어떤 차이도 취소 + 새로운 게시로 귀결됩니다. OpenBook에서 새로 체결된 주문은 OpenBook 측을 새로고침하는 다음 작업 시 풀 금고로 결제됩니다.
+
+통합자는 그리드를 계산할 필요가 거의 없습니다 (Raydium 키퍼가 이를 유지합니다). 하지만 다음을 알면 유용합니다:
+
+- 상당한 **온북** 유동성이 있는 풀은 유동성이 `k`에 기여하고, 유휴 상태가 아닙니다.
+- 오래된 OpenBook 마켓 (이벤트 큐가 가득 참, 크랭크 차단됨)은 그리드 업데이트를 방지합니다. AMM은 그 다음 크랭크까지 보이는 오더북과 다르게 가격을 인용할 수 있습니다.
+
+## 결제 단계 (PnL)
+
+0.03% 프로토콜 분배액은 `state_data.need_take_pnl_coin` 및 `state_data.need_take_pnl_pc`에 누적됩니다. `TakePnl`은 이 금액을 금고에서 관리자가 지정한 목적지로 이동한 후 카운터를 0으로 초기화합니다.
+
+결정적 속성: 불변식의 리저브는 항상 **PnL 차감 후** 계산되므로, `TakePnl`은 곡선을 움직이지 않습니다. 이는 CPMM 규칙과 일치합니다.
+
+## 작동 예제
+
+풀 상태:
+
+- `coin_reserve = 1_000_000_000_000` (100만 코인 측; 6 decimals)
+- `pc_reserve   = 2_000_000_000_000` (200만 pc 측; 6 decimals)
+- 수수료: 기본값 `swap = 25/10_000`, `pnl = 3/10_000`.
+
+사용자: `SwapBaseIn` 정확한 입력 `1_000_000_000` 코인 (1000 코인).
+
+```
+swap_fee        = ceil(1_000_000_000 * 25 / 10_000)    = 2_500_000
+amount_after_fee =                                      997_500_000
+
+amount_out = amount_after_fee * pc_reserve
+           / (coin_reserve + amount_after_fee)
+           = 997_500_000 * 2_000_000_000_000
+           / (1_000_000_000_000 + 997_500_000)
+           ≈ 1_995_015_009  (1,995.015 pc)
+
+// 2_500_000 스왑 수수료 중:
+pnl_share = 2_500_000 * 3 / 25  = 300_000    (프로토콜로 need_take_pnl_coin를 통해 이동)
+lp_share  = 2_500_000 * 22 / 25 = 2_200_000  (coin_reserve에 남음)
+
+new coin_reserve = 1_000_000_000_000 + 1_000_000_000                 = 1_001_000_000_000
+                   (이 중 300_000은 누적된 PnL)
+  curve coin_reserve = 1_001_000_000_000 − 300_000 = 1_000_999_700_000
+new pc_reserve   = 2_000_000_000_000 − 1_995_015_009                 ≈ 1_998_004_984_991
+
+k' = curve_coin_reserve * new_pc_reserve
+   ≈ 2.000_002_701E24
+k  = 1_000_000_000_000 * 2_000_000_000_000
+   = 2.0E24
+k' > k   ✓
+```
+
+LP 분배액(`2_200_000`)은 어디에도 분리되지 않습니다. `k'`을 올리는 잔차일 뿐입니다.
+
+## 정밀도 규칙
+
+- 리저브 곱셈은 `u128`을 사용하며, 최종 나눗셈은 0 방향으로 반올림합니다.
+- `swap_fee`는 반올림됩니다 (풀이 수수료를 과소청구하지 않도록).
+- `SwapBaseOut`의 `amount_in`은 반올림됩니다 (사용자가 미지불하지 않도록).
+- 극단적인 리저브 비율을 가진 풀은 매우 작은 입력에 대해 `ZeroTradingTokens`에 도달할 수 있습니다. CPMM과 동일한 규칙입니다.
+
+## CPMM 대비 제한사항
+
+- AMM v4의 리저브는 OpenBook 에스크로우 부분을 포함하므로, 통합자가 `getTokenAccountBalance`만으로는 올바르게 인용할 수 없습니다. 항상 전체 상태 (금고 + `open_orders.free` + `open_orders.locked`)를 가져오거나, SDK / API 인용을 사용하세요.
+- AMM v4는 구조화된 온체인 TWAP을 노출하지 않습니다. AMM v4 지원 가격을 원하는 외부 소비자는 거래 로그에서 직접 계산해야 합니다.
+- Token-2022는 지원되지 않습니다.
+
+## 다음 단계
+
+- [`products/amm-v4/instructions`](/ko/products/amm-v4/instructions) — `SwapBaseIn`, `Deposit` 등이 연결되는 곳.
+- [`products/amm-v4/fees`](/ko/products/amm-v4/fees) — 완전한 수수료 메커니즘, `TakePnl` 세부사항.
+- [`algorithms/constant-product`](/ko/algorithms/constant-product) — 공유되는 도출.
+
+출처:
+
+- [Raydium AMM 프로그램 소스 — `raydium-io/raydium-amm`](https://github.com/raydium-io/raydium-amm)
+- Raydium SDK v2 `Liquidity` 모듈

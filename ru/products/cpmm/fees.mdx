@@ -1,0 +1,264 @@
+---
+title: "Комиссии CPMM"
+description: "Как CPMM взимает торговую комиссию и отдельную комиссию создателя, распределяет торговую комиссию между поставщиками ликвидности, казной протокола и мультиподписью фонда, а также кто и когда собирает средства."
+---
+
+<Info>
+  **Эта страница переведена с помощью ИИ. За эталон принимается английская версия.**
+
+  [Открыть английскую версию →](/products/cpmm/fees)
+</Info>
+
+## Две независимые комиссии, четыре получателя
+
+CPMM взимает **две отдельно рассчитанные комиссии** при каждом своп:
+
+1. **Торговая комиссия** — взимается по ставке `AmmConfig.trade_fee_rate` и распределяется между тремя получателями:
+   - **Доля LP** — остаётся в хранилище и увеличивает `k`. Запрашивается неявно путём сжигания LP-токенов.
+   - **Доля протокола** — накапливается в `PoolState.protocol_fees_token*`; собирается `protocol_owner` через `CollectProtocolFee`.
+   - **Доля фонда** — накапливается в `PoolState.fund_fees_token*`; собирается `fund_owner` через `CollectFundFee`.
+2. **Комиссия создателя** (опционально, для каждого пула) — взимается по ставке `AmmConfig.creator_fee_rate` **независимо** от торговой комиссии, накапливается в `PoolState.creator_fees_token*`, собирается `pool_state.pool_creator` через `CollectCreatorFee`. Активна только если пул был создан с `enable_creator_fee = true`.
+
+Комиссия создателя **не является** частью торговой комиссии. Две ставки складываются при взятии комиссии на входе своп, но каждая остаётся в собственном счёте — доли протокола и фонда всегда берутся только из `trade_fee`, никогда из `creator_fee`. Пул с `creator_fee_rate = 1000` (0,10%) и `trade_fee_rate = 2500` (0,25%) взимает суммарно 0,35% входа при своп с комиссией создателя на входе, из которых создатель получает 0,10% а торговая комиссия занимает 0,25%.
+
+Ставки торговой комиссии (`trade_fee_rate`, `protocol_fee_rate`, `fund_fee_rate`) и `creator_fee_rate` находятся на `AmmConfig`. Флаг `enable_creator_fee` для каждого пула и режим `creator_fee_on` (с какой стороны своп берётся комиссия создателя) находятся на `PoolState`. См. [`products/cpmm/accounts`](/ru/products/cpmm/accounts).
+
+## Ставки и единицы
+
+Все ставки — это `u64` в единицах `1 / FEE_RATE_DENOMINATOR`, где `FEE_RATE_DENOMINATOR = 1_000_000`.
+
+- **`trade_fee_rate`** — доля **объёма своп**. `2500` ⇒ 0,25% от соответствующей стороны (входа или выхода, в зависимости от `creator_fee_on` — см. раздел "С какой стороны своп берутся комиссии" ниже).
+- **`creator_fee_rate`** — доля **объёма своп**, взимается **отдельно** от торговой комиссии. `1000` ⇒ 0,10% от соответствующей стороны.
+- **`protocol_fee_rate`** и **`fund_fee_rate`** — доли **торговой комиссии**, а не объёма. `120_000` ⇒ 12% торговой комиссии.
+
+Параметры по умолчанию для `AmmConfig[index=0]` (пула "стандартный" 0,25%) на mainnet для справки:
+
+| Поле | Значение | Эффективный процент |
+|-------|----------|-------------------|
+| `trade_fee_rate` | `2500` | 0,25% объёма (корзина торговой комиссии) |
+| `protocol_fee_rate` | `120000` | 12% торговой комиссии ≈ **0,030% объёма** |
+| `fund_fee_rate` | `40000` | 4% торговой комиссии ≈ **0,010% объёма** |
+| `creator_fee_rate` | `0` (по умолчанию) | 0% (отдельная корзина) |
+| → Эффективная доля LP | | **0,210% объёма** |
+
+Таким образом, при своп на \$1000 с использованием `AmmConfig[0]` и `enable_creator_fee = false`: всего \$2,50 торговой комиссии, из которых \$2,10 остаётся LP, \$0,30 идёт в протокол, \$0,10 в фонд. Корзина создателя равна 0, так как комиссия создателя отключена.
+
+Если бы тот же пул имел `enable_creator_fee = true` и `creator_fee_rate = 1000` (0,10%), пользователь платит дополнительно \$1,00 в корзину создателя — взимается с той же стороны своп, настроенной через `creator_fee_on` — итого \$3,50 комиссий. Корзина торговой комиссии и её распределение между протоколом/фондом остаются неизменными.
+
+Проверьте текущие значения mainnet в `GET https://api-v3.raydium.io/main/cpmm-config` — ставки администратором изменяются и должны читаться свежими, а не жёстко кодироваться.
+
+## Распределение в коде
+
+```rust
+// Упрощённо из raydium-cp-swap/programs/cp-swap/src/curve/{calculator,fees}.rs.
+// Реальный код ветвится на `is_creator_fee_on_input`; обе ветви сохраняют
+// инвариант, что creator_fee имеет собственную ставку, никогда не срез trade_fee.
+
+const FEE_RATE_DENOMINATOR_VALUE: u64 = 1_000_000;
+
+pub struct FeeBreakdown {
+    pub amount_in_after_fees: u64,    // вход минус все комиссии, взятые со входа
+    pub amount_out_after_fees: u64,   // выход минус любая комиссия создателя со выхода
+    pub trade_fee:    u64,            // → распределяется на LP / протокол / фонд ниже
+    pub protocol_fee: u64,            // доля trade_fee
+    pub fund_fee:     u64,            // доля trade_fee
+    pub creator_fee:  u64,            // независимая корзина (вход или выход)
+}
+
+fn take_fees_on_input(
+    amount_in: u64,
+    trade_rate: u64,
+    creator_rate: u64,
+    protocol_rate: u64,
+    fund_rate: u64,
+) -> (u64 /* trade_fee */, u64 /* creator_fee */, u64 /* amount_in_after_fees */) {
+    // Две ставки складываются, поэтому мы округляем один раз на объединённой комиссии,
+    // затем распределяем пропорционально — это чисто трюк округления/эффективности.
+    // Распределение соответствует ставкам точно: creator_fee/trade_fee == creator_rate/trade_rate.
+    let total_fee = ((amount_in as u128) * ((trade_rate + creator_rate) as u128))
+        .div_ceil(FEE_RATE_DENOMINATOR_VALUE as u128) as u64;
+
+    let creator_fee = ((total_fee as u128) * (creator_rate as u128)
+                       / ((trade_rate + creator_rate) as u128)) as u64;
+    let trade_fee   = total_fee - creator_fee;
+
+    (trade_fee, creator_fee, amount_in - total_fee)
+}
+
+fn take_creator_fee_on_output(amount_out_swapped: u64, creator_rate: u64) -> (u64, u64) {
+    // Когда creator_fee_on маршрутизирует комиссию создателя на выход,
+    // trade_fee берётся на входе как одна ставка, а creator_fee
+    // рассчитывается относительно выхода кривой.
+    let creator_fee = ((amount_out_swapped as u128) * (creator_rate as u128))
+        .div_ceil(FEE_RATE_DENOMINATOR_VALUE as u128) as u64;
+    (amount_out_swapped - creator_fee, creator_fee)
+}
+
+fn split_trade_fee(
+    trade_fee: u64,
+    protocol_rate: u64,
+    fund_rate: u64,
+) -> (u64 /* protocol_fee */, u64 /* fund_fee */) {
+    let protocol_fee = (trade_fee as u128 * protocol_rate as u128
+                        / FEE_RATE_DENOMINATOR_VALUE as u128) as u64;
+    let fund_fee     = (trade_fee as u128 * fund_rate as u128
+                        / FEE_RATE_DENOMINATOR_VALUE as u128) as u64;
+    (protocol_fee, fund_fee)
+}
+```
+
+Примечания:
+
+- Полная комиссия на входе округляется **вверх**, чтобы пул никогда не недозаряжал.
+- Подраспределения `trade_fee` (протокол, фонд) округляются **вниз**, так что их сумма никогда не превышает `trade_fee`; остаток — это доля LP.
+- `lp_share = trade_fee − protocol_fee − fund_fee` (creator_fee **не** вычитается здесь, так как это независимая корзина).
+- Комиссия создателя берётся со входа или выхода в зависимости от `PoolState.creator_fee_on` (см. следующий раздел). Ставка при этом не меняется.
+
+## С какой стороны своп берутся комиссии
+
+CPMM имеет настройку для каждого пула `creator_fee_on` (`BothToken` / `OnlyToken0` / `OnlyToken1`), которая определяет, берётся ли комиссия создателя со **входа** или **выхода** конкретного своп. Вспомогательная функция времени выполнения `is_creator_fee_on_input(direction)` сводит это к логическому значению для каждого своп:
+
+| `creator_fee_on` | Своп `0 → 1` | Своп `1 → 0` |
+|------------------|---------------|---------------|
+| `BothToken` (`0`) | сторона входа | сторона входа |
+| `OnlyToken0` (`1`) | сторона входа | сторона выхода |
+| `OnlyToken1` (`2`) | сторона выхода | сторона входа |
+
+Когда комиссия создателя находится на **входе**, как торговая комиссия, так и комиссия создателя вычитаются из `amount_in` до запуска кривой. Математика котировки: возьмите объединённую `trade_rate + creator_rate` с входа.
+
+Когда комиссия создателя находится на **выходе**, только торговая комиссия вычитается из `amount_in`; кривая производит выход без комиссии, затем комиссия создателя вычитается из этого выхода. Математика котировки: возьмите `trade_rate` с входа; возьмите `creator_rate` с выхода.
+
+Сама торговая комиссия всегда берётся на входе (стандартный паттерн Uniswap-V2). Только комиссия создателя может быть на выходе.
+
+## Как «накопленные» комиссии взаимодействуют с кривой
+
+Важный момент: **комиссии протокола, фонда и создателя остаются физически в хранилище** до вызова соответствующей инструкции `Collect*`. Но они исключены из представления кривой о балансе хранилища.
+
+Конкретная картина после одного своп:
+
+```
+raw_vault_0_balance = getTokenAccountBalance(vault_0).amount
+                    = lp_entitled + protocol_fees_token0
+                      + fund_fees_token0 + creator_fees_token0
+
+curve_x = raw_vault_0_balance − (protocol_fees_token0
+                                  + fund_fees_token0
+                                  + creator_fees_token0)
+```
+
+Программа использует `curve_x` (и аналогичный `curve_y`) при проверке `k' ≥ k`. Так комиссии, не относящиеся к LP, достигают своих адресатов **без** увеличения доли LP в пуле.
+
+Следствия, вокруг которых вы должны проектировать:
+
+- **Котировка по сырым балансам неправильна.** Если вы построите котировщик на основе `getTokenAccountBalance`, вы постоянно завысите цену, которую пул поддерживает. Всегда вычитайте накопленные комиссии или проводите симуляцию через `SwapBaseInput` / API.
+- **`CollectProtocolFee` не движет цену.** Она вывозит токены из хранилища *и* обнуляет счётчики `protocol_fees_token*`, так что `curve_x` и `curve_y` остаются неизменными.
+- **Комиссии LP не накапливаются на счётчик.** Они неявны в балансе хранилища. Право LP на накопленные комиссии LP осуществляется путём сжигания LP-токенов (то есть через `Withdraw`) — нет `CollectLpFee`.
+
+## Взаимодействие с комиссиями передачи Token-2022
+
+Комиссии передачи Token-2022 применяются **монетой**, а не CPMM. Они действуют при каждой передаче токена — своп, депозит, снятие и сборка `Collect*`. Математика торговой комиссии CPMM вычисляется на сумме, которая **фактически приземлилась в хранилище**, т.е. за вычетом комиссии передачи входной монеты (если таковая есть).
+
+Таким образом, в худшем случае пользователь платит три отдельных налога при своп с точным входом:
+
+1. Комиссия передачи входной монеты на `amount_in` (органу сбора комиссий монеты).
+2. Торговая комиссия пула на остаток (распределяется как описано выше).
+3. Комиссия передачи выходной монеты на `amount_out` (органу сбора комиссий монеты).
+
+Котировщик SDK учитывает все три, так что `minimum_amount_out` выражена в том, что пользователь действительно получает. Если вы пишете свой собственный котировщик, отразите это поведение, иначе ваши проверки проскальзывания будут систематически слишком мягкими.
+
+См. [`algorithms/token-2022-transfer-fees`](/ru/algorithms/token-2022-transfer-fees) для детального вывода.
+
+## Комиссия создателя
+
+Комиссия создателя опциональна и зависит от пула. **Ставка** находится на `AmmConfig.creator_fee_rate`; **флаг включения** и **сторона** (`creator_fee_on`) находятся на `PoolState`:
+
+- **Включена при создании пула.** `Initialize` по умолчанию устанавливает `enable_creator_fee = false`; пулы, созданные через `InitializeWithPermission` (используется выпускниками LaunchLab и другими охраняемыми путями), могут передать `enable_creator_fee = true` и выбрать `creator_fee_on`.
+- **Ставка общая с категорией комиссии.** Сама ставка — это `AmmConfig.creator_fee_rate`, одно и то же значение для каждого пула, связанного с этой конфигурацией. Каждый пул затем решает, взимать ли её (`enable_creator_fee`) и со стороны какого своп (`creator_fee_on`). Когда `enable_creator_fee = false`, эффективная ставка комиссии создателя пула равна нулю независимо от значения конфига (см. `PoolState::adjust_creator_fee_rate` в исходниках).
+- **Независима от торговой комиссии.** Комиссия создателя никогда не уменьшает доли LP / протокола / фонда — это собственная ставка, применяется отдельно, накапливается в собственных счётчиках.
+- **Собирается через `CollectCreatorFee`**, подписано `PoolState.pool_creator`.
+- **Не может быть переактивирована или перенаправлена после создания.** Пул, инициализированный с `enable_creator_fee = false`, никогда не будет взимать комиссию создателя; один, инициализированный с конкретным `creator_fee_on`, не может переключать стороны.
+
+Комиссии создателя — это механизм, стоящий за паттерном Raydium "Burn & Earn": LP-токены блокируются в программе [LP Lock](/ru/reference/program-addresses), так что создатель не может вывести ликвидность, но всё ещё может претендовать на `CollectCreatorFee` бесконечно.
+
+## Операционный процесс сборки
+
+| Подписант | Инструкция | Обнуленные счётчики источника | Типичная частота |
+|--------|-------------|------------------------|-----------------|
+| `amm_config.protocol_owner` | `CollectProtocolFee` | `protocol_fees_token{0,1}` | Еженедельно или программно |
+| `amm_config.fund_owner` | `CollectFundFee` | `fund_fees_token{0,1}` | Еженедельно или программно |
+| `pool_state.pool_creator` | `CollectCreatorFee` | `creator_fees_token{0,1}` | В любое время |
+
+Владельцы протокола и фонда — это мультиподпись Raydium на mainnet; см. [`security/admin-and-multisig`](/ru/security/admin-and-multisig). Подписант создателя — это учётная запись, которая запустила `Initialize`.
+
+## Изменение категории комиссии
+
+Ставки комиссии могут быть изменены администратором через `UpdateAmmConfig` (см. [`products/cpmm/instructions`](/ru/products/cpmm/instructions)). Изменения вступают в силу при **следующем своп** для каждого пула, связанного с этой `AmmConfig` — нет миграции, потому что пулы загружают конфиг при каждом своп.
+
+Что администратор не может делать:
+
+- Перемещать пул из одной `AmmConfig` в другую.
+- Переоценивать уже накопленные комиссии задним числом.
+- Собирать комиссии без подписи `protocol_owner` / `fund_owner`.
+
+## Чтение комиссий из работающего пула
+
+```ts
+// Вне цепи: текущие накопленные комиссии в каждой корзине
+const pool = await connection.getAccountInfo(poolStatePda);
+const decoded = PoolState.decode(pool.data);
+console.log(
+  "Protocol accrued:",
+  decoded.protocolFeesToken0.toString(),
+  decoded.protocolFeesToken1.toString(),
+);
+console.log(
+  "Fund accrued:",
+  decoded.fundFeesToken0.toString(),
+  decoded.fundFeesToken1.toString(),
+);
+console.log(
+  "Creator accrued:",
+  decoded.creatorFeesToken0.toString(),
+  decoded.creatorFeesToken1.toString(),
+);
+
+// Вне цепи: эффективные ставки сегодня.
+// trade_fee_rate, creator_fee_rate — доли объёма (знаменатель 1e6).
+// protocol_fee_rate, fund_fee_rate — доли *торговой комиссии* (тот же знаменатель).
+const config = await fetch("https://api-v3.raydium.io/main/cpmm-config")
+  .then((r) => r.json());
+const tier = config.data.find((t) => t.index === decoded.ammConfigIndex);
+
+const tradeFeeOfVolume   = tier.tradeFeeRate / 1_000_000;
+const protocolOfTradeFee = tier.protocolFeeRate / 1_000_000;
+const fundOfTradeFee     = tier.fundFeeRate / 1_000_000;
+const lpOfTradeFee       = 1 - protocolOfTradeFee - fundOfTradeFee;
+
+console.log("LP fee effective:",       (tradeFeeOfVolume * lpOfTradeFee * 100).toFixed(4), "%");
+console.log("Protocol fee effective:", (tradeFeeOfVolume * protocolOfTradeFee * 100).toFixed(4), "%");
+console.log("Fund fee effective:",     (tradeFeeOfVolume * fundOfTradeFee * 100).toFixed(4), "%");
+console.log(
+  "Creator fee effective:",
+  decoded.enableCreatorFee
+    ? ((tier.creatorFeeRate / 1_000_000) * 100).toFixed(4) + " %"
+    : "0 % (disabled on this pool)",
+);
+```
+
+## Сравнение с CLMM и AMM v4
+
+См. [`reference/fee-comparison`](/ru/reference/fee-comparison) для матрицы бок-о-бок. Краткий обзор:
+
+- **AMM v4** использует фиксированную 0,25% торговую комиссию с другим распределением LP/протокола и без комиссии фонда.
+- **CLMM** комиссии зависят от категории расстояния между тиками, накапливаются для каждой позиции (не для пула), и запрашиваются через `DecreaseLiquidity` или `CollectFees`.
+
+## Куда дальше
+
+- [`products/cpmm/math`](/ru/products/cpmm/math) — где вычитание торговой комиссии вставляется в кривую.
+- [`products/cpmm/instructions`](/ru/products/cpmm/instructions) — списки учётных записей инструкции `Collect*`.
+- [`algorithms/token-2022-transfer-fees`](/ru/algorithms/token-2022-transfer-fees) — как правильно объединить комиссию пула с комиссией передачи монеты.
+
+Источники:
+
+- [`raydium-io/raydium-cp-swap` — `states/config.rs`, `states/pool.rs`, `states/curve.rs`](https://github.com/raydium-io/raydium-cp-swap)
+- [Raydium API — `GET /main/cpmm-config`](https://api-v3.raydium.io/main/cpmm-config)

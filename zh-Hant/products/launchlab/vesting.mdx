@@ -1,0 +1,241 @@
+---
+title: "LaunchLab 代幣解鎖"
+description: "鎖定的代幣、懸崖期和線性解鎖時程、每位受益人的 VestingRecord 帳戶，以及建立者和平台用於在畢業後分配預留供應量的建立／領取指令。"
+---
+
+<Info>
+  **本頁內容由 AI 自動翻譯，所有內容以英文版本為準。**
+
+  [查看英文版 →](/products/launchlab/vesting)
+</Info>
+
+<Info>
+  LaunchLab 啟動時，代幣解鎖是**選用項目**。在 `Initialize` 時設定 `vesting_param.total_locked_amount = 0`，下面的章節將不適用。一旦啟用，時程在啟動的生命週期內固定；懸崖期和解鎖期無法事後變更。
+</Info>
+
+## 為什麼需要解鎖機制
+
+聯合曲線在募資期間售出 `base_supply_graduation` 個代幣，並將餘額用於畢業後的流動性池。解鎖機制從供應量中切割出額外的部分，將其鎖定一段可配置的懸崖期，然後線性地釋放給一個或多個受益人──通常是建立者的團隊、顧問或平台合作夥伴。
+
+實際應用案例：
+
+- **團隊分配。** 建立者為創始團隊預留供應量的 5%，鎖定 6 個月，然後在接下來的 12 個月內線性解鎖。
+- **平台分配。** 啟動平台通過 `CreatePlatformVestingAccount` 在每個列表項目上接收代幣的一部分，使用相同的時程。
+- **顧問／貢獻者贈款。** 多個受益人各自擁有 `VestingRecord` 帳戶，每個帳戶獨立跟蹤其已領取的數量。
+
+鎖定的代幣永遠不會進入曲線，也不是畢業後 LP 的一部分。它們在池的 `base_vault` 中處於休眠狀態，直到每位受益人呼叫 `ClaimVestedToken`。
+
+## 時程形狀
+
+啟動時的代幣解鎖由三個數字描述，並在 `Initialize` 時記錄一次：
+
+| 欄位 | 類型 | 含義 |
+|------|------|------|
+| `total_locked_amount` | `u64` | 跨所有受益人（建立者 + 平台）鎖定的所有基礎代幣的總和。必須滿足 `total_locked_amount <= supply * max_lock_rate / 1_000_000`（來自 `GlobalConfig` 的約束）。 |
+| `cliff_period` | `u64`（秒） | 募資結束後任何代幣解鎖前的等待時間。 |
+| `unlock_period` | `u64`（秒） | 懸崖期後線性解鎖窗口的持續時間。`0` 表示所有代幣在懸崖期結束時立即解鎖。 |
+
+這三個值存在於 `PoolState.vesting_schedule`（一個 `VestingSchedule` 結構）加上鏈上的 `start_time`，程序在募資成功結束的時刻（首次滿足畢業條件時）記錄為 `block_time + cliff_period`。
+
+```rust
+// states/pool.rs
+pub struct VestingSchedule {
+    pub total_locked_amount:     u64,
+    pub cliff_period:            u64,
+    pub unlock_period:           u64,
+    pub start_time:              u64,   // set by the program at fundraising end
+    pub allocated_share_amount:  u64,   // running sum of allocations to vesting records
+}
+```
+
+`allocated_share_amount` 是已通過 `CreateVestingAccount` / `CreatePlatformVestingAccount` 分配給 `VestingRecord` 帳戶的總金額。它永遠不能超過 `total_locked_amount`。如果建立者過度分配，下一個 `CreateVestingAccount` 呼叫將以 `InvalidTotalLockedAmount` 回退。
+
+## 線性解鎖公式
+
+募資結束後，程序為每個 `VestingRecord` 計算累計解鎖金額為：
+
+```
+elapsed         = min(now, start_time + unlock_period) − start_time
+unlocked_amount = token_share_amount × elapsed / unlock_period
+```
+
+如果 `unlock_period == 0`，整個 `token_share_amount` 在 `start_time` 時一次性變為可領取。否則曲線是從 `start_time` 的 0 到 `start_time + unlock_period` 的 `token_share_amount` 的直線，之後上限為 `token_share_amount`。
+
+每次 `ClaimVestedToken` 呼叫轉移的金額是新計算的累計解鎖金額與記錄上的 `claimed_amount` 欄位之間的差值。
+
+```
+delta_amount    = unlocked_amount − vesting_record.claimed_amount
+vesting_record.claimed_amount = unlocked_amount
+```
+
+在 `start_time` 之前領取將以 `VestingNotStarted` 回退。在 `start_time + unlock_period` 之後領取會結算全部餘額。
+
+## 帳戶佈局
+
+### `VestingSchedule`
+
+在 `PoolState` 上內聯。參見 [`accounts`](/zh-Hant/products/launchlab/accounts)。
+
+### `VestingRecord`
+
+每位受益人的記錄。PDA 衍生為：
+
+```
+seeds = [
+  b"pool_vesting",
+  pool_state.key(),
+  beneficiary.key(),
+]
+program = LaunchLab program
+```
+
+```rust
+// states/vesting.rs
+#[account]
+pub struct VestingRecord {
+    pub epoch:               u64,         // recent_epoch tracker
+    pub pool:                Pubkey,      // back-pointer to PoolState
+    pub beneficiary:         Pubkey,      // who can call ClaimVestedToken
+    pub claimed_amount:      u64,         // cumulative claimed
+    pub token_share_amount:  u64,         // total allocated to this beneficiary
+    pub padding:             [u64; 8],
+}
+```
+
+受益人在每個啟動中只能有**一個** `VestingRecord`。在同一啟動上再次分配給相同的受益人將回退，因為 PDA 已存在。
+
+## 指令
+
+### `CreateVestingAccount`
+
+僅限建立者。通過初始化新的 `VestingRecord` PDA 將池的 `total_locked_amount` 的一部分分配給新的受益人。
+
+**參數**
+
+```
+share_amount: u64    // tokens to assign to this beneficiary
+```
+
+**帳戶**
+
+| # | 名稱 | W | S | 備註 |
+|---|------|---|---|------|
+| 1 | `creator` | W | S | 必須等於 `pool_state.creator`；為新帳戶支付租金。 |
+| 2 | `beneficiary` | W |   | 稍後接收已解鎖的代幣。公鑰在此被鎖定——無法變更。 |
+| 3 | `pool_state` | W |   | 變更以增加 `vesting_schedule.allocated_share_amount`。 |
+| 4 | `vesting_record` | W |   | `init`；PDA `[b"pool_vesting", pool_state, beneficiary]`。 |
+| 5 | `system_program` |   |   | 帳戶建立所需。 |
+
+**前置條件**
+
+- `share_amount > 0`。
+- `pool_state.vesting_schedule.allocated_share_amount + share_amount <= total_locked_amount`。
+- `beneficiary` 公鑰在此池上沒有現有的 `VestingRecord`。
+
+**後置條件**
+
+- `vesting_record` 初始化，其中 `token_share_amount = share_amount`、`claimed_amount = 0`。
+- `pool_state.vesting_schedule.allocated_share_amount += share_amount`。
+
+**常見錯誤** — `InvalidTotalLockedAmount`、`InvalidInput`。
+
+### `CreatePlatformVestingAccount`
+
+`CreateVestingAccount` 的平台管理員變體。平台的解鎖錢包（存儲在 `PlatformConfig.platform_vesting_wallet` 上）是受益人，份額由 `PlatformConfig.platform_vesting_scale` 限制。
+
+簽署者必須等於 `platform_config.platform_vesting_wallet`。其他帳戶與 `CreateVestingAccount` 相同。當平台簽約在其列表的每次啟動上接收固定的解鎖份額時使用。
+
+### `ClaimVestedToken`
+
+僅限受益人。將任何新解鎖的代幣從池的 `base_vault` 轉移到受益人的 ATA。
+
+**參數**
+
+無（程序從時程中計算領取金額）。
+
+**帳戶**
+
+| # | 名稱 | W | S | 備註 |
+|---|------|---|---|------|
+| 1 | `beneficiary` | W | S | 必須等於 `vesting_record.beneficiary`。 |
+| 2 | `authority` |   |   | PDA `[b"vault_auth_seed"]`；簽署金庫轉移。 |
+| 3 | `pool_state` | W |   | 僅在時程需要重新驗證時變更。 |
+| 4 | `vesting_record` | W |   | `claimed_amount` 已更新。 |
+| 5 | `base_vault` | W |   | 池的基礎代幣金庫；被扣除。 |
+| 6 | `beneficiary_ata` | W |   | 接收已解鎖的代幣；`init_if_needed`。 |
+| 7 | `base_mint` |   |   | 池的基礎鑄幣。 |
+| 8 | `token_program` |   |   | SPL Token 或 Token-2022 程序。 |
+| 9 | `associated_token_program` |   |   | 如果需要，用於 ATA 建立。 |
+| 10 | `system_program` |   |   | 帳戶建立所需。 |
+
+**前置條件**
+
+- `block_time >= pool_state.vesting_schedule.start_time`（否則為 `VestingNotStarted`）。
+- `pool_state.status == PoolStatus::Migrated` — 畢業必須已發生。在畢業前呼叫將回退。
+- 已解鎖金額的差值大於零。無操作呼叫（計算差值為 0）將回退。
+
+**後置條件**
+
+- `vesting_record.claimed_amount` 前進至新的累計解鎖金額。
+- `delta_amount` 的基礎代幣轉移至 `beneficiary_ata`。
+
+**常見錯誤** — `VestingNotStarted`、`NoAssetsToCollect`、`MathOverflow`。
+
+## 工作範例
+
+啟動設定：
+
+- `supply = 1_000_000_000`
+- `total_locked_amount = 100_000_000`（供應量的 10%）
+- `cliff_period = 180 * 86400`（180 天）
+- `unlock_period = 365 * 86400`（懸崖期後 1 年線性解鎖）
+
+建立者在 `Initialize` 後立即分配兩個 `VestingRecord` 帳戶：
+
+- 受益人 A（團隊）：`share_amount = 70_000_000`
+- 受益人 B（顧問）：`share_amount = 30_000_000`
+
+`allocated_share_amount = 100_000_000`，等於 `total_locked_amount` — 無法進行進一步分配。
+
+募資在 `2027-01-01T00:00Z` 完成。程序設定 `start_time = 2027-01-01 + 180 天 = 2027-06-30`。
+
+在 `2027-09-30`（`start_time` 後 90 天），受益人 A 呼叫 `ClaimVestedToken`：
+
+```
+elapsed         = min(now, start_time + 365·86400) − start_time
+                = 90 · 86400
+unlocked_amount = 70_000_000 × (90 / 365) ≈ 17_260_274
+delta_amount    = 17_260_274 − 0 = 17_260_274
+```
+
+A 的錢包接收 1726 萬個基礎代幣。`vesting_record.claimed_amount` 前進至 17_260_274。
+
+六個月後（`2028-03-31`，`start_time` 後 270 天），A 再次領取：
+
+```
+unlocked_amount = 70_000_000 × (270 / 365) ≈ 51_780_822
+delta_amount    = 51_780_822 − 17_260_274 = 34_520_548
+```
+
+A 接收另外 3452 萬個代幣。在 `2028-06-30`（`unlock_period` 結束）後，下一次領取轉移剩餘的約 1822 萬個代幣，並將 `claimed_amount` 設定為 `token_share_amount`。
+
+## 邊界情況
+
+- **受益人丟失其金鑰。** `VestingRecord.beneficiary` 上的公鑰是唯一可以呼叫 `ClaimVestedToken` 的簽署者。沒有恢復路徑。如果恢復很重要，應將受益人設為多簽。
+- **Token-2022 轉移費用。** 如果基礎鑄幣是具有轉移費用擴展的 Token-2022 鑄幣，受益人接收 `delta_amount − transfer_fee`，而不是完整的差值。池的金庫仍然記錄轉移的總額 — 差值累積到鑄幣的保留費用帳戶。
+- **池未畢業。** 在畢業前呼叫 `ClaimVestedToken` 將回退。解鎖時鐘只在募資實際完成時開始；中止的啟動（永遠不設定 `start_time`）將鎖定的代幣留在金庫中無法使用。
+- **超額分配嘗試。** 程序在每個 `CreateVestingAccount` 上強制執行 `allocated_share_amount <= total_locked_amount`。`total_locked_amount` 中未分配的餘額（如有）被**遺失** — 一旦啟動畢業，這些代幣將永遠留在金庫中。除非是有意，否則分配全部金額。
+
+## 指標
+
+- [`products/launchlab/accounts`](/zh-Hant/products/launchlab/accounts) — 完整的 `PoolState` 佈局，包括 `VestingSchedule`。
+- [`products/launchlab/instructions`](/zh-Hant/products/launchlab/instructions) — 畢業生命週期。
+- [`products/launchlab/platform-config`](/zh-Hant/products/launchlab/platform-config) — 平台分配的 `platform_vesting_scale` 語義。
+- [`products/launchlab/global-config`](/zh-Hant/products/launchlab/global-config) — 限制 `total_locked_amount` 的 `max_lock_rate` 上限。
+
+來源：
+
+- `raydium-launch/programs/launchpad/src/states/vesting.rs` — `VestingRecord`。
+- `raydium-launch/programs/launchpad/src/states/pool.rs` — `VestingSchedule`、`VestingParams`、`is_vesting_started`、`vesting_end_time`。
+- `raydium-launch/programs/launchpad/src/instructions/create_vesting_account.rs`。
+- `raydium-launch/programs/launchpad/src/instructions/claim_vested_token.rs`。

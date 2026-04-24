@@ -1,0 +1,241 @@
+---
+title: "LaunchLab 代币释放"
+description: "锁定代币、悬崖期和线性解锁计划、每个受益人的 VestingRecord 账户，以及创建者和平台用来在毕业后分配预留供应量的创建/领取指令。"
+---
+
+<Info>
+  **本页内容由 AI 自动翻译，所有内容以英文版本为准。**
+
+  [查看英文版 →](/products/launchlab/vesting)
+</Info>
+
+<Info>
+  代币释放在 LaunchLab 启动中是**可选的**。在 `Initialize` 时设置 `vesting_param.total_locked_amount = 0`，下文内容则不适用。一旦启用，释放计划在启动期间固定；悬崖期和解锁期之后无法更改。
+</Info>
+
+## 为什么需要代币释放
+
+联合曲线在融资期间销售 `base_supply_graduation` 个代币，并用剩余部分作为毕业后流动性池的初始资金。代币释放机制从供应量中划出额外的一部分，将其锁定一段可配置的时间（悬崖期），然后线性地释放给一个或多个受益人——通常是创建者的团队、顾问或平台合作伙伴。
+
+实际应用场景：
+
+- **团队分配**。创建者预留供应量的 5%（例如）给创始团队，锁定 6 个月，之后线性解锁 12 个月。
+- **平台分配**。启动平台通过 `CreatePlatformVestingAccount` 从它列出的每个代币中获得一部分，按相同的计划释放。
+- **顾问/贡献者奖励**。多个受益人各自拥有独立的 `VestingRecord` 账户，各自跟踪已领取的金额。
+
+锁定的代币永不进入曲线，也不是毕业时流动性池的一部分。它们在池的 `base_vault` 中处于休眠状态，直到每个受益人调用 `ClaimVestedToken`。
+
+## 释放计划的形状
+
+启动的代币释放由三个数字描述，在 `Initialize` 时记录一次：
+
+| 字段 | 类型 | 含义 |
+|------|------|------|
+| `total_locked_amount` | `u64` | 所有受益人（创建者 + 平台）锁定的所有基础代币的总和。必须满足 `total_locked_amount <= supply * max_lock_rate / 1_000_000`，该约束来自 `GlobalConfig`。 |
+| `cliff_period` | `u64`（秒） | 融资结束后任何代币解锁前的等待时间。 |
+| `unlock_period` | `u64`（秒） | 悬崖期后线性解锁窗口的持续时间。`0` 表示在悬崖期结束时立即全部解锁。 |
+
+这三个值存储在 `PoolState.vesting_schedule`（一个 `VestingSchedule` 结构体）加上链上的 `start_time`，程序在融资成功结束时（首次满足毕业条件时）将其记录为 `block_time + cliff_period`。
+
+```rust
+// states/pool.rs
+pub struct VestingSchedule {
+    pub total_locked_amount:     u64,
+    pub cliff_period:            u64,
+    pub unlock_period:           u64,
+    pub start_time:              u64,   // 程序在融资结束时设置
+    pub allocated_share_amount:  u64,   // 分配给 vesting records 的运行总和
+}
+```
+
+`allocated_share_amount` 是已经通过 `CreateVestingAccount` / `CreatePlatformVestingAccount` 分配给 `VestingRecord` 账户的总金额。它不能超过 `total_locked_amount`。如果创建者超额分配，下一个 `CreateVestingAccount` 调用将回滚，并返回 `InvalidTotalLockedAmount`。
+
+## 线性解锁公式
+
+融资结束后，程序为每个 `VestingRecord` 计算累计解锁金额为：
+
+```
+elapsed         = min(now, start_time + unlock_period) − start_time
+unlocked_amount = token_share_amount × elapsed / unlock_period
+```
+
+如果 `unlock_period == 0`，整个 `token_share_amount` 在 `start_time` 时一步可领取。否则曲线是一条直线，从 `start_time` 处的 0 到 `start_time + unlock_period` 处的 `token_share_amount`，之后保持在 `token_share_amount`。
+
+每次 `ClaimVestedToken` 调用转移的金额是新计算的累计解锁金额与记录上运行的 `claimed_amount` 字段之间的差额。
+
+```
+delta_amount    = unlocked_amount − vesting_record.claimed_amount
+vesting_record.claimed_amount = unlocked_amount
+```
+
+在 `start_time` 之前的领取会回滚并返回 `VestingNotStarted`。在 `start_time + unlock_period` 之后的领取则转移全部剩余部分。
+
+## 账户布局
+
+### `VestingSchedule`
+
+内联存储在 `PoolState` 上。参见 [`accounts`](/zh/products/launchlab/accounts)。
+
+### `VestingRecord`
+
+每个受益人的记录。PDA 推导为：
+
+```
+seeds = [
+  b"pool_vesting",
+  pool_state.key(),
+  beneficiary.key(),
+]
+program = LaunchLab program
+```
+
+```rust
+// states/vesting.rs
+#[account]
+pub struct VestingRecord {
+    pub epoch:               u64,         // recent_epoch 跟踪器
+    pub pool:                Pubkey,      // 指向 PoolState 的反向指针
+    pub beneficiary:         Pubkey,      // 谁可以调用 ClaimVestedToken
+    pub claimed_amount:      u64,         // 累计已领取
+    pub token_share_amount:  u64,         // 分配给该受益人的总额
+    pub padding:             [u64; 8],
+}
+```
+
+一个受益人在每个启动上只能有**一个** `VestingRecord`。再次为同一启动上的同一受益人分配将回滚，因为 PDA 已存在。
+
+## 指令
+
+### `CreateVestingAccount`
+
+仅创建者。通过初始化一个全新的 `VestingRecord` PDA，将池的 `total_locked_amount` 的一部分分配给一个新受益人。
+
+**参数**
+
+```
+share_amount: u64    // 分配给该受益人的代币数量
+```
+
+**账户**
+
+| # | 名称 | W | S | 说明 |
+|---|------|---|---|------|
+| 1 | `creator` | W | S | 必须等于 `pool_state.creator`；为新账户支付租金。 |
+| 2 | `beneficiary` | W |   | 稍后接收解锁的代币。公钥被锁定在这里——无法更改。 |
+| 3 | `pool_state` | W |   | 变更以递增 `vesting_schedule.allocated_share_amount`。 |
+| 4 | `vesting_record` | W |   | `init`；PDA `[b"pool_vesting", pool_state, beneficiary]`。 |
+| 5 | `system_program` |   |   | 账户创建必需。 |
+
+**前置条件**
+
+- `share_amount > 0`。
+- `pool_state.vesting_schedule.allocated_share_amount + share_amount <= total_locked_amount`。
+- `beneficiary` 公钥对此池没有现存的 `VestingRecord`。
+
+**后置条件**
+
+- `vesting_record` 初始化为 `token_share_amount = share_amount`，`claimed_amount = 0`。
+- `pool_state.vesting_schedule.allocated_share_amount += share_amount`。
+
+**常见错误** — `InvalidTotalLockedAmount`，`InvalidInput`。
+
+### `CreatePlatformVestingAccount`
+
+`CreateVestingAccount` 的平台管理员变体。平台的代币释放钱包（存储在 `PlatformConfig.platform_vesting_wallet` 上）是受益人，分享额由 `PlatformConfig.platform_vesting_scale` 限制。
+
+签名者必须等于 `platform_config.platform_vesting_wallet`。其他账户镜像 `CreateVestingAccount`。当平台合约约定在其列出的每个启动上接收固定的代币释放分享时，使用此指令。
+
+### `ClaimVestedToken`
+
+仅受益人。从池的 `base_vault` 转移任何新解锁的代币到受益人的 ATA。
+
+**参数**
+
+无（程序从计划中计算领取金额）。
+
+**账户**
+
+| # | 名称 | W | S | 说明 |
+|---|------|---|---|------|
+| 1 | `beneficiary` | W | S | 必须等于 `vesting_record.beneficiary`。 |
+| 2 | `authority` |   |   | PDA `[b"vault_auth_seed"]`；为保险库转移签名。 |
+| 3 | `pool_state` | W |   | 仅当计划需要重新验证时变更。 |
+| 4 | `vesting_record` | W |   | `claimed_amount` 被更新。 |
+| 5 | `base_vault` | W |   | 池的基础代币保险库；被扣除。 |
+| 6 | `beneficiary_ata` | W |   | 接收解锁的代币；`init_if_needed`。 |
+| 7 | `base_mint` |   |   | 池的基础铸币。 |
+| 8 | `token_program` |   |   | SPL Token 或 Token-2022 程序。 |
+| 9 | `associated_token_program` |   |   | 如需要，用于 ATA 创建。 |
+| 10 | `system_program` |   |   | 账户创建必需。 |
+
+**前置条件**
+
+- `block_time >= pool_state.vesting_schedule.start_time`（否则 `VestingNotStarted`）。
+- `pool_state.status == PoolStatus::Migrated` — 毕业必须已发生。在毕业前调用将回滚。
+- 解锁金额增量大于零。无操作调用（计算增量为 0）会回滚。
+
+**后置条件**
+
+- `vesting_record.claimed_amount` 推进到新的累计解锁金额。
+- `delta_amount` 的基础代币转移到 `beneficiary_ata`。
+
+**常见错误** — `VestingNotStarted`，`NoAssetsToCollect`，`MathOverflow`。
+
+## 实际例子
+
+一个启动设置：
+
+- `supply = 1_000_000_000`
+- `total_locked_amount = 100_000_000`（供应量的 10%）
+- `cliff_period = 180 * 86400`（180 天）
+- `unlock_period = 365 * 86400`（悬崖期后 1 年线性解锁）
+
+创建者在 `Initialize` 之后立即分配两个 `VestingRecord` 账户：
+
+- 受益人 A（团队）：`share_amount = 70_000_000`
+- 受益人 B（顾问）：`share_amount = 30_000_000`
+
+`allocated_share_amount = 100_000_000`，等于 `total_locked_amount` — 不再可能有进一步的分配。
+
+融资在 `2027-01-01T00:00Z` 完成。程序设置 `start_time = 2027-01-01 + 180 days = 2027-06-30`。
+
+在 `2027-09-30`（`start_time` 之后 90 天），受益人 A 调用 `ClaimVestedToken`：
+
+```
+elapsed         = min(now, start_time + 365·86400) − start_time
+                = 90 · 86400
+unlocked_amount = 70_000_000 × (90 / 365) ≈ 17_260_274
+delta_amount    = 17_260_274 − 0 = 17_260_274
+```
+
+A 的钱包收到 17.26M 基础代币。`vesting_record.claimed_amount` 推进到 17_260_274。
+
+六个月后（`2028-03-31`，`start_time` 之后 270 天），A 再次领取：
+
+```
+unlocked_amount = 70_000_000 × (270 / 365) ≈ 51_780_822
+delta_amount    = 51_780_822 − 17_260_274 = 34_520_548
+```
+
+A 再收到 34.52M 代币。在 `2028-06-30`（`unlock_period` 结束）之后，下一次领取转移剩余的约 18.22M，并使 `claimed_amount == token_share_amount`。
+
+## 边界情况
+
+- **受益人丢失密钥**。`VestingRecord.beneficiary` 上的公钥是唯一能调用 `ClaimVestedToken` 的签名者。没有恢复路径。如果恢复很重要，将受益人设置为多签。
+- **Token-2022 转移费**。如果基础铸币是具有转移费扩展的 Token-2022 铸币，受益人接收 `delta_amount − transfer_fee`，而不是完整增量。池的保险库仍然将总额记录为已转移——差额计入铸币的代扣费用账户。
+- **池未毕业**。在毕业前调用 `ClaimVestedToken` 将回滚。代币释放时钟仅在融资实际完成时启动；中止的启动（从不设置 `start_time`）将锁定的代币在保险库中永久无法访问。
+- **超额分配尝试**。程序在每个 `CreateVestingAccount` 上强制实施 `allocated_share_amount <= total_locked_amount`。任何剩余的 `total_locked_amount`（如果有）未分配部分**会丢失** — 这些代币在启动毕业后永久留在保险库中。除非这是意图，否则分配全部金额。
+
+## 相关指引
+
+- [`products/launchlab/accounts`](/zh/products/launchlab/accounts) — 完整的 `PoolState` 布局，包括 `VestingSchedule`。
+- [`products/launchlab/instructions`](/zh/products/launchlab/instructions) — 毕业生命周期。
+- [`products/launchlab/platform-config`](/zh/products/launchlab/platform-config) — 平台分配的 `platform_vesting_scale` 语义。
+- [`products/launchlab/global-config`](/zh/products/launchlab/global-config) — `max_lock_rate` 上限，限制 `total_locked_amount`。
+
+来源：
+
+- `raydium-launch/programs/launchpad/src/states/vesting.rs` — `VestingRecord`。
+- `raydium-launch/programs/launchpad/src/states/pool.rs` — `VestingSchedule`，`VestingParams`，`is_vesting_started`，`vesting_end_time`。
+- `raydium-launch/programs/launchpad/src/instructions/create_vesting_account.rs`。
+- `raydium-launch/programs/launchpad/src/instructions/claim_vested_token.rs`。

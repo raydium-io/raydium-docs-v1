@@ -1,0 +1,256 @@
+---
+title: "Toán học tập trung thanh khoản"
+description: "Biểu diễn sqrt-price, công thức quy đổi liquidity-to-amount, các bước swap đơn tick và đa tick, hạch toán tăng phí — toán học đằng sau Raydium CLMM."
+---
+
+<Info>
+  **Trang này được dịch tự động bằng AI. Phiên bản tiếng Anh là bản chính thức.**
+
+  [Xem bản tiếng Anh →](/algorithms/clmm-math)
+</Info>
+
+<Info>
+  Trang này tập hợp các chứng minh đằng sau CLMM. Để xem cách triển khai on-chain, hãy xem [`products/clmm/math`](/vi/products/clmm/math) (tài liệu này tham chiếu trang hiện tại) và [`products/clmm/ticks-and-positions`](/vi/products/clmm/ticks-and-positions) (tài liệu này giải thích lưới tick).
+</Info>
+
+## Tại sao dùng sqrt-price, không dùng price
+
+Các CLMM họ Uniswap-v3 biểu diễn giá dưới dạng căn bậc hai của nó, được lưu trữ trong `Q64.64` số điểm cố định:
+
+```
+sqrt_price_x64 = floor(sqrt(price) · 2^64)
+```
+
+Có ba lý do:
+
+1. **Toán học liquidity tuyến tính.** Lượng token0 hoặc token1 trong một khoảng giá hóa ra là hàm tuyến tính của `sqrt_price`, không phải của `price`. Lưu trữ `sqrt_price` cho phép bước swap tính toán các công thức tuyến tính mà không cần tính căn bậc hai.
+2. **Kiểm soát tràn số.** `sqrt_price · L` vừa trong `u256` cho tất cả các tham số hợp lý; `price · L` có thể tràn sớm hơn.
+3. **Toán học tick đều đặn.** Vì tick được định nghĩa là `1.0001^i`, nên `sqrt(price) = 1.00005^i` cũng là lũy thừa chính xác của thang 1.00005. Mỗi lần vượt qua tick được dịch thành phép nhân nhỏ trong không gian `sqrt_price_x64`.
+
+Price và sqrt-price là một-một; phép chuyển đổi là `price = (sqrt_price_x64 / 2^64)^2`.
+
+## Lưới tick
+
+Các giá được rời rạc hóa trên một lưới:
+
+```
+price(tick_i) = 1.0001^i
+```
+
+`tick_i` là một `i32`. Khoảng hoạt động là `[MIN_TICK, MAX_TICK] = [−443636, 443636]`, cung cấp khoảng giá khoảng `[2^−128, 2^128]`. `tick_spacing` của mỗi pool được xác định bởi mức phí của nó: khoảng cách nhỏ hơn cho các cặp chặt chẽ (ví dụ: mức stablecoin 0.01% sử dụng spacing 1), khoảng cách lớn hơn cho các cặp biến động (mức 0.25% sử dụng 60, mức 1% sử dụng 120).
+
+Các vị thế phải có `tick_lower` và `tick_upper` căn chỉnh theo `tick_spacing`. Các tick hoạt động của một pool (những tick có liquidity bắt đầu hoặc kết thúc tại đó) là những tick duy nhất mà bước swap quan tâm.
+
+## Quy đổi từ liquidity sang amount
+
+Đối với một vị thế có liquidity `L` và khoảng giá `[sqrt_lo, sqrt_hi]` (tất cả các giá trị `sqrt_price`):
+
+| Trạng thái pool | Lượng token0 | Lượng token1 |
+|------------|-------------------|-------------------|
+| Giá cao hơn khoảng (`sqrt_p ≥ sqrt_hi`) | 0 | `L · (sqrt_hi − sqrt_lo)` |
+| Giá trong khoảng | `L · (sqrt_hi − sqrt_p) / (sqrt_p · sqrt_hi)` | `L · (sqrt_p − sqrt_lo)` |
+| Giá dưới khoảng (`sqrt_p ≤ sqrt_lo`) | `L · (sqrt_hi − sqrt_lo) / (sqrt_lo · sqrt_hi)` | 0 |
+
+Chứng minh: đạo hàm bất biến CPMM cục bộ. Bên trong bất kỳ khoảng tick nào, vị thế hành động như một CPMM với dự trữ ảo `(x_v, y_v)` được chọn sao cho `(sqrt_p, L)` hiện tại của pool nhất quán với `L = sqrt(x_v · y_v)`. Tích phân từ `sqrt_p` đến ranh giới của khoảng cho các số tiền ở trên.
+
+**Công thức nghịch đảo** (được sử dụng khi tạo vị thế cho một `amount0` hoặc `amount1` nhất định):
+
+```
+L_from_amount0(amount0, sqrt_lo, sqrt_hi, sqrt_p) =
+    amount0 · sqrt_p · sqrt_hi / (sqrt_hi − sqrt_p)
+
+L_from_amount1(amount1, sqrt_lo, sqrt_hi, sqrt_p) =
+    amount1 / (sqrt_p − sqrt_lo)
+
+// Để ký gửi đối xứng vào một vị thế trong khoảng, lấy giá trị nhỏ hơn.
+L = min(L_from_amount0, L_from_amount1)
+```
+
+## Bước swap đơn tick
+
+Trong một khoảng tick duy nhất, pool hành động như một CPMM. Cho `sqrt_p` hiện tại và `sqrt_target`:
+
+```
+Δamount0_step = L · (sqrt_target − sqrt_p) / (sqrt_p · sqrt_target)     // nếu swap cho token0
+Δamount1_step = L · (sqrt_target − sqrt_p)                              // nếu swap cho token1
+```
+
+### Bước nhập chính xác
+
+Cho `Δin_remaining`:
+
+```
+// Candidate sqrt_p mới nếu chúng ta điền đến ranh giới tick:
+sqrt_after_full = sqrt_target
+amount_to_full  = Δamount_in_to_reach(sqrt_p → sqrt_target)
+
+if Δin_remaining ≥ amount_to_full:
+    // tiêu thụ phần còn lại của thùng
+    sqrt_p'         = sqrt_target
+    Δin_consumed    = amount_to_full
+    Δout            = amount_out_at_boundary
+else:
+    // chúng ta không vượt qua; giải để tìm sqrt_p cuối cùng
+    sqrt_p'         = L · sqrt_p / (L + Δin_remaining · sqrt_p)      // cho swap 0→1
+    Δin_consumed    = Δin_remaining
+    Δout            = L · (sqrt_p − sqrt_p')                          // tỷ lệ thuận với Δsqrt
+```
+
+Swap `0→1` hạ thấp `sqrt_p` (giá giảm khi chúng ta bán token0 vào). Swap `1→0` nâng cao nó. Các công thức đối xứng với `sqrt_p` và `sqrt_target` được hoán đổi.
+
+### Bước xuất chính xác
+
+Cấu trúc giống nhau, giải để tìm `Δin` thay thế.
+
+## Vòng lặp swap đa tick
+
+Một swap lặp qua các tick cho đến khi input hết hoặc giới hạn giá bị chạm tới:
+
+```
+while Δin_remaining > 0 and sqrt_p != sqrt_price_limit:
+    next_tick = find_next_initialized_tick(pool.tick_current, direction)
+    sqrt_target = min(next_tick.sqrt_price, sqrt_price_limit)       // có hướng
+
+    (Δin, Δout, sqrt_p') = single_step(sqrt_p, sqrt_target, L, Δin_remaining)
+
+    Δin_remaining -= Δin
+    accumulated_out += Δout
+
+    if sqrt_p' == next_tick.sqrt_price:
+        // vượt qua tick
+        L += next_tick.liquidity_net * direction_sign
+        flip_fee_growth_outside(next_tick)
+        match_limit_orders_at_tick(next_tick, ...)        // xem products/clmm/math
+        pool.tick_current = next_tick.tick_index
+    sqrt_p = sqrt_p'
+```
+
+Mỗi `single_step` sử dụng `L` hiện tại của pool. `L` chỉ thay đổi **khi** vượt qua một tick đã được khởi tạo. Liquidity giữa các tick là hằng số, đó là những gì làm cho toán học bước đóng.
+
+`liquidity_net` tại một tick là tổng có dấu của liquidities vị thế bắt đầu tại tick đó trừ đi những cái kết thúc tại đó. Vượt lên trên thêm `liquidity_net`; vượt xuống dưới trừ đi nó.
+
+Khi pool có các lệnh giới hạn mở tại một tick, bước vượt qua tick cũng có cơ hội tiêu thụ một phần input swap để điền các lệnh đó (FIFO trên các nhóm). Thuật toán khớp và mức phí động có thể áp dụng trên cơ sở bước cơ sở được ghi chép trong [`products/clmm/math`](/vi/products/clmm/math); chúng không thay đổi công thức bước đóng đơn ở trên.
+
+## Bộ tích lũy tăng phí
+
+CLMM theo dõi phí trên một đơn vị liquidity hoạt động, trên mỗi bên, toàn cầu và trên mỗi tick:
+
+```
+fee_growth_global_0_x64     // Q64.64, đơn điệu
+fee_growth_global_1_x64
+tick.fee_growth_outside_0_x64   // "phí tích lũy khi tick này nằm ngoài khoảng hoạt động"
+tick.fee_growth_outside_1_x64
+```
+
+Trên mỗi `single_step`:
+
+```
+step_lp_fee = (Δin · fee_rate) · (1 − protocol_fraction − fund_fraction)
+fee_growth_global += step_lp_fee · 2^64 / L     // chỉ cho phía input
+```
+
+(`fee_growth_global` của phía còn lại không di chuyển trên bước này, vì không có token nào ở phía đó được thanh toán làm input.)
+
+Khi vượt qua một tick, chương trình **lật** `fee_growth_outside`:
+
+```
+tick.fee_growth_outside_0_x64 = fee_growth_global_0_x64 − tick.fee_growth_outside_0_x64
+tick.fee_growth_outside_1_x64 = fee_growth_global_1_x64 − tick.fee_growth_outside_1_x64
+```
+
+"Ngoài" là tương đối với `tick_current`. Khi `tick_current` ở trên tick, ngoài có nghĩa là "dưới". Khi `tick_current` ở dưới, ngoài có nghĩa là "trên". Lần lật này hoán đổi cách giải thích.
+
+### `fee_growth_inside` cho một vị thế
+
+Cho một vị thế `[tick_lower, tick_upper]` và `tick_current` hiện tại:
+
+```
+if tick_current >= tick_upper:
+    inside = tick_lower.fee_growth_outside − tick_upper.fee_growth_outside
+else if tick_current < tick_lower:
+    inside = tick_upper.fee_growth_outside − tick_lower.fee_growth_outside
+else:     // vị thế nằm trong khoảng
+    inside = fee_growth_global
+           − tick_lower.fee_growth_outside
+           − tick_upper.fee_growth_outside
+```
+
+Phí chưa nhận của một vị thế cho phía token `s` là:
+
+```
+tokens_owed_s += L · (fee_growth_inside_s − fee_growth_inside_last_s) / 2^64
+fee_growth_inside_last_s = fee_growth_inside_s
+```
+
+Cập nhật này chạy trên mỗi tương tác với vị thế (`IncreaseLiquidity`, `DecreaseLiquidity`, `CollectFees`).
+
+## Ví dụ có chi tiết — vượt qua một tick
+
+Pool (đơn giản hóa):
+
+- `sqrt_p_x64 = 2^64 · 1.0 = 2^64` (giá = 1.0)
+- `L = 1_000_000`
+- `tick_current = 0`
+- Tick đã khởi tạo tiếp theo bên dưới: `tick = −60`, `sqrt_price = 1.0001^(−30) ≈ 0.99700`, `liquidity_net = −400_000` (tick này kết thúc một vị thế, vì vậy một lần vượt xuống dưới loại bỏ 400k)
+- Mức phí: 0.25%
+
+Swap: `Δin = 10_000` token0, hướng = 0→1.
+
+**Bước 1 — đến `sqrt_target = 0.99700 · 2^64`**:
+
+```
+amount_in_to_target = L · (1/sqrt_target − 1/sqrt_p)
+                    = 1_000_000 · (1/0.99700 − 1/1.0)
+                    ≈ 1_000_000 · 0.003009
+                    ≈ 3_009
+```
+
+3.009 &lt; 10.000, vì vậy chúng ta điền hoàn toàn bước này:
+
+```
+Δin_step  = 3_009 / (1 − 0.0025)  = 3_017    // tính cả phí
+Δout_step = L · (sqrt_p − sqrt_target) ≈ 1_000_000 · 0.00299 ≈ 2_990
+sqrt_p    = 0.99700 · 2^64
+tick_current = −60
+L         = 1_000_000 + (−400_000)  = 600_000         // đã vượt qua tick
+fee_growth_outside tại tick −60 được lật
+Δin_remaining = 10_000 − 3_017 = 6_983
+```
+
+**Bước 2 — với `L = 600_000` mới**:
+
+Tick đã khởi tạo tiếp theo (nói `tick = −120`) ở `sqrt = 0.99402`. Tính toán lại `amount_in_to_target`:
+
+```
+amount_in_to_target = 600_000 · (1/0.99402 − 1/0.99700)
+                    ≈ 600_000 · 0.003010
+                    ≈ 1_806
+```
+
+Vẫn nhỏ hơn `Δin_remaining`. Vượt qua lần nữa. Tiếp tục cho đến khi `Δin_remaining` đạt không.
+
+Trình tự đầy đủ của `Δout` tích lũy thành output swap cuối cùng.
+
+## Khởi tạo và bảo vệ tràn số
+
+- `MIN_SQRT_PRICE_X64` và `MAX_SQRT_PRICE_X64` tương ứng với `tick = ±443636`. Bất kỳ swap nào sẽ đẩy `sqrt_p` ra ngoài khoảng này sẽ hoàn lại.
+- Tham số `sqrt_price_limit` của người dùng phải nằm trong cùng một khoảng; chương trình kiểm tra.
+- Các tích của `L · Δsqrt` được tính toán trong `u256` rồi dịch trở lại `u128` để tránh tràn.
+
+## Khác biệt so với Uniswap v3
+
+- **Oracle.** `ObservationState` của Raydium lưu trữ vòng đệm `(block_timestamp, tick_cumulative, seconds_per_liquidity_cumulative)`; định dạng dây khác một chút so với Uniswap nhưng cùng toán học TWAP.
+- **Token-2022.** Raydium CLMM hỗ trợ các mint Token-2022; biến thể phí chuyển yêu cầu các điều chỉnh số tiền trước/sau swap bổ sung. Xem [`algorithms/token-2022-transfer-fees`](/vi/algorithms/token-2022-transfer-fees).
+- **Tick bitmap.** Raydium đóng gói bitmap tick đã khởi tạo thành `[u64; 16]` cho mỗi pool để `find_next_initialized_tick` nhanh; Uniswap sử dụng ánh xạ on-chain cho mỗi từ. Việc đánh đổi là tiền thuê so với chi phí tra cứu.
+- **Các slot phần thưởng.** Raydium hỗ trợ 3 luồng phần thưởng mỗi pool với các bộ đếm `reward_growth_global_x64` riêng; cấu trúc giống như bộ tích lũy tăng phí.
+
+## Các con trỏ
+
+- [`products/clmm/math`](/vi/products/clmm/math) — cách triển khai on-chain và ví dụ có chi tiết với các trường struct CLMM thực tế.
+- [`products/clmm/ticks-and-positions`](/vi/products/clmm/ticks-and-positions) — lưới tick, ngữ nghĩa `liquidity_net`/`gross` và khoảng hoạt động.
+- [`products/clmm/fees`](/vi/products/clmm/fees) — bộ tích lũy tăng phí đang hoạt động.
+
+Nguồn:
+
+- Whitepaper Uniswap v3 (chứng minh chính tắc của toán học sqrt-price).
+- Mã nguồn chương trình Raydium CLMM.

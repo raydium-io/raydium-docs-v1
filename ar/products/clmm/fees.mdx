@@ -1,0 +1,266 @@
+---
+title: "رسوم ومكافآت CLMM"
+description: "كيفية توزيع رسوم التداول في CLMM بين مزودي السيولة والبروتوكول والصندوق؛ وآلية إصدار نظام المكافآت ذي الثلاثة فتحات للمراكز النشطة؛ وكيفية تسوية كليهما في أرصدة خاصة بكل مركز."
+---
+
+<Info>
+  **هذه الصفحة مُترجَمة آليًا بواسطة الذكاء الاصطناعي. النسخة الإنجليزية هي المرجع المعتمد.**
+
+  [عرض النسخة الإنجليزية →](/products/clmm/fees)
+</Info>
+
+## مستويات الرسوم
+
+تُربط مجمعات CLMM بـ `AmmConfig` عند إنشائها؛ إذ يحدد هذا الإعداد معدل رسوم التداول، وحصص البروتوكول والصندوق، فضلاً عن **التباعد بين النقاط** (tick spacing) (راجع [`products/clmm/ticks-and-positions`](/ar/products/clmm/ticks-and-positions)). المستويات المنشورة الاعتيادية (تحقق من البيانات الحية عبر `GET https://api-v3.raydium.io/main/clmm-config`):
+
+| مؤشر `AmmConfig` | `trade_fee_rate` | تباعد النقاط | الاستخدام الاعتيادي |
+|---|---|---|---|
+| 0 | `100` (0.01%) | 1 | أزواج مستقرة |
+| 1 | `500` (0.05%) | 10 | عملات رئيسية مترابطة |
+| 2 | `2_500` (0.25%) | 60 | أزواج قياسية |
+| 3 | `10_000` (1.00%) | 120 | عملات متقلبة أو ذات قيمة سوقية منخفضة |
+
+معدل رسوم التداول مُعبَّر عنه بوحدات `1/FEE_RATE_DENOMINATOR = 1/1_000_000` من حجم التداول. أما معدلا البروتوكول والصندوق فيُطبَّقان على **رسوم التداول** لا على الحجم — وهو نفس الاصطلاح المتبع في CPMM.
+
+## توزيع الرسوم على كل عملية مبادلة
+
+في كل خطوة من خطوات عملية swap (راجع [`products/clmm/math`](/ar/products/clmm/math)):
+
+```
+step_trade_fee   = ceil(step_input * trade_fee_rate / 1_000_000)
+step_protocol    = floor(step_trade_fee * protocol_fee_rate / 1_000_000)
+step_fund        = floor(step_trade_fee * fund_fee_rate     / 1_000_000)
+step_lp          = step_trade_fee - step_protocol - step_fund
+```
+
+- يتدفق `step_lp` إلى `fee_growth_global_{input_side}_x64` مُرجَّحاً بالسيولة النشطة الحالية: `fee_growth_global += step_lp × 2^64 / pool.liquidity`.
+- يتراكم `step_protocol` في `PoolState.protocol_fees_token_{input_side}` — ويُجمَّع عبر `CollectProtocolFee`.
+- يتراكم `step_fund` في `PoolState.fund_fees_token_{input_side}` — ويُجمَّع عبر `CollectFundFee`.
+
+وكما هو الحال في CPMM، تبقى حصص البروتوكول والصندوق داخل الخزائن لكنها **مستثناة من حساب السيولة في المنحنى**: إذ تقرأ رياضيات المبادلة `pool.liquidity` التي لا تشمل الرسوم المتراكمة غير المُجمَّعة.
+
+## سبب كون الرسوم لكل طرف على حدة
+
+خلافاً لـ CPMM — حيث تُخصَم رسوم المبادلة دائماً من الرمز المُدخَل دون أن يطال الجانب الآخر أي تراكم للبروتوكول/الصندوق في هذه العملية — تسري في CLMM القاعدة ذاتها على كل خطوة: **تتراكم الرسوم في أي رمز يكون هو المُدخَل في تلك الخطوة**. وبما أن المبادلة متعددة النقاط تسير في اتجاه ثابت، فجميع الخطوات تفرض رسوماً على الرمز نفسه — وبالتالي تذهب رسوم أي مبادلة بعينها إلى *جانب واحد*.
+
+عند مبادلة المستخدم token0 → token1 يرتفع `fee_growth_global_0_x64`، بينما يظل `fee_growth_global_1_x64` ثابتاً. تكسب المراكز رسوماً بـ token0 من هذه المبادلة. قد تسير المبادلة التالية في الاتجاه المعاكس فتُضيف إلى `fee_growth_global_1_x64` عوضاً عن ذلك. وعلى المدى البعيد، يتراكم الرصيد على الجانبين في المجمعات المتوازنة.
+
+## الرسوم أحادية الجانب (`CollectFeeOn`)
+
+يمكن للمجمعات المُنشأة عبر [`CreateCustomizablePool`](/ar/products/clmm/instructions) اختيار وضع تحصيل رسوم غير افتراضي. يُحدَّد هذا الوضع عند إنشاء المجمع ويُخزَّن في `PoolState.fee_on`.
+
+| قيمة `CollectFeeOn` | بايت `fee_on` | السلوك |
+|---|---|---|
+| `FromInput` (الافتراضي) | `0` | النمط الكلاسيكي لـ Uniswap-V3 — تُخصَم الرسوم دائماً من الرمز المُدخَل في كل خطوة مبادلة. يتناوب الرمز المُدخَل تبعاً لاتجاه المبادلة. |
+| `Token0Only` | `1` | تُحتسَب الرسوم دائماً بـ token0. في مبادلات 0→1 تكون الرسوم من الرمز المُدخَل (مطابق لـ `FromInput`). في مبادلات 1→0 تُؤخذ الرسوم من مخرج المبادلة (token0). |
+| `Token1Only` | `2` | مكافئ تماماً لـ `Token0Only` — لكن الرسوم دائماً بـ token1. |
+
+**لماذا يختار مجمع `Token0Only` أو `Token1Only`؟** — لمنح مزودي السيولة عملة تراكم واحدة يمكن التنبؤ بها. أزواج من قبيل `MEMECOIN / USDC` حيث يعمل مزودو السيولة بالدولار تستفيد من `Token1Only` (تستقر الرسوم دائماً بـ USDC)؛ وبذلك لا يتأثر ربح/خسارة مزودي السيولة باتجاهات التداول السائدة. غير أن الجانب السلبي هو أنه في الاتجاهات التي تُخصَم فيها الرسوم من مخرج المبادلة، يستلم المستخدم `out − fee` بدلاً من `out − ε` من المُدخَل، لذا يجب على منطق الاقتباس خصم الرسوم من جانب المخرج. تتولى دالة `computeAmountOut` في SDK التعامل مع هذا التفرع انطلاقاً من `fee_on`؛ والكود الذي يقرأ `pool.fee_on` مباشرةً ينبغي أن يعكس الدوال المساعدة في `PoolState`:
+
+```rust
+pool.is_fee_on_input(zero_for_one: bool) -> bool   // true → fee is deducted from input
+pool.is_fee_on_token0(zero_for_one: bool) -> bool  // for telemetry / accounting
+```
+
+**التأثير على مستوى مزود السيولة** — لا تزال الرسوم تُوجَّه عبر مُجمِّعات `fee_growth_global_{0,1}_x64` القياسية في كل خطوة مبادلة، وبالتالي تستمر المراكز في تسوية الرسوم بالصيغة ذاتها لـ `fee_growth_inside`. التباين يقتصر على *اتجاه* التراكم الجانبي، لا على الرياضيات.
+
+`fee_on` **لا يمكن** تعديله بعد الإنشاء. المجمعات المُنشأة عبر `CreatePool` القديم تعتمد `FromInput` بصفة دائمة.
+
+## الرسوم الديناميكية
+
+المجمعات المُنشأة بـ `enable_dynamic_fee = true` تُطبِّق رسوماً إضافية مدفوعة بالتقلب، فوق `AmmConfig.trade_fee_rate`. الآلية هي نسخة مُبسَّطة من تصميم الرسوم الديناميكية المعتمد في Trader Joe / Meteora.
+
+### الحالة
+
+يحمل `PoolState.dynamic_fee_info` خمسة معاملات معايرة (لقطة من `DynamicFeeConfig` عند إنشاء المجمع) إضافةً إلى أربعة حقول حالة تُحدَّث بكل مبادلة. راجع [`products/clmm/accounts`](/ar/products/clmm/accounts#dynamicfeeconfig-and-dynamicfeeinfo) لتفاصيل تخطيط البايتات.
+
+### التحديث عند كل مبادلة
+
+في كل خطوة مبادلة يُنفِّذ البرنامج ثلاث مراحل فرعية:
+
+1. **تضعيف المرجع**. إذا كان `now - last_update_timestamp > filter_period`، يتراجع مرجع التقلب:
+
+    ```
+    if elapsed > decay_period:
+        volatility_reference = 0
+    elif elapsed > filter_period:
+        volatility_reference = volatility_accumulator * reduction_factor / 10_000
+    # else: hold the previous reference
+    ```
+
+2. **تحديث المُجمِّع**. يساوي المُجمِّع الجديد المرجع مضافاً إليه المسافة المطلقة المقطوعة (بوحدات `tick_spacing`)، مضروبةً في مقياس الدقة، ومحدودةً بالحد الأقصى المُعيَّن:
+
+    ```
+    delta_idx     = abs(tick_spacing_index_reference - current_tick_spacing_index)
+    accumulator   = volatility_reference + delta_idx * 10_000   // VOLATILITY_ACCUMULATOR_SCALE
+    accumulator   = min(accumulator, max_volatility_accumulator)
+    ```
+
+3. **حساب الرسوم الإضافية**. الرسوم الإضافية تتناسب مع مربع المُجمِّع (لأن "مسافة النقطة" في المبادلة مُربَّعة في الصيغة المرجعية)، مضروبةً في معامل الكسب `dynamic_fee_control`:
+
+    ```
+    fee_increment_rate = dynamic_fee_control * (accumulator * tick_spacing)^2
+                       / (100_000 * 10_000^2)
+    fee_rate           = AmmConfig.trade_fee_rate + fee_increment_rate
+    fee_rate           = min(fee_rate, 100_000)              // 10% cap
+    ```
+
+حد 10% (`MAX_FEE_RATE_NUMERATOR = 100_000` بوحدات `1e6`) مُشفَّر كضامن أمان؛ وفي التطبيق العملي تقع الإعدادات المُعايَرة جيداً أدنى من ذلك بكثير.
+
+### اختيار المعاملات
+
+النطاقات الافتراضية التي أثبتت نجاعتها في المجمعات التجريبية:
+
+| المعامل | النطاق الاعتيادي | ملاحظات |
+|---|---|---|
+| `filter_period` | 30 – 60 ثانية | يحتفظ بالمرجع في مواجهة التقلبات الدقيقة؛ القيمة الأدنى = تفاعل أسرع |
+| `decay_period` | 300 – 1800 ثانية | بعد هذه الفترة من الهدوء تعود الرسوم إلى قيمتها الأساسية |
+| `reduction_factor` | 4_000 – 8_000 | من `10_000`. القيمة الأعلى = الرسوم المرتفعة تبقى أطول |
+| `dynamic_fee_control` | 1_000 – 50_000 | من `100_000`. معامل الكسب على المنحنى |
+| `max_volatility_accumulator` | 100_000 – 10_000_000 | يُحدِّد سقف ارتفاع الرسوم الإضافية |
+
+يُنصح بالمعايرة عبر إعادة تشغيل المبادلات التاريخية على الصيغة دون اتصال، ثم ضبط `dynamic_fee_control` حتى تتطابق الرسوم المتوسطة الناتجة مع الهدف المنشود (مثلاً، 1.5× القاعدة في أيام انحراف معياري واحد، و5× في أيام ثلاثة انحرافات معيارية).
+
+### ما يراه مزودو السيولة
+
+تتدفق إيرادات الرسوم الديناميكية عبر المُجمِّعات ذاتها للرسوم الأساسية — `fee_growth_global_{0,1}_x64`. لا يوجد حقل منفصل لـ "نمو الرسوم الديناميكية". يكسب مزودو السيولة في المجمعات المتقلبة ببساطة رسوماً أعلى خلال فترات التقلب، دون الحاجة إلى أي مطالبة أو تعليمات تسوية إضافية.
+
+### ما يحتاج المُدمِجون معرفته
+
+- الرسوم التي يُعيدها الاقتباس قابلة للتغيير بين الكتلة N والكتلة N+1 حتى لو لم تتحرك احتياطيات المجمع — فكل مبادلة تُحرِّك مُجمِّع التقلب. اقتباسات Trade API صالحة عند كتلة الاقتباس وقد تنحرف ببضع نقاط أساس إذا تحرك المجمع بين الاقتباس والتنفيذ.
+- `volatility_accumulator` و`last_update_timestamp` متاحان على السلسلة — يستطيع العملاء تطبيق الصيغة محلياً لإجراء محاكاة دون اتصال.
+
+## المحاسبة على مستوى كل مركز
+
+يُخزِّن كل مركز، عند آخر لمسة له:
+
+- `fee_growth_inside_0_last_x64` و`fee_growth_inside_1_last_x64` — نمو الرسوم الخاص بالنطاق عند تلك اللقطة.
+
+عند كل لمسة لاحقة (`IncreaseLiquidity`، `DecreaseLiquidity`، وضمنياً أي انتقال حالة يُحدِّث نمو الرسوم عند حدود النقاط):
+
+1. يعيد البرنامج حساب `fee_growth_inside_{0,1}_x64` من نمو الرسوم **العالمي** ولقطات نقطتي الطرف `fee_growth_outside_*`.
+2. يُضاف الفارق Δ إلى `tokens_fees_owed_{0,1}` مُرجَّحاً بسيولة المركز:
+
+   ```
+   Δ_fee_growth_inside_0 = fee_growth_inside_now_0 - fee_growth_inside_last_0
+   tokens_fees_owed_0  += Δ_fee_growth_inside_0 * position.liquidity / 2^64
+   ```
+
+3. يُحدَّث `fee_growth_inside_{0,1}_last_x64`.
+
+لا تنتقل الرموز فعلياً إلا عبر `DecreaseLiquidity` أو مسار `CollectFees` المخصص (في مجموعة التعليمات الحالية لـ Raydium، تُجمَّع الرسوم كجزء من `DecreaseLiquidity`). ضبط `liquidity = 0` في استدعاء `DecreaseLiquidity` هو الأسلوب المعتمد لـ "التحصيل فقط".
+
+### المراكز خارج النطاق لا تكسب شيئاً
+
+إذا كان نطاق المركز لا يتضمن `tick_current`، فإن `fee_growth_inside` المحسوب له **محدود من الأعلى** ولا يتحرك طالما يقع السعر خارجه. يتوقف المركز عن تراكم الرسوم حتى يعود السعر إلى نطاقه. هذه ميزة مقصودة لا خلل — إذ هكذا تُركِّز السيولة المُركَّزة *عائد الرسوم* إلى جانب رأس المال.
+
+## تدفقات المكافآت
+
+يمكن لمجمع CLMM أن يمتلك ما يصل إلى **ثلاثة** تدفقات مكافآت نشطة في وقت واحد. كل تدفق عبارة عن صف (mint المكافأة، معدل الإصدار، وقت البداية، وقت النهاية) مُخزَّن في `PoolState.reward_infos[i]`.
+
+```rust
+pub struct RewardInfo {
+    pub reward_state: u8,               // Uninitialized | Initialized | Open | Ended
+    pub open_time: u64,
+    pub end_time: u64,
+    pub last_update_time: u64,
+    pub emissions_per_second_x64: u128, // Q64.64 reward tokens per second
+    pub reward_total_emissioned: u64,
+    pub reward_claimed: u64,
+    pub token_mint:    Pubkey,
+    pub token_vault:   Pubkey,
+    pub authority:     Pubkey,           // who can SetRewardParams / fund
+    pub reward_growth_global_x64: u128,  // accumulator, Q64.64
+}
+```
+
+### حلقة التسوية
+
+تُقدِّم كل تعليمة تلمس السيولة (و`UpdateRewardInfos` كتعليمة مستقلة) جميع التدفقات النشطة حتى اللحظة `now`:
+
+```
+for each reward_info with state in {Open, Ended within grace}:
+    elapsed         = min(now, end_time) − last_update_time
+    if elapsed > 0 && pool.liquidity > 0:
+        reward_growth_global_x64 += emissions_per_second_x64 × elapsed × 2^64 / pool.liquidity
+        reward_total_emissioned  += emissions_per_second × elapsed
+    last_update_time = min(now, end_time)
+```
+
+إذا كانت `pool.liquidity == 0` خلال فترة ما، فإصدارات تلك الفترة **لا تُوزَّع** (إذ لا توجد سيولة نشطة لتلقيها). يبقى الرصيد المتبقي في خزينة المكافآت. يستطيع البروتوكولات التي تُصدِر دون متابعة تعبئة التدفق أو إنهاؤه عبر `SetRewardParams`.
+
+### تراكم المكافآت على مستوى كل مركز
+
+يسير بنفس منهجية الرسوم، مع بُعد إضافي لكل تدفق:
+
+```
+for each stream i:
+    reward_growth_inside_now_i   = compute_inside_i(pool, tick_lower, tick_upper)
+    Δ_i = reward_growth_inside_now_i - personal_position.reward_infos[i].growth_inside_last_x64
+    personal_position.reward_infos[i].reward_amount_owed += Δ_i * personal_position.liquidity / 2^64
+    personal_position.reward_infos[i].growth_inside_last_x64 = reward_growth_inside_now_i
+```
+
+يطالب المستخدمون بمكافآتهم عبر `CollectReward`، التي تُحوِّل `reward_amount_owed` من خزينة التدفق إلى المستخدم وتُصفِّر العداد.
+
+### المكافآت للمراكز النشطة فقط
+
+يستخدم `reward_growth_inside` الصيغة ذاتها لـ `fee_growth_inside` — عبر مُجمِّعات "خارج النقطة" — لذا لا تتراكم مكافآت للمراكز خارج نطاق السعر الحالي. هذا يُحاكي خيار التصميم في Uniswap v3 القائل "الحوافز تذهب للسيولة النشطة"، ويُوائم مصلحة مزودي السيولة مع تغطية السعر الفوري.
+
+### تمويل التدفقات وإنهاؤها
+
+يُنشأ التدفق عبر `InitializeReward`، الذي يودع الميزانية الكاملة (`emissions_per_second × (end_time − open_time)`) في خزينة المكافآت مسبقاً. يرفض البرنامج `InitializeReward` إذا كان رصيد الممول غير كافٍ. يستطيع `SetRewardParams` تمديد `end_time` أو رفع معدل الإصدار؛ أما تقليص أي منهما فمحظور لتفادي سحب المكافآت الموعودة لمزودي السيولة.
+
+عند تجاوز `now` لـ `end_time` ينتقل التدفق إلى حالة `Ended` غير أن `reward_growth_global_x64` يستمر في القراءة — ويظل بإمكان مزودي السيولة تنفيذ `CollectReward` للمبالغ المكتسبة تاريخياً بعد توقف الإصدار.
+
+## تحصيل المُشغِّل
+
+| المُوقِّع | التعليمة | التأثير |
+|--------|-------------|--------|
+| `amm_config.owner` | `CollectProtocolFee` | تجميع `protocol_fees_token_{0,1}` لمستلم محدد. |
+| `amm_config.fund_owner` | `CollectFundFee` | تجميع `fund_fees_token_{0,1}` لمستلم محدد. |
+
+لا يُحرِّك أيٌّ منهما المنحنى — فالمبالغ المتراكمة تقع خارج `pool.liquidity` أصلاً. راجع [`security/admin-and-multisig`](/ar/security/admin-and-multisig) لمعرفة مَن يحمل هذه المُوقِّعات على الشبكة الرئيسية.
+
+## التفاعلات مع Token-2022
+
+الرسوم والمكافآت كلها مُحتسَبة بأحد رموز المجمع أو التدفق. تتصرف إضافات Token-2022 بنفس الطريقة المتبعة في CPMM:
+
+- **رسوم التحويل على mint المُدخَل في مبادلة.** يستقبل المجمع `amount_in − mint_transfer_fee`. يُحسَب مُدخَل خطوة CLMM مقابل المبلغ الصافي، وبالتالي تعكس مُجمِّعات رسوم المجمع الرموز الفعلية في الخزينة.
+- **رسوم التحويل على mint المُخرَج.** يُرسِل المجمع `amount_out`؛ يستلم المستخدم `amount_out − mint_transfer_fee`. ينبغي إجراء فحوصات الانزلاق مقابل المبلغ الذي يصل للمستخدم.
+- **رسوم التحويل على mint المكافأة.** تُحتسب الإصدارات بوحدات "داخل الخزينة" عند `InitializeReward` (يدفع الممول رسوم نقل mint إلى الخزينة). ثم تترتب على عمليات السحب عند `CollectReward` رسوم نقل mint إضافية؛ على مزودي السيولة توقع خصم طفيف على رموز المكافآت ذات رسوم التحويل.
+- **Mint غير قابل للتحويل / سري / عضو مجموعة.** يُرفض عند `CreatePool` / `InitializeReward`.
+
+قد يكون التأثير المشترك على مبادلة متعددة المراحل ذات رسوم تحويل كبيراً. أدوات الاقتباس التي تتجاهله ستُبالغ في وعودها؛ راجع [`algorithms/token-2022-transfer-fees`](/ar/algorithms/token-2022-transfer-fees) للحساب المرجعي.
+
+## قراءة الرسوم والمكافآت خارج السلسلة
+
+```ts
+const pool = await raydium.clmm.getPoolInfoFromRpc(poolId);
+const position = await raydium.clmm.getOwnerPositionInfo({
+  wallet: owner.publicKey,
+});
+
+for (const p of position) {
+  console.log("Position", p.nftMint.toBase58(),
+              "range", p.tickLower, "→", p.tickUpper,
+              "L", p.liquidity.toString(),
+              "fees owed:", p.tokenFeesOwed0.toString(),
+              p.tokenFeesOwed1.toString(),
+              "rewards owed:", p.rewardInfos.map(r => r.rewardAmountOwed.toString()));
+}
+```
+
+`tokenFeesOwed*` و`rewardAmountOwed` هما لقطتان من آخر مرة تم فيها تحديث المركز. للاطلاع على القيم **الحالية** (التي تعكس النمو منذ ذلك الحين)، استدعِ `IncreaseLiquidity` بسيولة صفرية في محاكاة، أو أعِد الحساب مباشرةً باستخدام `fee_growth_*` العالمي ولقطات "خارج النقطة" لكلا طرفي النطاق.
+
+## الخطوات التالية
+
+- [`products/clmm/math`](/ar/products/clmm/math) — الاشتقاق الكامل لـ `fee_growth_inside`.
+- [`products/clmm/instructions`](/ar/products/clmm/instructions) — قوائم الحسابات لـ `CollectReward` و`InitializeReward` و`SetRewardParams`.
+- [`algorithms/token-2022-transfer-fees`](/ar/algorithms/token-2022-transfer-fees) — الاقتباس مع mint ذات رسوم التحويل.
+- [`reference/fee-comparison`](/ar/reference/fee-comparison) — مصفوفة رسوم CLMM/CPMM/AMM-v4 جنباً إلى جنب.
+
+المصادر:
+
+- [`raydium-io/raydium-clmm` — `states/pool.rs`, `libraries/fixed_point_64.rs`](https://github.com/raydium-io/raydium-clmm)
+- ورقة "Uniswap v3 Core" البيضاء، §7 (نمو الرسوم)

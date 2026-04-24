@@ -1,0 +1,285 @@
+---
+title: "LaunchLab 代码演示"
+description: "端到端 TypeScript：创建 LaunchLab 启动，在黏合曲线上买卖，毕业进入 CPMM 池，并收集创建者费用。"
+---
+
+<Info>
+  **本页内容由 AI 自动翻译，所有内容以英文版本为准。**
+
+  [查看英文版 →](/products/launchlab/code-demos)
+</Info>
+
+<Info>
+  **版本信息。**
+
+  - SDK: `@raydium-io/raydium-sdk-v2@0.2.42-alpha`
+  - 集群: Solana `mainnet-beta`
+  - 程序 ID: 见 [`reference/program-addresses`](/zh/reference/program-addresses)
+  - 最后验证: 2026-04
+
+  在 `package.json` 中固定 SDK 版本。黏合曲线接口在次版本间有所演变。
+</Info>
+
+## 设置
+
+本节演示对应 [`raydium-sdk-V2-demo/src/launchpad`](https://github.com/raydium-io/raydium-sdk-V2-demo/tree/master/src/launchpad) 中的文件。引导步骤遵循演示仓库的 [`config.ts.template`](https://github.com/raydium-io/raydium-sdk-V2-demo/blob/master/src/config.ts.template)：
+
+```ts
+import { Connection, Keypair, clusterApiUrl, PublicKey } from "@solana/web3.js";
+import { Raydium, TxVersion } from "@raydium-io/raydium-sdk-v2";
+import BN from "bn.js";
+import fs from "node:fs";
+
+const connection = new Connection(process.env.RPC_URL ?? clusterApiUrl("mainnet-beta"));
+const owner = Keypair.fromSecretKey(
+  new Uint8Array(JSON.parse(fs.readFileSync(process.env.KEYPAIR!, "utf8"))),
+);
+const raydium = await Raydium.load({
+  owner,
+  connection,
+  cluster: "mainnet",
+  disableFeatureCheck: true,
+  blockhashCommitment: "finalized",
+});
+export const txVersion = TxVersion.V0;
+```
+
+## 创建启动
+
+源代码: [`src/launchpad/createMint.ts`](https://github.com/raydium-io/raydium-sdk-V2-demo/blob/master/src/launchpad/createMint.ts)（以及 [`createBonkMintApi.ts`](https://github.com/raydium-io/raydium-sdk-V2-demo/blob/master/src/launchpad/createBonkMintApi.ts) 用于 API 驱动的 Bonk 变体）
+
+```ts
+import { NATIVE_MINT } from "@solana/spl-token";
+
+const { execute, extInfo } = await raydium.launchpad.createLaunchpad({
+  programId: /* LaunchLab program ID from reference/program-addresses */,
+  // Token metadata for the new base mint:
+  name:   "Example Token",
+  symbol: "EXMPL",
+  uri:    "https://example.com/metadata.json",
+  decimals: 6,
+
+  // Curve params:
+  curveType: 0,                                      // 0 = quadratic
+  supply:    new BN(1_000_000_000).mul(new BN(10).pow(new BN(6))), // 1B base (6 dec)
+  graduationFractionBps: 8000,                       // 80% → graduation
+  initialK:  new BN("40"),                           // curve shape parameter
+
+  // Quote side:
+  quoteMint: NATIVE_MINT,                            // WSOL
+  openTime:  new BN(Math.floor(Date.now() / 1000) + 60),  // opens in 1min
+
+  // Fee policy:
+  fees: {
+    buyNumerator:   new BN(100),                     // 1.00%
+    buyDenominator: new BN(10_000),
+    sellNumerator:  new BN(100),
+    sellDenominator: new BN(10_000),
+    lpShare:         new BN(60),
+    creatorShare:    new BN(20),
+    protocolShare:   new BN(20),
+    totalShare:      new BN(100),
+  },
+
+  postGraduationLpPolicy: "burn",                    // "burn" | "lock" | "toCreator"
+
+  txVersion: TxVersion.V0,
+});
+
+const { txId } = await execute({ sendAndConfirm: true });
+console.log("Launch:", extInfo.launchState.toBase58());
+console.log("Base mint:", extInfo.baseMint.toBase58());
+console.log("Create tx:", txId);
+```
+
+注意：
+
+- `initialK` 是二次曲线的缩放因子。调整它可针对毕业时的特定开盘 CPMM 价格。参见 [`products/launchlab/bonding-curve`](/zh/products/launchlab/bonding-curve) 了解推导过程。
+- SDK 在单个事务中处理创建基础 token、元数据 PDA 和两个保管库。如果元数据 URI 很长，可能超过 1232 字节；此时 SDK 会分成两个事务。
+- `Initialize` 之后，启动在 `openTime` 前不可交易。将 `openTime` 设置为提前一两分钟，以减少抢跑者的机会。
+
+## 获取启动状态
+
+```ts
+const launchId = new PublicKey("<LAUNCH_STATE>");
+
+const launch = await raydium.launchpad.getLaunchById({ launchId });
+console.log("Status:", ["Active","Graduated","Cancelled"][launch.status]);
+console.log("Base sold:", launch.baseSold.toString(),
+            "/", launch.baseSupplyMax.toString());
+console.log("Quote collected:", launch.quoteReserveReal.toString(),
+            "target:", launch.quoteReserveTarget.toString());
+if (launch.status === 1) {
+  console.log("Post-graduation CPMM pool:", launch.cpmmPoolState.toBase58());
+}
+```
+
+`getLaunchById` 返回解码后的 `LaunchState` 以及计算得出的「毕业进度」分数（以 `Decimal` 形式）。
+
+## 买入 — 精确报价输入
+
+源代码: [`src/launchpad/buy.ts`](https://github.com/raydium-io/raydium-sdk-V2-demo/blob/master/src/launchpad/buy.ts)
+
+```ts
+const quoteIn        = new BN(1).mul(new BN(10).pow(new BN(9)));  // 1 SOL
+const minimumBaseOut = new BN(0);  // accept any; tighten for production
+
+// Preview the quote off-chain so your UI can show expected base_out:
+const preview = raydium.launchpad.computeBuyBase({
+  launchState: launch,
+  quoteIn,
+});
+console.log("Expected base_out:", preview.baseOut.toString(),
+            "price impact:", preview.priceImpact.toString());
+
+const { execute } = await raydium.launchpad.buyExactIn({
+  launchInfo: launch,
+  quoteIn,
+  minimumBaseOut,
+  txVersion: TxVersion.V0,
+});
+
+const { txId } = await execute({ sendAndConfirm: true });
+console.log("Buy tx:", txId);
+```
+
+`computeBuyBase` 镜像链上 Newton 求解器（二次曲线）或闭式 CPMM 逆向（curve_type 1）。用它来填充「你将收到」UI 字段。
+
+## 买入 — 精确基础输出
+
+```ts
+const baseOut         = new BN(1_000_000).mul(new BN(10).pow(new BN(6)));  // 1M base
+const maximumQuoteIn  = new BN(2).mul(new BN(10).pow(new BN(9)));          // cap at 2 SOL
+
+const { execute } = await raydium.launchpad.buyExactOut({
+  launchInfo: launch,
+  baseOut,
+  maximumQuoteIn,
+  txVersion: TxVersion.V0,
+});
+
+await execute({ sendAndConfirm: true });
+```
+
+适用于「恰好买 X 个 token」的 UI。如果曲线移动幅度太大，导致报价需求现已超过 `maximumQuoteIn`，则以 `ExceededSlippage` 拒绝。
+
+## 卖出
+
+源代码: [`src/launchpad/sell.ts`](https://github.com/raydium-io/raydium-sdk-V2-demo/blob/master/src/launchpad/sell.ts)
+
+```ts
+const baseIn           = new BN(500_000).mul(new BN(10).pow(new BN(6)));  // 0.5M base
+const minimumQuoteOut  = new BN(0);
+
+const { execute } = await raydium.launchpad.sellExactIn({
+  launchInfo: launch,
+  baseIn,
+  minimumQuoteOut,
+  txVersion: TxVersion.V0,
+});
+
+await execute({ sendAndConfirm: true });
+```
+
+曲线的卖出路径与买入路径对称：将 `base_sold` 减少 `baseIn` 后返回的 `quote_out` 等于曲线在 `base_sold − baseIn` 和 `base_sold` 之间的积分面积，减去卖出费用。
+
+## 在阈值交叉买入时自动毕业
+
+当 SDK 检测到买入后的状态将跨越阈值时，它会在 `buy*` 事务中链接 `Graduate` 指令：
+
+```ts
+const { execute, willGraduate } = await raydium.launchpad.buyExactIn({
+  launchInfo: launch,
+  quoteIn: new BN(100).mul(new BN(10).pow(new BN(9))),    // large buy
+  minimumBaseOut: new BN(0),
+  txVersion: TxVersion.V0,
+  autoGraduate: true,                                      // default
+});
+
+if (willGraduate) {
+  console.log("This buy will trigger graduation.");
+}
+
+const { txId } = await execute({ sendAndConfirm: true });
+```
+
+因为 `Graduate` 是无权限的，任何人（包括 MEV 机器人）都可以争相在阈值跨越后首次执行 `Graduate` — 通常在几秒内，而不是几分钟。首次成功的人只需支付 CPMM 池账户的租赁费；他们没有其他好处。
+
+## 手动 `Graduate`
+
+如果 `autoGraduate` 关闭或阈值交叉事务失败，你可以单独执行毕业：
+
+```ts
+const { execute } = await raydium.launchpad.graduate({
+  launchInfo: launch,
+  txVersion: TxVersion.V0,
+});
+
+await execute({ sendAndConfirm: true });
+```
+
+如果在提交时 `quote_reserve_real < quote_reserve_target`，则以 `NotAtThreshold` 拒绝。可重试安全 — 成功后的第二次 `Graduate` 尝试将以 `NotActive` 拒绝。
+
+## 收集创建者费用
+
+源代码: [`src/launchpad/claimCreatorFee.ts`](https://github.com/raydium-io/raydium-sdk-V2-demo/blob/master/src/launchpad/claimCreatorFee.ts)（单个 token）和 [`collectAllCreatorFees.ts`](https://github.com/raydium-io/raydium-sdk-V2-demo/blob/master/src/launchpad/collectAllCreatorFees.ts)（批处理）
+
+```ts
+const { execute } = await raydium.launchpad.collectCreatorFees({
+  launchInfo: launch,
+  txVersion: TxVersion.V0,
+});
+
+await execute({ sendAndConfirm: true });
+```
+
+将累积的创建者费用计数器报价金额转移到创建者在报价 token 上的 ATA。可在毕业前或后调用；定期使用而不是等待余额积累到很大。
+
+## 通过生命周期追踪启动
+
+整合在一起，监控脚本可能如下所示：
+
+```ts
+async function watch(launchId: PublicKey) {
+  while (true) {
+    const launch = await raydium.launchpad.getLaunchById({ launchId });
+    const progress =
+      Number(launch.quoteReserveReal) /
+      Number(launch.quoteReserveTarget);
+
+    console.log(
+      `status=${["Active","Graduated","Cancelled"][launch.status]}`,
+      `progress=${(progress * 100).toFixed(2)}%`,
+      `num_buys=${launch.stateData.numBuys}`,
+    );
+
+    if (launch.status === 1) {
+      console.log("Graduated to CPMM pool:", launch.cpmmPoolState.toBase58());
+      break;
+    }
+    await new Promise(r => setTimeout(r, 10_000));
+  }
+}
+```
+
+## Rust CPI
+
+从你自己的 Anchor 程序调用 LaunchLab 很少见（大多数启动集成仅在 TS 一侧）。如果要这样做，程序提供 Anchor crate `raydium_launchlab`，其中包含 `cpi::accounts::Buy`、`cpi::accounts::Sell` 等 — 模式镜像 CPMM/CLMM CPI 示例。当该网站被填充时，参见 [`sdk-api/rust-cpi`](/zh/sdk-api/rust-cpi) 获取通用模板。
+
+## 陷阱
+
+- **费用分割算术偏差一。** 如果 `total_share` 不完全等于 `lp_share + creator_share + protocol_share`，`Initialize` 将以 `InvalidFeeShares` 拒绝。将 `totalShare` 设置为相加总和。
+- **使用非允许的报价 token。** `launch_config.allowed_quote_mints` 是固定列表；传入任何其他 token 将拒绝。首先用 `raydium.launchpad.getConfig()` 检查。
+- **元数据大小。** 长 `uri` 字符串会让 Metaplex CPI 超出预算。保持 `uri` 在 ~200 字符以下 — 大多数 CDN 托管的 JSON 元数据轻松适配。
+- **毕业竞争。** 自动化机器人监控 `quote_reserve_real` 并在阈值跨越后一两个 slot 内抢跑 `Graduate`。这是无害的 — 只需他们支付租赁费 — 但意味着你的 UI 应将 `status` 转换视为快速事件。
+
+## 接下来在哪里
+
+- [`products/launchlab/bonding-curve`](/zh/products/launchlab/bonding-curve) — 曲线数学。
+- [`products/cpmm/code-demos`](/zh/products/cpmm/code-demos) — 如何处理生成的池。
+- [`user-flows/launch-token-launchlab`](/zh/user-flows/launch-token-launchlab) — 端到端启动 token 指南，包括链下步骤。
+
+源代码：
+
+- [Raydium SDK v2](https://github.com/raydium-io/raydium-sdk-V2)
+- Raydium LaunchLab 程序源代码

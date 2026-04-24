@@ -1,0 +1,159 @@
+---
+title: "Tick'ler ve Pozisyonlar"
+description: "CLMM'nin fiyatı tick'lere nasıl ayrıştırdığı, tick dizilerinin depolamayı nasıl sıkıştırdığı ve bir pozisyonun nerede yaşayabileceğini belirleyen kurallar."
+---
+
+<Info>
+  **Bu sayfa yapay zekâ tarafından otomatik olarak çevrilmiştir. İngilizce sürüm esas alınır.**
+
+  [İngilizce sürümü görüntüle →](/products/clmm/ticks-and-positions)
+</Info>
+
+## Neden tick'ler vardır?
+
+CLMM'nin likiditesi fiyat aralıklarına yoğunlaştırılır. Aralıkları zincir üzerinde yönetilebilir hâle getirmek için fiyatlar tamsayı **tick'lere** nicemlenir; her tick, bir öncekinin sabit bir katıdır:
+
+$$
+\text{price}(i) = 1.0001^{\,i}
+$$
+
+Bir tick, %0,01'lik bir fiyat hareketine veya ~1 baz puana karşılık gelir. Eşleme şu şekildedir:
+
+| Tick indeksi `i` | Fiyat çarpanı |
+|---|---|
+| `0` | `1.0000` |
+| `100` | `1.0100` (≈ +%1,00) |
+| `-100` | `0.9900` (≈ −%0,99) |
+| `10000` | `2.7181` (≈ e) |
+| `MAX_TICK = 443636` | ≈ `1.84e19` |
+| `MIN_TICK = -443636` | ≈ `5.42e-20` |
+
+`MIN_TICK` ve `MAX_TICK`, `sqrt_price_x64`'ün her iki uçta da bir `u128`'e sığması için seçilir. Her pool, `tick_lower >= MIN_TICK` ve `tick_upper <= MAX_TICK` olmasını zorunlu kılar. Uygulamada, web arayüzü aralığı, kullanıcıların likiditeyi erişilemeyen tick'lere kilitlemesini önlemek için çok daha dar bir aralığa sınırlar.
+
+## Tick aralığı (Tick spacing)
+
+Bir pool'un `AmmConfig`'i bir **tick aralığı** belirler — bir pozisyonun uç noktalar olarak kullanmasına izin verilen tek tick'ler. `tick_spacing = 60` ise, yalnızca `…, −120, −60, 0, 60, 120, …` tick'leri geçerlidir. Uç noktası `31` olan bir pozisyon açma denemesi, `InvalidTickIndex` ile geri döner.
+
+Yaygın yayımlanan aralıklar:
+
+| Ücret katmanı | `trade_fee_rate` | Tick aralığı | Tick pozisyonu başına en kalın fiyat adımı |
+|----------|------------------|--------------|---------------------------------------|
+| 0.01% | `100` | 1 | 0.01% |
+| 0.05% | `500` | 10 | 0.10% |
+| 0.25% | `2500` | 60 | 0.60% |
+| 1.00% | `10000` | 120 | 1.21% |
+
+Aralık ne kadar kaba ise, başlatılacak tick dizileri o kadar az, geniş bir pozisyon açmak o kadar ucuz ve fiyat sınırı o kadar bulanık olur. Değişken çiftler tipik olarak 120 aralıklı katmanlarda yaşar; stabil çiftler 1 aralıklı katmanlarda yaşar.
+
+## Tick dizileri
+
+Pool, tick başına durumu ayrı hesaplarda depolamaz. Bunun yerine, `TICK_ARRAY_SIZE` bitişik tick'leri (mevcut Raydium CLMM'de 60) tek bir `TickArrayState`'e paketler. Dizinin ilk tick'i `start_tick_index`'idir ve tam olarak `TICK_ARRAY_SIZE * tick_spacing` tamsayı-tick birimlerini kapsar.
+
+`tick_spacing = 60` ve `TICK_ARRAY_SIZE = 60` için:
+
+- Her tick dizisi `60 × 60 = 3600` tamsayı tick'i kapsar.
+- `start_tick_index`, 3600'ün katıdır: `…, -7200, -3600, 0, 3600, 7200, …`.
+
+`tick_spacing = 60` olan bir pozisyon uç noktası `t = 2040`, `start_tick_index = 0` olan tick dizisinde yaşar. Bir pozisyon uç noktası `t = 4200`, `start_tick_index = 3600` olan dizide yaşar.
+
+### Bir dizi ne zaman oluşturulur?
+
+Bir tick dizisi tembel yüklenir: buna referans veren **ilk** pozisyon, dizi içindeki herhangi bir tick'i başlatır ve kiraya ödeme yapar. Swap'ler tick dizilerini başlatmaz — bitmap kullanarak başlatılmamış dizileri atlar. SDK'nın pozisyon açma akışı, seçilen aralığı inceler, dokunduğu tick dizilerinin listesini hesaplar ve herhangi biri eksikse aynı işlemde `OpenPosition` ile birlikte `init_tick_array` talimatları ekler.
+
+### Tick dizileri kapatılmaz
+
+Bir tick dizisi başlatıldıktan sonra, pool'un ömrü boyunca kalıcı olur. Program, `initialized_tick_count` sıfıra dönse bile, bir tick dizisini kapatmak için bir yol **sunmaz**. Tick dizileri için kira geri alımı yoktur; bir diziye dokunmayan ilk pozisyon tarafından ödenen kira o hesapta kalıcı olarak kilitlenir. Bu bilinçli bir tradeoff'dur: mevcut bir tick dizisini yeniden kullanmak, sonraki her pozisyon için ücretsizdir, bu nedenle yoğun ticari bir pool, değişkenliğe bakılmaksızın `(pool, start_tick_index)` yuvası başına kira maliyetini yalnızca bir kez öder.
+
+### Bitmap
+
+"Geçerli tick'in solundaki/sağındaki sonraki başlatılmış tick'i bul" hızlı olmalıdır — bir swap birçok tick'i geçebilir. Pool, `PoolState`'de tick 0 etrafında ±1.024 dizi aralığı için satır içi 1 bitlik-tick dizisi bitmap'i depolar. Bu aralığın dışında (tam aralıklı pozisyonlar, egzotik kurulumlar), `TickArrayBitmapExtension` taşmayı sağlar.
+
+Bir swap bitmap'i yürür: `lowest_set_bit_above(tick_current_array_index)`, swap'ın geçiş yaptığı tarafta başlatılmış bir tick'li bir sonraki diziyi verir. O dizinin içinde, benzer bir bit taraması sonraki başlatılmış tick'i bulur.
+
+## `liquidity_gross` ve `liquidity_net`
+
+Her **başlatılmış** tick iki likidite değeri depolar:
+
+- **`liquidity_gross`** — bu tick'i uç noktalardan biri olarak referans veren tüm pozisyonlar üzerinden `L`'nin toplamı. `liquidity_gross` sıfıra ulaştığında, tick başlatılmamış hâle gelir ve bitmap'ten kaldırılabilir.
+- **`liquidity_net`** — fiyat bu tick'i **yukarı doğru** geçerken pool seviyesi `liquidity`'ye *işaretli* değişim (tick alanında soldan sağa). Bu tick, `L` boyutundaki bir pozisyonun alt sınırı ise, `+L`'ye katkıda bulunur; o pozisyonun üst sınırı ise `−L`'ye katkıda bulunur.
+
+Örnek: aynı pool'da iki pozisyon.
+
+- Pozisyon A: `tick_lower = -120`, `tick_upper = 0`, likidite `L_A = 100`.
+- Pozisyon B: `tick_lower = -60`, `tick_upper = 60`, likidite `L_B = 50`.
+
+Tick bazında durum:
+
+| Tick | Kime tarafından dokunuldu | `liquidity_gross` | `liquidity_net` |
+|------|------------|-------------------|------------------|
+| `-120` | A alt | 100 | +100 |
+| `-60` | B alt | 50 | +50 |
+| `0` | A üst | 100 | −100 |
+| `60` | B üst | 50 | −50 |
+
+Farklı `tick_current` değerleri için pool seviyesi `liquidity`:
+
+- `tick_current = -180`: `liquidity = 0` (herhangi bir pozisyondan önce)
+- `tick_current = -90`: `liquidity = 100` (yalnızca A içinde)
+- `tick_current = -30`: `liquidity = 150` (A ve B içinde)
+- `tick_current = 30`: `liquidity = 50` (yalnızca B içinde)
+- `tick_current = 90`: `liquidity = 0` (her ikisinin de ötesinde)
+
+Bir swap sırasında her tick geçişinde, program `liquidity_net` (muhtemelen negatif) ekler `PoolState.liquidity`'ye. Bu, tam Uniswap-v3 mekanizmasıdır.
+
+## Pozisyonlar olarak NFT'ler
+
+Bir Raydium CLMM pozisyonu bir NFT'dir. Bir pozisyon açmak, çağıranın cüzdanında arz 1 ile yepyeni bir mint'i basarak ve mint'in yetkilisi CLMM programı olarak ayarlanır. Program, pozisyon sahipliğini **CPI zamanında o mint'in ATA'sında bir bakiyeyi tutan kişiye** bağlar.
+
+Sonuçlar:
+
+- **Pozisyonlar aktarılabilir.** Bir cüzdan, NFT'yi aktararak bir pozisyonu satabilir veya airdrop edebilir. Yeni sahip, `CollectRewards`, `IncreaseLiquidity` vb. çağırabilir.
+- **Pozisyonlar CLMM dışında adreslenebilir.** Pazaryerleri ve cüzdanlar, pozisyonları diğer NFT'ler gibi görüntüler. SDK, mint metaverilerine makul `name`/`symbol` ayarlar.
+- **Bir pozisyonun PDA'sı NFT mint'inden türetilir.** Şu anda kimi tuttuğunu bilmeden `PersonalPositionState`'i bulabilirsiniz.
+
+### Token-2022 pozisyonları
+
+Daha yeni CLMM pool'ları, klasik SPL Token yerine Token-2022 altında pozisyon basabilir. Program, NFT mint'ine sahip olan token programı ötesinde özdeş semantiğe sahip iki paralel açma talimatı sunar — `OpenPosition` ve `OpenPositionWithToken22Nft`. Cüzdan ve pazaryeri uyumluluğu farklılık gösterir; Raydium'ın arayüzü her ikisini de takip eder.
+
+## İzin verilen aralık kuralları
+
+`OpenPosition` zamanında program şunları zorunlu kılar:
+
+1. `tick_lower < tick_upper`.
+2. `tick_lower % tick_spacing == 0` ve `tick_upper % tick_spacing == 0`.
+3. `MIN_TICK <= tick_lower` ve `tick_upper <= MAX_TICK`.
+4. Çağıran, `tick_lower` ve `tick_upper`'ı içeren tick dizilerini sağlamıştır — zaten başlatılmış veya aynı işlemde bir `init_tick_array` yoluyla.
+5. Bitmap uzantısı hesabı, eğer bu pozisyon uzantı aralığına uzanırsa.
+
+Herhangi bir kontrol başarısız olursa talimat, hangi kısıtlamaya bağlı olarak `InvalidTickIndex`, `NotApproved` veya `InsufficientLiquidity` ile geri döner. Bkz. [`reference/error-codes`](/tr/reference/error-codes).
+
+## "Aralık içinde" vs "aralık dışında"
+
+Bir pozisyon **aralık içindedir** `tick_lower <= tick_current < tick_upper` olduğunda. Yalnızca aralık içi pozisyonlar `PoolState.liquidity`'ye katkıda bulunur ve bu nedenle yalnızca onlar swap ücretlerini kazanır.
+
+Aralık dışı bir pozisyon:
+
+- *Bir* token'ın %100'ünü tutar (aralığı geçmiş olanı). Spesifik olarak, `tick_current < tick_lower` ise, pozisyon yalnızca token1 tutar (zaten fiyat uzaklaşarak "satılmış"); `tick_current >= tick_upper` ise, yalnızca token0 tutar.
+- Swap ücretlerini **kazanmaz**.
+- Pool'un ödül akışları aralık dışı likiditeyi yayıyorsa ödülleri birikintiye **devam eder** — ancak Raydium'ın varsayılan davranışı "yalnızca aralık içine yay"dır, Uniswap v3 konvansiyonuyla eşleşir. Bkz. [`products/clmm/fees`](/tr/products/clmm/fees).
+
+CLMM pozisyonlarını yöneten LP'ler, fiyat değiştikçe pozisyonları aralık içinde tutmaya çoğu zaman odaklanırlar.
+
+## Yaygın entegrasyon tuzakları
+
+- **Aralık dışı uç noktalar.** Hedef fiyattan bir tick hesaplayan kod, bunu `OpenPosition`'a geçmeden önce `tick_spacing`'in katına yapıştırmalıdır. SDK yardımcıları (`TickUtils.getTickWithPriceAndTickspacing`) bunu yapar; ev yapımı matematik genellikle yapmaz.
+- **Eksik tick dizileri.** Geniş bir pozisyon açmak birkaç tick dizisini başlatmayı gerektirebilir; bunları yazılabilir hesaplar olarak geçmeyi unutmak geri döner. SDK'nın `openPositionFromBase`, listeyi sizin için döndürür.
+- **Swap'ten sonra eski tick.** `tick_current`, bir swap'te birçok tick'i geçebilir. UX'iniz bir RPC çağrısından "geçerli tick" gösterir ve ardından daha sonra bir pozisyon açarsa, canlı fiyata karşı göreceli konum düzinelerce tick kadar olabilir. İmzalamadan önce yeniden getirin.
+- **Ekstra metaveri ile pozisyon NFT'leri.** Raydium pozisyonlarını tanıyan bir cüzdan oluşturursanız, sabit kodlanmış bir metaveri alanı yerine mint otoritesi (= CLMM programının PDA'sı) tarafından tanıyın.
+
+## Sonra nereye gitmeli
+
+- [Math](/tr/products/clmm/math) — swap adım adım ve tick sınırlarının katıldığı ücret büyümesi türetilmesi.
+- [Accounts](/tr/products/clmm/accounts) — `TickArrayState` ve `PositionState` düzenleri.
+- [Ücretler ve ödüller](/tr/products/clmm/fees) — aralık içi olmak ücret birikimini nasıl sınırlandırır.
+- [`algorithms/clmm-math`](/tr/algorithms/clmm-math) — yoğunlaştırılmış likidite formüllerinin paylaşılan türetilmesi.
+
+Kaynaklar:
+
+- [`raydium-io/raydium-clmm` — `tick_array`, `tick`, `position` modülleri](https://github.com/raydium-io/raydium-clmm)
+- "Uniswap v3 Core" teknik inceleme, §6 (tick'ler), §7 (ücret büyümesi)

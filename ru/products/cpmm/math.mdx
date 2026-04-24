@@ -1,0 +1,258 @@
+---
+title: "Математика CPMM"
+description: "Инвариант константного произведения, SwapBaseInput и SwapBaseOutput, обработка комиссий Token-2022 и правило обновления счета наблюдений."
+---
+
+<Info>
+  **Эта страница переведена с помощью ИИ. За эталон принимается английская версия.**
+
+  [Открыть английскую версию →](/products/cpmm/math)
+</Info>
+
+## Инвариант
+
+CPMM поддерживает классический инвариант константного произведения на двух своих хранилищах:
+
+$$
+x \cdot y = k
+$$
+
+где `x` — это баланс vault0 **после** всех комиссий передачи Token-2022 при получении, и аналогично для `y`. Каждый свап должен оставить `k' ≥ k` после учёта торговых комиссий, зачисленных LP (протокол, фонд и комиссии создателя *не учитываются* при расчёте `k` — они находятся в хранилище, но исключаются из представления кривой, см. [Комиссии на кривой](#комиссии-на-кривой) ниже). Таким образом, `k` монотонно растёт с течением времени по мере начисления комиссий LP.
+
+Цена LP-доли определяется резервами пула, а не `k`:
+
+$$
+\text{цена LP в token0} = \frac{x}{\text{lpSupply}}, \qquad \text{цена LP в token1} = \frac{y}{\text{lpSupply}}
+$$
+
+Сжигание `ΔLP` LP-токенов возвращает ровно `ΔLP × x / lpSupply` token0 и `ΔLP × y / lpSupply` token1. При депозите или выводе ни кривая, ни `k` не движутся — цена меняется только при свопах.
+
+## Модель комиссий на пути свопа
+
+CPMM применяет **две независимо установленные комиссии** на каждом свопе:
+
+- **Торговая комиссия** берётся на входе с коэффициентом `AmmConfig.trade_fee_rate`. Затем она разделяется на доли LP, протокола и фонда (доля LP остаётся в хранилище и увеличивает `k`; доли протокола и фонда извлекаются из учёта хранилища).
+- **Комиссия создателя** (активна только когда `enable_creator_fee == true`) берётся с коэффициентом `AmmConfig.creator_fee_rate`. Она берётся на **входе** или **выходе** в зависимости от `PoolState.creator_fee_on` и направления свопа (см. [`/ru/products/cpmm/fees#с-какой-стороны-торговли-берутся-комиссии`](/ru/products/cpmm/fees#с-какой-стороны-торговли-берутся-комиссии)). Это отдельная корзина — никогда не доля торговой комиссии.
+
+Пусть:
+
+- `FEE_RATE_DENOMINATOR = 1_000_000`
+- `trade_fee_rate` — из `AmmConfig`, например `2500` = 0,25% от соответствующего объёма
+- `creator_fee_rate` — из `AmmConfig`, например `1000` = 0,10% от соответствующего объёма
+- `protocol_fee_rate`, `fund_fee_rate` — в единицах `1/FEE_RATE_DENOMINATOR` **торговой комиссии**, а не объёма
+
+Когда комиссия создателя берётся на входе:
+
+```
+total_input_fee = ceil(amount_in * (trade_fee_rate + creator_fee_rate) / FEE_RATE_DENOMINATOR)
+creator_fee     = floor(total_input_fee * creator_fee_rate / (trade_fee_rate + creator_fee_rate))
+trade_fee       = total_input_fee - creator_fee
+amount_in_after_fees = amount_in - total_input_fee
+```
+
+Когда комиссия создателя берётся на выходе:
+
+```
+trade_fee            = ceil(amount_in * trade_fee_rate / FEE_RATE_DENOMINATOR)
+amount_in_after_fees = amount_in - trade_fee
+amount_out_curve     = curve_output(amount_in_after_fees, ...)
+creator_fee          = ceil(amount_out_curve * creator_fee_rate / FEE_RATE_DENOMINATOR)
+amount_out           = amount_out_curve - creator_fee
+```
+
+В обоих случаях торговая комиссия разделяется одинаково:
+
+```
+protocol_fee   = floor(trade_fee * protocol_fee_rate / FEE_RATE_DENOMINATOR)
+fund_fee       = floor(trade_fee * fund_fee_rate     / FEE_RATE_DENOMINATOR)
+lp_fee         = trade_fee - protocol_fee - fund_fee     // creator_fee НЕ вычитается здесь
+```
+
+Сумма `protocol_fee + fund_fee + creator_fee` хранится в хранилищах, но отслеживается отдельно в состоянии пула (`protocol_fees_token*`, `fund_fees_token*`, `creator_fees_token*`). Когда проверка инварианта константного произведения проверяет `k' ≥ k`, она использует балансы хранилища **минус** все три накопленные, но неизвлечённые комиссии — таким образом LP захватывают только `lp_fee`.
+
+См. [`/ru/products/cpmm/fees`](/ru/products/cpmm/fees) для инструкций по сбору и выполненных численных примеров.
+
+## SwapBaseInput (вход точен)
+
+"Пользователь дает нам ровно `amount_in` входного токена и получает как минимум `minimum_amount_out` выходного токена."
+
+Пока игнорируем Token-2022:
+
+```
+amount_in_after_trade_fee = amount_in - trade_fee
+amount_out                = y − (x * y) / (x + amount_in_after_trade_fee)
+```
+
+По алгебре:
+
+$$
+\text{amount\_out} = \frac{y \cdot \Delta x_{\text{net}}}{x + \Delta x_{\text{net}}}
+$$
+
+где `Δx_net = amount_in_after_trade_fee`.
+
+Затем программа обновляет учет хранилища так, чтобы часть `trade_fee`, полагающаяся протоколу/фонду/создателю, находилась в корзинах "накопленных" комиссий (не включаются в следующее `x` кривой), тогда как доля LP присоединяется к `x` для следующего свопа.
+
+### Token-2022 на входе
+
+Если входной токен имеет расширение transfer-fee, **монета** вычитает свою комиссию при передаче от пользователя → хранилище. Поэтому хранилище фактически получает `amount_in − transfer_fee_in(amount_in)`. Программа CPMM поэтому вычисляет:
+
+```
+amount_actually_received = amount_in − transfer_fee_in(amount_in)
+trade_fee                = ceil(amount_actually_received * trade_fee_rate / FEE_RATE_DENOMINATOR)
+amount_in_after_trade_fee = amount_actually_received − trade_fee
+```
+
+и запускает кривую против `amount_in_after_trade_fee`. Это важно, потому что **цена кривой вычисляется исходя из чистой суммы, поступившей в хранилище**, а не из объявленной суммы пользователя.
+
+### Token-2022 на выходе
+
+Если выходной токен имеет комиссию передачи, пул отправляет `amount_out` из своего хранилища пользователю. **Монета** затем снимает свою комиссию в пути, поэтому пользователь получает `amount_out − transfer_fee_out(amount_out)`. Программа вычисляет `amount_out` из кривой как обычно, но задача интегратора — преобразовать число "отправка из хранилища" пула в число "получение пользователем" при показе котировок.
+
+### Проверка скольжения
+
+После вычисления `amount_out`:
+
+```
+require(amount_out >= minimum_amount_out, "AmountSpecifiedLessThanMinimum")
+```
+
+Если выходной токен берёт комиссию передачи, SDK применяет комиссию передачи *перед* установкой `minimum_amount_out`, так чтобы константа скольжения была номинирована в том, что пользователь фактически получит, а не в том, что отправит хранилище.
+
+## SwapBaseOutput (выход точен)
+
+"Пользователь получит ровно `amount_out` выходного токена и готов заплатить до `maximum_amount_in` входного токена."
+
+Инвертируя кривую для `Δx_net`:
+
+$$
+\Delta x_{\text{net}} = \left\lceil \frac{x \cdot \text{amount\_out}}{y - \text{amount\_out}} \right\rceil
+$$
+
+Потолок важен — он гарантирует `k' ≥ k` после целочисленного усечения. Затем:
+
+```
+// Работаем в обратном направлении от чистого входа к брутто входу.
+// комиссия применяется на брутто, поэтому:
+//   чистое = брутто − ceil(брутто * ставка / D)
+//       ≈ брутто * (D − ставка) / D
+// инвертируем с потолком в нужных местах:
+gross_needed = ceil(Δx_net * D / (D − trade_fee_rate))
+```
+
+На Token-2022 входе оборачиваем:
+
+```
+gross_needed_before_mint_fee
+  = inflate_for_transfer_fee(gross_needed, input_mint)
+```
+
+так чтобы пользователь заплатил достаточно, чтобы после вычета комиссии передачи монеты пул получил `gross_needed`.
+
+### Проверка скольжения
+
+```
+require(gross_needed_before_mint_fee <= maximum_amount_in, "AmountSpecifiedExceedsMaximum")
+```
+
+## Выполненный пример
+
+Состояние пула, игнорируя Token-2022:
+
+- `x = 1_000_000_000_000` (1 000 000,000000 token0, 6 знаков)
+- `y = 2_000_000_000_000` (2 000 000,000000 token1, 6 знаков)
+- `AmmConfig`: `trade_fee_rate = 2500`, `protocol_fee_rate = 120_000`, `fund_fee_rate = 40_000`, `creator_fee_rate = 0`
+
+Пользователь: `SwapBaseInput` с `amount_in = 1_000_000_000` (1 000,000000 token0). Комиссия создателя отключена (`enable_creator_fee = false`).
+
+```
+trade_fee                = ceil(1_000_000_000 * 2500 / 1_000_000)       = 2_500_000
+  protocol_fee           = floor(2_500_000 * 120_000 / 1_000_000)       = 300_000
+  fund_fee               = floor(2_500_000 *  40_000 / 1_000_000)       = 100_000
+  lp_fee                 = 2_500_000 − 300_000 − 100_000                 = 2_100_000
+creator_fee              = 0                                              // отключено
+
+amount_in_after_trade_fee = 1_000_000_000 − 2_500_000                    = 997_500_000
+
+amount_out = y − (x * y) / (x + Δx_net)
+           = 2_000_000_000_000
+             − (1_000_000_000_000 * 2_000_000_000_000)
+               / (1_000_000_000_000 + 997_500_000)
+           ≈ 1_995_015_009
+
+new_vault0_raw   = x + amount_in                                        = 1_001_000_000_000
+new_vault1       = y − amount_out                                       ≈ 1_998_004_984_991
+
+// Из 1_000_000_000 полученных в vault0, 400_000 — это "накопленная комиссия"
+// (протокол + фонд), которую кривая должна исключить:
+curve_x          = new_vault0_raw − (protocol_fees_token0 + fund_fees_token0)
+                 = 1_001_000_000_000 − 400_000
+                 = 1_000_999_600_000
+
+k' = curve_x * new_vault1 ≈ 2.000_002_501_E24  ≥  k = 2.0E24   ✓
+```
+
+Если бы у того же пула было `enable_creator_fee = true` с `creator_fee_rate = 1000` (0,10%) на входе, программа взимала бы `total_input_fee = ceil(1_000_000_000 * 3500 / 1_000_000) = 3_500_000`, затем разделила бы это как `creator_fee = 1_000_000` и `trade_fee = 2_500_000`. Арифметика протокол/фонд/LP на `trade_fee` не изменяется по сравнению с примером выше — комиссия создателя — это отдельная корзина, накопленная в `creator_fees_token0` и исключённая из `curve_x` вместе с корзинами протокола и фонда.
+
+Если входной токен имеет комиссию передачи Token-2022 в размере 1%, хранилище получает `990_000_000` токенов вместо `1_000_000_000`, и все последующие вычисления используют эту чистую сумму.
+
+## Правило обновления наблюдений
+
+При каждом свопе программа оценивает, нужно ли добавить новое наблюдение в кольцевой буфер:
+
+```
+let since_last = now − observations[head].block_timestamp;
+if since_last >= MIN_OBSERVATION_INTERVAL {
+    let price0 = (vault1 << 32) / vault0;            // Q32.32-ish
+    let price1 = (vault0 << 32) / vault1;
+    let head' = (head + 1) % OBSERVATION_NUM;
+    observations[head'] = Observation {
+        block_timestamp: now,
+        cumulative_token0_price_x32:
+            observations[head].cumulative_token0_price_x32 + price0 * since_last,
+        cumulative_token1_price_x32:
+            observations[head].cumulative_token1_price_x32 + price1 * since_last,
+    };
+    head = head';
+}
+```
+
+Два свойства:
+
+- **Кумулятивная цена, не спотовая цена.** Одно наблюдение — это не цена. Чтобы получить TWAP за период от `t0` до `t1`, прочитайте наблюдения, ближайшие к каждому концу, и вычислите `(cumulative(t1) − cumulative(t0)) / (t1 − t0)`.
+- **Образцы ограничены по частоте.** Последовательные свопы в одном слоте могут делить одно наблюдение. Чтение наблюдения сразу после свопа может поэтому выглядеть устаревшим на один слот — это нормально.
+
+Подробнее в [`/ru/products/clmm/accounts`](/ru/products/clmm/accounts).
+
+## Комиссии на кривой
+
+Это тонкая часть, стоящая того, чтобы её выделить. Арифметика кривой работает с **чистыми** балансами хранилища — то есть с опубликованным балансом SPL минус накопленные комиссии протокола, фонда и создателя (все три — независимые корзины — см. [`/ru/products/cpmm/fees`](/ru/products/cpmm/fees)). Конкретная картина:
+
+```
+raw_vault_balance   = что возвращает RPC getTokenAccountBalance
+accrued_fees        = protocol_fees_token{0,1} + fund_fees_token{0,1} + creator_fees_token{0,1}
+curve_balance       = raw_vault_balance − accrued_fees
+invariant           = curve_balance0 * curve_balance1
+```
+
+Последствия для интеграторов:
+
+- **Не котируйте из сырых балансов.** Сначала вычтите поля накопленных комиссий, или вызовите `SwapBaseInput` как имитацию и возьмите его результат.
+- **`CollectProtocolFee` перемещает токены из хранилища.** После сбора `raw_vault_balance` падает, но `curve_balance` остаётся неизменным; цена пула не движется. Это намеренно.
+
+## Точность и переполнение
+
+- Вся арифметика кривой использует промежуточные значения `u128` для предотвращения переполнения при `x * y`.
+- Деление округляется к нулю, за исключением `SwapBaseOutput`'s `Δx_net`, который округляется вверх, и вычисления комиссии, которое округляется вверх на `trade_fee` и вниз на подразделения. Эти направления округления выбраны так, чтобы инвариант никогда не уменьшался из-за целочисленного усечения.
+- Пулы с экстремальными соотношениями хранилищ (миллиарды : 1) могут попадать в полы точности при малых торговлях; программа возвращает `ZeroTradingTokens` в этом случае. См. [`/ru/reference/error-codes`](/ru/reference/error-codes).
+
+## Куда дальше
+
+- [`/ru/products/cpmm/fees`](/ru/products/cpmm/fees) — полная семантика уровней комиссий и сбора.
+- [`/ru/products/cpmm/instructions`](/ru/products/cpmm/instructions) — инструкции, которые вызывают эту математику.
+- [`/ru/algorithms/constant-product`](/ru/algorithms/constant-product) — вывод и граничные случаи `x · y = k`, общие для AMM v4 и CPMM.
+
+Источники:
+
+- [`raydium-io/raydium-cp-swap` — математика свопа в `states/curve.rs`](https://github.com/raydium-io/raydium-cp-swap)
+- Отчёты аудитов Raydium, на которые указано в [`/ru/security/audits`](/ru/security/audits)

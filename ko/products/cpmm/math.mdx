@@ -1,0 +1,258 @@
+---
+title: "CPMM 수학"
+description: "등-곱 불변량, SwapBaseInput vs SwapBaseOutput, Token-2022 전송 수수료 처리, 그리고 관찰 계정 업데이트 방식."
+---
+
+<Info>
+  **이 페이지는 AI 자동 번역입니다. 모든 내용은 영문판을 기준으로 합니다.**
+
+  [영문판 보기 →](/products/cpmm/math)
+</Info>
+
+## 불변량
+
+CPMM은 두 개의 볼트에 대해 고전적인 등-곱 불변량을 유지합니다:
+
+$$
+x \cdot y = k
+$$
+
+여기서 `x`는 vault0의 잔액이며 수령 시 Token-2022 전송 수수료를 **이미 반영한** 값입니다. `y`도 마찬가지입니다. 모든 스왑은 LP에 귀속되는 거래 수수료를 처리한 후 `k' ≥ k`를 만족해야 합니다. (프로토콜, 펀드, 크리에이터 수수료는 곡선에 포함되지 않습니다. 이들은 볼트에 있지만 곡선 계산에서는 제외됩니다. 아래 [곡선 상의 수수료](#곡선-상의-수수료) 참고) 따라서 `k`는 LP가 수수료를 축적하면서 시간이 지남에 따라 단조증가합니다.
+
+LP 주식은 `k`가 아니라 풀의 준비금으로 가격이 책정됩니다:
+
+$$
+\text{LP는 token0으로의 가격} = \frac{x}{\text{lpSupply}}, \qquad \text{LP는 token1으로의 가격} = \frac{y}{\text{lpSupply}}
+$$
+
+`ΔLP` LP 토큰을 소각하면 정확히 `ΔLP × x / lpSupply`의 token0과 `ΔLP × y / lpSupply`의 token1을 반환합니다. 입금 또는 출금 시 곡선이나 `k`는 변하지 않습니다. 오직 스왑만이 가격을 변화시킵니다.
+
+## 스왑 경로의 수수료 모델
+
+CPMM은 모든 스왑에서 **독립적으로 책정된 두 가지 수수료**를 적용합니다:
+
+- **거래 수수료**는 입력 측에 적용되며, `AmmConfig.trade_fee_rate`로 책정됩니다. 이는 LP, 프로토콜, 펀드 몫으로 나뉩니다 (LP 몫은 볼트에 남아 `k`를 증가시키고, 프로토콜 및 펀드 몫은 볼트 회계에서 추출됩니다).
+- **크리에이터 수수료** (`enable_creator_fee == true`일 때만 활성화)는 `AmmConfig.creator_fee_rate`로 책정됩니다. **입력** 측 또는 **출력** 측에 적용되며, `PoolState.creator_fee_on`과 스왑 방향에 따라 결정됩니다 ([`products/cpmm/fees`](/ko/products/cpmm/fees#which-side-of-the-trade-the-fees-are-taken-from) 참고). 이는 독자적인 수수료 버킷입니다. 거래 수수료의 일부가 아닙니다.
+
+정의:
+
+- `FEE_RATE_DENOMINATOR = 1_000_000`
+- `trade_fee_rate` — `AmmConfig`에서, 예: `2500` = 관련 거래액의 0.25%
+- `creator_fee_rate` — `AmmConfig`에서, 예: `1000` = 관련 거래액의 0.10%
+- `protocol_fee_rate`, `fund_fee_rate` — 거래액이 아닌 거래 수수료의 `1/FEE_RATE_DENOMINATOR` 단위로 표시됨
+
+크리에이터 수수료가 입력 측에 있을 때:
+
+```
+total_input_fee = ceil(amount_in * (trade_fee_rate + creator_fee_rate) / FEE_RATE_DENOMINATOR)
+creator_fee     = floor(total_input_fee * creator_fee_rate / (trade_fee_rate + creator_fee_rate))
+trade_fee       = total_input_fee - creator_fee
+amount_in_after_fees = amount_in - total_input_fee
+```
+
+크리에이터 수수료가 출력 측에 있을 때:
+
+```
+trade_fee            = ceil(amount_in * trade_fee_rate / FEE_RATE_DENOMINATOR)
+amount_in_after_fees = amount_in - trade_fee
+amount_out_curve     = curve_output(amount_in_after_fees, ...)
+creator_fee          = ceil(amount_out_curve * creator_fee_rate / FEE_RATE_DENOMINATOR)
+amount_out           = amount_out_curve - creator_fee
+```
+
+두 경우 모두 거래 수수료는 같은 방식으로 분할됩니다:
+
+```
+protocol_fee   = floor(trade_fee * protocol_fee_rate / FEE_RATE_DENOMINATOR)
+fund_fee       = floor(trade_fee * fund_fee_rate     / FEE_RATE_DENOMINATOR)
+lp_fee         = trade_fee - protocol_fee - fund_fee     // creator_fee는 여기서 차감되지 않음
+```
+
+`protocol_fee + fund_fee + creator_fee` 금액은 볼트에 보관되지만 풀 상태에서 별도로 추적됩니다 (`protocol_fees_token*`, `fund_fees_token*`, `creator_fees_token*`). 등-곱 불변량이 `k' ≥ k`를 확인할 때, 볼트 잔액에서 세 가지 미결제 수수료를 모두 **뺀** 값을 사용합니다. 따라서 LP는 오직 `lp_fee`만 얻습니다.
+
+수집 지침과 계산된 수치 예시는 [`products/cpmm/fees`](/ko/products/cpmm/fees)를 참고하세요.
+
+## SwapBaseInput (입력-정확)
+
+"사용자가 정확히 `amount_in`의 입력 민트를 제공하고 최소 `minimum_amount_out`의 출력 민트를 받습니다."
+
+일단 Token-2022를 무시하면:
+
+```
+amount_in_after_trade_fee = amount_in - trade_fee
+amount_out                = y − (x * y) / (x + amount_in_after_trade_fee)
+```
+
+대수로:
+
+$$
+\text{amount\_out} = \frac{y \cdot \Delta x_{\text{net}}}{x + \Delta x_{\text{net}}}
+$$
+
+여기서 `Δx_net = amount_in_after_trade_fee`입니다.
+
+프로그램은 거래 수수료 중 프로토콜/펀드/크리에이터에 해당하는 부분이 "누적된" 수수료 버킷에 있도록 (다음 `x` 곡선 계산에 포함되지 않음) 볼트 회계를 업데이트하는 한편, LP 몫은 다음 스왑을 위해 `x`에 포함됩니다.
+
+### 입력 측 Token-2022
+
+입력 민트에 전송 수수료 확장이 있으면, **민트**는 사용자 → 볼트 전송 시 수수료를 차감합니다. 따라서 볼트는 실제로 `amount_in − transfer_fee_in(amount_in)`을 받습니다. CPMM 프로그램은 따라서:
+
+```
+amount_actually_received = amount_in − transfer_fee_in(amount_in)
+trade_fee                = ceil(amount_actually_received * trade_fee_rate / FEE_RATE_DENOMINATOR)
+amount_in_after_trade_fee = amount_actually_received − trade_fee
+```
+
+을 계산하고 `amount_in_after_trade_fee`에 대해 곡선을 실행합니다. 이것이 중요한 이유는 **곡선 가격이 볼트에 실제로 도달한 순 금액을 기준으로 계산되기 때문**입니다. 사용자의 표면상 금액이 아닙니다.
+
+### 출력 측 Token-2022
+
+출력 민트에 전송 수수료가 있으면, 풀은 볼트에서 `amount_out`을 사용자에게 보냅니다. **민트**는 출금할 때 수수료를 떼어가므로, 사용자는 `amount_out − transfer_fee_out(amount_out)`을 받습니다. 프로그램은 평소대로 곡선에서 `amount_out`을 계산하지만, 견적을 보여줄 때 풀의 "볼트 전송" 금액을 "사용자 수령" 금액으로 변환하는 것은 통합자의 책임입니다.
+
+### 슬리피지 확인
+
+`amount_out`을 계산한 후:
+
+```
+require(amount_out >= minimum_amount_out, "AmountSpecifiedLessThanMinimum")
+```
+
+출력 민트가 전송 수수료를 부과하면, SDK는 `minimum_amount_out`을 설정하기 전에 전송 수수료를 적용하여 슬리피지 상수가 볼트가 보내는 금액이 아닌 사용자가 실제로 받을 금액으로 표시되도록 합니다.
+
+## SwapBaseOutput (출력-정확)
+
+"사용자는 정확히 `amount_out`의 출력 민트를 받고 입력 민트로 최대 `maximum_amount_in`을 지불할 의향이 있습니다."
+
+`Δx_net`에 대해 곡선을 역계산:
+
+$$
+\Delta x_{\text{net}} = \left\lceil \frac{x \cdot \text{amount\_out}}{y - \text{amount\_out}} \right\rceil
+$$
+
+천정값이 중요합니다. 이는 정수 잘림 후 `k' ≥ k`를 보장합니다. 그 다음:
+
+```
+// 순입력에서 총입력으로 역계산합니다.
+// 수수료는 총입력에 적용되므로:
+//   net = gross − ceil(gross * rate / D)
+//       ≈ gross * (D − rate) / D
+// 올바른 위치에서 천정값으로 역계산:
+gross_needed = ceil(Δx_net * D / (D − trade_fee_rate))
+```
+
+Token-2022 입력에서 다음과 같이 래핑:
+
+```
+gross_needed_before_mint_fee
+  = inflate_for_transfer_fee(gross_needed, input_mint)
+```
+
+사용자가 충분히 지불하도록 민트의 전송 수수료 차감 후 풀이 여전히 `gross_needed`를 받도록 합니다.
+
+### 슬리피지 확인
+
+```
+require(gross_needed_before_mint_fee <= maximum_amount_in, "AmountSpecifiedExceedsMaximum")
+```
+
+## 계산 예시
+
+풀 상태 (Token-2022 무시):
+
+- `x = 1_000_000_000_000` (1,000,000.000000 token0, 6 소수 자리)
+- `y = 2_000_000_000_000` (2,000,000.000000 token1, 6 소수 자리)
+- `AmmConfig`: `trade_fee_rate = 2500`, `protocol_fee_rate = 120_000`, `fund_fee_rate = 40_000`, `creator_fee_rate = 0`
+
+사용자: `amount_in = 1_000_000_000` (1,000.000000 token0)으로 `SwapBaseInput` 실행. 크리에이터 수수료 비활성화 (`enable_creator_fee = false`).
+
+```
+trade_fee                = ceil(1_000_000_000 * 2500 / 1_000_000)       = 2_500_000
+  protocol_fee           = floor(2_500_000 * 120_000 / 1_000_000)       = 300_000
+  fund_fee               = floor(2_500_000 *  40_000 / 1_000_000)       = 100_000
+  lp_fee                 = 2_500_000 − 300_000 − 100_000                 = 2_100_000
+creator_fee              = 0                                              // 비활성화
+
+amount_in_after_trade_fee = 1_000_000_000 − 2_500_000                    = 997_500_000
+
+amount_out = y − (x * y) / (x + Δx_net)
+           = 2_000_000_000_000
+             − (1_000_000_000_000 * 2_000_000_000_000)
+               / (1_000_000_000_000 + 997_500_000)
+           ≈ 1_995_015_009
+
+new_vault0_raw   = x + amount_in                                        = 1_001_000_000_000
+new_vault1       = y − amount_out                                       ≈ 1_998_004_984_991
+
+// vault0에서 수령한 1_000_000_000 중 400_000은 "누적 수수료"
+// (프로토콜 + 펀드)이며 곡선에서 제외되어야 합니다:
+curve_x          = new_vault0_raw − (protocol_fees_token0 + fund_fees_token0)
+                 = 1_001_000_000_000 − 400_000
+                 = 1_000_999_600_000
+
+k' = curve_x * new_vault1 ≈ 2.000_002_501_E24  ≥  k = 2.0E24   ✓
+```
+
+같은 풀이 `enable_creator_fee = true`이고 입력 측에서 `creator_fee_rate = 1000` (0.10%)을 가지고 있으면, 프로그램은 `total_input_fee = ceil(1_000_000_000 * 3500 / 1_000_000) = 3_500_000`을 청구한 다음 `creator_fee = 1_000_000`과 `trade_fee = 2_500_000`으로 분할합니다. `trade_fee`에 대한 프로토콜/펀드/LP 산술은 위 예시와 동일합니다. 크리에이터 수수료는 독자적인 버킷이며 `creator_fees_token0`에 누적되고 프로토콜 및 펀드 버킷과 함께 `curve_x`에서 제외됩니다.
+
+입력 민트가 1% Token-2022 전송 수수료를 가지면, 볼트는 `1_000_000_000` 대신 `990_000_000` 토큰을 받으며, 이후의 모든 계산은 그 순 금액을 사용합니다.
+
+## 관찰 업데이트 규칙
+
+모든 스왑 시 프로그램은 링 버퍼에 새 관찰을 푸시할지 평가합니다:
+
+```
+let since_last = now − observations[head].block_timestamp;
+if since_last >= MIN_OBSERVATION_INTERVAL {
+    let price0 = (vault1 << 32) / vault0;            // Q32.32-ish
+    let price1 = (vault0 << 32) / vault1;
+    let head' = (head + 1) % OBSERVATION_NUM;
+    observations[head'] = Observation {
+        block_timestamp: now,
+        cumulative_token0_price_x32:
+            observations[head].cumulative_token0_price_x32 + price0 * since_last,
+        cumulative_token1_price_x32:
+            observations[head].cumulative_token1_price_x32 + price1 * since_last,
+    };
+    head = head';
+}
+```
+
+두 가지 특징:
+
+- **누적 가격, 현물 가격 아님.** 단일 관찰은 가격이 아닙니다. `t0`에서 `t1`까지의 TWAP를 얻으려면, 각 끝 근처의 관찰을 읽고 `(cumulative(t1) − cumulative(t0)) / (t1 − t0)`를 계산합니다.
+- **샘플은 속도 제한됨.** 같은 슬롯의 연속 스왑은 한 관찰을 공유할 수 있습니다. 스왑 직후 관찰을 읽으면 한 슬롯만큼 오래된 것처럼 보일 수 있습니다. 이는 정상입니다.
+
+더 자세한 내용은 [`products/clmm/accounts`](/ko/products/clmm/accounts)를 참고하세요.
+
+## 곡선 상의 수수료
+
+이 부분은 미묘하고 언급할 가치가 있습니다. 곡선 산술은 **순** 볼트 잔액에 대해 작동합니다. 즉, 원본 SPL 잔액에서 누적된 프로토콜, 펀드, 크리에이터 수수료를 뺀 것입니다 (세 가지 모두 독립적인 수수료 버킷입니다. [`products/cpmm/fees`](/ko/products/cpmm/fees) 참고). 구체적인 그림:
+
+```
+raw_vault_balance   = RPC getTokenAccountBalance가 반환하는 것
+accrued_fees        = protocol_fees_token{0,1} + fund_fees_token{0,1} + creator_fees_token{0,1}
+curve_balance       = raw_vault_balance − accrued_fees
+invariant           = curve_balance0 * curve_balance1
+```
+
+통합자를 위한 결과:
+
+- **원본 잔액으로부터 견적을 얻지 마세요.** 누적 수수료 필드를 먼저 차감하거나, `SwapBaseInput`을 시뮬레이션으로 호출하고 반환값을 가져가세요.
+- **`CollectProtocolFee`는 토큰을 볼트 밖으로 이동합니다.** 수집 후, `raw_vault_balance`는 떨어지지만 `curve_balance`는 변하지 않습니다. 풀의 가격은 움직이지 않습니다. 이는 의도된 것입니다.
+
+## 정밀도 및 오버플로우
+
+- 모든 곡선 산술은 `x * y`의 오버플로우를 방지하기 위해 `u128` 중간값을 사용합니다.
+- 나눗셈은 영도쪽으로 반올림되며, `SwapBaseOutput`의 `Δx_net` (올림), 그리고 수수료 계산 (`trade_fee`에서 올림, 부분 분할에서 내림)은 예외입니다. 이 올림 방향은 불변량이 정수 잘림으로 인해 감소하지 않도록 선택되었습니다.
+- 극단적인 볼트 비율 (수십억 : 1)을 가진 풀은 작은 거래에서 정밀도 한계에 도달할 수 있으며, 프로그램은 그 경우 `ZeroTradingTokens`을 반환합니다. [`reference/error-codes`](/ko/reference/error-codes) 참고.
+
+## 다음 단계
+
+- [`products/cpmm/fees`](/ko/products/cpmm/fees) — 완전한 수수료 등급 및 수집 의미론.
+- [`products/cpmm/instructions`](/ko/products/cpmm/instructions) — 이 수학을 호출하는 지침.
+- [`algorithms/constant-product`](/ko/algorithms/constant-product) — AMM v4와 CPMM에서 공유되는 `x · y = k`의 파생 및 경계값.
+
+출처:
+
+- [`raydium-io/raydium-cp-swap` — `states/curve.rs`의 스왑 수학](https://github.com/raydium-io/raydium-cp-swap)
+- Raydium 감사 보고서 [`security/audits`](/ko/security/audits)에 링크됨

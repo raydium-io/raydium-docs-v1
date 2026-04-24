@@ -1,0 +1,238 @@
+---
+title: "Trade API"
+description: "Серверный эндпоинт для свопов Raydium: получение котировки, построение, подпись и отправка транзакции. Паттерн интеграции для приложений, которые хотят использовать маршрутизацию Raydium без подключения SDK — что возвращается, чем отличается от SDK и как его используют агрегаторы."
+---
+
+<Info>
+  **Эта страница переведена с помощью ИИ. За эталон принимается английская версия.**
+
+  [Открыть английскую версию →](/sdk-api/trade-api)
+</Info>
+
+<Info>
+  **Trade API** — это набор эндпоинтов на `transaction-v1.raydium.io` (и зеркалированные пути на `api-v3.raydium.io`), которые выдают котировку свопа, строят подписанную готовую транзакцию Solana и возвращают её в один запрос туда-обратно. Это тот же интерфейс, который использует UI Raydium. Используйте его, когда вам нужна маршрутизация Raydium без подключения TS SDK — для бэкендов, Blink-обработчиков, ботов Telegram, приложений третьих сторон.
+</Info>
+
+## Когда использовать Trade API вместо SDK
+
+| Вам нужно… | Используйте |
+|---|---|
+| Интегрировать свопы в бэкенд, который не может подключать npm-пакеты (например, бот на Python, сервис на Go, сервис на Rust) | **Trade API** |
+| Отобразить своп Blink в социальном посте | **Trade API** |
+| Собрать браузерное приложение, где размер критичен | **Trade API** |
+| Встроить логику маршрутизации в другую программу Solana (CPI) | Ни то, ни другое — используйте [`sdk-api/rust-cpi`](/ru/sdk-api/rust-cpi) |
+| Создать полноценного DEX-клиента с пользовательским предпросмотром маршрута, оверлеями графиков, эвристикой по приоритетным комиссиям | **TS SDK** |
+| Нужна детерминированная оффлайн-котировка без сетевых запросов | **TS SDK** (с локальным состоянием пула) |
+
+SDK богаче; Trade API проще. Оба оборачивают одни и те же программы CPMM/CLMM/AMM v4, поэтому результирующий своп on-chain идентичен.
+
+## Три эндпоинта
+
+### 1. `GET /compute/swap-base-in`
+
+По размеру входа выбирает маршрут и возвращает котировку.
+
+```
+GET https://transaction-v1.raydium.io/compute/swap-base-in
+  ?inputMint=So11111111111111111111111111111111111111112
+  &outputMint=EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v
+  &amount=1000000000
+  &slippageBps=50
+  &txVersion=V0
+```
+
+Ответ:
+
+```json
+{
+  "id": "b2e4...",
+  "success": true,
+  "version": "V1",
+  "data": {
+    "swapType": "BaseIn",
+    "inputMint":  "So11111111111111111111111111111111111111112",
+    "inputAmount":  "1000000000",
+    "outputMint": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+    "outputAmount": "165234567",
+    "otherAmountThreshold": "164408394",
+    "slippageBps": 50,
+    "priceImpactPct": 0.0012,
+    "referrerAmount": "0",
+    "routePlan": [
+      { "poolId": "58oQ...", "inputMint": "So11...", "outputMint": "USDC...", "feeAmount": "2500000", "feeMint": "So11..." }
+    ]
+  }
+}
+```
+
+Поле `id` — это непрозрачный дескриптор котировки, передаваемый на следующий эндпоинт. Котировка стабильна примерно 30 секунд; после этого запросите новую.
+
+### 2. `GET /compute/swap-base-out`
+
+Инвертированная форма: «я хочу получить ровно N выходного токена; сколько мне нужно входного?»
+
+```
+GET /compute/swap-base-out
+  ?inputMint=<MINT_IN>
+  &outputMint=<MINT_OUT>
+  &amount=<DESIRED_OUTPUT_AMOUNT>
+  &slippageBps=50
+  &txVersion=V0
+```
+
+Симметричная форма ответа относительно `swap-base-in`; семантика поля `amount` меняется.
+
+### 3. `POST /transaction/swap-base-in` и `/transaction/swap-base-out`
+
+Принимает котировку из шага 1 и возвращает подписанную готовую версионированную транзакцию:
+
+```
+POST https://transaction-v1.raydium.io/transaction/swap-base-in
+Content-Type: application/json
+
+{
+  "computeUnitPriceMicroLamports": "50000",
+  "swapResponse": { ... вставьте объект data из swap-base-in ... },
+  "txVersion": "V0",
+  "wallet": "<user_pubkey>",
+  "wrapSol": true,
+  "unwrapSol": false,
+  "inputAccount": "<optional_token_account>",
+  "outputAccount": "<optional_token_account>"
+}
+```
+
+Ответ:
+
+```json
+{
+  "id": "9f1c...",
+  "success": true,
+  "version": "V1",
+  "data": [
+    { "transaction": "<base64-encoded-versioned-transaction>" }
+  ]
+}
+```
+
+Может вернуться несколько транзакций, если своп требует подготовки (например, создание ATA, оборачивание SOL). Подпишите и отправьте их по порядку.
+
+## Минимальный end-to-end пример (Python)
+
+```python
+import base64, requests
+from solders.transaction import VersionedTransaction
+from solders.keypair import Keypair
+from solana.rpc.api import Client
+
+rpc = Client("https://api.mainnet-beta.solana.com")
+kp = Keypair.from_bytes(bytes([...]))    # your signer
+
+SOL  = "So11111111111111111111111111111111111111112"
+USDC = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+
+quote = requests.get(
+    "https://transaction-v1.raydium.io/compute/swap-base-in",
+    params={
+        "inputMint": SOL, "outputMint": USDC,
+        "amount": 1_000_000_000, "slippageBps": 50, "txVersion": "V0",
+    },
+).json()
+
+built = requests.post(
+    "https://transaction-v1.raydium.io/transaction/swap-base-in",
+    json={
+        "computeUnitPriceMicroLamports": "50000",
+        "swapResponse": quote,
+        "txVersion": "V0",
+        "wallet": str(kp.pubkey()),
+        "wrapSol": True,
+        "unwrapSol": False,
+    },
+).json()
+
+for entry in built["data"]:
+    raw = base64.b64decode(entry["transaction"])
+    tx = VersionedTransaction.from_bytes(raw)
+    tx.sign([kp])
+    sig = rpc.send_raw_transaction(bytes(tx)).value
+    print(f"Sent: {sig}")
+```
+
+Это примерно 20 строк. Аналог с TS SDK — примерно 30, но дает вам больше контроля (пользовательский выбор маршрута, бюджетирование Compute Unit для каждого пула, подробные метаданные об ошибках).
+
+## Маршрутизация и выбор пула
+
+Trade API маршрутизирует через **все** программы Raydium (CPMM, CLMM, AMM v4) и выбирает лучшее выполнение для запрошенного размера. Характеристики:
+
+- **Поддерживается многоскачковая маршрутизация.** Своп SOL→USDC может маршрутизироваться через wSOL→JUP→USDC, если это дешевле.
+- **Разделение по нескольким пулам одной программы не поддерживается.** Одна котировка проходит ровно по одному маршруту; если вам нужно разделить размер по пулам, делайте это на клиентской стороне (две котировки, два tx).
+- **Стабильные vs концентрированные.** Маршрутизатор предпочтительно использует CLMM, когда в диапазоне достаточно ликвидности, иначе откатывается на CPMM для длинного хвоста пар.
+- **Включение AMM v4.** Пулы AMM v4 включены в маршрутизацию, но выбираются только если предлагают лучшую цену, чем альтернативы CPMM/CLMM.
+
+Чтобы принудительно направить маршрутизацию через определённый пул, используйте SDK вместо этого — Trade API не предоставляет параметр привязки к пулу.
+
+## Параметр referrer
+
+Добавьте `&referrer=<wallet_pubkey>` к эндпоинту compute, чтобы получить 1% реферального вознаграждения от свопа. см. [`user-flows/referrals-and-blinks`](/ru/user-flows/referrals-and-blinks) для деталей. При наличии:
+
+- `referrerAmount` в ответе котировки — это абсолютная сумма (в входном токене), которая будет отправлена рефереру.
+- Финальная транзакция содержит дополнительный трансфер SPL-токена на ATA рефереру.
+
+## Приоритетные комиссии
+
+`computeUnitPriceMicroLamports` в запросе сборки устанавливает приоритетную комиссию для возвращённой транзакции. Правило практики:
+
+- `50_000` (0.00005 lamports/CU × 200k CU ≈ 0.00001 SOL): минимальная, подходит для некритичных моментов.
+- `200_000`: умеренная перегруженность.
+- `1_000_000`: высокая перегруженность.
+
+Для адаптивной настройки сначала вызовите `getRecentPrioritizationFees` на вашем RPC и передайте медиану. см. [`integration-guides/priority-fee-tuning`](/ru/integration-guides/priority-fee-tuning).
+
+## Версии транзакций
+
+- `"V0"` возвращает версионированную (`MessageV0`) транзакцию с таблицей поиска для обычных аккаунтов. Меньше, быстрее. **Рекомендуется.**
+- `"LEGACY"` возвращает legacy-транзакцию. Больше; используйте только если ваш кошелёк/инфраструктура не поддерживает V0.
+
+## Формы ошибок
+
+API возвращает HTTP 200 с `success: false` для логических ошибок, HTTP 4xx/5xx для ошибок транспорта / инфраструктуры.
+
+Распространённые логические ошибки:
+
+- `"No route found"` — нет пути между двумя минтами при таком размере. Уменьшите `amount` или пересмотрите пару.
+- `"Insufficient liquidity"` — маршрут существует, но превышает `slippageBps`. Расширьте слиппедж.
+- `"Quote expired"` — `swapResponse` старше 30 секунд. Запросите новую котировку.
+- `"Unsupported mint"` — минт не входит в вселенную Raydium (не листирован или на устаревшей программе).
+
+## Лимиты частоты запросов
+
+- **Эндпоинты котировок:** 120 запросов/мин на IP.
+- **Эндпоинты сборки:** 60 запросов/мин на IP (выше нагрузка на сервер).
+- Превышение лимитов возвращает HTTP 429 с заголовком `Retry-After`.
+
+Для повышенной пропускной способности свяжитесь с отделом разработчиков Raydium; доступны ключи на уровне агрегаторов.
+
+## Архитектурный паттерн для интеграторов
+
+```
+┌─────────────┐   quote   ┌───────────────┐   build   ┌───────────────┐   sign/send   ┌──────────┐
+│ Your front  │──────────►│ Trade API     │──────────►│ Trade API     │──────────────►│ Solana   │
+│   end       │◄──────────│ /compute/...  │◄──────────│ /transaction/ │               │   RPC    │
+└─────────────┘           └───────────────┘           └───────────────┘               └──────────┘
+                              (stateless)                 (stateless)
+```
+
+Всё без состояния — единственное, что нужно передать между вызовом котировки и вызовом сборки — это сам результат котировки.
+
+## Куда дальше
+
+- [`sdk-api/typescript-sdk`](/ru/sdk-api/typescript-sdk) — богатый программный интерфейс с теми же программами.
+- [`sdk-api/rest-api`](/ru/sdk-api/rest-api) — read-эндпоинты (информация о пулах, информация о минтах) для дополнения write-стороны Trade API.
+- [`user-flows/swap`](/ru/user-flows/swap) — полный UI-флоу свопа.
+- [`integration-guides/aggregator`](/ru/integration-guides/aggregator) — паттерн для агрегаторов, маршрутизирующих через многие DEX'ы.
+
+Источники:
+
+- Живые эндпоинты `transaction-v1.raydium.io`.
+- Инспекция сетевой вкладки Raydium UI (тот же используемый интерфейс).

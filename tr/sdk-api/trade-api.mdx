@@ -1,0 +1,238 @@
+---
+title: "Trade API"
+description: "Raydium'un sunucu tarafından oluşturulan swap işlem uç noktası: teklif, inşa, imzala, gönder. SDK'yı sevk etmeden Raydium yönlendirmesi isteyenler için entegrasyon deseni — neler döndürdüğü, SDK'dan farkları ve toplayıcıların bunu nasıl tükettikleri."
+---
+
+<Info>
+  **Bu sayfa yapay zekâ tarafından otomatik olarak çevrilmiştir. İngilizce sürüm esas alınır.**
+
+  [İngilizce sürümü görüntüle →](/sdk-api/trade-api)
+</Info>
+
+<Info>
+  **Trade API**, `transaction-v1.raydium.io` üzerinde (ve `api-v3.raydium.io` üzerindeki bazı yansıtılmış yollarda) bir ince uç nokta setidir ve swap teklifini alır, imzalı bir Solana işlemini inşa eder, bunları tek bir gidiş-dönüş içinde döndürür. Raydium arayüzünün kullandığı yüzeyle aynıdır. TypeScript SDK'yı paketlemeden Raydium yönlendirmesini istediğinizde kullanın — arka uçlar, Blinks işleyicileri, Telegram botları, üçüncü taraf uygulamalar için.
+</Info>
+
+## Trade API'yi SDK'ya karşı ne zaman kullanacağınız
+
+| Şunu yapmak istiyorsanız… | Kullanın |
+|---|---|
+| npm paketlerini paketleyemeyecek bir arka uca swapları entegre etmek (örn. Python botu, Go servisi, Rust servisi) | **Trade API** |
+| Sosyal bir yazıda swap Blink'i render etmek | **Trade API** |
+| kilolite tasarrufu önemli olan bir tarayıcı uygulaması oluşturmak | **Trade API** |
+| Yönlendirme mantığını başka bir Solana programının içine (CPI) gömmek | Hiçbiri — [`sdk-api/rust-cpi`](/tr/sdk-api/rust-cpi) kullanın |
+| Özel rota önizlemesi, grafik katmanları, öncelikli ücret buluşsal yöntemiyle tam DEX benzeri bir istemci oluşturmak | **TS SDK** |
+| Ağ gidiş-dönüşü olmadan belirleyici çevrimdışı teklif gerekli | **TS SDK** (yerel havuz durumu ile) |
+
+SDK daha zengin; Trade API daha basittir. Her ikisi de aynı temel CPMM/CLMM/AMM v4 programlarını sarar, bu nedenle ortaya çıkan zincir üstü swap aynıdır.
+
+## Üç uç nokta
+
+### 1. `GET /compute/swap-base-in`
+
+Giriş miktarı verildiğinde, bir rota seçin ve bir teklif döndürün.
+
+```
+GET https://transaction-v1.raydium.io/compute/swap-base-in
+  ?inputMint=So11111111111111111111111111111111111111112
+  &outputMint=EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v
+  &amount=1000000000
+  &slippageBps=50
+  &txVersion=V0
+```
+
+Yanıt:
+
+```json
+{
+  "id": "b2e4...",
+  "success": true,
+  "version": "V1",
+  "data": {
+    "swapType": "BaseIn",
+    "inputMint":  "So11111111111111111111111111111111111111112",
+    "inputAmount":  "1000000000",
+    "outputMint": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+    "outputAmount": "165234567",
+    "otherAmountThreshold": "164408394",
+    "slippageBps": 50,
+    "priceImpactPct": 0.0012,
+    "referrerAmount": "0",
+    "routePlan": [
+      { "poolId": "58oQ...", "inputMint": "So11...", "outputMint": "USDC...", "feeAmount": "2500000", "feeMint": "So11..." }
+    ]
+  }
+}
+```
+
+`id` alanı sonraki uç noktaya aktarılan opak bir teklif tutamacıdır. Teklif ~30 saniye boyunca kararlıdır; bundan sonra yeniden teklif alın.
+
+### 2. `GET /compute/swap-base-out`
+
+Ters biçim: "Çıktının tam olarak N'sini almak istiyorum; gerekli girişi bana teklif et."
+
+```
+GET /compute/swap-base-out
+  ?inputMint=<MINT_IN>
+  &outputMint=<MINT_OUT>
+  &amount=<DESIRED_OUTPUT_AMOUNT>
+  &slippageBps=50
+  &txVersion=V0
+```
+
+`swap-base-in` ile simetrik yanıt şekli; `amount` alanı anlamları çevrilerek.
+
+### 3. `POST /transaction/swap-base-in` ve `/transaction/swap-base-out`
+
+Adım 1'den teklifi alır ve imzalı bir versiyonlu işlem döndürür:
+
+```
+POST https://transaction-v1.raydium.io/transaction/swap-base-in
+Content-Type: application/json
+
+{
+  "computeUnitPriceMicroLamports": "50000",
+  "swapResponse": { ... swap-base-in'den veri nesnesini yapıştırın ... },
+  "txVersion": "V0",
+  "wallet": "<user_pubkey>",
+  "wrapSol": true,
+  "unwrapSol": false,
+  "inputAccount": "<optional_token_account>",
+  "outputAccount": "<optional_token_account>"
+}
+```
+
+Yanıt:
+
+```json
+{
+  "id": "9f1c...",
+  "success": true,
+  "version": "V1",
+  "data": [
+    { "transaction": "<base64-encoded-versioned-transaction>" }
+  ]
+}
+```
+
+Swap kurulum gerektiriyorsa (örn. ATA oluşturma, SOL sarma) birden fazla işlem döndürülebilir. Bunları sırasına göre imzalayın ve gönderin.
+
+## Minimal uçtan uca örnek (Python)
+
+```python
+import base64, requests
+from solders.transaction import VersionedTransaction
+from solders.keypair import Keypair
+from solana.rpc.api import Client
+
+rpc = Client("https://api.mainnet-beta.solana.com")
+kp = Keypair.from_bytes(bytes([...]))    # sizin imzalayan
+
+SOL  = "So11111111111111111111111111111111111111112"
+USDC = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+
+quote = requests.get(
+    "https://transaction-v1.raydium.io/compute/swap-base-in",
+    params={
+        "inputMint": SOL, "outputMint": USDC,
+        "amount": 1_000_000_000, "slippageBps": 50, "txVersion": "V0",
+    },
+).json()
+
+built = requests.post(
+    "https://transaction-v1.raydium.io/transaction/swap-base-in",
+    json={
+        "computeUnitPriceMicroLamports": "50000",
+        "swapResponse": quote,
+        "txVersion": "V0",
+        "wallet": str(kp.pubkey()),
+        "wrapSol": True,
+        "unwrapSol": False,
+    },
+).json()
+
+for entry in built["data"]:
+    raw = base64.b64decode(entry["transaction"])
+    tx = VersionedTransaction.from_bytes(raw)
+    tx.sign([kp])
+    sig = rpc.send_raw_transaction(bytes(tx)).value
+    print(f"Sent: {sig}")
+```
+
+Bu ~20 satırdır. TS SDK ile eşdeğeri ~30'dur ancak daha zengin kontrol sağlar (özel rota seçici, havuz başına Compute Unit bütçelemesi, ayrıntılı hata metaveri).
+
+## Yönlendirme ve havuz seçimi
+
+Trade API **tüm** Raydium programlarında (CPMM, CLMM, AMM v4) yönlendirir ve alıntılanan boyut için en iyi yürütmeyi seçer. Özellikler:
+
+- **Multi-hop desteklenir.** SOL→USDC swapı, daha ucuzsa wSOL→JUP→USDC aracılığıyla yönlendirebilir.
+- **Aynı program multi-havuz bölme desteklenmez.** Tek bir teklif tam olarak bir yol üzerinden gider; boyutu havuzlar arasında bölmek isterseniz, istemci tarafında yapın (iki teklif, iki işlem).
+- **Sabit ve konsantre.** Yönlendirici mevcut olduğunda CLMM tercih eder, uzun kuyruk çiftleri için CPMM'ye geri döner.
+- **AMM v4 dahil.** AMM v4 havuzları yönlendirmeye dahildir ancak yalnızca CPMM/CLMM alternatiflerinden daha iyi fiyatlandırma sunduğunda seçilir.
+
+Belirli bir havuz üzerinden yönlendirmeyi zorlamak için SDK'yı kullanın — Trade API havuz-pin parametresini göstermez.
+
+## Referrer parametresi
+
+`&referrer=<wallet_pubkey>` öğesini compute uç noktasına ekleyerek swaptan %1 referral kesintisi alın. Anlamlar için [`user-flows/referrals-and-blinks`](/tr/user-flows/referrals-and-blinks) bölümüne bakın. Mevcut olduğunda:
+
+- Teklif yanıtında `referrerAmount` referrer'a yönlendirilecek mutlak miktardır (giriş mintinde).
+- Son işlem, referrer'ın ATA'sına ek bir SPL token transferi içerir.
+
+## Öncelik ücretleri
+
+İnşa isteğinde `computeUnitPriceMicroLamports`, döndürülen işlem için öncelik ücreti ayarlar. Temel kural:
+
+- `50_000` (0,00005 lamports/CU × 200k CU ≈ 0,00001 SOL): minimal, tıkanık olmayan anlar için iyidir.
+- `200_000`: orta düzey tıkanıklık.
+- `1_000_000`: ağır tıkanıklık.
+
+Uyarlanabilir ayarlama için öncelikle RPC'de `getRecentPrioritizationFees` öğesini çağırın ve medyanı geçirin. [`integration-guides/priority-fee-tuning`](/tr/integration-guides/priority-fee-tuning) bölümüne bakın.
+
+## İşlem sürümleri
+
+- `"V0"` yaygın hesaplar için arama tablosu içeren versiyonlu (`MessageV0`) işlemini döndürür. Daha küçük, daha hızlı. **Önerilir.**
+- `"LEGACY"` eski işlem döndürür. Daha büyük; yalnızca cüzdanınız/altyapınız V0'ı işlemezse kullanın.
+
+## Hata şekilleri
+
+API, mantıksal hatalar için HTTP 200 ile `success: false` döndürür, transport / altyapı hataları için HTTP 4xx/5xx döndürür.
+
+Ortak mantıksal hatalar:
+
+- `"No route found"` — bu boyutta iki mint arasında yol yok. `amount` öğesini azaltın veya çifti yeniden düşünün.
+- `"Insufficient liquidity"` — bir rota var ancak `slippageBps` öğesini aşar. Slippageı genişletin.
+- `"Quote expired"` — `swapResponse` 30 saniyeden eski. Yeniden teklif alın.
+- `"Unsupported mint"` — mint, Raydium'un evreninde değildir (listelenmemiş veya kullanımdan kaldırılan program üzerinde).
+
+## Hız sınırları
+
+- **Teklif uç noktaları:** IP başına 120 istek/dakika.
+- **İnşa uç noktaları:** IP başına 60 istek/dakika (sunucuda daha yüksek maliyet).
+- Sınırları aşmak, `Retry-After` başlığı ile HTTP 429 döndürür.
+
+Daha yüksek verim için Raydium geliştirici ilişkilerine başvurun; toplayıcı katmanı anahtarları mevcuttur.
+
+## Entegrasyoncular için mimari desen
+
+```
+┌─────────────┐   teklif   ┌───────────────┐   inşa    ┌───────────────┐   imzala/gönder   ┌──────────┐
+│ Sizin ön    │──────────►│ Trade API     │──────────►│ Trade API     │──────────────────►│ Solana   │
+│   uç        │◄──────────│ /compute/...  │◄──────────│ /transaction/ │                   │   RPC    │
+└─────────────┘           └───────────────┘           └───────────────┘                   └──────────┘
+                              (durumsuz)                 (durumsuz)
+```
+
+Her şey durumsuz — teklif çağrısı ile inşa çağrısı arasında aktarmanız gereken tek şey, teklif yanıtı gövdesidir.
+
+## Sırada ne var
+
+- [`sdk-api/typescript-sdk`](/tr/sdk-api/typescript-sdk) — aynı temel programlara sahip daha zengin programlı arayüz.
+- [`sdk-api/rest-api`](/tr/sdk-api/rest-api) — Trade API'nin yazı tarafını tamamlamak için okuma taraflı uç noktaları (havuz bilgisi, mint bilgisi).
+- [`user-flows/swap`](/tr/user-flows/swap) — uçtan uca UI swap akışı.
+- [`integration-guides/aggregator`](/tr/integration-guides/aggregator) — birçok DEX üzerinde yönlendiren toplayıcılar için desen.
+
+Kaynaklar:
+
+- `transaction-v1.raydium.io` canlı uç noktaları.
+- Raydium arayüzü ağ sekmesi incelemesi (tüketilen aynı yüzey).

@@ -1,0 +1,154 @@
+---
+title: "Estimating CLMM APR"
+description: "How Raydium computes the APR numbers shown on CLMM pools, how to estimate your own APR for a hypothetical range before opening a position, and the edge cases that make trailing APR misleading."
+---
+
+<Info>
+  The **APR shown on the Raydium UI** for a CLMM pool is the realised fee APR of the **in-range liquidity** over the past 24 hours, projected to a year. It is not the APR *your position* would have earned — that depends on your range, your time-in-range, and your share of the liquidity that was active during the trading window.
+</Info>
+
+## The headline formula
+
+For a CLMM pool, the daily fee APR shown on Raydium is computed as:
+
+```
+apr_24h = (fees_24h / tvl_in_range_24h) · 365
+```
+
+Where:
+
+- `fees_24h` is the sum of LP-side swap fees accrued in the last 24 hours (in USD).
+- `tvl_in_range_24h` is the time-weighted average USD value of liquidity that was **in range** during the window.
+
+The denominator is what distinguishes CLMM APR from CPMM APR. CPMM uses total pool TVL because every dollar is always contributing. CLMM uses only the in-range subset because out-of-range dollars earn nothing.
+
+## What your APR will actually be
+
+The headline APR is a statistic of the pool, not of your position. Your APR depends on four multipliers:
+
+```
+your_APR = headline_APR
+         · (your_in_range_fraction / pool_in_range_fraction)     # concentration bonus
+         · time_in_range                                          # range discipline
+         · (1 − transfer_fee_haircut)                             # token-2022 tax
+         · compounding_factor                                     # if you auto-restake
+```
+
+- **Concentration bonus.** If your range is tighter than the pool-wide average, every active tick has more of your liquidity per dollar than the average LP's. Tighter = bigger bonus (and proportionally bigger IL amplification).
+- **Time in range.** If you are in range only 40% of the time, multiply by 0.40.
+- **Transfer-fee haircut.** For Token-2022 mints with transfer fees, every fee collection hops through a transfer that itself bleeds basis points.
+- **Compounding.** If you `collectFee` and redeploy into the same range weekly, the effective APR is about `(1 + daily_APR)^365 − 1`. Without compounding it is linear.
+
+### Worked example
+
+Suppose a SOL/USDC CLMM pool has:
+
+- 24h volume: \$120M
+- Fee tier: 0.05% (LP share 88% of fees after protocol cut)
+- Total TVL: \$40M
+- In-range TVL: \$18M (45% of pool is currently in range)
+
+```
+fees_24h = 120M · 0.0005 · 0.88 = $52,800
+apr_24h  = (52,800 / 18,000,000) · 365 = 107%
+```
+
+The Raydium UI shows **107% APR** for the pool. (This example uses a deep, high-volume pool to keep the numbers concrete; typical CLMM pools display anywhere from 10% to 50% APR, with low-volume pools well under 10%.)
+
+Now you are considering opening a position:
+
+- Your range: tight enough that you have 2× the average concentration.
+- Expected time-in-range: 70% (you will check weekly).
+- No Token-2022 fees. No auto-compounding.
+
+```
+your_APR ≈ 107% · 2 · 0.70 = 150%
+```
+
+That is an estimate, not a guarantee. Realised volume can halve or double in a week.
+
+## Why trailing APR is a lagging signal
+
+CLMM APR moves **fast** relative to CPMM APR because the in-range TVL denominator moves fast:
+
+- A large price move pushes chunks of positions out of range, shrinking the denominator. Suddenly your remaining in-range TVL looks "higher APR" — but only because competitors left, and typically volume falls too.
+- A pool reaching a new ATH can temporarily show 500–1000% APR for an hour as most positions were calibrated for lower prices and only a few aggressive LPs remain in range.
+- Once the market settles, LPs rebalance and APR mean-reverts.
+
+Rules of thumb:
+
+- **Ignore sub-24h APR.** Too much noise.
+- **Prefer 7d and 30d windows.** Raydium exposes both via [`GET /pools/info/ids`](/sdk-api/rest-api) — fields `week.apr` and `month.apr`.
+- **Backtest your specific range** on historical volume and price data before committing meaningful capital.
+
+## How the math works (single-tick step)
+
+Inside a single tick the CLMM behaves like a CPMM on the amount of liquidity `L` active in that tick. Fees accrue in `fee_growth_global_X` and `fee_growth_global_Y` per unit of liquidity. For a position with liquidity `Lₚ` that spans tick ranges `[i_lo, i_hi]`:
+
+```
+fees_earned_X = Lₚ · (fee_growth_inside_X(i_lo, i_hi, now) − fee_growth_inside_X(i_lo, i_hi, t_open))
+fees_earned_Y = Lₚ · (fee_growth_inside_Y(i_lo, i_hi, now) − fee_growth_inside_Y(i_lo, i_hi, t_open))
+```
+
+Where `fee_growth_inside` subtracts fee growth below `i_lo` and above `i_hi` from the global accumulator. Details in [`algorithms/clmm-math`](/algorithms/clmm-math).
+
+To compute *expected* fees over a future period for a prospective range, estimate:
+
+```
+expected_fees_per_day = Σ_ticks_in_range (volume_at_tick · fee_rate · your_share_at_tick)
+```
+
+Raydium's SDK exposes `getEstimateAprFromPositionAndPool` which does this estimation using the recent volume-per-tick histogram.
+
+## SDK helper
+
+```ts
+import { Raydium, TxVersion } from "@raydium-io/raydium-sdk-v2";
+
+const raydium = await Raydium.load({ owner, connection });
+const pool = await raydium.clmm.getPoolInfoFromRpc({ poolId });
+
+const apr = await raydium.clmm.estimatedApr({
+  poolInfo: pool.poolInfo,
+  poolKeys: pool.poolKeys,
+  tickLower: -100,   // your intended range
+  tickUpper:  100,
+  volumeUsd24h: pool.poolInfo.day.volume, // or a custom estimate
+});
+
+console.log(`Expected APR: ${apr.feeApr * 100}% (fee-only, excludes farm incentives)`);
+```
+
+The method also separately returns any farm APR if the pool has an attached farm. Your full "LP APR" is `feeApr + farmApr`.
+
+## Where farm APR fits in
+
+Raydium CLMM pools can have Farm v6 emissions layered on top. Farm rewards are paid in a **reward mint** (often RAY or a partner token) independent of swap fees. The Raydium UI typically shows:
+
+```
+Total APR = Fee APR + Farm APR [in $X, Y, Z reward mints]
+```
+
+Farm APR is computed similarly but using the reward emission schedule and the current price of the reward mint in USD. Unlike fee APR it is not volatility-dependent — it is a fixed schedule.
+
+See [`products/farm-staking/overview`](/products/farm-staking/overview) for farm emission math.
+
+## Common mistakes
+
+- **"APR is compounded automatically."** No. Fees must be claimed via `collectFee`, then manually redeployed. Raydium does not auto-compound CLMM fees.
+- **"My APR = headline APR."** Only if your concentration is average, your time-in-range is 100%, and you compound at the same cadence. All three are usually false.
+- **"Higher fee tier = higher APR."** Only if volume survives the higher fee. At 1% a pair may quote 50% APR but do 1/10 the volume; net less than 0.25% at 120% × 0.1 = 12%.
+- **"Out-of-range positions have zero risk."** They have zero fee income but full IL on the existing token composition — the position is now "100% of whichever side".
+
+## Pointers
+
+- [`algorithms/clmm-math`](/algorithms/clmm-math) — full derivation of the fee-growth accumulator.
+- [`algorithms/impermanent-loss`](/algorithms/impermanent-loss) — the loss side of the LP equation.
+- [`user-flows/choosing-a-pool-type`](/user-flows/choosing-a-pool-type) — decision framework that uses this APR estimate.
+- [`sdk-api/rest-api`](/sdk-api/rest-api) — live volume / APR endpoints.
+
+Sources:
+
+- Raydium SDK v2 `estimatedApr` implementation.
+- Raydium UI pool page (live APR fields).
+- Uniswap V3 fee-growth derivation.

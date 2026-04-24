@@ -1,0 +1,187 @@
+---
+title: "Infraestructura compartida"
+description: "Las primitivas que comparten todos los programas de Raydium — PDA de autoridad, cuentas AmmConfig, el reparto de comisiones entre protocolo/fondo/creador, cuentas de observación y la superficie pública de la API REST — definidas una sola vez para que los capítulos por producto puedan referirse aquí."
+---
+
+<Info>
+  **Esta página fue traducida automáticamente por IA. La versión en inglés es la fuente autorizada.**
+
+  [Ver versión en inglés →](/protocol-overview/shared-infrastructure)
+</Info>
+
+<Info>
+  Los programas de producto de Raydium son bases de código independientes, pero fueron diseñados siguiendo un conjunto compartido de convenciones. Esta página es la referencia canónica de esas convenciones. Los capítulos por producto describen cómo las convenciones se *instancian* en sus cuentas; esta página describe las convenciones en sí.
+</Info>
+
+## Qué significa «compartido» aquí
+
+Tres tipos de compartir recorren el código:
+
+- **Compartir convenciones.** Cada programa usa el mismo patrón de derivación de PDA, la misma forma de reparto de comisiones y la misma idea de cuenta de observación — pero cada uno las implementa en su propio programa con sus propias semillas.
+- **Compartir cuentas.** Un puñado de cuentas son *literalmente* el mismo registro en muchos pools (el PDA de autoridad global en CPMM, las cuentas AmmConfig).
+- **Compartir fuera de la cadena.** Una API REST y un SDK TypeScript atienden a los cuatro programas. Los integradores interactúan con un host HTTP y un paquete NPM sin importar qué programa terminen llamando.
+
+Las cinco primitivas a continuación cubren todo lo que cruza límites de programa.
+
+## 1. PDA de autoridad
+
+Cada programa de Raydium tiene exactamente un PDA que posee sus bóvedas de tokens. Los usuarios nunca tienen la autoridad de la bóveda directamente — el PDA de autoridad es el único firmante que puede mover fondos hacia afuera, y solo firma cuando una instrucción de programa válida se lo indica.
+
+El patrón es idéntico en todos los productos; las semillas difieren:
+
+| Programa | Semillas del PDA de autoridad | Notas |
+|----------|-------------------------------|-------|
+| **AMM v4** | `[poolId]` | Autoridad por pool. Misma forma que el diseño por pool de v4. |
+| **CPMM** | `[b"vault_and_lp_mint_auth_seed"]` | **PDA único compartido por todos los pools CPMM.** Sin semilla específica de pool. |
+| **CLMM** | `[b"pool_vault_and_lp_mint_auth_seed"]` | PDA único compartido entre todos los pools CLMM. |
+| **Farm v3 / v5 / v6** | `[farmId]` | Por granja. El PDA posee las bóvedas de staking + recompensas para esa granja. |
+| **LaunchLab** | `[b"vault_auth", launchId]` | Por lanzamiento. Posee las bóvedas base + quote antes de la graduación. |
+
+Algunas cosas se derivan de esto:
+
+- Para CPMM y CLMM, el PDA de autoridad es **una cuenta global** — cada pool de ese tipo la utiliza. Si estás haciendo CPI en CPMM la necesitas una sola vez, no por pool.
+- Para autoridades por pool / por granja, derivas el PDA a partir del ID del pool/granja. El SDK lo hace en `getPoolKeys` / `getFarmKeys`; si estás integrando directamente, lo derivas con `findProgramAddressSync`.
+- **La propiedad de la bóveda no puede cambiarse.** Una vez que se crea una cuenta de token con el PDA de autoridad como propietario, solo ese PDA — invocado por el programa — puede transferir hacia afuera. No hay anulación de administrador.
+
+Para las semillas exactas y los diseños de ATA por programa, ve [`products/cpmm/accounts`](/es/products/cpmm/accounts), [`products/clmm/accounts`](/es/products/clmm/accounts), [`products/amm-v4/accounts`](/es/products/amm-v4/accounts), [`products/farm-staking/accounts`](/es/products/farm-staking/accounts), [`products/launchlab/accounts`](/es/products/launchlab/accounts).
+
+## 2. Cuentas de administrador y configuración
+
+CPMM y CLMM comparten un patrón de cuenta de configuración llamado **`AmmConfig`**: una pequeña cuenta global, indexada por un `u16`, que contiene las tasas de comisión y los destinos de administrador que se aplican a un *nivel de comisión* completo. Los pools se vinculan a una configuración en la creación y nunca se re-vinculan.
+
+```rust
+// CPMM AmmConfig (resumido — la versión CLMM es estructuralmente similar)
+pub struct AmmConfig {
+    pub bump: u8,
+    pub disable_create_pool: bool,        // gate new pool creation in this tier
+    pub index: u16,                       // tier index
+    pub trade_fee_rate: u64,              // fraction of trade going to fees
+    pub protocol_fee_rate: u64,           // fraction of trade fee to protocol
+    pub fund_fee_rate: u64,               // fraction of trade fee to fund
+    pub create_pool_fee: u64,             // one-time per-pool creation fee
+    pub protocol_owner: Pubkey,           // signer for CollectProtocolFee
+    pub fund_owner: Pubkey,               // signer for CollectFundFee
+    pub padding: [u64; 16],
+}
+```
+
+**Reglas del juego:**
+
+- **Los niveles de comisión son globales.** Cuando un pool dice «este es un pool del 0.25%», significa que se vincula al AmmConfig cuya `trade_fee_rate` era del 0.25% en el momento de la creación. No hay anulación de tarifa por pool.
+- **Se puede cambiar una configuración pero los pools no la siguen.** Si la autoridad de configuración edita un AmmConfig, cada pool existente vinculado a esa configuración recoge la nueva tarifa inmediatamente. Esto es una característica, no un error; es cómo los cambios económicos a nivel de protocolo se propagan sin migraciones por pool.
+- **`disable_create_pool` es la palanca de deprecación.** Cuando se descontinúa un nivel de comisión, el multifirma del protocolo establece esta bandera — los pools existentes siguen funcionando pero no se puede elegir el nivel para nuevos pools.
+- **`protocol_owner` / `fund_owner`** son los *firmantes* para las llamadas de recopilación de comisiones. Establecerlos en un multifirma es lo que controla el retiro de comisiones. NO son las direcciones de destino de las comisiones en sí; eso es `protocol_fee_destination` / `fund_fee_destination` en la misma cuenta.
+
+AMM v4 no tiene `AmmConfig` — sus parámetros de comisión son por pool, codificados en la creación. Farm y LaunchLab tienen sus propios equivalentes (`FarmConfig`, `LaunchConfig`) cubiertos en sus respectivos capítulos.
+
+Una tabla completa de quién puede cambiar qué está en [`security/admin-and-multisig`](/es/security/admin-and-multisig). Los repartos de comisiones actuales visibles para el usuario están en [`ray/protocol-fees`](/es/ray/protocol-fees).
+
+## 3. El reparto de comisiones entre protocolo / fondo / creador
+
+Cada comisión de swap en CPMM y CLMM se divide entre hasta cuatro destinos en el camino:
+
+```
+                         total swap fee
+                              │
+              ┌───────────────┼───────────────┬──────────────┐
+              ▼               ▼               ▼              ▼
+        LP pool side     Protocol         Fund         Creator
+        (raises k)       treasury         multisig     (LaunchLab pools)
+```
+
+Mecánicamente:
+
+1. **La comisión comercial se acumula en el pool.** La comisión se extrae del lado de entrada del swap y la cantidad *después de comisión* es lo que ve la matemática de producto constante. Esto es lo que significa «el LP gana la comisión» — `k` sube y también sube el valor implícito por token LP.
+2. **Las porciones de protocolo/fondo/creador se deducen de esa acumulación en el lado LP en cuentas de contador por pool.** Se sientan en el estado del pool (`protocol_fees_token{0,1}`, `fund_fees_token{0,1}`, etc.) hasta que alguien llama a `CollectProtocolFee` / `CollectFundFee` / `CollectCreatorFee`. No salen de las bóvedas del pool hasta entonces; desde la perspectiva de un swap todavía están «en el pool».
+3. **La recopilación las saca.** El firmante respectivo (las claves `protocol_owner` / `fund_owner` en AmmConfig, o el creador de lanzamiento para los pools de LaunchLab) llama a la instrucción de recopilación y el programa transfiere desde la bóveda del pool a un ATA de destino.
+
+Algunas observaciones importantes:
+
+- **Los porcentajes de reparto se hacen sobre la comisión comercial, no sobre la operación.** Una comisión comercial del 0.25% con una participación de protocolo del 12% significa que el protocolo obtiene `0.25% × 12% = 0.03%` de la operación — no el 12% de la operación.
+- **Las comisiones de creador solo existen en pools graduados de LaunchLab.** Los pools CPMM/CLMM estándar tienen un reparto de 3 vías (LP / protocolo / fondo). LaunchLab añade una cuarta ranura dirigida a quien lanzó el token, configurada en `Initialize` e inmutable.
+- **AMM v4 se divide solo dos maneras**, codificadas por pool: LP y protocolo. Sin ranura de fondo, sin ranura de creador.
+- **Fondo versus protocolo** — ambos son destinos de tesorería del protocolo, pero tienen diferentes firmantes e intenciones diferentes. `protocolo` históricamente financia operaciones; `fondo` es la tesorería a más largo plazo. El reparto entre los dos es en sí mismo ajustable.
+
+Las tasas específicas están en [`reference/fee-comparison`](/es/reference/fee-comparison) y [`ray/protocol-fees`](/es/ray/protocol-fees).
+
+## 4. Cuentas de observación (búfer de anillo TWAP)
+
+Tanto CPMM como CLMM mantienen una **cuenta de observación** por pool — un búfer de anillo de tamaño fijo de muestras `(timestamp, cumulative_price)` que otros contratos pueden usar para derivar un TWAP resistente a manipulación.
+
+```rust
+// CPMM ObservationState (resumido)
+pub struct ObservationState {
+    pub initialized: bool,
+    pub observation_index: u16,            // next slot to overwrite
+    pub pool_id: Pubkey,
+    pub observations: [Observation; OBSERVATION_NUM],
+    pub padding: [u64; 4],
+}
+
+pub struct Observation {
+    pub block_timestamp: u64,
+    pub cumulative_token_0_price_x32: u128,  // sum of (price × dt) since init
+    pub cumulative_token_1_price_x32: u128,
+}
+```
+
+Cómo funciona:
+
+- **Cada swap llama a `update_observation`.** El programa lee el precio actual, lo multiplica por los segundos transcurridos desde la observación anterior y lo suma al contador acumulativo. La nueva entrada sobrescribe la ranura más antigua (estilo búfer de anillo).
+- **TWAP sobre una ventana** = `(cumul[end] − cumul[start]) / (timestamp[end] − timestamp[start])`. Los consumidores eligen dos observaciones entre la ventana deseada y dividen.
+- **Raydium en sí no usa el TWAP para fijar precios.** La matemática AMM lee las reservas spot directamente. Las observaciones son una externalidad — Raydium paga el costo de escribirlas para que otros contratos puedan leer.
+- **AMM v4 no tiene cuenta de observación.** Es más antiguo que el diseño ObservationState; los integradores que quieren un TWAP v4 tienen que computar uno fuera de la cadena a partir del historial de logs.
+
+Los detalles de diseño y la matemática de indexación están en [`products/cpmm/accounts`](/es/products/cpmm/accounts) y [`products/clmm/accounts`](/es/products/clmm/accounts).
+
+## 5. API REST + SDK + IDL
+
+La superficie fuera de la cadena es un trío único usado por cada producto:
+
+- **API REST** — `https://api-v3.raydium.io`. Una vista indexada de solo lectura de todo el estado on-chain más un motor de cotización. Un host, un esquema.
+- **SDK TypeScript** — `@raydium-io/raydium-sdk-v2` en NPM. Construye y firma transacciones para cada programa. Habla con la API para cotizaciones/metadatos, habla con un RPC de Solana para actualizaciones de estado pre-firma.
+- **Registro IDL** — Los IDL de Anchor para cada programa publicado viven en el repositorio [`raydium-idl`](https://github.com/raydium-io/raydium-idl) (un JSON por programa: CPMM, CLMM, LaunchLab). El SDK TypeScript consume estos IDL internamente; los clientes Rust / Python descendentes se regeneran a partir de los mismos archivos.
+
+El límite entre ellos es nítido:
+
+| Pieza | Lee de | Escribe a | Tolerancia de desfase |
+|-------|--------|-----------|----------------------|
+| API REST | Indexador (analiza logs de cadena) | — (solo lectura para integradores) | Unos segundos |
+| SDK | API + RPC | Construye transacciones; no las emite | Ninguna — debes re-buscar el estado pre-firma |
+| IDL | Fuente del programa | — | Versionado por actualización de programa |
+
+Un error común es alimentar la salida de la API REST directamente en una transacción. No lo hagas — re-busca el estado relevante del pool/posición desde un RPC de Solana en el slot que estás firmando. El SDK lo hace automáticamente para flujos de primera parte; si pasas por alto el SDK tienes que hacerlo tú mismo.
+
+La referencia completa está en [`sdk-api/`](/es/sdk-api), con la superficie del IDL específicamente en [`sdk-api/anchor-idl`](/es/sdk-api/anchor-idl).
+
+## 6. Indexadores y fuentes de precios
+
+La API REST es alimentada por el indexador propio de Raydium, que se suscribe a los logs del programa desde una flota de RPC de Solana y escribe registros desnormalizados en un almacén SQL. Dos consecuencias para los integradores:
+
+- **El indexador es lo único que «sabe acerca de» estado entre programas.** Mapear un pool CPMM a su contraparte CLMM, computar un número de volumen de 24h entre versiones de programa, recoger una granja asociada con un LP mint — todo eso es trabajo del indexador. Los programas en sí no lo hacen.
+- **El tiempo de inactividad del indexador es tiempo de inactividad de la API.** Si la API devuelve datos desfasados o vacíos, el indexador es el sospechoso. El estado on-chain no se ve afectado; los integradores con su propio RPC y SDK pueden seguir realizando transacciones.
+
+Las fuentes de precios son una preocupación separada. La API publica un campo `priceUsd` en la mayoría de las respuestas de pool; esto se computa fuera de la cadena a partir de una instantánea de la vista del indexador de las reservas del pool y un precio de referencia entrecomillado (pools USDC como el pivote común). Es suficientemente bueno para la interfaz; no es seguro usarlo como un oráculo on-chain. Usa el TWAP de observación para eso.
+
+## Qué no es compartido
+
+Vale la pena enumerarlo explícitamente, porque los nuevos lectores a menudo asumen más compartir del que existe:
+
+- **Los programas no se llaman entre sí.** Un swap CPMM nunca hace CPI en CLMM o AMM v4. El único programa que compone múltiples AMM es el programa AMM Routing — y ese mismo es delgado, simplemente emitiendo CPI en cada AMM en secuencia.
+- **Sin autoridad de actualización compartida entre programas.** Cada programa on-chain tiene su propia clave de actualización de programa (un multifirma 3/4 más un timelock de 24h). No están vinculadas.
+- **Sin estado compartido entre granjas y AMM.** Una granja no sabe si el LP que estaca es de un pool CPMM, de un mint NFT de posición CLMM o de un token SPL no relacionado. El programa de granja trata el mint de staking como opaco.
+- **Sin dependencia de oráculo.** Los precios son reservas on-chain. No hay fallback de Pyth/Switchboard; el AMM no verifica un oráculo antes de liquidar.
+
+## Punteros
+
+- [`protocol-overview/architecture`](/es/protocol-overview/architecture) — el diagrama canónico mostrando cómo estas piezas se componen.
+- [`protocol-overview/versions-and-migration`](/es/protocol-overview/versions-and-migration) — cómo las convenciones evolucionaron entre versiones de programa.
+- [`security/admin-and-multisig`](/es/security/admin-and-multisig) — quién controla las claves detrás de los AmmConfig.
+- [`reference/fee-comparison`](/es/reference/fee-comparison) — matriz de tasas de comisión por producto.
+- [`reference/program-addresses`](/es/reference/program-addresses) — IDs de programa canónicos.
+
+Fuentes:
+
+- [Raydium SDK v2](https://github.com/raydium-io/raydium-sdk-V2) — la fuente de verdad para semillas de PDA, diseños de cuentas y definiciones de IDL.
+- [Registro IDL de Raydium](https://github.com/raydium-io/raydium-idl) — IDL de Anchor.
+- Páginas de cuentas por producto citadas en línea arriba.

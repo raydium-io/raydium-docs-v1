@@ -1,0 +1,264 @@
+---
+title: "CPMM ücretleri"
+description: "CPMM'nin bir işlem ücreti ve ayrı bir yaratıcı ücreti nasıl aldığını, işlem ücretini LP'ler, protokol hazinesi ve fon multisig arasında nasıl böldüğünü ve kimin neyi, ne zaman topladığını açıklar."
+---
+
+<Info>
+  **Bu sayfa yapay zekâ tarafından otomatik olarak çevrilmiştir. İngilizce sürüm esas alınır.**
+
+  [İngilizce sürümü görüntüle →](/products/cpmm/fees)
+</Info>
+
+## İki bağımsız ücreti, dört hedef
+
+CPMM her swap işleminde **iki ayrı oranlı ücreti** alır:
+
+1. **İşlem ücreti** — `AmmConfig.trade_fee_rate` ile alınır ve üç hedef arasında bölünür:
+   - **LP payı** — kasada kalır ve `k` değerini büyütür. LP token'ları yakarak kapalı olarak talep edilir.
+   - **Protokol payı** — `PoolState.protocol_fees_token*` hesaplamalarına birikir; `protocol_owner` tarafından `CollectProtocolFee` aracılığıyla toplanır.
+   - **Fon payı** — `PoolState.fund_fees_token*` hesaplamalarına birikir; `fund_owner` tarafından `CollectFundFee` aracılığıyla toplanır.
+2. **Yaratıcı ücreti** (isteğe bağlı, havuz başına) — `AmmConfig.creator_fee_rate` ile işlem ücretinden **bağımsız** olarak alınır, `PoolState.creator_fees_token*` hesaplamalarına birikir, `pool_state.pool_creator` tarafından `CollectCreatorFee` aracılığıyla toplanır. Yalnızca havuz `enable_creator_fee = true` ile oluşturulduğunda aktiftir.
+
+Yaratıcı ücreti işlem ücretinin bir dilimi **değildir**. İki oran da swap girdisinde ücreti alındığında birlikte eklenir, ancak her biri kendi kovası olarak kalır — protokol ve fon payları her zaman yalnızca `trade_fee`'den türetilir, asla `creator_fee`'den değil. `creator_fee_rate = 1000` (0.10%) ve `trade_fee_rate = 2500` (0.25%) olan bir havuz, yaratıcı-ücreti-girdiye-karşı swap'inde girdinin 0.35%'ini birleşik olarak alır; bunun 0.10%'ini yaratıcı tutar ve 0.25%'i işlem-ücreti-kovası alır.
+
+İşlem-ücreti oranları (`trade_fee_rate`, `protocol_fee_rate`, `fund_fee_rate`) ve `creator_fee_rate` hepsi `AmmConfig` üzerinde yaşar. Havuz başına `enable_creator_fee` bayrağı ve `creator_fee_on` modu (işlemin hangi tarafından yaratıcı ücreti alındığı) `PoolState` üzerinde yaşar. Bkz. [`/tr/products/cpmm/accounts`](/tr/products/cpmm/accounts).
+
+## Oranlar ve birimler
+
+Tüm oranlar `u64` türündedir ve `1 / FEE_RATE_DENOMINATOR` birimlerinde ifade edilir, burada `FEE_RATE_DENOMINATOR = 1_000_000`'dir.
+
+- **`trade_fee_rate`** işlem **hacminin** bir kesridir. `2500` ⇒ ilgili tarafın 0.25%'i (giriş veya çıkış, `creator_fee_on`'a bağlı olarak — aşağıdaki "Ücretlerin işlemin hangi tarafından alındığı" başlığına bakınız).
+- **`creator_fee_rate`** işlem **hacminin** bir kesridir, işlem ücretinden **bağımsız** olarak alınır. `1000` ⇒ ilgili tarafın 0.10%'i.
+- **`protocol_fee_rate`** ve **`fund_fee_rate`** hacimden değil, **işlem ücretinin** bir kesridir. `120_000` ⇒ işlem ücretinin 12%'si.
+
+Mainnet'te `AmmConfig[index=0]` (standart 0.25% havuz) için varsayılan parametreler, referans için:
+
+| Alan | Değer | Efektif yüzde |
+|------|-------|----------------|
+| `trade_fee_rate` | `2500` | Hacmin 0.25%'i (işlem-ücreti-kovası) |
+| `protocol_fee_rate` | `120000` | İşlem ücretinin 12%'si ≈ **hacmin 0.030%'i** |
+| `fund_fee_rate` | `40000` | İşlem ücretinin 4%'ü ≈ **hacmin 0.010%'i** |
+| `creator_fee_rate` | `0` (varsayılan) | 0% (ayrı kova) |
+| → LP payı efektif | | **hacmin 0.210%'i** |
+
+Öyleyse `AmmConfig[0]` karşısında 1.000 \$ swap'inde `enable_creator_fee = false` ile: 2,50 \$ toplam işlem ücreti, bunun 2,10 \$ LP'lerde kalır, 0,30 \$ protokole gider, 0,10 \$ fona gider. Yaratıcı ücreti devre dışı bırakıldığı için yaratıcı kovası 0'dır.
+
+Aynı havuzun `enable_creator_fee = true` ve `creator_fee_rate = 1000` (0.10%) olması durumunda, kullanıcı yaratıcı kontasına ek olarak 1,00 \$ daha öder — `creator_fee_on` tarafından yapılandırılan işlemin aynı tarafından alınır — toplam 3,50 \$ ücreti için. İşlem-ücreti-kovası ve protokol/fon bölünmesi değişmez.
+
+Mevcut mainnet değerlerini `GET https://api-v3.raydium.io/main/cpmm-config` karşısında doğrulayınız — oranlar yönetici tarafından değiştirilebilir ve sabit kodlanmak yerine taze okunmalıdır.
+
+## Kod içindeki bölünme
+
+```rust
+// raydium-cp-swap/programs/cp-swap/src/curve/{calculator,fees}.rs'ten uyarlanmıştır.
+// Gerçek kod `is_creator_fee_on_input` üzerine dal açar; her iki dal da creator_fee'nin
+// kendi oranı olduğu, asla trade_fee'nin dilimi olmadığı değişmezini korur.
+
+const FEE_RATE_DENOMINATOR_VALUE: u64 = 1_000_000;
+
+pub struct FeeBreakdown {
+    pub amount_in_after_fees: u64,    // giriş eksi giriş tarafında alınan tüm ücretler
+    pub amount_out_after_fees: u64,   // çıkış eksi çıkış tarafında alınan yaratıcı ücreti
+    pub trade_fee:    u64,            // → aşağıda LP / protokol / fon kovaları arasında bölünür
+    pub protocol_fee: u64,            // trade_fee'nin payı
+    pub fund_fee:     u64,            // trade_fee'nin payı
+    pub creator_fee:  u64,            // bağımsız kova (giriş veya çıkış tarafı)
+}
+
+fn take_fees_on_input(
+    amount_in: u64,
+    trade_rate: u64,
+    creator_rate: u64,
+    protocol_rate: u64,
+    fund_rate: u64,
+) -> (u64 /* trade_fee */, u64 /* creator_fee */, u64 /* amount_in_after_fees */) {
+    // İki oran eklenir, böylece birleşik ücrette bir kez yuvarlama yapılır, sonra orantılı
+    // olarak bölünür — bu tamamen yuvarlama/verimlilik hilesidir. Bölünme oranları tam
+    // olarak onurlandırır: creator_fee/trade_fee == creator_rate/trade_rate.
+    let total_fee = ((amount_in as u128) * ((trade_rate + creator_rate) as u128))
+        .div_ceil(FEE_RATE_DENOMINATOR_VALUE as u128) as u64;
+
+    let creator_fee = ((total_fee as u128) * (creator_rate as u128)
+                       / ((trade_rate + creator_rate) as u128)) as u64;
+    let trade_fee   = total_fee - creator_fee;
+
+    (trade_fee, creator_fee, amount_in - total_fee)
+}
+
+fn take_creator_fee_on_output(amount_out_swapped: u64, creator_rate: u64) -> (u64, u64) {
+    // creator_fee_on yaratıcı ücreti çıkış tarafına yönlendirdiğinde,
+    // trade_fee giriş tarafında tek oran olarak alınır ve creator_fee
+    // eğri çıktısına karşı hesaplanır.
+    let creator_fee = ((amount_out_swapped as u128) * (creator_rate as u128))
+        .div_ceil(FEE_RATE_DENOMINATOR_VALUE as u128) as u64;
+    (amount_out_swapped - creator_fee, creator_fee)
+}
+
+fn split_trade_fee(
+    trade_fee: u64,
+    protocol_rate: u64,
+    fund_rate: u64,
+) -> (u64 /* protocol_fee */, u64 /* fund_fee */) {
+    let protocol_fee = (trade_fee as u128 * protocol_rate as u128
+                        / FEE_RATE_DENOMINATOR_VALUE as u128) as u64;
+    let fund_fee     = (trade_fee as u128 * fund_rate as u128
+                        / FEE_RATE_DENOMINATOR_VALUE as u128) as u64;
+    (protocol_fee, fund_fee)
+}
+```
+
+Notlar:
+
+- Giriş tarafındaki toplam ücreti **yukarı** yuvarlama yapılır, böylece havuz asla az ücret almaz.
+- `trade_fee` (protokol, fon) alt bölünmeleri **aşağı** yuvarlama yapılır, böylece toplamları `trade_fee`'yi aşmaz; kalan LP payıdır.
+- `lp_share = trade_fee − protocol_fee − fund_fee` (creator_fee burada **çıkarılmaz** çünkü kendi kovası olur).
+- Yaratıcı ücreti `PoolState.creator_fee_on`'a bağlı olarak giriş veya çıkış tarafından alınır (sonraki bölüme bakınız). Oran her iki şekilde de değişmez.
+
+## Ücretlerin işlemin hangi tarafından alındığı
+
+CPMM, yaratıcı ücretinin belirli bir swap'inin **giriş** tarafından mı yoksa **çıkış** tarafından mı alındığını belirleyen havuz başına `creator_fee_on` ayarına (`BothToken` / `OnlyToken0` / `OnlyToken1`) sahiptir. Runtime yardımcı `is_creator_fee_on_input(direction)` bunu swap başına bir boolean'a dönüştürür:
+
+| `creator_fee_on` | `0 → 1` Swap | `1 → 0` Swap |
+|------------------|--------------|--------------|
+| `BothToken` (`0`) | giriş tarafı | giriş tarafı |
+| `OnlyToken0` (`1`) | giriş tarafı | çıkış tarafı |
+| `OnlyToken1` (`2`) | çıkış tarafı | giriş tarafı |
+
+Yaratıcı ücreti **giriş** tarafında olduğunda, işlem ücreti ve yaratıcı ücreti her ikisi de eğri çalışmadan önce `amount_in`'den düşülür. Fiyat matematiği: girdiden birleşik `trade_rate + creator_rate` alınır.
+
+Yaratıcı ücreti **çıkış** tarafında olduğunda, yalnızca işlem ücreti `amount_in`'den düşülür; eğri ücretlendirilmemiş bir çıktı üretir, ardından yaratıcı ücreti bu çıktıdan düşülür. Fiyat matematiği: girdiden `trade_rate` alınır; çıktıdan `creator_rate` alınır.
+
+İşlem ücreti kendisi her zaman giriş tarafından alınır (standart Uniswap-V2 deseni). Yalnızca yaratıcı ücreti çıktıya iniş yapabilir.
+
+## "Birikmiş" ücretler eğri ile nasıl etkileşim kurar
+
+Önemli bir incelik: **protokol, fon ve yaratıcı ücretleri ilgili `Collect*` talimatı çağrılıncaya kadar fiziksel olarak kasada kalır**. Ancak eğrinin kasa bakiyesi görünümünden hariç tutulurlar.
+
+Bir swap'inin ardından somut bir resim:
+
+```
+raw_vault_0_balance = getTokenAccountBalance(vault_0).amount
+                    = lp_entitled + protocol_fees_token0
+                      + fund_fees_token0 + creator_fees_token0
+
+curve_x = raw_vault_0_balance − (protocol_fees_token0
+                                  + fund_fees_token0
+                                  + creator_fees_token0)
+```
+
+Program `k' ≥ k` uygulandığında `curve_x` (ve analoji `curve_y`) kullanır. Bu, LP payını şişirmeden LP dışı ücretlerin hedeflerine ulaşmasıdır.
+
+Etrafında tasarım yapmanız gereken sonuçlar:
+
+- **Ham bakiyelerden fiyat teklifi almak yanlıştır.** `getTokenAccountBalance`'den bir fiyatlandırıcı oluşturursanız, havuzun onayladığı fiyatı sürekli olarak abartacaksınız. Her zaman birikmiş ücretleri çıkarınız veya `SwapBaseInput` / API aracılığıyla simülasyon yapınız.
+- **`CollectProtocolFee` fiyatı taşımaz.** Token'ları kasadan çıkarır *ve* `protocol_fees_token*` sayaçlarını sıfırlar, böylece `curve_x` ve `curve_y` değişmez.
+- **LP ücretleri sayaca biriktirilmez.** Bunlar kasa bakiyesi içinde kapalıdır. LP'nin birikmiş LP ücretlerine hak ettiği şey, LP token'ları yakarak (yani `Withdraw` aracılığıyla) kullanılır — `CollectLpFee` yoktur.
+
+## Token-2022 aktarım ücretleri ile etkileşim
+
+Token-2022 aktarım ücretleri CPMM tarafından değil, **mint** tarafından uygulanır. Bunlar her token aktarımına etki eder — swap, yatırma, çekme ve `Collect*` toplamaları. CPMM'nin işlem-ücreti matematiği **kasaya gerçekten inen** miktara karşı hesaplanır; yani giriş mint'inin aktarım ücretinden (varsa) arınmıştır.
+
+Öyleyse en kötü durumda kullanıcı giriş-tam swap'inde üç ayrı vergi öder:
+
+1. Giriş mint'inin `amount_in` üzerine aktarım ücreti (mint'inin ücret otoritesine).
+2. Havuzun `trade_fee` bakiyeye (yukarıda bölündüğü gibi).
+3. Çıkış mint'inin `amount_out` üzerine aktarım ücreti (mint'inin ücret otoritesine).
+
+SDK'nın fiyatlandırıcısı üçünü de hesaba katar, böylece `minimum_amount_out` kullanıcının gerçekten aldığı şeyde ifade edilir. Kendi fiyatlandırıcınızı yazıyorsanız, bu davranışı yansıtınız veya kayma kontrolleriniz sistematik olarak çok hoşgörülü olur.
+
+Detaylı türetme için [`/tr/algorithms/token-2022-transfer-fees`](/tr/algorithms/token-2022-transfer-fees) bakınız.
+
+## Yaratıcı ücreti
+
+Yaratıcı ücreti isteğe bağlı ve havuz başınadır. **Oran** `AmmConfig.creator_fee_rate` üzerinde yaşar; **etkinleştirme bayrağı** ve **taraf** (`creator_fee_on`) `PoolState` üzerinde yaşar:
+
+- **Havuz oluşturmada etkinleştirilir.** `Initialize` varsayılan olarak `enable_creator_fee = false` ayarlar; `InitializeWithPermission` aracılığıyla (LaunchLab mezuniyetleri ve diğer kontrollü yollar tarafından kullanılan) oluşturulan havuzlar `enable_creator_fee = true` geçebilir ve `creator_fee_on` seçebilir.
+- **Oran ücret katmanı ile paylaşılır.** Oranın kendisi `AmmConfig.creator_fee_rate`'tir, bu konfigürasyon ile bağlı her havuz arasında aynı değer. Her havuz ardından onu ücretlendirecek mi (`enable_creator_fee`) ve swap'inin hangi tarafında ücretlendirecek mi (`creator_fee_on`) karar verir. `enable_creator_fee = false` olduğunda, havuzun etkili yaratıcı-ücreti oranı yapılandırma değerinden bağımsız olarak sıfırdır (kaynaktaki `PoolState::adjust_creator_fee_rate` bakınız).
+- **İşlem ücretinden bağımsız.** Yaratıcı ücreti hiçbir zaman LP / protokol / fon paylarını azaltmaz — kendi oranıdır, ayrı olarak uygulanır, kendi sayaçlarında biriktirilir.
+- **`CollectCreatorFee` aracılığıyla toplanır**, `PoolState.pool_creator` tarafından imzalanır.
+- **Oluşturmadan sonra yeniden etkinleştirilemez veya yeniden yönlendirilemez.** `enable_creator_fee = false` ile başlatılan havuz asla yaratıcı ücreti almayacak; belirli bir `creator_fee_on` ile başlatılan havuz taraf değiştiremez.
+
+Yaratıcı ücretleri Raydium'un "Burn & Earn" deseni arkasındaki mekanizmadır: LP token'ları [LP Lock](/tr/reference/program-addresses) programı altında kilitlenmiş, yaratıcı likiditeyi çekemez, ancak yine de `CollectCreatorFee`'yi sınırsız talep edebilir.
+
+## Toplama operasyonel akışı
+
+| İmzacı | Talimat | Kaynak sayaçları sıfırlama | Tipik hızlılık |
+|--------|---------|------------------------------|------------------|
+| `amm_config.protocol_owner` | `CollectProtocolFee` | `protocol_fees_token{0,1}` | Haftalık veya programlı |
+| `amm_config.fund_owner` | `CollectFundFee` | `fund_fees_token{0,1}` | Haftalık veya programlı |
+| `pool_state.pool_creator` | `CollectCreatorFee` | `creator_fees_token{0,1}` | İstediğiniz zaman |
+
+Protokol ve fon sahipleri mainnet'te Raydium multisig'idir; bkz. [`/tr/security/admin-and-multisig`](/tr/security/admin-and-multisig). Yaratıcı imzacı `Initialize`'ı çalıştıran hesaptır.
+
+## Ücret katmanını değiştirme
+
+Ücret oranları yönetici tarafından `UpdateAmmConfig` aracılığıyla değiştirilebilir (bkz. [`/tr/products/cpmm/instructions`](/tr/products/cpmm/instructions)). Değişiklikler bu `AmmConfig` ile bağlı her havuz için **sonraki swap**'de etkili olur — hiçbir geçiş yoktur, çünkü havuzlar her swap'te konfigürasyonu yükler.
+
+Yöneticinin yapamadığı şeyler:
+
+- Havuzu bir `AmmConfig`'ten diğerine taşımak.
+- Zaten birikmiş ücretlerin fiyatını retroaktif olarak değiştirmek.
+- `protocol_owner` / `fund_owner` imzacı olmadan ücretleri toplamak.
+
+## Çalışan havuzdan ücretleri okuma
+
+```ts
+// Off-chain: her kovada birikmiş mevcut ücretler
+const pool = await connection.getAccountInfo(poolStatePda);
+const decoded = PoolState.decode(pool.data);
+console.log(
+  "Protocol birikmiş:",
+  decoded.protocolFeesToken0.toString(),
+  decoded.protocolFeesToken1.toString(),
+);
+console.log(
+  "Fon birikmiş:",
+  decoded.fundFeesToken0.toString(),
+  decoded.fundFeesToken1.toString(),
+);
+console.log(
+  "Yaratıcı birikmiş:",
+  decoded.creatorFeesToken0.toString(),
+  decoded.creatorFeesToken1.toString(),
+);
+
+// Off-chain: bugün efektif oranlar.
+// trade_fee_rate, creator_fee_rate hacim kesrleridir (payda 1e6).
+// protocol_fee_rate, fund_fee_rate *işlem ücreti* kesrleridir (aynı payda).
+const config = await fetch("https://api-v3.raydium.io/main/cpmm-config")
+  .then((r) => r.json());
+const tier = config.data.find((t) => t.index === decoded.ammConfigIndex);
+
+const tradeFeeOfVolume   = tier.tradeFeeRate / 1_000_000;
+const protocolOfTradeFee = tier.protocolFeeRate / 1_000_000;
+const fundOfTradeFee     = tier.fundFeeRate / 1_000_000;
+const lpOfTradeFee       = 1 - protocolOfTradeFee - fundOfTradeFee;
+
+console.log("LP ücreti efektif:",       (tradeFeeOfVolume * lpOfTradeFee * 100).toFixed(4), "%");
+console.log("Protokol ücreti efektif:", (tradeFeeOfVolume * protocolOfTradeFee * 100).toFixed(4), "%");
+console.log("Fon ücreti efektif:",     (tradeFeeOfVolume * fundOfTradeFee * 100).toFixed(4), "%");
+console.log(
+  "Yaratıcı ücreti efektif:",
+  decoded.enableCreatorFee
+    ? ((tier.creatorFeeRate / 1_000_000) * 100).toFixed(4) + " %"
+    : "0 % (bu havuzda devre dışı)",
+);
+```
+
+## CLMM ve AMM v4 ile karşılaştırma
+
+Yan yana matris için [`/tr/reference/fee-comparison`](/tr/reference/fee-comparison) bakınız. Özet:
+
+- **AMM v4** sabit 0.25% işlem ücreti kullanır, farklı LP/protokol bölünmesi ve fon ücreti yoktur.
+- **CLMM** ücretleri işaret-aralığı katmanına, havuzda değil konuma göre biriktirilir ve `DecreaseLiquidity` veya `CollectFees` aracılığıyla talep edilir.
+
+## Sonra nereye
+
+- [`/tr/products/cpmm/math`](/tr/products/cpmm/math) — işlem-ücreti kesintisinin eğriye nasıl uygulandığı.
+- [`/tr/products/cpmm/instructions`](/tr/products/cpmm/instructions) — `Collect*` talimatı hesap listeleri.
+- [`/tr/algorithms/token-2022-transfer-fees`](/tr/algorithms/token-2022-transfer-fees) — havuz işlem ücretini mint aktarım ücreti ile doğru şekilde nasıl birleştireceğiniz.
+
+Kaynaklar:
+
+- [`raydium-io/raydium-cp-swap` — `states/config.rs`, `states/pool.rs`, `states/curve.rs`](https://github.com/raydium-io/raydium-cp-swap)
+- [Raydium API — `GET /main/cpmm-config`](https://api-v3.raydium.io/main/cpmm-config)

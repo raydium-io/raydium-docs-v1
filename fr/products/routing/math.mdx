@@ -1,0 +1,161 @@
+---
+title: "Mathématiques du routage"
+description: "Le routeur ne fait aucun calcul de tarification lui-même ; chaque saut délègue à la courbe de son programme de pool. Le slippage multi-saut se compose ; les sauts CLMM utilisent limit_prices."
+---
+
+<Info>
+  **Cette page est traduite automatiquement par IA. La version anglaise fait foi.**
+
+  [Voir la version anglaise →](/products/routing/math)
+</Info>
+
+## Le routeur ne fait aucun calcul
+
+Le programme de routage **n'implémente aucune logique de tarification**. C'est un pur orchestrateur : il accepte une route, transmet les comptes aux programmes enfants, et enchaîne les flux de jetons.
+
+Chaque saut se tarifie selon la courbe de son propre programme de pool :
+
+- **Sauts AMM v4 :** utilisent la formule du produit constant (`x · y = k`) avec tarification hybride OpenBook. Voir [`products/amm-v4/math`](/fr/products/amm-v4/math).
+- **Sauts CPMM :** utilisent la formule du produit constant avec niveaux de frais configurables. Voir [`products/cpmm/math`](/fr/products/cpmm/math).
+- **Sauts CLMM :** utilisent les mathématiques des tick de liquidité concentrée. Voir [`algorithms/clmm-math`](/fr/algorithms/clmm-math).
+- **Sauts stables :** utilisent la courbe stable-swap pour les actifs équivalents. Voir [`products/stable/math`](/fr/products/stable/math).
+
+L'implication du routeur se limite à :
+
+1. Appeler l'instruction de swap de chaque pool via CPI.
+2. Collecter le montant en sortie.
+3. Le passer comme montant en entrée au saut suivant.
+4. Vérifier la sortie finale par rapport à la limite de slippage de l'appelant.
+
+## Composition du slippage
+
+Sur une route multi-saut, le slippage à chaque saut se compose. Un petit slippage au saut 1 devient un slippage plus grand au saut 2 parce que le volume entrant au saut 2 est déjà réduit.
+
+**Exemple :**
+
+```
+Route: USDC → SOL → STEP
+
+Pool 1 (USDC / SOL):
+  Input: 1000 USDC
+  Slippage: 1% (spot would give 0.5 SOL, but you get 0.495 SOL)
+  Output: 0.495 SOL
+
+Pool 2 (SOL / STEP):
+  Input: 0.495 SOL (already reduced)
+  Slippage: 1% (spot would give 495 STEP, but you get 490 STEP)
+  Output: 490 STEP
+
+Total effective slippage on USDC → STEP: 1.99%, not 1% + 1% = 2%.
+```
+
+Quand vous fournissez `minimum_amount_out`, le routeur vérifie votre sortie finale par rapport à cette limite globale. Chaque saut vérifie aussi son propre swap par rapport à sa structure de frais locale, mais le routeur n'effectue pas de nouvelle cotation en cours de route—vous devez pré-calculer la route et intégrer suffisamment de tolérance de slippage.
+
+## Sauts CLMM et limit_prices
+
+Pour chaque saut dans un pool CLMM, le routeur vérifie que le `sqrt_price_x64` actuel du pool se situe dans une limite spécifiée. Les limites sont passées comme un `VecDeque<u128>` appelé `limit_prices` :
+
+- Un `sqrt_price_x64` par saut CLMM dans la route.
+- `sqrt_price_x64` est la représentation du prix basée sur les tick utilisée par CLMM. Voir [`algorithms/clmm-math`](/fr/algorithms/clmm-math) pour la définition.
+- Le routeur applique :
+
+```
+  sqrt_price_lower <= pool.sqrt_price_x64 <= sqrt_price_upper
+```
+
+pour chaque saut CLMM, en rejetant le swap si le prix est en dehors des limites.
+
+### Variantes d'instruction et limit_prices
+
+- **`SwapBaseInWithUserAccount`, `SwapBaseOutWithUserAccount` (Hérité, tags 0 et 1) :** le VecDeque `limit_prices` est **requis**. Une deque vide est rejetée avec une erreur si un saut est un pool CLMM. Vous devez fournir un prix par saut CLMM, dans l'ordre.
+
+- **`SwapBaseIn`, `SwapBaseOut` (Actuel, tags 8 et 9) :** le VecDeque `limit_prices` est **optionnel**. Une deque vide est silencieusement ignorée ; aucune vérification de prix n'est effectuée. Le nouveau code doit utiliser ceux-ci.
+
+### Construction de limit_prices
+
+Pour une route avec M sauts CLMM, la deque doit contenir exactement M entrées. Ordonnez-les par saut :
+
+```
+limit_prices = [
+  sqrt_price_for_first_clmm_hop,
+  sqrt_price_for_second_clmm_hop,
+  ...
+]
+```
+
+### Quand vérifier limit_prices
+
+Le `sqrt_price_x64` est un instantané du prix actuel du pool. Il change continuellement à mesure que les swaps s'exécutent. Vous devez :
+
+1. Récupérer l'état actuel du pool en chaîne.
+2. Calculer les limites acceptables (par exemple, ±0,5 % du prix actuel).
+3. Encoder ces limites dans `limit_prices`.
+4. Inclure les limites dans votre instruction de routeur.
+
+Si le prix du pool dépasse vos limites avant que la transaction ne soit validée, le routeur la rejettera.
+
+## Gestion des frais
+
+Chaque pool facture ses propres frais selon sa configuration :
+
+- **AMM v4 :** 0,25 % (fixe) partagé entre LP, protocole et fonds.
+- **CPMM :** configurable par `AmmConfig` (par défaut 0,25 %, partage varie selon le niveau).
+- **CLMM :** configurable par pool, prélevé sur le montant en entrée.
+- **Stable :** comme AMM v4, 0,25 % partagé.
+
+Le routeur **ne prélève aucun frais propre**. Tous les frais sont délégués à chaque pool enfant. La sortie du saut N a déjà les frais de ce saut déduits.
+
+Consultez la documentation des frais du pool individuel :
+
+- [`products/amm-v4/fees`](/fr/products/amm-v4/fees)
+- [`products/cpmm/fees`](/fr/products/cpmm/fees)
+- [`products/clmm/fees`](/fr/products/clmm/fees) (si disponible)
+- [`products/stable/fees`](/fr/products/stable/fees) (si disponible)
+
+## Exemple de comptabilité multi-saut
+
+Supposons que vous routiez USDC → SOL → STEP à travers deux pools de produit constant, chacun avec un frais de 0,25 % :
+
+```
+Input: 1000 USDC
+Pool 1 (USDC/SOL):
+  Fee taken: ceil(1000 * 0.25%) = 2.5 USDC
+  Net input to curve: 997.5 USDC
+  Curve output (before slippage): 0.5 SOL
+  Slippage margin: assume 1%, so you get ~0.495 SOL
+
+Pool 2 (SOL/STEP):
+  Input: 0.495 SOL
+  Fee taken: ceil(0.495 * 0.25%) ≈ 0.001 SOL
+  Net input to curve: 0.494 SOL
+  Curve output: ~494 STEP
+  Slippage margin: 1%, so you get ~489 STEP
+
+Final output: ~489 STEP
+```
+
+Le routeur vérifie :
+
+```
+489 >= minimum_amount_out  // specified by caller
+```
+
+Si c'est faux, toute la route échoue de manière atomique.
+
+## Considérations de précision
+
+Comme tous les programmes Solana, le routeur utilise l'arithmétique entière :
+
+- Tous les montants sont `u64` (lamports ou plus petites unités de jeton).
+- Les calculs de courbe utilisent des intermédiaires `u128` si nécessaire pour éviter le débordement.
+- Les conventions d'arrondi dépendent du programme enfant. Le routeur n'effectue pas d'arrondi supplémentaire.
+
+Si un saut produit un montant zéro en raison de rapports de prix extrêmes (par exemple, swapper 1 lamport sur un pool 1B:1), le routeur propage ce zéro au saut suivant, qui peut alors le rejeter comme insuffisant. Consultez les codes d'erreur du pool individuel.
+
+## Où aller ensuite
+
+- [`products/amm-v4/math`](/fr/products/amm-v4/math) — mathématiques du produit constant.
+- [`products/cpmm/math`](/fr/products/cpmm/math) — CPMM produit constant avec Token-2022.
+- [`algorithms/clmm-math`](/fr/algorithms/clmm-math) — tarification de la liquidité concentrée.
+- [`products/stable/math`](/fr/products/stable/math) — courbe stable-swap.
+- [`products/routing/code-demos`](/fr/products/routing/code-demos) — exemples de cotation avant routage.

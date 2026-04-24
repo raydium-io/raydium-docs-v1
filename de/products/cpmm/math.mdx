@@ -1,0 +1,258 @@
+---
+title: "CPMM-Mathematik"
+description: "Das Constant-Product-Invariant, SwapBaseInput vs SwapBaseOutput, Token-2022-Transfergebührenhandhabung und wie das Observation-Konto aktualisiert wird."
+---
+
+<Info>
+  **Diese Seite wurde mit KI automatisch übersetzt. Maßgeblich ist stets die englische Version.**
+
+  [Englische Version ansehen →](/products/cpmm/math)
+</Info>
+
+## Das Invariant
+
+CPMM erhält das klassische Constant-Product-Invariant auf seinen zwei Vaults:
+
+$$
+x \cdot y = k
+$$
+
+wobei `x` der Vault0-Saldo **nach** etwaigen Token-2022-Transfergebühren beim Empfang ist, und analog für `y`. Jeder Swap muss `k' ≥ k` hinterlassen, nach Abrechnung der Handelsgebühren, die den LPs gutgeschrieben werden (die Protocol-, Fund- und Creator-Buckets zählen *nicht* zu `k` — sie befinden sich im Vault, sind aber vom Kurvenblick ausgeschlossen, siehe [Gebühren auf der Kurve](#gebühren-auf-der-kurve) unten). `k` wächst daher im Laufe der Zeit monoton, während LPs Gebühren ansammeln.
+
+LP-Anteile werden nach den Poolreserven bepreist, nicht nach `k`:
+
+$$
+\text{LP-Preis in Token0} = \frac{x}{\text{lpSupply}}, \qquad \text{LP-Preis in Token1} = \frac{y}{\text{lpSupply}}
+$$
+
+Das Verbrennen von `ΔLP` LP-Token gibt genau `ΔLP × x / lpSupply` von Token0 und `ΔLP × y / lpSupply` von Token1 zurück. Weder die Kurve noch `k` bewegen sich bei Einzahlungen oder Abhebungen — nur Swaps ändern den Preis.
+
+## Gebührenmodell auf dem Swap-Pfad
+
+CPMM wendet **zwei unabhängig bewertete Gebühren** auf jeden Swap an:
+
+- Die **Handelsgebühr** wird auf der Eingabenseite erhoben, berechnet nach `AmmConfig.trade_fee_rate`. Sie wird dann in LP-, Protocol- und Fund-Anteile aufgeteilt (der LP-Anteil bleibt im Vault und lässt `k` wachsen; die Protocol- und Fund-Anteile werden aus der Vault-Buchhaltung extrahiert).
+- Die **Creator-Gebühr** (aktiv nur wenn `enable_creator_fee == true`) wird nach `AmmConfig.creator_fee_rate` berechnet. Sie wird auf der **Eingabe**- oder **Ausgabe**seite erhoben, je nach `PoolState.creator_fee_on` und Swap-Richtung (siehe [`products/cpmm/fees`](/de/products/cpmm/fees#welche-seite-des-handels-die-gebühren-erhoben-werden)). Sie ist ihr eigener Bucket — nie ein Teil der Handelsgebühr.
+
+Sei:
+
+- `FEE_RATE_DENOMINATOR = 1_000_000`
+- `trade_fee_rate` — von `AmmConfig`, z.B. `2500` = 0,25% der relevanten Volumenseite
+- `creator_fee_rate` — von `AmmConfig`, z.B. `1000` = 0,10% der relevanten Volumenseite
+- `protocol_fee_rate`, `fund_fee_rate` — denominiert in Einheiten von `1/FEE_RATE_DENOMINATOR` **der Handelsgebühr**, nicht des Volumens
+
+Wenn die Creator-Gebühr auf der Eingabenseite ist:
+
+```
+total_input_fee = ceil(amount_in * (trade_fee_rate + creator_fee_rate) / FEE_RATE_DENOMINATOR)
+creator_fee     = floor(total_input_fee * creator_fee_rate / (trade_fee_rate + creator_fee_rate))
+trade_fee       = total_input_fee - creator_fee
+amount_in_after_fees = amount_in - total_input_fee
+```
+
+Wenn die Creator-Gebühr auf der Ausgabenseite ist:
+
+```
+trade_fee            = ceil(amount_in * trade_fee_rate / FEE_RATE_DENOMINATOR)
+amount_in_after_fees = amount_in - trade_fee
+amount_out_curve     = curve_output(amount_in_after_fees, ...)
+creator_fee          = ceil(amount_out_curve * creator_fee_rate / FEE_RATE_DENOMINATOR)
+amount_out           = amount_out_curve - creator_fee
+```
+
+In beiden Fällen wird die Handelsgebühr auf die gleiche Weise aufgeteilt:
+
+```
+protocol_fee   = floor(trade_fee * protocol_fee_rate / FEE_RATE_DENOMINATOR)
+fund_fee       = floor(trade_fee * fund_fee_rate     / FEE_RATE_DENOMINATOR)
+lp_fee         = trade_fee - protocol_fee - fund_fee     // creator_fee wird hier NICHT subtrahiert
+```
+
+Der `protocol_fee + fund_fee + creator_fee`-Betrag wird in den Vaults gehalten, aber separat im Pool-Status verfolgt (`protocol_fees_token*`, `fund_fees_token*`, `creator_fees_token*`). Wenn das Constant-Product-Invariant `k' ≥ k` überprüft, verwendet es Vault-Bilanzen **minus** alle drei aufgelaufenen, aber nicht eingezogenen Gebühren — sodass LPs nur `lp_fee` erfassen.
+
+Siehe [`products/cpmm/fees`](/de/products/cpmm/fees) für die Erfassungsanweisungen und ausgearbeitete numerische Beispiele.
+
+## SwapBaseInput (Input-Exact)
+
+„Der Benutzer gibt uns genau `amount_in` des Input-Mints und erhält mindestens `minimum_amount_out` des Output-Mints."
+
+Ignorieren wir Token-2022 für einen Moment:
+
+```
+amount_in_after_trade_fee = amount_in - trade_fee
+amount_out                = y − (x * y) / (x + amount_in_after_trade_fee)
+```
+
+Nach Algebra:
+
+$$
+\text{amount\_out} = \frac{y \cdot \Delta x_{\text{net}}}{x + \Delta x_{\text{net}}}
+$$
+
+wobei `Δx_net = amount_in_after_trade_fee`.
+
+Das Programm aktualisiert dann die Vault-Buchhaltung so, dass der Anteil von `trade_fee`, der Protocol/Fund/Creator gehört, in „aufgelaufenen" Buckets sitzt (nicht in der nächsten `x` der Kurve enthalten), während der LP-Anteil `x` für den nächsten Swap beitritt.
+
+### Token-2022 auf der Eingabenseite
+
+Wenn der Input-Mint eine Transfer-Fee-Erweiterung hat, zieht der **Mint** seine Gebühr bei der Übertragung vom Benutzer → Vault ab. Der Vault empfängt also tatsächlich `amount_in − transfer_fee_in(amount_in)`. Das CPMM-Programm berechnet daher:
+
+```
+amount_actually_received = amount_in − transfer_fee_in(amount_in)
+trade_fee                = ceil(amount_actually_received * trade_fee_rate / FEE_RATE_DENOMINATOR)
+amount_in_after_trade_fee = amount_actually_received − trade_fee
+```
+
+und führt die Kurve gegen `amount_in_after_trade_fee` aus. Dies ist wichtig, weil **der Kurvenkurs aus dem Nettobetrag berechnet wird, der im Vault gelandet ist**, nicht aus dem Schlagzahlamount des Benutzers.
+
+### Token-2022 auf der Ausgabenseite
+
+Wenn der Output-Mint eine Transfergebühr hat, sendet der Pool `amount_out` aus seinem Vault zum Benutzer. Der **Mint** wird dann seine Gebühr auf dem Weg nach draußen abziehen, sodass der Benutzer `amount_out − transfer_fee_out(amount_out)` erhält. Das Programm berechnet `amount_out` wie üblich aus der Kurve, aber es ist die Verantwortung des Integrators, die Zahl des Pools „Vault senden" in eine „Benutzer empfangen"-Zahl umzuwandeln, wenn Kurse angezeigt werden.
+
+### Slippage-Überprüfung
+
+Nach der Berechnung von `amount_out`:
+
+```
+require(amount_out >= minimum_amount_out, "AmountSpecifiedLessThanMinimum")
+```
+
+Wenn der Output-Mint eine Transfergebühr erhebt, wendet das SDK die Transfergebühr an, *bevor* `minimum_amount_out` gesetzt wird, sodass die Slippage-Konstante in dem Betrag denominiert ist, den der Benutzer tatsächlich erhält, nicht in dem, was der Vault sendet.
+
+## SwapBaseOutput (Output-Exact)
+
+„Der Benutzer erhält genau `amount_out` des Output-Mints und ist bereit, bis zu `maximum_amount_in` des Input-Mints zu zahlen."
+
+Inversion der Kurve für `Δx_net`:
+
+$$
+\Delta x_{\text{net}} = \left\lceil \frac{x \cdot \text{amount\_out}}{y - \text{amount\_out}} \right\rceil
+$$
+
+Die Obergrenze ist wichtig — sie garantiert `k' ≥ k` nach Integer-Kürzung. Dann:
+
+```
+// Arbeite rückwärts vom Netto-Input zum Brutto-Input.
+// Die Gebühr wird auf dem Brutto erhoben, also:
+//   net = gross − ceil(gross * rate / D)
+//       ≈ gross * (D − rate) / D
+// Inversion mit Obergrenze an den richtigen Stellen:
+gross_needed = ceil(Δx_net * D / (D − trade_fee_rate))
+```
+
+Bei Token-2022-Input umschließen mit:
+
+```
+gross_needed_before_mint_fee
+  = inflate_for_transfer_fee(gross_needed, input_mint)
+```
+
+sodass der Benutzer genug bezahlt, damit der Pool nach Abzug der Mint-Transfergebühr immer noch `gross_needed` erhält.
+
+### Slippage-Überprüfung
+
+```
+require(gross_needed_before_mint_fee <= maximum_amount_in, "AmountSpecifiedExceedsMaximum")
+```
+
+## Ausgearbeitetes Beispiel
+
+Pool-Status, ignorieren Token-2022:
+
+- `x = 1_000_000_000_000` (1.000.000,000000 von Token0, 6 Dezimalstellen)
+- `y = 2_000_000_000_000` (2.000.000,000000 von Token1, 6 Dezimalstellen)
+- `AmmConfig`: `trade_fee_rate = 2500`, `protocol_fee_rate = 120_000`, `fund_fee_rate = 40_000`, `creator_fee_rate = 0`
+
+Benutzer: `SwapBaseInput` mit `amount_in = 1_000_000_000` (1.000,000000 von Token0). Creator-Gebühr ist deaktiviert (`enable_creator_fee = false`).
+
+```
+trade_fee                = ceil(1_000_000_000 * 2500 / 1_000_000)       = 2_500_000
+  protocol_fee           = floor(2_500_000 * 120_000 / 1_000_000)       = 300_000
+  fund_fee               = floor(2_500_000 *  40_000 / 1_000_000)       = 100_000
+  lp_fee                 = 2_500_000 − 300_000 − 100_000                 = 2_100_000
+creator_fee              = 0                                              // deaktiviert
+
+amount_in_after_trade_fee = 1_000_000_000 − 2_500_000                    = 997_500_000
+
+amount_out = y − (x * y) / (x + Δx_net)
+           = 2_000_000_000_000
+             − (1_000_000_000_000 * 2_000_000_000_000)
+               / (1_000_000_000_000 + 997_500_000)
+           ≈ 1_995_015_009
+
+new_vault0_raw   = x + amount_in                                        = 1_001_000_000_000
+new_vault1       = y − amount_out                                       ≈ 1_998_004_984_991
+
+// Von den 1_000_000_000, die in Vault0 empfangen wurden, sind 400_000 „aufgelaufene Gebühren"
+// (Protocol + Fund), die die Kurve ausschließen sollte:
+curve_x          = new_vault0_raw − (protocol_fees_token0 + fund_fees_token0)
+                 = 1_001_000_000_000 − 400_000
+                 = 1_000_999_600_000
+
+k' = curve_x * new_vault1 ≈ 2.000_002_501_E24  ≥  k = 2.0E24   ✓
+```
+
+Wenn derselbe Pool `enable_creator_fee = true` mit `creator_fee_rate = 1000` (0,10%) auf der Eingabenseite hätte, würde das Programm `total_input_fee = ceil(1_000_000_000 * 3500 / 1_000_000) = 3_500_000` berechnen, dann als `creator_fee = 1_000_000` und `trade_fee = 2_500_000` aufteilen. Die Protocol/Fund/LP-Arithmetik auf `trade_fee` ist unverändert vom obigen Beispiel — die Creator-Gebühr ist ihr eigener Bucket, aufgelaufen zu `creator_fees_token0` und ausgeschlossen von `curve_x` zusammen mit den Protocol- und Fund-Buckets.
+
+Wenn der Input-Mint eine 1%-Token-2022-Transfergebühr hat, empfängt der Vault `990_000_000` Token statt `1_000_000_000`, und jede nachfolgende Berechnung verwendet diesen Nettobetrag.
+
+## Regel für die Beobachtungsaktualisierung
+
+Bei jedem Swap bewertet das Programm, ob eine neue Beobachtung in den Ringpuffer gepusht werden soll:
+
+```
+let since_last = now − observations[head].block_timestamp;
+if since_last >= MIN_OBSERVATION_INTERVAL {
+    let price0 = (vault1 << 32) / vault0;            // Q32.32-ish
+    let price1 = (vault0 << 32) / vault1;
+    let head' = (head + 1) % OBSERVATION_NUM;
+    observations[head'] = Observation {
+        block_timestamp: now,
+        cumulative_token0_price_x32:
+            observations[head].cumulative_token0_price_x32 + price0 * since_last,
+        cumulative_token1_price_x32:
+            observations[head].cumulative_token1_price_x32 + price1 * since_last,
+    };
+    head = head';
+}
+```
+
+Zwei Eigenschaften:
+
+- **Kumulativer Preis, nicht Spotpreis.** Eine einzelne Beobachtung ist kein Preis. Um einen TWAP von Zeit `t0` zu `t1` zu erhalten, lesen Sie die Beobachtungen, die dem Ende am nächsten sind, und berechnen Sie `(cumulative(t1) − cumulative(t0)) / (t1 − t0)`.
+- **Proben sind ratenbegrenzt.** Back-to-Back-Swaps im selben Slot können eine Beobachtung teilen. Das Lesen einer Beobachtung unmittelbar nach einem Swap kann daher um einen Slot veraltet aussehen — dies ist normal.
+
+Mehr in [`products/clmm/accounts`](/de/products/clmm/accounts).
+
+## Gebühren auf der Kurve
+
+Dies ist der subtile Teil und es lohnt sich, ihn hervorzuheben. Die Kurven-Arithmetik arbeitet gegen die **Netto**-Vault-Bilanzen — d.h. rohes SPL-Saldo minus aufgelaufene Protocol-, Fund- und Creator-Gebühren (alle drei sind unabhängige Buckets — siehe [`products/cpmm/fees`](/de/products/cpmm/fees)). Ein konkretes Bild:
+
+```
+raw_vault_balance   = was ein RPC getTokenAccountBalance zurückgibt
+accrued_fees        = protocol_fees_token{0,1} + fund_fees_token{0,1} + creator_fees_token{0,1}
+curve_balance       = raw_vault_balance − accrued_fees
+invariant           = curve_balance0 * curve_balance1
+```
+
+Konsequenzen für Integratoren:
+
+- **Zitieren Sie nicht aus rohen Bilanzen.** Subtrahieren Sie zuerst die aufgelaufenen Gebührenfelder, oder rufen Sie `SwapBaseInput` als Simulation auf und nehmen Sie das Ergebnis.
+- **`CollectProtocolFee` bewegt Token aus dem Vault.** Nach der Erfassung sinkt `raw_vault_balance`, aber `curve_balance` bleibt unverändert; der Poolpreis bewegt sich nicht. Dies ist beabsichtigt.
+
+## Präzision und Überläufe
+
+- Alle Kurven-Arithmetiken verwenden `u128`-Intermediate, um Überläufe auf `x * y` zu verhindern.
+- Division rundet gegen Null, außer für `SwapBaseOutput`'s `Δx_net`, die aufrundet, und Gebührenberechnung, die aufrundet auf die `trade_fee` und abrundet auf die Unterteilungen. Diese Rundungsrichtungen werden gewählt, damit das Invariant aufgrund von Integer-Kürzung nicht abnimmt.
+- Pools mit extremen Vault-Verhältnissen (Milliarden : 1) können bei kleinen Trades auf Präzisions-Untergrenze treffen; das Programm gibt in diesem Fall `ZeroTradingTokens` zurück. Siehe [`reference/error-codes`](/de/reference/error-codes).
+
+## Nächste Schritte
+
+- [`products/cpmm/fees`](/de/products/cpmm/fees) — die vollständige Gebührenstaffeln- und Erfassungssemantik.
+- [`products/cpmm/instructions`](/de/products/cpmm/instructions) — die Anweisungen, die diese Mathematik aufrufen.
+- [`algorithms/constant-product`](/de/algorithms/constant-product) — die Herleitung und Grenzfälle von `x · y = k`, geteilt über AMM v4 und CPMM.
+
+Quellen:
+
+- [`raydium-io/raydium-cp-swap` — Swap-Mathematik in `states/curve.rs`](https://github.com/raydium-io/raydium-cp-swap)
+- Raydium-Auditenberichte, auf die in [`security/audits`](/de/security/audits) verwiesen wird

@@ -1,0 +1,260 @@
+---
+title: "Rust CPI"
+description: "استدعاء برامج Raydium من برنامج Solana آخر — بناء قوائم الحسابات وبذور التوقيع والميزانية الحسابية ونماذج نشر الأخطاء لـ CPMM و CLMM وفارم v6 و LaunchLab. يتم تغطية AMM v4 بشكل منفصل لأنه لا يحتوي على crate Anchor."
+---
+
+<Info>
+  **هذه الصفحة مُترجَمة آليًا بواسطة الذكاء الاصطناعي. النسخة الإنجليزية هي المرجع المعتمد.**
+
+  [عرض النسخة الإنجليزية →](/sdk-api/rust-cpi)
+</Info>
+
+<Info>
+  CPI («cross-program invocation») هو الآلية التي يستدعي بموجبها برنامج Solana واحد برنامجًا آخر. تُرسل برامج Raydium المدعومة بـ Anchor مع crate غلاف CPI تجعل موقع الاستدعاء يبدو مثل استدعاء دالة مكتوبة بشكل صريح — هياكل حساب مع أسماء حقول تم التحقق من صحتها ومساعدات `cpi::<ix>()`. تُوثّق هذه الصفحة النمط العام؛ للحصول على مقاطع برمجية خاصة بكل منتج، انظر إلى صفحة code-demos في فصل كل منتج.
+</Info>
+
+## تبعيات Cargo
+
+```toml
+[dependencies]
+anchor-lang            = "0.29"
+anchor-spl             = "0.29"
+raydium_cp_swap        = { git = "https://github.com/raydium-io/raydium-cp-swap", features = ["cpi"] }
+raydium_amm_v3         = { git = "https://github.com/raydium-io/raydium-clmm",    features = ["cpi"] }
+# AMM v4 and farm v6: no published Anchor CPI crate. See "AMM v4 / farm v6" below.
+```
+
+علم الميزة `cpi` يجعل الـ crates تُترجم إلى سطح CPI فقط (هياكل حساب + invokers) بدلاً من البرنامج الكامل، بحيث يبقى ملفك الثنائي صغيرًا.
+
+للحصول على أمثلة CPI فعلية تربط هياكل الحسابات بالكامل، انظر إلى [`raydium-io/raydium-cpi-example`](https://github.com/raydium-io/raydium-cpi-example) (يغطي AMM v4 و CPMM و CLMM).
+
+## بناء قائمة الحسابات
+
+كل CPI من Raydium يتطلب هيكل `Accounts` في البرنامج الذي يستدعيه. تطابق الحقول ترتيب حساب التعليمات في البرنامج 1-لـ-1، مع محققي على مستوى الحقل:
+
+```rust
+use anchor_lang::prelude::*;
+use anchor_spl::token::{Token, TokenAccount, Mint};
+
+#[derive(Accounts)]
+pub struct MyProxySwap<'info> {
+    #[account(mut)]
+    pub user: Signer<'info>,
+
+    /// CHECK: validated by CPMM
+    #[account(mut)]
+    pub pool_state: UncheckedAccount<'info>,
+
+    /// CHECK: ditto
+    pub amm_config: UncheckedAccount<'info>,
+
+    /// CHECK: ditto
+    pub pool_authority: UncheckedAccount<'info>,
+
+    #[account(mut)]
+    pub input_vault: Account<'info, TokenAccount>,
+    #[account(mut)]
+    pub output_vault: Account<'info, TokenAccount>,
+
+    pub input_mint: Account<'info, Mint>,
+    pub output_mint: Account<'info, Mint>,
+
+    #[account(mut)]
+    pub user_input_ata:  Account<'info, TokenAccount>,
+    #[account(mut)]
+    pub user_output_ata: Account<'info, TokenAccount>,
+
+    pub cpmm_program: Program<'info, raydium_cp_swap::program::RaydiumCpSwap>,
+    pub token_program: Program<'info, Token>,
+    pub token_program_2022: Program<'info, anchor_spl::token_2022::Token2022>,
+    /// CHECK: observation PDA
+    #[account(mut)]
+    pub observation_state: UncheckedAccount<'info>,
+}
+```
+
+معظم حسابات جانب Raydium هي `UncheckedAccount` لأن البرنامج المُستدعى (Raydium) يمتلك التحقق. برنامجك الذي يستدعيه يتحقق فقط بشكل صريح من الحسابات التي *تمتلكها* — ATAs المستخدم، PDAs الخاصة بك. تعليق `/// CHECK:` يُثبّط تحذير Anchor حول الفحوصات المفقودة.
+
+## بناء استدعاء CPI
+
+يُنشئ Anchor مساعدًا واحدًا لكل تعليمة:
+
+```rust
+use raydium_cp_swap::cpi::{self, accounts::Swap as CpmmSwap};
+
+pub fn my_proxy_swap(
+    ctx: Context<MyProxySwap>,
+    amount_in: u64,
+    minimum_amount_out: u64,
+) -> Result<()> {
+    let cpi_accounts = CpmmSwap {
+        payer:                ctx.accounts.user.to_account_info(),
+        authority:            ctx.accounts.user.to_account_info(),
+        amm_config:           ctx.accounts.amm_config.to_account_info(),
+        pool_state:           ctx.accounts.pool_state.to_account_info(),
+        input_token_account:  ctx.accounts.user_input_ata.to_account_info(),
+        output_token_account: ctx.accounts.user_output_ata.to_account_info(),
+        input_vault:          ctx.accounts.input_vault.to_account_info(),
+        output_vault:         ctx.accounts.output_vault.to_account_info(),
+        input_token_program:  ctx.accounts.token_program.to_account_info(),
+        output_token_program: ctx.accounts.token_program.to_account_info(),
+        input_token_mint:     ctx.accounts.input_mint.to_account_info(),
+        output_token_mint:    ctx.accounts.output_mint.to_account_info(),
+        observation_state:    ctx.accounts.observation_state.to_account_info(),
+    };
+    let cpi_ctx = CpiContext::new(
+        ctx.accounts.cpmm_program.to_account_info(),
+        cpi_accounts,
+    );
+
+    cpi::swap_base_input(cpi_ctx, amount_in, minimum_amount_out)?;
+    Ok(())
+}
+```
+
+يتم إنشاء `cpi::swap_base_input` من IDL؛ قائمة الحجج الخاصة به تعكس قائمة حجج التعليمات من Anchor.
+
+## بذور التوقيع (PDA-signed CPI)
+
+عندما يوقّع برنامجك CPI نيابة عن PDA (شائع للأقبية والضمانات، وما إلى ذلك)، استخدم `CpiContext::new_with_signer`:
+
+```rust
+let bump         = ctx.accounts.my_authority_bump;
+let signer_seeds: &[&[&[u8]]] = &[&[b"my_authority", &[bump]]];
+
+let cpi_ctx = CpiContext::new_with_signer(
+    ctx.accounts.cpmm_program.to_account_info(),
+    cpi_accounts,
+    signer_seeds,
+);
+
+cpi::swap_base_input(cpi_ctx, amount_in, minimum_amount_out)?;
+```
+
+يجب أن تطابق بذور التوقيع اشتقاق PDA. لأي حساب تم تمريره كـ `authority` (أو دور توقيع مشابه)، تحقق runtime Solana من أن PDA يوقّع عبر هذه البذور.
+
+## الحسابات المتبقية
+
+بعض تعليمات Raydium تأخذ **حسابات متبقية** — قائمة ذات طول متغير مُلحقة بعد الحسابات الثابتة. الأمثلة الكنسية:
+
+- **CLMM `SwapV2`**: تُلحق 1–8 حسابات `TickArrayState` تقابل مصفوفات القيمة التي قد تقطعها المبادلة.
+- **Farm v6 `Deposit`**: تُلحق أزواج `(reward_vault, user_reward_ata)` لكل تدفق مكافآت نشط.
+
+مساعدات CPI من Anchor لا تفحص النوع للحسابات المتبقية. مررها عبر `.with_remaining_accounts(...)`:
+
+```rust
+let cpi_ctx = CpiContext::new(program, accounts)
+    .with_remaining_accounts(ctx.remaining_accounts.to_vec());
+```
+
+يهم الترتيب: برنامج المستقبِل يكرر الحسابات المتبقية بالترتيب الذي تمريه. بالنسبة لـ CLMM، يجب ترتيب مصفوفات القيمة اتجاهيًا (مصفوفة أولى في اتجاه المبادلة أولاً). بالنسبة لـ farm v6، تذهب فتحات المكافآت في ترتيب فهرس الفتحة.
+
+## نشر الأخطاء
+
+برامج Raydium تُرجع enum أخطائها الخاصة. Anchor يلفّها؛ برنامجك الذي يستدعيه يراها كـ `Err(ProgramError::Custom(code))`. للتعامل مع أخطاء محددة:
+
+```rust
+use raydium_cp_swap::error::ErrorCode as CpmmErr;
+
+match cpi::swap_base_input(cpi_ctx, amount_in, minimum_amount_out) {
+    Ok(_) => Ok(()),
+    Err(e) => {
+        msg!("CPMM swap failed: {:?}", e);
+        // Re-raise, or convert to your own error type.
+        Err(e)
+    }
+}
+```
+
+رقم الكود الخطأ مستقر حسب سياسة IDL ([`sdk-api/anchor-idl`](/ar/sdk-api/anchor-idl)). يمكنك الاختبار مقابل أكواد محددة بالمقارنة مقابل القيمة الرقمية.
+
+## الميزانية الحسابية في CPIs المركبة
+
+كل إطار CPI له overhead (~1,500 CU للاستدعاء نفسه)، واستهلاك البرنامج المُستدعى بالـ CU يتراكم على رأسك. معاملة تستدعي CPMM swap من داخل برنامجك تنفق:
+
+```
+your_program_cu
++ ~1_500       (CPI overhead)
++ ~150_000     (CPMM swap, SPL-token variant)
++ ~200_000     (if Token-2022 with transfer fee)
++ ~10_000      (observation update)
+```
+
+للتوجيه المُكدّس (برنامجك → aggregator → CPMM + CLMM + farm harvest)، الميزانية ≥500k CU. اضبط دائمًا تعليمة `ComputeBudgetProgram::set_compute_unit_limit(...)` صريحة في المعاملة — حد 200k CU الافتراضي سينفد بصمت.
+
+## AMM v4 — بناء Instruction يدويًا
+
+AMM v4 ليس لديه crate Anchor. بناء `Instruction` يدويًا:
+
+```rust
+use anchor_lang::solana_program::program::invoke_signed;
+use anchor_lang::solana_program::instruction::{Instruction, AccountMeta};
+
+const AMM_V4_PROGRAM_ID: Pubkey = pubkey!("675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8");
+
+// SwapBaseIn discriminator is 9.
+let mut data = vec![9u8];
+data.extend_from_slice(&amount_in.to_le_bytes());
+data.extend_from_slice(&minimum_amount_out.to_le_bytes());
+
+let ix = Instruction {
+    program_id: AMM_V4_PROGRAM_ID,
+    accounts: vec![
+        AccountMeta::new_readonly(token_program_id, false),
+        AccountMeta::new(amm_id, false),
+        AccountMeta::new_readonly(amm_authority, false),
+        // ... remaining accounts per products/amm-v4/instructions ...
+    ],
+    data,
+};
+invoke_signed(&ix, &account_infos, signer_seeds)?;
+```
+
+انظر إلى [`products/amm-v4/code-demos`](/ar/products/amm-v4/code-demos) لقائمة الحسابات الكاملة.
+
+## Farm v6 — حسابات الأزواج المتبقية للمكافآت
+
+Farm v6 الـ `Deposit` / `Withdraw` / `Harvest` تستخدم نمط زوج `(reward_vault_i, user_reward_ata_i)` في الحسابات المتبقية. التسلسل الدقيق:
+
+```
+remaining_accounts = [
+    reward_vault_0, user_reward_ata_0,
+    reward_vault_1, user_reward_ata_1,
+    ...
+]
+```
+
+زوج واحد لكل فتحة مكافآت **نشطة** (قيد التشغيل أو انتهت لكن لم تُطالب). تجاهل الفتحات غير المستخدمة؛ البرنامج ينقل من `farm_state.reward_infos[i].reward_state`.
+
+## اختبار تدفق CPI
+
+يتطلب dev محليًا أن تكون برامج Raydium متاحة في محقق الاختبار الخاص بك. الخيارات:
+
+1. **`anchor test` مع نسخ البرنامج** — في `Anchor.toml`:
+
+   ```toml
+   [test.validator]
+   clone = [
+     { address = "CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK" },  # CPMM
+     { address = "CLMM...program-id..." },                          # CLMM
+     { address = "farm-v6-program-id..." },                         # farm v6
+   ]
+   ```
+
+   هذا يسحب رمز النشر من mainnet إلى محقق محليك.
+
+2. **Devnet** — Raydium ينشر جميع البرامج إلى devnet بنفس معرفات البرامج مثل mainnet. شغّل `anchor test --provider.cluster devnet` للوصول إلى الكود الحي.
+
+3. **النشر المحلي** — استنسخ مستودعات Raydium و `anchor deploy` إلى محقق محلي. يضيف overhead دورة اختبار لكنه يتيح لك تعديل المستقبِل للتصحيح.
+
+## مؤشرات
+
+- [`products/cpmm/code-demos`](/ar/products/cpmm/code-demos), [`products/clmm/code-demos`](/ar/products/clmm/code-demos), [`products/amm-v4/code-demos`](/ar/products/amm-v4/code-demos), [`products/farm-staking/code-demos`](/ar/products/farm-staking/code-demos) — أمثلة CPI خاصة بالمنتج.
+- [`sdk-api/anchor-idl`](/ar/sdk-api/anchor-idl) — استرجاع IDL وإعادة توليد العميل.
+- [`integration-guides/cpi-integration`](/ar/integration-guides/cpi-integration) — أنماط على مستوى أعلى: الضمانات والأقبية وتركيب المجمّع.
+
+المصادر:
+
+- [raydium-cp-swap](https://github.com/raydium-io/raydium-cp-swap)
+- [raydium-clmm](https://github.com/raydium-io/raydium-clmm)
+- [Anchor CPI docs](https://www.anchor-lang.com/docs/cross-program-invocations)

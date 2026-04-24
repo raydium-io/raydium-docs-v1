@@ -1,0 +1,206 @@
+---
+title: "Constant-product AMM"
+description: "The x·y=k invariant, reserve-based pricing, slippage derivation, and the fee handling variants used by Raydium CPMM and AMM v4. This is the reference math page every x·y=k product at Raydium links back to."
+---
+
+## The invariant
+
+A constant-product market maker (CPMM) holds two reserves `x` and `y` and enforces:
+
+```
+x · y ≥ k       (after every trade)
+```
+
+where `k` is the product of the reserves before the trade. For a fee-free market, `x · y = k` exactly. With fees, `k` strictly grows (the LP share of the fee is retained in the reserves).
+
+The invariant is deliberately geometric: it guarantees that no matter how small one reserve becomes, the other grows unboundedly to match — i.e. the pool can never be drained to zero on either side.
+
+## Pricing
+
+### Spot price
+
+The marginal price of `y` denominated in `x` at any instant is the tangent of the curve:
+
+```
+p = y / x
+```
+
+(derivation: implicit differentiation of `x · y = k` gives `dy/dx = −y/x`; ignoring the sign, `|dy/dx| = y/x`).
+
+This is the price that the pool quotes for an infinitesimally small trade. For any finite trade, the realized price is worse due to slippage along the curve.
+
+### Exact-input swap (give `Δx`, receive `Δy`)
+
+With fees, let `f` be the fee rate (e.g. `f = 0.0025` for 25 bps). Apply the fee to the input, then use the invariant to solve for the output:
+
+```
+Δx_after_fee = Δx · (1 − f)
+Δy           = y · Δx_after_fee / (x + Δx_after_fee)
+```
+
+Post-trade reserves:
+
+```
+x' = x + Δx
+y' = y − Δy
+```
+
+The full `Δx` enters the reserves. The LP portion of the fee stays in `x'`; the protocol portion is excluded from the curve via a separate accounting step (see [Fee accounting variants](#fee-accounting-variants) below).
+
+### Exact-output swap (receive `Δy`, pay the minimal `Δx`)
+
+```
+Δx_after_fee = x · Δy / (y − Δy)
+Δx           = Δx_after_fee / (1 − f)
+```
+
+`Δx` is rounded up to ensure the pool does not undercharge.
+
+## Slippage and price impact
+
+**Price impact** measures how much the pool's spot price moves as a result of the trade:
+
+```
+p_before = y / x
+p_after  = y' / x' = (y − Δy) / (x + Δx)
+impact   = (p_before − p_after) / p_before
+```
+
+For small `Δx / x`, a first-order expansion gives:
+
+```
+impact ≈ 2 · Δx / x      (ignoring fees)
+```
+
+Intuition: a 1% swap causes a ~2% price impact. This factor of 2 is the reason CPMM pools quoted for mid-size trades look "thin" compared to orderbook markets — you are not just buying against the current best bid, you are walking up your own marginal price.
+
+**Effective price** paid by the swapper:
+
+```
+effective = Δx / Δy
+```
+
+The spread between `p_before` and `effective` is **slippage**. On-chain `slippage` UI is usually expressed as `(effective − p_before) / p_before`; the SDK's `computeAmountOut` returns both `amountOut` and `priceImpact` for this reason.
+
+## Invariant check in code
+
+After a swap, protocols re-verify:
+
+```
+k' = x' · y'  ≥  k  =  x · y
+```
+
+Any violation is a program bug or an arithmetic overflow. Raydium's swap instructions make this check explicit as a post-condition:
+
+```rust
+let k_before = coin_reserve_before as u128 * pc_reserve_before as u128;
+let k_after  = coin_reserve_after  as u128 * pc_reserve_after  as u128;
+require!(k_after >= k_before, ErrorCode::InvariantViolation);
+```
+
+## Fee accounting variants
+
+The invariant check assumes the LP fee stays in the reserves. Different Raydium products handle the protocol / fund / creator components differently:
+
+### CPMM convention
+
+Fees are `u64` basis-point-like rates on a `1_000_000` denominator. The trade fee is split into `trade_fee_rate` (total) and then subdivided via `protocol_fee_rate`, `fund_fee_rate`, `creator_fee_rate`. On each swap:
+
+```
+trade_fee     = ceil(Δx · trade_fee_rate / 1_000_000)
+protocol_fee  = trade_fee · protocol_fee_rate / 1_000_000
+fund_fee      = trade_fee · fund_fee_rate     / 1_000_000
+creator_fee   = trade_fee · creator_fee_rate  / 1_000_000
+lp_fee        = trade_fee − protocol_fee − fund_fee − creator_fee
+```
+
+The three non-LP shares accrue into separate counters (`protocol_fees_*`, `fund_fees_*`, `creator_fees_*`) that are **excluded** from the reserves used in the invariant. This is how fees can be swept without moving the curve. See [`products/cpmm/fees`](/products/cpmm/fees).
+
+### AMM v4 convention
+
+Fees are `numerator / denominator` ratios on a `10_000` denominator. The split is fixed at pool creation and stored on `AmmInfo.fees`:
+
+```
+swap_fee  = ceil(Δx · swap_fee_numerator / swap_fee_denominator)    // e.g. 0.25%
+pnl_share = swap_fee · pnl_numerator / swap_fee_numerator            // e.g. 0.03 / 0.25 = 12%
+lp_share  = swap_fee − pnl_share                                     // 0.22% of volume
+```
+
+`pnl_share` accrues into `state_data.need_take_pnl_*` and is excluded from reserves; `lp_share` stays in the vault. See [`products/amm-v4/fees`](/products/amm-v4/fees).
+
+Both conventions preserve the invariant the same way — the difference is cosmetic (denominator + number of sub-categories).
+
+## Rounding rules
+
+- **Fee calculation rounds up.** Ensures the pool never undercharges on the fee.
+- **Output amount rounds down.** Ensures the invariant holds strictly (`k' > k` even before the fee is added).
+- **Exact-output input amount rounds up.** Ensures the user does not underpay.
+
+All arithmetic uses `u128` for the intermediate `x · Δx` products to avoid overflow on large reserves. Final results are cast back to `u64` with a saturation check.
+
+## Edge cases
+
+### Empty pool
+
+Before the first `Deposit`, `x = y = 0`. Swap instructions reject pre-deposit.
+
+### Zero output
+
+If `Δx` is small enough that the rounded-down `Δy` is 0, the instruction reverts with `ZeroTradingTokens`. This prevents extraction of value without payment; also means dust swaps on highly imbalanced pools fail.
+
+### Dust LP
+
+The first `Deposit` has special handling: it computes the initial LP supply as `sqrt(x · y)` and burns a small "init burn" amount (usually 100 LP units) to prevent the "first-depositor inflation attack" (where an attacker donates to the vault and inflates the LP token value). Subsequent deposits use pro-rata math.
+
+## Relationship to arbitrage
+
+A CPMM pool's price only changes via:
+
+1. Trades through the pool itself (users walking the curve).
+2. Donations (sending tokens to the vault without a swap).
+
+Because trades move the price deterministically with the curve, any pool whose price diverges from the broader market creates an arbitrage opportunity. Arbitrageurs bring the pool price back toward the market price in expectation. This is why CPMM pools are said to "quote a price without an oracle": the market finds the price through arbitrage rather than the pool reading it externally.
+
+The flip side: the pool itself is the arbitrageur's counterparty, so any arbitrage profit is LP impermanent loss (minus the fee captured by LPs).
+
+## Worked examples
+
+### Example 1 — small trade, negligible slippage
+
+Pool: `x = 1_000_000, y = 2_000_000, k = 2·10^12`. Fee `f = 0.0025`.
+
+Trade `Δx = 1_000`:
+
+```
+Δx_after_fee = 1000 · 0.9975  = 997.5
+Δy           = 2_000_000 · 997.5 / (1_000_000 + 997.5)
+             = 1_995_000_000 / 1_000_997.5
+             ≈ 1_993.01
+```
+
+Effective price: `1000 / 1993.01 ≈ 0.5018`. Spot before: `0.5`. Impact: ~0.36%.
+
+### Example 2 — mid-size trade, visible slippage
+
+Same pool, `Δx = 100_000` (10% of `x`):
+
+```
+Δx_after_fee = 100_000 · 0.9975 = 99_750
+Δy           = 2_000_000 · 99_750 / (1_000_000 + 99_750)
+             = 199_500_000_000 / 1_099_750
+             ≈ 181_405
+```
+
+Effective: `100_000 / 181_405 ≈ 0.5513`. Impact: ~10.3% — roughly half the `2 · 10% = 20%` rule of thumb (the rule is a worst-case ceiling for a no-fee constant-product curve; the trade fee plus the inversion in the formula brings it down).
+
+## Pointers
+
+- [`products/cpmm/math`](/products/cpmm/math) — CPMM's specific rounding + fee-denominator choices.
+- [`products/amm-v4/math`](/products/amm-v4/math) — how AMM v4's OpenBook-integrated reserves extend this model.
+- [`algorithms/slippage-and-price-impact`](/algorithms/slippage-and-price-impact) — dedicated page on slippage tolerance sizing for UIs.
+
+Sources:
+
+- Uniswap v2 whitepaper — the canonical statement of `x · y = k`.
+- Raydium CPMM program source.
+- Raydium AMM v4 program source.

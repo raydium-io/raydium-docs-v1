@@ -1,0 +1,158 @@
+---
+title: "Slippage und Preisauswirkung"
+description: "Präzise Definitionen von Slippage versus Preisauswirkung, wie Raydiums SDK minAmountOut und maxAmountIn dimensioniert, Unterschiede zwischen AMM-Typen und MEV-Überlegungen für produktive Routing."
+---
+
+<Info>
+  **Diese Seite wurde mit KI automatisch übersetzt. Maßgeblich ist stets die englische Version.**
+
+  [Englische Version ansehen →](/algorithms/slippage-and-price-impact)
+</Info>
+
+## Zwei unterschiedliche Konzepte
+
+**Preisauswirkung** und **Slippage** werden in UIs häufig vermischt, beziehen sich aber auf unterschiedliche Dinge.
+
+- **Preisauswirkung** ist eine deterministische Eigenschaft eines Handels gegen einen bestimmten Pool-Status. Gegeben `(Δin, reserves)` ist die Preisauswirkung vollständig berechenbar, bevor der Handel eingereicht wird.
+
+- **Slippage** ist der realisierte Unterschied zwischen dem Preis, den Sie *erwartet haben* zum Zeitpunkt des Angebots, und dem Preis, den Sie beim *tatsächlichen Ausführen* erhalten haben. Das ist eine Funktion von Latenz, gleichzeitigen Transaktionen und der Blockaufnahmereihenfolge — nicht der Pool-Mathematik.
+
+Ein 1%-Angebot gegen einen ansonsten inaktiven Pool hat 0% Slippage, wenn es im nächsten Block landet; die 1% war die Preisauswirkung. Dasselbe Angebot landet 0,2% schlechter, wenn vorher ein anderer Handel den Pool trifft — die zusätzlichen 0,2% sind Slippage.
+
+## Formale Definitionen
+
+### Preisauswirkung
+
+```
+p_before = pool.spot_price()
+p_after  = pool.spot_price_if_trade(Δin) applied
+impact   = (p_before − p_after) / p_before       // kann vorzeichenbehaftet sein
+```
+
+Für einen CPMM: `impact ≈ 2 · Δin / reserve_in` für kleine Handelsgeschäfte. Für CLMM: hängt davon ab, wie viele Ticks der Handel kreuzt; oft flach innerhalb des aktuellen Tick-Bereichs, springt bei jedem Tick-Übergang.
+
+### Realisierter Slippage
+
+```
+quoted_out = amount_out berechnet zum Angebotszeitpunkt
+actual_out = amount_out beobachtet auf der Chain
+slippage   = (quoted_out − actual_out) / quoted_out
+```
+
+Slippage ist immer nicht-negativ (oder null), vorausgesetzt das Angebot war ehrlich. Ein negativer Wert würde bedeuten, Sie haben *mehr* bekommen als angeboten — möglich, wenn sich der Pool-Status zwischen Angebot und Ausführung zu Ihren Gunsten verschoben hat.
+
+## Dimensionierung von `minAmountOut` und `maxAmountIn`
+
+Jeder Raydium-Swap nimmt eine Slippage-Schutzgrenze:
+
+- `SwapBaseInput(amount_in, min_amount_out)` — exakte Eingabe, untere Grenze für die Ausgabe.
+- `SwapBaseOutput(max_amount_in, amount_out)` — exakte Ausgabe, obere Grenze für die Eingabe.
+
+Das SDK berechnet diese als:
+
+```ts
+const computed = raydium.<pool_type>.computeAmountOut({
+  poolInfo,
+  amountIn,
+  mintIn,
+  mintOut,
+  slippage: 0.005,     // 0,5% Toleranz
+});
+
+// computed.amountOut         — das „erwartete" Angebot
+// computed.minAmountOut      — amountOut × (1 − slippage), als On-Chain-Grenze verwendet
+// computed.priceImpact       — deterministisch, nur Pool-Status
+// computed.fee               — insgesamt erhobene Gebühr (alle Komponenten summiert)
+```
+
+Die Slippage-Toleranz ist ein **Puffer um die Preisauswirkung**, nicht die Preisauswirkung selbst. Eine 0,5%-Toleranz bedeutet „akzeptiere höchstens 0,5% schlechter als mein Angebot" — unabhängig davon, ob die Preisauswirkung 0,01% (ein winziger Handel) oder 2% (ein großer Handel) war. Für einen Handel mit 2% Preisauswirkung und 0,5% Toleranz liegt `minAmountOut` 2,5% unter dem Pre-Trade-Spot — im Wesentlichen die Summe aus Auswirkung und Toleranz.
+
+## Empfohlene Slippage-Toleranzen
+
+Es gibt keine einzelne richtige Zahl; die richtige Grenze hängt ab von:
+
+1. **Pair-Stabilität.** Stablecoin-zu-Stablecoin-Pools können sicher 0,1% verwenden. Volatile Meme-Pair-Pools benötigen oft 3–5% nur um zuverlässig zu landen.
+2. **Handelsgröße.** Größere Handelsgeschäfte haben größere Preisauswirkungen, daher muss die Toleranz mit ihnen skalieren, um Umkehrungen zu vermeiden. Das SDK's automatische Slippage-Standardwerte liegen um `max(0,5%, 2 × price_impact)` aus diesem Grund.
+3. **Block-Aufnahmelatenz.** Transaktionen, die mehrere Blöcke im Mempool sitzen, sind mehreren gleichzeitigen Handeln ausgesetzt. Jito-Bundles und Priority Fees reduzieren dies.
+
+Faustregel (Raydium UI Standardwerte):
+
+| Pair-Typ | Standardtoleranz |
+|-----------|-------------------|
+| Stabil-stabil (USDC-USDT, USDC-USDS) | 0,1% |
+| Stabil-Haupt (USDC-SOL, USDC-BTC) | 0,5% |
+| Haupt-Haupt (SOL-BTC, SOL-ETH) | 1% |
+| Volatil (Meme-Tokens, illiquide Long-Tail) | 3–5% |
+
+## Unterschiede zwischen AMM-Typen
+
+### CPMM
+
+Preisauswirkung ist glatt und kontinuierlich (Closed-Form `2 · Δin / reserve_in`). Slippage-Toleranz skaliert linear mit der Handelsgröße.
+
+### AMM v4
+
+Gleiche Kurvenmathe wie CPMM, aber die „effektiven Reserven" enthalten die vom Pool gebuchten OpenBook-Limit-Order. In der Praxis bedeutet das:
+
+- Quoting gegen rohe Vault-Salden *unterschätzt* Reserven und überschätzt daher die Auswirkung.
+- Das SDK fetcht `AmmInfo` und summiert `vault + on_book.free + on_book.locked` um die richtige Zahl zu bekommen.
+- Alter OpenBook-Status (Crank blockiert) kann dazu führen, dass die angebotene Auswirkung von der On-Chain-Realität abweicht. Aggregatoren kurbeln routinemäßig vorab (Permissionless `MonitorStep`) vor einem großen AMM-v4-Handel.
+
+### CLMM
+
+Preisauswirkung ist **schrittweise**. Innerhalb des aktuellen Tick-Bereichs ist die Auswirkung ungefähr linear in `Δin / L`. Das Überqueren einer Tick-Grenze kann `L` diskret ändern, was zu einem plötzlichen Sprung im Grenzpreis führt. Ein Handel, der mehrere dünn besiedelte Ticks kreuzt, kann viel höhere Auswirkungen haben als die Faustregel `2 · Δin / reserve` nahelegt.
+
+Das CLMM-Angebot des SDK wiederholt den Swap-Schritt deterministisch, um ein genaues erwartetes `amountOut` zurückzugeben, sodass `minAmountOut = amountOut · (1 − slippage)` korrekt ist. Aber der **priceImpact** Rückgabewert sollte als „die Spanne zwischen Pre-Trade-Spot und Post-Trade-Spot" interpretiert werden, was auf CLMM viel größer als der effektive Slippage des Swaps für einen Benutzer sein kann, der sich nur um `amount_out` kümmert.
+
+### LaunchLab-Kurve
+
+Ähnlich wie CPMM, aber mit einer asymmetrischen Kurve (quadratisch oder virtuelle Reserven). Die Auswirkung wächst schneller für späte Käufer, wenn sich die Kurve zur Graduierung steilt. Pre-Buyer-UIs sollten warnen, wenn ein Kauf die Kurve um mehr als ~5% von `quote_reserve_target` in einer Transaktion verschieben soll.
+
+## MEV-Überlegungen
+
+Auf Solana wird MEV-Extraktion gegen Swaps hauptsächlich als **Sandwich-Attacken** durchgeführt: Ein Bot platziert eine Back-Run-Transaktion, die nach Ihrer Transaktion handelt, plus ein Front-Run, das vorher handelt, beide im selben Slot. Ihr Handel füllt sich zu einem schlechteren Preis als ohne das Sandwich; der Back-Run erfasst den Unterschied.
+
+Minderungen:
+
+1. **Enge `minAmountOut`.** Aggressive Slippage-Grenzen führen dazu, dass die Victim-Transaktion revertiert, wenn sie stark gesandwicht wird, was Gelder schützt (aber Gas verschwendet). Auf Solana ist dies Standardpraxis — Ablehnung ist billig.
+2. **Jito-Bundles.** Das Einreichen über Jito mit gebündeltem Tip schließt Mittelmänner davon aus, Ihre Tx umzuordnen. Bundles landen als atomare Blöcke.
+3. **Priority Fees.** Eine hohe Priority Fee erhöht die Chance, dass Ihr Handel im aktuellen Leader-Block landest, bevor ein Sandwicher reagieren kann. Weniger robust als Bundles, Standard.
+4. **Privates RPC.** Das Einreichen über ein privates RPC (oder über einen Validator-direkten Endpunkt) reduziert das Fenster, in dem ein Mempool-Sandwicher Ihre Transaktion beobachten kann.
+
+Raydiums SDK bündelt nicht; Integrierer legen typischerweise Jito darüber. Siehe [`integration-guides/routing-and-mev`](/de/integration-guides/routing-and-mev) für Muster.
+
+## Slippage für Multi-Hop-Routen
+
+Wenn ein Swap durch mehrere Pools läuft (z.B. `USDC → SOL → RAY`), sollte Slippage-Toleranz pro Hop angewendet werden, nicht nur End-zu-End:
+
+```ts
+// Falsch: 0,5% nur am Ende angewendet, daher schlägt jedes mittlere Hop-Sliding den zweiten Hop fehl.
+const finalMin = finalAmount * (1 - 0.005);
+
+// Besser: jedes Hop erzwingt seine eigene Grenze.
+const hop1Min  = hop1Amount * (1 - 0.005);
+const hop2Min  = hop2Amount * (1 - 0.005);
+// End-zu-End ist dies enger (zusammengesetzt), aber atomar — wenn eines Hop sich verschlechtert, revertiert die Tx früh.
+```
+
+Das Router des SDK wendet Per-Hop-Grenzen automatisch an, wenn Sie `raydium.trade.swap` aufrufen. Für benutzerdefinierte Router replizieren Sie das Muster.
+
+## Berichterstattung an Benutzer
+
+Faustregeln für eine gute Swap-UI:
+
+- Zeigen Sie **sowohl** erwartete Preisauswirkung als auch Slippage-Toleranz separat an.
+- Heben Sie hervor, wenn die Preisauswirkung ~2% übersteigt — „hohe Auswirkung" Warnung.
+- Heben Sie hervor, wenn die Preisauswirkung die Toleranz übersteigt — die Transaktion wird mit hoher Wahrscheinlichkeit revertiert.
+- Bieten Sie für volatile Pairs einen „Hochslippage-Modus" an, der die Grenze lockert und eine stärkere Warnung anzeigt.
+
+## Verweise
+
+- [`products/cpmm/math`](/de/products/cpmm/math), [`products/amm-v4/math`](/de/products/amm-v4/math), [`products/clmm/math`](/de/products/clmm/math) — Auswirkungsableitungen pro Pool-Typ.
+- [`integration-guides/routing-and-mev`](/de/integration-guides/routing-and-mev) — Multi-Hop-Routing + MEV-Abwehr.
+- [`integration-guides/priority-fee-tuning`](/de/integration-guides/priority-fee-tuning) — Dimensionierung von Priority Fees zur Slippage-Reduktion.
+
+Quellen:
+
+- Raydium SDK v2 Slippage / Impact Implementierung.
+- Flashbots / Jito auf Solana MEV.

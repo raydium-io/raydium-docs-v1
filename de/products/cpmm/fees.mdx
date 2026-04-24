@@ -1,0 +1,264 @@
+---
+title: "CPMM-Gebühren"
+description: "Wie CPMM eine Handelsgebühr und eine separate Creator-Gebühr berechnet, die Handelsgebühr zwischen LPs, dem Protokoll-Treasury und dem Fund Multisig aufteilt, und wer was und wann einzieht."
+---
+
+<Info>
+  **Diese Seite wurde mit KI automatisch übersetzt. Maßgeblich ist stets die englische Version.**
+
+  [Englische Version ansehen →](/products/cpmm/fees)
+</Info>
+
+## Zwei unabhängige Gebühren, vier Destinationen
+
+CPMM erhebt auf jeden Swap **zwei separat bewertete Gebühren**:
+
+1. **Handelsgebühr** — berechnet mit `AmmConfig.trade_fee_rate` und aufgeteilt auf drei Ziele:
+   - **LP-Anteil** — verbleibt im Vault und lässt `k` wachsen. Wird implizit durch das Verbrennen von LP-Token beansprucht.
+   - **Protokoll-Anteil** — auflaufend auf `PoolState.protocol_fees_token*`; eingezogen durch den `protocol_owner` via `CollectProtocolFee`.
+   - **Fund-Anteil** — auflaufend auf `PoolState.fund_fees_token*`; eingezogen durch den `fund_owner` via `CollectFundFee`.
+2. **Creator-Gebühr** (optional, pro Pool) — berechnet mit `AmmConfig.creator_fee_rate` **unabhängig** von der Handelsgebühr, auflaufend auf `PoolState.creator_fees_token*`, eingezogen durch `pool_state.pool_creator` via `CollectCreatorFee`. Aktiv nur, wenn der Pool mit `enable_creator_fee = true` erstellt wurde.
+
+Die Creator-Gebühr ist **nicht** ein Teil der Handelsgebühr. Die beiden Sätze werden zusammengezählt, wenn die Gebühr auf die Swap-Eingabe genommen wird, aber jeder bleibt sein eigener Bucket — die Protokoll- und Fund-Anteile werden immer nur von `trade_fee` abgeleitet, nie von `creator_fee`. Ein Pool mit `creator_fee_rate = 1000` (0,10%) und `trade_fee_rate = 2500` (0,25%) berechnet bei einem Creator-Gebühr-auf-Eingabe-Swap kombiniert 0,35% der Eingabe, wobei der Creator die 0,10% behält und der Handelsgebühr-Bucket die 0,25% erhält.
+
+Die Handelsgebühr-Sätze (`trade_fee_rate`, `protocol_fee_rate`, `fund_fee_rate`) und der `creator_fee_rate` befinden sich alle auf `AmmConfig`. Das Pro-Pool-Flag `enable_creator_fee` und der `creator_fee_on`-Modus (von welcher Seite des Handels die Creator-Gebühr genommen wird) befinden sich auf `PoolState`. Siehe [`products/cpmm/accounts`](/de/products/cpmm/accounts).
+
+## Sätze und Einheiten
+
+Alle Sätze sind `u64`s, bezeichnet in Einheiten von `1 / FEE_RATE_DENOMINATOR`, wobei `FEE_RATE_DENOMINATOR = 1_000_000`.
+
+- **`trade_fee_rate`** ist ein Bruchteil des **Swap-Volumens**. `2500` ⇒ 0,25% der relevanten Seite (Eingabe oder Ausgabe, je nach `creator_fee_on` — siehe „Von welcher Seite des Handels die Gebühren genommen werden" unten).
+- **`creator_fee_rate`** ist ein Bruchteil des **Swap-Volumens**, genommen **separat** von der Handelsgebühr. `1000` ⇒ 0,10% der relevanten Seite.
+- **`protocol_fee_rate`** und **`fund_fee_rate`** sind Bruchteile der **Handelsgebühr**, nicht des Volumens. `120_000` ⇒ 12% der Handelsgebühr.
+
+Standard-Parameter für `AmmConfig[index=0]` (der „Standard" 0,25%-Pool) im Mainnet, zu Referenzzwecken:
+
+| Feld | Wert | Effektiver Prozentsatz |
+|-------|------|-------------------|
+| `trade_fee_rate` | `2500` | 0,25% des Volumens (Handelsgebühr-Bucket) |
+| `protocol_fee_rate` | `120000` | 12% der Handelsgebühr ≈ **0,030% des Volumens** |
+| `fund_fee_rate` | `40000` | 4% der Handelsgebühr ≈ **0,010% des Volumens** |
+| `creator_fee_rate` | `0` (Standard) | 0% (separater Bucket) |
+| → LP-Anteil effektiv | | **0,210% des Volumens** |
+
+Also bei einem \$1.000-Swap gegen `AmmConfig[0]` mit `enable_creator_fee = false`: \$2,50 Gesamthandelsgebühr, davon \$2,10 bleiben bei den LPs, \$0,30 gehen zum Protokoll, \$0,10 zum Fund. Der Creator-Bucket ist 0, weil die Creator-Gebühr deaktiviert ist.
+
+Wenn derselbe Pool `enable_creator_fee = true` und `creator_fee_rate = 1000` (0,10%) hätte, zahlt der Nutzer zusätzlich \$1,00 in den Creator-Bucket — genommen auf der gleichen Seite des Handels, konfiguriert durch `creator_fee_on` — für insgesamt \$3,50 an Gebühren. Der Handelsgebühr-Bucket und seine Protokoll-/Fund-Aufteilung bleiben unverändert.
+
+Überprüfen Sie die aktuellen Mainnet-Werte gegen `GET https://api-v3.raydium.io/main/cpmm-config` — Sätze sind vom Admin veränderbar und sollten frisch ausgelesen werden statt hart codiert zu sein.
+
+## Die Aufteilung im Code
+
+```rust
+// Paraphrased from raydium-cp-swap/programs/cp-swap/src/curve/{calculator,fees}.rs.
+// The actual code branches on `is_creator_fee_on_input`; both branches preserve the
+// invariant that creator_fee is its own rate, never a slice of trade_fee.
+
+const FEE_RATE_DENOMINATOR_VALUE: u64 = 1_000_000;
+
+pub struct FeeBreakdown {
+    pub amount_in_after_fees: u64,    // input minus all fees taken on the input side
+    pub amount_out_after_fees: u64,   // output minus any creator fee taken on the output side
+    pub trade_fee:    u64,            // → split into LP / protocol / fund buckets below
+    pub protocol_fee: u64,            // share of trade_fee
+    pub fund_fee:     u64,            // share of trade_fee
+    pub creator_fee:  u64,            // independent bucket (input or output side)
+}
+
+fn take_fees_on_input(
+    amount_in: u64,
+    trade_rate: u64,
+    creator_rate: u64,
+    protocol_rate: u64,
+    fund_rate: u64,
+) -> (u64 /* trade_fee */, u64 /* creator_fee */, u64 /* amount_in_after_fees */) {
+    // The two rates are added so we round once on the combined fee, then split
+    // proportionally — this is purely a rounding/efficiency trick. The split
+    // honours the rates exactly: creator_fee/trade_fee == creator_rate/trade_rate.
+    let total_fee = ((amount_in as u128) * ((trade_rate + creator_rate) as u128))
+        .div_ceil(FEE_RATE_DENOMINATOR_VALUE as u128) as u64;
+
+    let creator_fee = ((total_fee as u128) * (creator_rate as u128)
+                       / ((trade_rate + creator_rate) as u128)) as u64;
+    let trade_fee   = total_fee - creator_fee;
+
+    (trade_fee, creator_fee, amount_in - total_fee)
+}
+
+fn take_creator_fee_on_output(amount_out_swapped: u64, creator_rate: u64) -> (u64, u64) {
+    // When creator_fee_on routes the creator fee to the output side,
+    // trade_fee is taken on input as a single rate, and creator_fee
+    // is computed against the curve output.
+    let creator_fee = ((amount_out_swapped as u128) * (creator_rate as u128))
+        .div_ceil(FEE_RATE_DENOMINATOR_VALUE as u128) as u64;
+    (amount_out_swapped - creator_fee, creator_fee)
+}
+
+fn split_trade_fee(
+    trade_fee: u64,
+    protocol_rate: u64,
+    fund_rate: u64,
+) -> (u64 /* protocol_fee */, u64 /* fund_fee */) {
+    let protocol_fee = (trade_fee as u128 * protocol_rate as u128
+                        / FEE_RATE_DENOMINATOR_VALUE as u128) as u64;
+    let fund_fee     = (trade_fee as u128 * fund_rate as u128
+                        / FEE_RATE_DENOMINATOR_VALUE as u128) as u64;
+    (protocol_fee, fund_fee)
+}
+```
+
+Hinweise:
+
+- Die Gesamtgebühr auf der Eingabe rundet **auf**, damit der Pool nie untergebührt wird.
+- Die Unter-Aufteilungen von `trade_fee` (Protokoll, Fund) runden **ab**, damit ihre Summe `trade_fee` nicht übersteigt; der Rest ist der LP-Anteil.
+- `lp_share = trade_fee − protocol_fee − fund_fee` (creator_fee wird hier **nicht** subtrahiert, da es sein eigener Bucket ist).
+- Die Creator-Gebühr wird von der Eingabe oder Ausgabe genommen, abhängig von `PoolState.creator_fee_on` (siehe nächster Abschnitt). Der Satz bleibt in beiden Fällen gleich.
+
+## Von welcher Seite des Handels die Gebühren genommen werden
+
+CPMM hat eine Pro-Pool-Einstellung `creator_fee_on` (`BothToken` / `OnlyToken0` / `OnlyToken1`), die bestimmt, ob die Creator-Gebühr von der **Eingabe**-Seite oder der **Ausgabe**-Seite eines bestimmten Swaps genommen wird. Der Runtime-Helper `is_creator_fee_on_input(direction)` reduziert das pro Swap auf einen Boolean:
+
+| `creator_fee_on` | Swap `0 → 1` | Swap `1 → 0` |
+|------------------|---------------|---------------|
+| `BothToken` (`0`) | Eingabe-Seite | Eingabe-Seite |
+| `OnlyToken0` (`1`) | Eingabe-Seite | Ausgabe-Seite |
+| `OnlyToken1` (`2`) | Ausgabe-Seite | Eingabe-Seite |
+
+Wenn die Creator-Gebühr auf der **Eingabe**-Seite ist, werden sowohl die Handelsgebühr als auch die Creator-Gebühr von `amount_in` abgezogen, bevor die Kurve läuft. Quote-Mathematik: nimm den kombinierten `trade_rate + creator_rate` von der Eingabe.
+
+Wenn die Creator-Gebühr auf der **Ausgabe**-Seite ist, wird nur die Handelsgebühr von `amount_in` abgezogen; die Kurve produziert eine ungefühne Ausgabe, dann wird die Creator-Gebühr von dieser Ausgabe abgezogen. Quote-Mathematik: nimm `trade_rate` von der Eingabe; nimm `creator_rate` von der Ausgabe.
+
+Die Handelsgebühr selbst wird immer von der Eingabe-Seite genommen (das Standard-Uniswap-V2-Muster). Nur die Creator-Gebühr kann auf die Ausgabe landen.
+
+## Wie „auflaufende" Gebühren mit der Kurve interagieren
+
+Eine wichtige Subtilität: **die Protokoll-, Fund- und Creator-Gebühren bleiben physisch im Vault**, bis ihre jeweilige `Collect*`-Instruction aufgerufen wird. Aber sie werden von der Sicht der Kurve auf den Vault-Saldo ausgeschlossen.
+
+Ein konkretes Bild nach einem Swap:
+
+```
+raw_vault_0_balance = getTokenAccountBalance(vault_0).amount
+                    = lp_entitled + protocol_fees_token0
+                      + fund_fees_token0 + creator_fees_token0
+
+curve_x = raw_vault_0_balance − (protocol_fees_token0
+                                  + fund_fees_token0
+                                  + creator_fees_token0)
+```
+
+Das Programm nutzt `curve_x` (und das analoge `curve_y`), wenn es `k' ≥ k` durchsetzt. Dies ist, wie die Nicht-LP-Gebühren ihre Ziele erreichen, **ohne** den LP-Anteil des Pools zu erhöhen.
+
+Folgen, auf die Sie entwickeln sollten:
+
+- **Quoting über rohe Salden ist falsch.** Wenn Sie einen Quoter über `getTokenAccountBalance` bauen, werden Sie den Preis, den der Pool ehren wird, systematisch zu hoch veranschlagen. Subtrahieren Sie immer auflaufende Gebühren, oder simulieren Sie via `SwapBaseInput` / die API.
+- **`CollectProtocolFee` bewegt den Preis nicht.** Es bewegt Token aus dem Vault *und* nullt die `protocol_fees_token*`-Zähler, daher sind `curve_x` und `curve_y` unverändert.
+- **LP-Gebühren laufen nicht auf einem Zähler auf.** Sie sind implizit im Vault-Saldo. Der Anspruch des LP auf akkumulierte LP-Gebühren wird durch das Verbrennen von LP-Token ausgeübt (d.h. via `Withdraw`) — es gibt kein `CollectLpFee`.
+
+## Interaction mit Token-2022-Transfergebühren
+
+Token-2022-Transfergebühren werden durch die **Mint** angewendet, nicht durch CPMM. Sie wirken sich auf jeden Token-Transfer aus — Swap, Einzahlung, Auszahlung und die `Collect*`-Eintreibungen. CPMMs Handelsgebühren-Mathematik wird gegen den Betrag berechnet, der **tatsächlich im Vault landete**, d.h. netto der Transfergebühr der Eingabe-Mint (falls vorhanden).
+
+Also im schlimmsten Fall zahlt ein Nutzer drei verschiedene Steuern auf einen input-exakten Swap:
+
+1. Die Transfergebühr der Eingabe-Mint auf `amount_in` (zur Gebühren-Autorität der Mint).
+2. Der `trade_fee` des Pools auf den Rest (aufgeteilt wie oben).
+3. Die Transfergebühr der Ausgabe-Mint auf `amount_out` (zur Gebühren-Autorität der Mint).
+
+Der SDK-Quoter berücksichtigt alle drei, daher ist `minimum_amount_out` in dem Nominiert, was der Nutzer tatsächlich erhält. Wenn Sie Ihren eigenen Quoter schreiben, spiegeln Sie dieses Verhalten wider, sonst sind Ihre Slippage-Prüfungen systematisch zu großzügig.
+
+Siehe [`algorithms/token-2022-transfer-fees`](/de/algorithms/token-2022-transfer-fees) für die detaillierte Herleitung.
+
+## Creator-Gebühr
+
+Die Creator-Gebühr ist optional und pro Pool. Der **Satz** befindet sich auf `AmmConfig.creator_fee_rate`; das **Enable-Flag** und die **Seite** (`creator_fee_on`) befinden sich auf `PoolState`:
+
+- **Bei Pool-Erstellung aktiviert.** `Initialize` setzt `enable_creator_fee = false` standardmäßig; Pools, die via `InitializeWithPermission` erstellt werden (verwendet durch LaunchLab-Graduationen und andere gated Paths), können `enable_creator_fee = true` übergeben und `creator_fee_on` wählen.
+- **Satz wird mit dem Gebühren-Tier geteilt.** Der Satz selbst ist `AmmConfig.creator_fee_rate`, der gleiche Wert über jeden Pool, der an diese Config gebunden ist. Jeder Pool entscheidet dann, ob er ihn berechnet (`enable_creator_fee`) und von welcher Seite des Swaps er ihn berechnet (`creator_fee_on`). Wenn `enable_creator_fee = false`, ist der effektive Creator-Gebühren-Satz des Pools null, unabhängig vom Config-Wert (siehe `PoolState::adjust_creator_fee_rate` in der Quelle).
+- **Unabhängig von der Handelsgebühr.** Die Creator-Gebühr reduziert nie die LP-/Protokoll-/Fund-Anteile — sie ist ihr eigener Satz, separat angewendet, in ihren eigenen Zählern auflaufend.
+- **Eingezogen via `CollectCreatorFee`**, signiert durch `PoolState.pool_creator`.
+- **Kann nach der Erstellung nicht wieder aktiviert oder umgeleitet werden.** Ein Pool, der mit `enable_creator_fee = false` initialisiert wurde, wird niemals eine Creator-Gebühr berechnen; einer, der mit einem bestimmten `creator_fee_on` initialisiert wurde, kann nicht die Seiten wechseln.
+
+Creator-Gebühren sind der Mechanismus hinter Raydiums „Burn & Earn"-Muster: LP-Token werden unter dem [LP Lock](/de/reference/program-addresses)-Programm gesperrt, daher kann der Creator keine Liquidität abheben, kann aber trotzdem `CollectCreatorFee` unbegrenzt einziehen.
+
+## Eintreibungs-Operationsfluss
+
+| Signatur | Instruction | Quellzähler gelöscht | Typische Häufigkeit |
+|--------|-------------|------------------------|-----------------|
+| `amm_config.protocol_owner` | `CollectProtocolFee` | `protocol_fees_token{0,1}` | Wöchentlich oder programmatisch |
+| `amm_config.fund_owner` | `CollectFundFee` | `fund_fees_token{0,1}` | Wöchentlich oder programmatisch |
+| `pool_state.pool_creator` | `CollectCreatorFee` | `creator_fees_token{0,1}` | Jederzeit |
+
+Protokoll- und Fund-Besitzer sind das Raydium Multisig im Mainnet; siehe [`security/admin-and-multisig`](/de/security/admin-and-multisig). Die Creator-Signatur ist das Konto, das `Initialize` ausgeführt hat.
+
+## Ändern eines Gebühren-Tiers
+
+Gebührensätze können vom Admin via `UpdateAmmConfig` geändert werden (siehe [`products/cpmm/instructions`](/de/products/cpmm/instructions)). Änderungen treten beim **nächsten Swap** für jeden Pool, der an diesen `AmmConfig` gebunden ist, in Kraft — es gibt keine Migration, da Pools die Config bei jedem Swap laden.
+
+Was der Admin nicht tun kann:
+
+- Einen Pool von einer `AmmConfig` zu einer anderen verschieben.
+- Bereits auflaufende Gebühren rückwirkend neu bewerten.
+- Gebühren ohne `protocol_owner` / `fund_owner` Signatur einziehen.
+
+## Gebühren aus einem laufenden Pool lesen
+
+```ts
+// Off-chain: current accrued fees in each bucket
+const pool = await connection.getAccountInfo(poolStatePda);
+const decoded = PoolState.decode(pool.data);
+console.log(
+  "Protocol accrued:",
+  decoded.protocolFeesToken0.toString(),
+  decoded.protocolFeesToken1.toString(),
+);
+console.log(
+  "Fund accrued:",
+  decoded.fundFeesToken0.toString(),
+  decoded.fundFeesToken1.toString(),
+);
+console.log(
+  "Creator accrued:",
+  decoded.creatorFeesToken0.toString(),
+  decoded.creatorFeesToken1.toString(),
+);
+
+// Off-chain: effective rates today.
+// trade_fee_rate, creator_fee_rate are fractions of volume (denominator 1e6).
+// protocol_fee_rate, fund_fee_rate are fractions of the *trade fee* (same denominator).
+const config = await fetch("https://api-v3.raydium.io/main/cpmm-config")
+  .then((r) => r.json());
+const tier = config.data.find((t) => t.index === decoded.ammConfigIndex);
+
+const tradeFeeOfVolume   = tier.tradeFeeRate / 1_000_000;
+const protocolOfTradeFee = tier.protocolFeeRate / 1_000_000;
+const fundOfTradeFee     = tier.fundFeeRate / 1_000_000;
+const lpOfTradeFee       = 1 - protocolOfTradeFee - fundOfTradeFee;
+
+console.log("LP fee effective:",       (tradeFeeOfVolume * lpOfTradeFee * 100).toFixed(4), "%");
+console.log("Protocol fee effective:", (tradeFeeOfVolume * protocolOfTradeFee * 100).toFixed(4), "%");
+console.log("Fund fee effective:",     (tradeFeeOfVolume * fundOfTradeFee * 100).toFixed(4), "%");
+console.log(
+  "Creator fee effective:",
+  decoded.enableCreatorFee
+    ? ((tier.creatorFeeRate / 1_000_000) * 100).toFixed(4) + " %"
+    : "0 % (disabled on this pool)",
+);
+```
+
+## Vergleich mit CLMM und AMM v4
+
+Siehe [`reference/fee-comparison`](/de/reference/fee-comparison) für eine Seite-an-Seite-Matrix. Zusammenfassung:
+
+- **AMM v4** nutzt eine feste 0,25%-Handelsgebühr mit einer unterschiedlichen LP-/Protokoll-Aufteilung und keine Fund-Gebühr.
+- **CLMM** Gebühren sind pro Tick-Spacing-Tier, auflaufend pro Position (nicht pro Pool), und beansprucht via `DecreaseLiquidity` oder `CollectFees`.
+
+## Wo es weitergeht
+
+- [`products/cpmm/math`](/de/products/cpmm/math) — wo die Handelsgebühren-Abzug in die Kurve pluggt.
+- [`products/cpmm/instructions`](/de/products/cpmm/instructions) — die `Collect*` Instruction Kontolisten.
+- [`algorithms/token-2022-transfer-fees`](/de/algorithms/token-2022-transfer-fees) — wie man eine Pool-Handelsgebühr mit einer Mint-Transfergebühr korrekt kombiniert.
+
+Quellen:
+
+- [`raydium-io/raydium-cp-swap` — `states/config.rs`, `states/pool.rs`, `states/curve.rs`](https://github.com/raydium-io/raydium-cp-swap)
+- [Raydium API — `GET /main/cpmm-config`](https://api-v3.raydium.io/main/cpmm-config)

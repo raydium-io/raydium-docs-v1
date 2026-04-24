@@ -1,0 +1,187 @@
+---
+title: "Infrastructure partagée"
+description: "Les primitives partagées par tous les programmes Raydium — PDAs d'autorité, comptes AmmConfig, la répartition des frais protocole/fond/créateur, les comptes d'observation et la surface API REST publique — définies une seule fois afin que les chapitres par produit puissent s'y référer."
+---
+
+<Info>
+  **Cette page est traduite automatiquement par IA. La version anglaise fait foi.**
+
+  [Voir la version anglaise →](/protocol-overview/shared-infrastructure)
+</Info>
+
+<Info>
+  Les programmes de produits Raydium sont des codebases indépendantes, mais ils ont été conçus selon un ensemble de conventions partagées. Cette page est la référence canonique de ces conventions. Les chapitres par produit décrivent comment les conventions sont *instanciées* dans leurs comptes ; cette page décrit les conventions elles-mêmes.
+</Info>
+
+## Ce que « partagé » signifie ici
+
+Trois formes de partage traversent la codebase :
+
+- **Partage de convention.** Tous les programmes utilisent le même motif de dérivation PDA, la même forme de répartition des frais et la même idée de compte d'observation — mais chacun les implémente dans son propre programme avec ses propres seeds.
+- **Partage de compte.** Une poignée de comptes sont *littéralement* le même enregistrement dans de nombreux pools (le PDA d'autorité global en CPMM, les comptes AmmConfig).
+- **Partage hors chaîne.** Une seule API REST et un seul SDK TypeScript font face à tous les quatre programmes. Les intégrateurs interagissent avec un seul hôte HTTP et un seul package NPM, quel que soit le programme qu'ils finissent par appeler.
+
+Les cinq primitives ci-dessous couvrent tout ce qui franchit les limites des programmes.
+
+## 1. PDAs d'autorité
+
+Chaque programme Raydium a exactement un PDA qui possède ses coffres à tokens. Les utilisateurs ne détiennent jamais directement l'autorité du coffre — le PDA d'autorité est le seul signataire qui peut déplacer les fonds, et il ne signe que lorsqu'une instruction de programme valide le demande.
+
+Le motif est identique dans tous les produits ; les seeds diffèrent :
+
+| Programme | Seeds du PDA d'autorité | Remarques |
+|---------|---------------------|-------|
+| **AMM v4** | `[poolId]` | Autorité par pool. Même forme que le design par pool de v4. |
+| **CPMM** | `[b"vault_and_lp_mint_auth_seed"]` | **PDA unique partagé par tous les pools CPMM.** Pas de seed spécifique au pool. |
+| **CLMM** | `[b"pool_vault_and_lp_mint_auth_seed"]` | PDA unique partagé dans tous les pools CLMM. |
+| **Farm v3 / v5 / v6** | `[farmId]` | Par ferme. Le PDA possède les coffres de staking + récompenses pour cette ferme. |
+| **LaunchLab** | `[b"vault_auth", launchId]` | Par lancement. Possède les coffres de base + devis pré-graduation. |
+
+Quelques conséquences découlent de ceci :
+
+- Pour CPMM et CLMM, le PDA d'autorité est **un compte global** — chaque pool de ce type l'utilise. Si vous effectuez un CPI dans CPMM, vous n'en avez besoin qu'une seule fois, pas par pool.
+- Pour les autorités par pool / par ferme, vous dérivez le PDA à partir de l'ID du pool/ferme. Le SDK le fait dans `getPoolKeys` / `getFarmKeys` ; si vous intégrez directement, vous dérivez avec `findProgramAddressSync`.
+- **La propriété du coffre ne peut pas être modifiée.** Une fois qu'un compte de token est créé avec le PDA d'autorité comme propriétaire, seul ce PDA — invoqué par le programme — peut transférer. Il n'y a pas de contournement administratif.
+
+Pour les seeds exactes et les layouts ATA par programme, voir [`products/cpmm/accounts`](/fr/products/cpmm/accounts), [`products/clmm/accounts`](/fr/products/clmm/accounts), [`products/amm-v4/accounts`](/fr/products/amm-v4/accounts), [`products/farm-staking/accounts`](/fr/products/farm-staking/accounts), [`products/launchlab/accounts`](/fr/products/launchlab/accounts).
+
+## 2. Comptes admin et config
+
+CPMM et CLMM partagent un motif de compte de configuration appelé **`AmmConfig`** : un petit compte global, indexé par un `u16`, contenant les taux de frais et les destinations administrateur qui s'appliquent à un *palier de frais* entier. Les pools se lient à une config à la création et ne se rellient jamais.
+
+```rust
+// CPMM AmmConfig (abrégé — la version CLMM est structurellement similaire)
+pub struct AmmConfig {
+    pub bump: u8,
+    pub disable_create_pool: bool,        // gate new pool creation in this tier
+    pub index: u16,                       // tier index
+    pub trade_fee_rate: u64,              // fraction of trade going to fees
+    pub protocol_fee_rate: u64,           // fraction of trade fee to protocol
+    pub fund_fee_rate: u64,               // fraction of trade fee to fund
+    pub create_pool_fee: u64,             // one-time per-pool creation fee
+    pub protocol_owner: Pubkey,           // signer for CollectProtocolFee
+    pub fund_owner: Pubkey,               // signer for CollectFundFee
+    pub padding: [u64; 16],
+}
+```
+
+**Règles à respecter :**
+
+- **Les paliers de frais sont globaux.** Quand un pool dit « c'est un pool à 0,25% », cela signifie qu'il se lie à l'AmmConfig dont le `trade_fee_rate` était 0,25% au moment de la création. Il n'y a pas de contournement de taux par pool.
+- **Une config peut être modifiée mais les pools ne suivent pas.** Si l'autorité de la config modifie un AmmConfig, chaque pool existant lié à cette config adopte immédiatement le nouveau taux. C'est une fonctionnalité, pas un bug ; c'est ainsi que les changements économiques au niveau du protocole se propagent sans migrations par pool.
+- **`disable_create_pool` est le levier de dépréciation.** Quand un palier de frais est supprimé, le multisig du protocole définit cet indicateur — les pools existants continuent de fonctionner mais aucun nouveau pool ne peut choisir le palier.
+- **`protocol_owner` / `fund_owner`** sont les *signataires* pour les appels de collecte de frais. Les définir sur un multisig est ce qui contrôle le retrait des frais. Ce ne sont PAS les adresses de destination des frais eux-mêmes ; ce sont `protocol_fee_destination` / `fund_fee_destination` sur le même compte.
+
+AMM v4 n'a pas de `AmmConfig` — ses paramètres de frais sont par pool, codés en dur à la création. Farm et LaunchLab ont leurs propres équivalents (`FarmConfig`, `LaunchConfig`) couverts dans leurs chapitres respectifs.
+
+Un tableau complet de qui peut modifier quoi se trouve dans [`security/admin-and-multisig`](/fr/security/admin-and-multisig). Les répartitions de frais actuelles visibles par l'utilisateur se trouvent dans [`ray/protocol-fees`](/fr/ray/protocol-fees).
+
+## 3. La répartition des frais protocole / fond / créateur
+
+Chaque frais de swap CPMM et CLMM est réparti entre jusqu'à quatre destinations en sortie :
+
+```
+                         total swap fee
+                              │
+              ┌───────────────┼───────────────┬──────────────┐
+              ▼               ▼               ▼              ▼
+        LP pool side     Protocol         Fund         Creator
+        (raises k)       treasury         multisig     (LaunchLab pools)
+```
+
+Mécaniquement :
+
+1. **Les frais de transaction s'accumulent dans le pool.** Les frais sont déduits du côté d'entrée du swap et le montant *après frais* est ce que les mathématiques du produit constant voient. C'est ce que « le LP gagne le frais » signifie — `k` augmente et donc la valeur par token LP implicite.
+2. **Les portions protocole/fond/créateur sont déduites de cette accumulation côté LP dans des comptes de compteur par pool.** Elles se trouvent sur l'état du pool (`protocol_fees_token{0,1}`, `fund_fees_token{0,1}`, etc.) jusqu'à ce que quelqu'un appelle `CollectProtocolFee` / `CollectFundFee` / `CollectCreatorFee`. Elles ne quittent pas les coffres du pool jusqu'à ce moment ; du point de vue d'un swap, elles sont toujours « dans le pool ».
+3. **La collecte les déplace.** Le signataire respectif (les clés `protocol_owner` / `fund_owner` sur AmmConfig, ou le créateur de lancement pour les pools LaunchLab) appelle l'instruction de collecte et le programme transfère du coffre du pool vers un ATA de destination.
+
+Quelques observations importantes :
+
+- **Les pourcentages de répartition sont sur les frais de transaction, pas sur la transaction.** Un frais de transaction de 0,25% avec une part protocole de 12% signifie que le protocole obtient `0,25% × 12% = 0,03%` de la transaction — pas 12% de la transaction.
+- **Les frais de créateur n'existent que sur les pools diplômés LaunchLab.** Les pools CPMM/CLMM standard ont une répartition à 3 voies (LP / protocole / fond). LaunchLab ajoute un quatrième slot acheminé vers celui qui a lancé le token, configuré à `Initialize` et immuable.
+- **AMM v4 se divise en deux voies seulement**, codées en dur par pool : LP et protocole. Pas de slot fond, pas de slot créateur.
+- **Fond vs protocole** — les deux sont des destinations de trésorerie de protocole, mais ils ont des signataires différents et des utilisations prévues différentes. `protocol` finance historiquement les opérations ; `fund` est la trésorerie à plus long terme. La répartition entre les deux est elle-même réglable.
+
+Les taux spécifiques se trouvent dans [`reference/fee-comparison`](/fr/reference/fee-comparison) et [`ray/protocol-fees`](/fr/ray/protocol-fees).
+
+## 4. Comptes d'observation (tampon en anneau TWAP)
+
+CPMM et CLMM maintiennent chacun un **compte d'observation** par pool — un tampon en anneau de taille fixe d'échantillons `(timestamp, cumulative_price)` que d'autres contrats peuvent utiliser pour dériver un TWAP résistant à la manipulation.
+
+```rust
+// CPMM ObservationState (abrégé)
+pub struct ObservationState {
+    pub initialized: bool,
+    pub observation_index: u16,            // next slot to overwrite
+    pub pool_id: Pubkey,
+    pub observations: [Observation; OBSERVATION_NUM],
+    pub padding: [u64; 4],
+}
+
+pub struct Observation {
+    pub block_timestamp: u64,
+    pub cumulative_token_0_price_x32: u128,  // sum of (price × dt) since init
+    pub cumulative_token_1_price_x32: u128,
+}
+```
+
+Comment cela fonctionne :
+
+- **Chaque swap appelle `update_observation`.** Le programme lit le prix actuel, le multiplie par les secondes écoulées depuis l'observation précédente, et l'ajoute au compteur cumulatif. La nouvelle entrée écrase le slot le plus ancien (style tampon en anneau).
+- **TWAP sur une fenêtre** = `(cumul[end] − cumul[start]) / (timestamp[end] − timestamp[start])`. Les consommateurs choisissent deux observations encadrant la fenêtre souhaitée et divisent.
+- **Raydium lui-même n'utilise pas le TWAP pour les prix.** Les mathématiques AMM lisent les réserves spot directement. Les observations sont une externalité — Raydium paie le coût de les écrire pour que d'autres contrats puissent les lire.
+- **AMM v4 n'a pas de compte d'observation.** Il est plus ancien que la conception ObservationState ; les intégrateurs voulant un TWAP v4 doivent en calculer un hors chaîne à partir de l'historique des logs.
+
+Les détails de layout et les mathématiques d'indexation se trouvent dans [`products/cpmm/accounts`](/fr/products/cpmm/accounts) et [`products/clmm/accounts`](/fr/products/clmm/accounts).
+
+## 5. API REST + SDK + IDL
+
+La surface hors chaîne est un trio unique utilisé par chaque produit :
+
+- **API REST** — `https://api-v3.raydium.io`. Une vue indexée en grande partie en lecture de tous les états on-chaîne plus un moteur de devis. Un seul hôte, un seul schéma.
+- **SDK TypeScript** — `@raydium-io/raydium-sdk-v2` sur NPM. Construit et signe des transactions pour chaque programme. Communique avec l'API pour les devis/métadonnées, communique avec un RPC Solana pour les rafraîchissements d'état pré-signature.
+- **Registre IDL** — Les IDLs Anchor pour chaque programme publié se trouvent dans le référentiel [`raydium-idl`](https://github.com/raydium-io/raydium-idl) (un JSON par programme : CPMM, CLMM, LaunchLab). Le SDK TypeScript consomme ces IDLs en interne ; les clients Rust / Python en aval régénèrent à partir des mêmes fichiers.
+
+La limite entre eux est claire :
+
+| Pièce | Lit depuis | Écrit vers | Tolérance d'obsolescence |
+|-------|-----------|-----------|-----------------|
+| API REST | Indexeur (analyse les logs de chaîne) | — (lecture seule pour les intégrateurs) | Quelques secondes |
+| SDK | API + RPC | Construit les transactions ; ne diffuse pas | Aucune — doit rafraîchir l'état pré-signature |
+| IDL | Source du programme | — | Versionnée par mise à niveau du programme |
+
+Une erreur courante est d'alimenter directement la sortie API REST dans une transaction. Ne le faites pas — rafraîchissez l'état de pool/position pertinent à partir d'un RPC Solana dans le slot que vous signerez. Le SDK le fait automatiquement pour les flux de première partie ; si vous contournez le SDK, vous devez le faire vous-même.
+
+La référence complète se trouve dans [`sdk-api/`](/fr/sdk-api), avec la surface IDL spécifiquement dans [`sdk-api/anchor-idl`](/fr/sdk-api/anchor-idl).
+
+## 6. Indexeurs et feeds de prix
+
+L'API REST est alimentée par l'indexeur de Raydium, qui s'abonne aux logs du programme à partir d'une flotte de RPC Solana et écrit les enregistrements dénormalisés dans un magasin SQL. Deux conséquences pour les intégrateurs :
+
+- **L'indexeur est la seule chose qui « connaît » l'état inter-programmes.** Mapper un pool CPMM à son homologue CLMM, calculer un nombre de volume sur 24h dans les versions du programme, récupérer une ferme associée à une mint LP — tout cela est un travail d'indexeur. Les programmes eux-mêmes ne le font pas.
+- **Le temps d'arrêt de l'indexeur est le temps d'arrêt de l'API.** Si l'API retourne des données obsolètes ou vides, l'indexeur est le suspect. L'état on-chaîne n'est pas affecté ; les intégrateurs avec leur propre RPC et SDK peuvent continuer à effectuer des transactions.
+
+Les feeds de prix sont une préoccupation distincte. L'API publie un champ `priceUsd` sur la plupart des réponses de pool ; c'est calculé hors chaîne à partir d'une capture de la vue de l'indexeur des réserves du pool et d'un prix de référence cité (les pools USDC comme pivot commun). C'est assez bon pour l'UI ; ce n'est pas sûr d'utiliser comme un oracle on-chaîne. Utilisez le TWAP d'observation pour cela.
+
+## Ce qui n'est pas partagé
+
+Cela vaut la peine de lister explicitement, car les nouveaux lecteurs supposent souvent plus de partage qu'il n'en existe :
+
+- **Les programmes ne s'appellent pas mutuellement.** Un swap CPMM ne fait jamais un CPI dans CLMM ou AMM v4. Le seul programme qui compose plusieurs AMM est le programme AMM Routing — et celui-ci est lui-même mince, émettant simplement des CPIs dans chaque AMM en séquence.
+- **Pas d'autorité de mise à niveau partagée entre les programmes.** Chaque programme on-chaîne a sa propre clé de mise à niveau du programme (un multisig 3/4 plus un délai d'attente de 24h). Elles ne sont pas liées.
+- **Pas d'état partagé entre les fermes et les AMM.** Une ferme ne sait pas si le LP qu'elle met en jeu provient d'un pool CPMM, d'une NFT-mint de position CLMM ou d'un token SPL non associé. Le programme de ferme traite la mint de staking comme opaque.
+- **Pas de dépendance oracle.** Les prix sont sur les réserves on-chaîne. Il n'y a pas de secours Pyth/Switchboard ; l'AMM ne vérifie pas un oracle avant de se dégager.
+
+## Pointeurs
+
+- [`protocol-overview/architecture`](/fr/protocol-overview/architecture) — le diagramme canonique montrant comment ces pièces se composent.
+- [`protocol-overview/versions-and-migration`](/fr/protocol-overview/versions-and-migration) — comment les conventions ont évolué dans les versions du programme.
+- [`security/admin-and-multisig`](/fr/security/admin-and-multisig) — qui contrôle les clés derrière les AmmConfigs.
+- [`reference/fee-comparison`](/fr/reference/fee-comparison) — matrice des taux de frais par produit.
+- [`reference/program-addresses`](/fr/reference/program-addresses) — IDs de programme canoniques.
+
+Sources :
+
+- [Raydium SDK v2](https://github.com/raydium-io/raydium-sdk-V2) — la source de vérité pour les seeds PDA, les layouts de compte et les définitions IDL.
+- [Registre Raydium IDL](https://github.com/raydium-io/raydium-idl) — IDLs Anchor.
+- Pages de comptes par produit citées en ligne ci-dessus.

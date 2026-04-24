@@ -1,0 +1,390 @@
+---
+title: "Инструкции CPMM"
+description: "Все инструкции программы CPMM с аргументами, списком аккаунтов, предусловиями, постусловиями и возвращаемыми ошибками."
+---
+
+<Info>
+  **Эта страница переведена с помощью ИИ. За эталон принимается английская версия.**
+
+  [Открыть английскую версию →](/products/cpmm/instructions)
+</Info>
+
+## Итоговая таблица инструкций
+
+| Имя дискриминатора | Кто подписывает | Что делает |
+|-------|-----------|--------------|
+| `Initialize` | создатель пула | Создаёт новый пул CPMM из двух монет и `AmmConfig`. Без ограничений: любой может её вызвать. Устанавливает `enable_creator_fee = false` для нового пула. Аккаунт `pool_state` может быть либо каноническим PDA, либо случайной свежей парой (см. аккаунты Initialize). |
+| `InitializeWithPermission` | плательщик + владелец PDA `Permission` | Версия `Initialize` с ограничениями. Вызывающий (`payer`) должен владеть PDA `Permission`, производной от его публичного ключа. Используется платформами, нуждающимися в контролируемом создании пула (например, LaunchLab выпуски). Позволяет вызывающему зафиксировать `creator_fee_on` (`BothToken` / `OnlyToken0` / `OnlyToken1`) и устанавливает `enable_creator_fee = true` для нового пула. Поле `creator` на `pool_state` принимает значение отдельно переданного аккаунта `creator`, а не плательщика. Та же гибкость в выборе между каноническим PDA и случайной парой для `pool_state`, как в `Initialize`. |
+| `Deposit` | LP | Добавляет ликвидность в обе монеты; получает LP-токены. |
+| `Withdraw` | LP | Сжигает LP-токены; получает обе базовые монеты пропорционально. |
+| `SwapBaseInput` | трейдер | Своп с точным входом (`amount_in` входит, выходит ≥ `minimum_amount_out`). |
+| `SwapBaseOutput` | трейдер | Своп с точным выходом (входит ≤ `maximum_amount_in`, выходит `amount_out`). |
+| `CollectProtocolFee` | `protocol_owner` (из `AmmConfig`) | Снимает накопленные комиссии протокола из хранилищ. |
+| `CollectFundFee` | `fund_owner` (из `AmmConfig`) | Снимает накопленные комиссии фонда из хранилищ. |
+| `CollectCreatorFee` | `pool_creator` | Снимает накопленные комиссии создателя (если комиссия была включена). |
+| `UpdatePoolStatus` | `admin` | Приостанавливает / возобновляет определённые операции на пуле через битовую маску. |
+| `UpdateAmmConfig` | `admin` | Изменяет ставки комиссий или владельца протокола/фонда на `AmmConfig`. |
+| `CreateAmmConfig` | `admin` | Создаёт новый уровень комиссий (новый аккаунт `AmmConfig`). |
+| `CreatePermissionPda` | `admin` | Выпускает PDA `Permission`, позволяющий определённому органу вызывать `InitializeWithPermission`. |
+| `ClosePermissionPda` | `admin` | Отзывает ранее выпущенный PDA `Permission`. |
+
+Битовая маска состояния: поле `status` каждого пула — это `u8`, где бит 0 = депозиты отключены, бит 1 = снятия отключены, бит 2 = своп отключён (`PoolStatusBitIndex { Deposit, Withdraw, Swap }` в программе). Нулевой бит означает, что операция разрешена; установленный бит означает, что она приостановлена. `UpdatePoolStatus` берёт сырой `u8` и перезаписывает существующее значение.
+
+Следующие разделы подробно рассматривают каждую инструкцию. Порядок аккаунтов следует IDL CPMM; SDK и Rust-клиент в `raydium-cp-swap/programs/cp-swap/src/instructions` соответствуют этому порядку.
+
+## `Initialize`
+
+Создаёт новый пул CPMM.
+
+**Аргументы**
+
+```
+init_amount_0: u64
+init_amount_1: u64
+open_time:     u64   // Unix timestamp; своп отклоняется до этого момента
+```
+
+**Аккаунты** (W = записываемый, S = подписывает)
+
+| # | Имя | W | S | Примечания |
+|---|------|---|---|-------|
+| 1 | `creator` | W | S | Оплачивает ренту; записывается как `pool_state.pool_creator`. |
+| 2 | `amm_config` |   |   | Выбранный уровень комиссий. |
+| 3 | `authority` |   |   | Глобальный PDA полномочий CPMM. |
+| 4 | `pool_state` | W | S* | Инициализируется здесь. **Либо** каноническая PDA `["pool", amm_config, token_0_mint, token_1_mint]` **либо** свежая случайная пара — когда не каноническая PDA, программа требует чтобы `pool_state` подписала (`require_eq!(pool_account_info.is_signer, true)`). Путь со случайной парой позволяет создателю избежать фронт-раннинга на канонической PDA. Производные PDA (`lp_mint`, хранилища, `observation_state`) выводятся из `pool_state.key()` в любом случае. |
+| 5 | `token_0_mint` |   |   | Отсортирована: `token_0_mint < token_1_mint`. |
+| 6 | `token_1_mint` |   |   | |
+| 7 | `lp_mint` | W |   | Инициализируется здесь. Полномочия установлены на `authority`. |
+| 8 | `creator_token_0` | W |   | Исходящая ATA для `init_amount_0`. |
+| 9 | `creator_token_1` | W |   | Исходящая ATA для `init_amount_1`. |
+| 10 | `creator_lp_token` | W |   | Назначение для LP (создаётся если отсутствует). |
+| 11 | `token_0_vault` | W |   | Инициализируется здесь. Принадлежит `authority`. |
+| 12 | `token_1_vault` | W |   | |
+| 13 | `create_pool_fee` | W |   | Целевая ATA для `create_pool_fee`, уплачиваемой создателем. |
+| 14 | `observation_state` | W |   | Инициализируется здесь. |
+| 15 | `token_program` |   |   | SPL Token (для LP-минта). |
+| 16 | `token_0_program` |   |   | SPL Token или Token-2022. |
+| 17 | `token_1_program` |   |   | SPL Token или Token-2022. |
+| 18 | `associated_token_program` |   |   | |
+| 19 | `system_program` |   |   | |
+| 20 | `rent` |   |   | |
+
+`*` `pool_state` подписывает только на пути со случайной парой; путь с канонической PDA выполняется без подписи `pool_state`.
+
+**Предусловия**
+
+- Монеты отсортированы (`token_0_mint < token_1_mint` по порядку байтов).
+- Ни одна монета не использует расширение вне списка разрешений CPMM (`TransferFeeConfig`, `MetadataPointer`, `TokenMetadata`, `InterestBearingConfig`, `ScaledUiAmount`) — см. [`products/cpmm/accounts`](/ru/products/cpmm/accounts#vaults-and-token-2022). Небольшой список разрешений монет внутри программы позволяет обходить проверку для поочередного подключения.
+- `creator` имеет как минимум `init_amount_0` и `init_amount_1` в соответствующих ATA.
+- `amm_config.disable_create_pool == false`.
+
+**Постусловия**
+
+- `pool_state` существует с `lp_supply = sqrt(init_amount_0 * init_amount_1) − LOCKED_LP`.
+- Начальные LP токены в количестве `LOCKED_LP` (`100` унитов LP) постоянно заблокированы в пуле — `pool_state.lp_supply` записывает `liquidity − 100`, в то время как `100` LP единиц остаются вне обращения, предотвращая полное истощение пула и деление на ноль.
+- `observation_state` инициализируется; `observation_index = 0` и `pool_id = pool_state.key()`.
+- `create_pool_fee` ламортов передаются от создателя к получателю и синхронизируются как нативный SOL (это ATA wSOL).
+- Битовая маска состояния пула — `0` (депозиты / снятия / своп все включены).
+- `enable_creator_fee = false` и `creator_fee_on = BothToken`. `Initialize` **не поддерживает** включение комиссии создателя — этот путь — `InitializeWithPermission`.
+- `open_time` повышается до `block_timestamp + 1` если вызывающий передал значение `<= block_timestamp`. Своп отклоняется до `open_time`; депозиты и снятия работают немедленно.
+
+**Частые ошибки** (полный список в [`reference/error-codes`](/ru/reference/error-codes))
+
+- `InvalidInput` — монеты не отсортированы или идентичны.
+- `NotSupportMint` — заблокированное расширение Token-2022.
+- `ExceededSlippage` — редко; если `init_amount_0/1` приводят к нулевому LP из-за несовпадения десятичных знаков.
+
+## `Deposit`
+
+Добавляет ликвидность в обе монеты пропорционально пулу.
+
+**Аргументы**
+
+```
+lp_token_amount:   u64   // сколько LP-токенов выпустить LP
+maximum_token_0:   u64
+maximum_token_1:   u64
+```
+
+**Аккаунты**
+
+| # | Имя | W | S |
+|---|------|---|---|
+| 1 | `owner` |   | S |
+| 2 | `authority` |   |   |
+| 3 | `pool_state` | W |   |
+| 4 | `owner_lp_token` | W |   |
+| 5 | `token_0_account` | W |   |
+| 6 | `token_1_account` | W |   |
+| 7 | `token_0_vault` | W |   |
+| 8 | `token_1_vault` | W |   |
+| 9 | `token_program` |   |   |
+| 10 | `token_program_2022` |   |   |
+| 11 | `vault_0_mint` |   |   |
+| 12 | `vault_1_mint` |   |   |
+| 13 | `lp_mint` | W |   |
+
+**Математика**
+
+```
+needed_token_0 = ceil(lp_token_amount * vault_0 / lp_supply)
+needed_token_1 = ceil(lp_token_amount * vault_1 / lp_supply)
+require(needed_token_0 <= maximum_token_0, "ExceededSlippage")
+require(needed_token_1 <= maximum_token_1, "ExceededSlippage")
+```
+
+Без изменения пропорциональности `k` — хранилища и `lp_supply` масштабируются на один и тот же множитель.
+
+**Постусловия**
+
+- `lp_supply += lp_token_amount`.
+- `vault_0 += needed_token_0` (с учётом любой комиссии за передачу Token-2022 на входе).
+- `vault_1 += needed_token_1` (с учётом любой комиссии за передачу Token-2022 на входе).
+
+**Частые ошибки** — `ExceededSlippage`, `ZeroTradingTokens`, `InvalidStatus` если депозит приостановлен.
+
+## `Withdraw`
+
+Сжигает LP-токены и получает обе базовые монеты пропорционально.
+
+**Аргументы**
+
+```
+lp_token_amount:   u64
+minimum_token_0:   u64
+minimum_token_1:   u64
+```
+
+**Аккаунты**
+
+| # | Имя | W | S |
+|---|------|---|---|
+| 1 | `owner` |   | S |
+| 2 | `authority` |   |   |
+| 3 | `pool_state` | W |   |
+| 4 | `owner_lp_token` | W |   |
+| 5 | `token_0_account` | W |   |
+| 6 | `token_1_account` | W |   |
+| 7 | `token_0_vault` | W |   |
+| 8 | `token_1_vault` | W |   |
+| 9 | `token_program` |   |   |
+| 10 | `token_program_2022` |   |   |
+| 11 | `vault_0_mint` |   |   |
+| 12 | `vault_1_mint` |   |   |
+| 13 | `lp_mint` | W |   |
+
+(Идентичны `Deposit`; `lp_mint` записываемый потому что LP-токены сжигаются.)
+
+**Математика**
+
+```
+out_token_0 = floor(lp_token_amount * vault_0 / lp_supply)
+out_token_1 = floor(lp_token_amount * vault_1 / lp_supply)
+require(out_token_0 >= minimum_token_0, "ExceededSlippage")
+require(out_token_1 >= minimum_token_1, "ExceededSlippage")
+```
+
+**Постусловия**
+
+- `lp_supply -= lp_token_amount`.
+- Хранилища отправляют `out_token_0` / `out_token_1` (полная сумма; пользователь получает с учётом любой комиссии за передачу Token-2022).
+
+## `SwapBaseInput`
+
+Своп с точным входом.
+
+**Аргументы**
+
+```
+amount_in:            u64
+minimum_amount_out:   u64
+```
+
+**Аккаунты**
+
+| # | Имя | W | S |
+|---|------|---|---|
+| 1 | `payer` |   | S |
+| 2 | `authority` |   |   |
+| 3 | `amm_config` |   |   |
+| 4 | `pool_state` | W |   |
+| 5 | `input_token_account` | W |   |
+| 6 | `output_token_account` | W |   |
+| 7 | `input_vault` | W |   |
+| 8 | `output_vault` | W |   |
+| 9 | `input_token_program` |   |   |
+| 10 | `output_token_program` |   |   |
+| 11 | `input_token_mint` |   |   |
+| 12 | `output_token_mint` |   |   |
+| 13 | `observation_state` | W |   |
+
+Порядок **вход → выход** задаётся направлением пользователя, а не каноническим `token_0 / token_1` пула. Программа определяет какое хранилище какое, сопоставляя минты.
+
+**Математика** — см. [`products/cpmm/math`](/ru/products/cpmm/math).
+
+**Предусловия**
+
+- `open_time <= now`.
+- `pool_status` разрешает своп.
+- Ни одна монета не приостановлена или заморожена для этого органа.
+- `amount_in > 0`.
+
+**Частые ошибки**
+
+- `ExceededSlippage` — `amount_out < minimum_amount_out`.
+- `ZeroTradingTokens` — сделка округляется до нуля.
+- `NotApproved` — пул приостановлен для своп через `UpdatePoolStatus`.
+- `InvalidInput` — минты не соответствуют ни одной из монет хранилищ пула.
+
+## `SwapBaseOutput`
+
+Своп с точным выходом.
+
+**Аргументы**
+
+```
+max_amount_in:  u64
+amount_out:     u64
+```
+
+**Аккаунты** — как в `SwapBaseInput`.
+
+**Математика** — обратная кривая с потолком, см. [`products/cpmm/math`](/ru/products/cpmm/math).
+
+**Частые ошибки** — `ExceededSlippage` (`gross_in > max_amount_in`), `ZeroTradingTokens`, `InvalidInput`, `NotApproved`.
+
+## `CollectProtocolFee`
+
+Снимает накопленные комиссии протокола из хранилищ в целевое хранилище протокола.
+
+**Аргументы** — отсутствуют.
+
+**Аккаунты**
+
+| # | Имя | W | S |
+|---|------|---|---|
+| 1 | `owner` |   | S | Должен совпадать с `amm_config.protocol_owner`. |
+| 2 | `authority` |   |   |
+| 3 | `pool_state` | W |   |
+| 4 | `amm_config` |   |   |
+| 5 | `token_0_vault` | W |   |
+| 6 | `token_1_vault` | W |   |
+| 7 | `vault_0_mint` |   |   |
+| 8 | `vault_1_mint` |   |   |
+| 9 | `recipient_token_0_account` | W |   |
+| 10 | `recipient_token_1_account` | W |   |
+| 11 | `token_program` |   |   |
+| 12 | `token_program_2022` |   |   |
+
+**Эффект**
+
+```
+transfer pool_state.protocol_fees_token0 from vault_0 to recipient_0
+transfer pool_state.protocol_fees_token1 from vault_1 to recipient_1
+pool_state.protocol_fees_token0 = 0
+pool_state.protocol_fees_token1 = 0
+```
+
+Без изменения эффективных балансов кривой (накопленные комиссии уже исключены).
+
+**Частая ошибка** — `NotApproved` если подписывающий не является `protocol_owner`.
+
+## `CollectFundFee`
+
+Та же структура, что `CollectProtocolFee`, но подписывается `fund_owner` и обнуляет счётчики `fund_fees_*`.
+
+## `CollectCreatorFee`
+
+Та же структура, подписывается `pool_state.pool_creator`. Выпускает передачи только если пул был инициализирован с ненулевой ставкой комиссии создателя.
+
+## `UpdatePoolStatus`
+
+Приостанавливает или возобновляет отдельные операции на пуле. Поле `status` — битовая маска:
+
+| Бит | Флаг | Эффект при установке |
+|-----|------|-----------------|
+| 0 | `DEPOSIT_DISABLED` | `Deposit` отклоняет с `NotApproved`. |
+| 1 | `WITHDRAW_DISABLED` | `Withdraw` отклоняет. |
+| 2 | `SWAP_DISABLED` | `SwapBaseInput` / `SwapBaseOutput` отклоняют. |
+
+**Аргументы**
+
+```
+status: u8      // новая битовая маска
+```
+
+**Аккаунты**
+
+| # | Имя | W | S |
+|---|------|---|---|
+| 1 | `authority` |   | S | Должен совпадать с ключом администратора в программе CPMM. |
+| 2 | `pool_state` | W |   |
+
+Ключ администратора — это орган обновления программы CPMM — на практике мультиподпись Raydium. См. [`security/admin-and-multisig`](/ru/security/admin-and-multisig).
+
+## `CreateAmmConfig`
+
+Создаёт новый уровень комиссий.
+
+**Аргументы**
+
+```
+index:             u16
+trade_fee_rate:    u64
+protocol_fee_rate: u64
+fund_fee_rate:     u64
+create_pool_fee:   u64
+```
+
+**Аккаунты**
+
+| # | Имя | W | S |
+|---|------|---|---|
+| 1 | `owner` | W | S | Администратор. |
+| 2 | `amm_config` | W |   | Инициализируется здесь. |
+| 3 | `system_program` |   |   |
+
+**Предусловия**
+
+- Существующей `AmmConfig` с тем же `index` нет.
+- `protocol_fee_rate + fund_fee_rate <= FEE_RATE_DENOMINATOR_VALUE`.
+
+## `UpdateAmmConfig`
+
+Изменяет ставки комиссий или владение на существующем `AmmConfig`. Берёт `param: u8` (дискриминатор какое поле обновлять) и `value: u64`. Семантика значений для параметра находится в исходном коде; обычно:
+
+- `param = 0` → `trade_fee_rate`
+- `param = 1` → `protocol_fee_rate`
+- `param = 2` → `fund_fee_rate`
+- `param = 3` → `new_protocol_owner` (передаёт байты `Pubkey` как переинтерпретацию)
+- `param = 4` → `new_fund_owner`
+- `param = 5` → `create_pool_fee`
+- `param = 6` → `disable_create_pool`
+
+Изменения подписываются администратором и влияют на **каждый пул привязанный к этому `AmmConfig`** при следующем своп. Без миграции; пулы просто читают новые значения.
+
+## Матрица изменения состояния
+
+| Инструкция | `lp_supply` | Балансы хранилищ | Поля накопленных комиссий | `observation` |
+|-------------|------------|---------------|-------------------|---------------|
+| `Initialize` | + LP инициализ. | + `init_amount_{0,1}` | 0 | инициализ. |
+| `InitializeWithPermission` | + LP инициализ. | + `init_amount_{0,1}` | 0 | инициализ. |
+| `Deposit` | + | + обе | — | — |
+| `Withdraw` | − | − обе | — | — |
+| `SwapBaseInput` | — | + вход, − выход | + `trade_fee` разделён на протокол/фонд; + `creator_fee` если включена | + (если интервал истёк) |
+| `SwapBaseOutput` | — | + вход, − выход | + `trade_fee` разделён на протокол/фонд; + `creator_fee` если включена | + (если интервал истёк) |
+| `CollectProtocolFee` | — | − (по протокол) | `protocol_*` → 0 | — |
+| `CollectFundFee` | — | − (по фонду) | `fund_*` → 0 | — |
+| `CollectCreatorFee` | — | − (по создателю) | `creator_*` → 0 | — |
+| `UpdatePoolStatus` | — | — | — | — |
+
+## Куда дальше
+
+- [`products/cpmm/code-demos`](/ru/products/cpmm/code-demos) — запускаемые примеры TypeScript для приведённого выше.
+- [`reference/error-codes`](/ru/reference/error-codes) — полная таблица ошибок Anchor.
+- [`products/cpmm/fees`](/ru/products/cpmm/fees) — модель накопления комиссий которую `CollectProtocolFee` / `CollectFundFee` / `CollectCreatorFee` снимают.
+
+Источники:
+
+- [`raydium-io/raydium-cp-swap` — instructions](https://github.com/raydium-io/raydium-cp-swap/tree/master/programs/cp-swap/src/instructions)
+- [Raydium SDK v2 — `@raydium-io/raydium-sdk-v2`](https://github.com/raydium-io/raydium-sdk-V2)

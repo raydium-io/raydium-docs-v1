@@ -1,0 +1,349 @@
+---
+title: "Instructions LaunchLab"
+description: "Initialize, Buy, Sell, Graduate, CollectFees, SetParams — formes des arguments, listes de comptes, et conditions pré/postconditions pour chaque instruction LaunchLab."
+---
+
+<Info>
+  **Cette page est traduite automatiquement par IA. La version anglaise fait foi.**
+
+  [Voir la version anglaise →](/products/launchlab/instructions)
+</Info>
+
+<Info>
+  LaunchLab expose un ensemble d'instructions resserré : six appels accessibles aux utilisateurs plus quelques primitives admin. Le SDK les enveloppe tous ; cette page documente la surface brute pour les agrégateurs, outils de surveillance et programmes ayant besoin de CPI.
+</Info>
+
+## Inventaire des instructions
+
+| Groupe | Instruction | Appelable par |
+|-------|-------------|-------------|
+| Config global | `CreateConfig` / `UpdateConfig` | Admin |
+| Cycle de lancement | `Initialize` / `InitializeV2` | Quiconque (créateur) — lancements SPL Token ; V2 enregistre `amm_creator_fee_on` pour la graduation CPMM ultérieure |
+| Cycle de lancement | `InitializeWithToken2022` | Quiconque (créateur) — lancement Token-2022, `TransferFeeConfig` optionnel |
+| Trade | `BuyExactIn` / `BuyExactOut` | Quiconque — achat exact-input / exact-output sur la courbe de liaison |
+| Trade | `SellExactIn` / `SellExactOut` | Quiconque — vente exact-input / exact-output sur la courbe de liaison |
+| Graduation | `MigrateToAmm` | Portefeuille de migration (défini sur `GlobalConfig`) — graduation vers AMM v4. Utilisé quand `amm_creator_fee_on = BothToken` afin que les frais créateur puissent être collectés de chaque côté. |
+| Graduation | `MigrateToCpswap` | Portefeuille de migration — graduation vers CPMM. Utilisé quand `amm_creator_fee_on = QuoteToken` et obligatoire pour les lancements Token-2022. Enveloppe `InitializeWithPermission` sur CPMM. |
+| Frais | `CollectFee` | Admin — prélèvement des frais de protocole d'un lancement |
+| Frais | `CollectMigrateFee` | Admin — prélèvement des frais de migration accumulés |
+| Frais | `ClaimCreatorFee` | Créateur — réclame les frais créateur accumulés pendant la phase courbe |
+| Vesting | `CreateVestingAccount` | Créateur — alloue les tokens verrouillés à un bénéficiaire, déverrouillés après graduation |
+| Vesting | `CreatePlatformVestingAccount` | Admin de plateforme — alloue les tokens verrouillés aux bénéficiaires côté plateforme |
+| Vesting | `ClaimVestedToken` | Bénéficiaire — réclame les tokens déverrouillés après la falaise |
+| Config de plateforme | `CreatePlatformConfig` / `UpdatePlatformConfig` | Admin de plateforme |
+| Config de plateforme | `UpdatePlatformCurveParam` / `RemovePlatformCurveParam` | Admin de plateforme — gère la liste par-plateforme des formes de courbe autorisées |
+| Frais de plateforme | `ClaimPlatformFee` / `ClaimPlatformFeeFromVault` | Admin de plateforme |
+| Accès à la plateforme | `CreatePlatformGlobalAccess` / `ClosePlatformGlobalAccess` | Admin — contrôle quelles plates-formes peuvent utiliser un `GlobalConfig` donné |
+
+La division « ExactIn/ExactOut » reflète celle de CPMM `SwapBaseInput` / `SwapBaseOutput` — sur chaîne, ce sont des discriminateurs d'instruction distincts avec un arrondi légèrement différent.
+
+**Sélection du chemin de graduation.** `migrate_type` est enregistré sur `PoolState` au moment de `Initialize{V2,WithToken2022}` et détermine laquelle des deux instructions de graduation peut s'exécuter. Les lancements Token-2022 migrent toujours vers CPMM. Les lancements SPL Token migrent vers AMM v4 ou CPMM selon le paramètre `amm_creator_fee_on` :
+
+- `BothToken` → `MigrateToAmm` → pool AMM v4 (les frais créateur peuvent être collectés de chaque côté ; AMM v4 n'a pas de champ natif de frais créateur, donc les frais créateur sont prélevés via le mécanisme du NFT LP-lock à la place).
+- `QuoteToken` → `MigrateToCpswap` → pool CPMM avec `creator_fee_on = OnlyQuoteToken` (le créateur continue de gagner des frais du pool CPMM via le NFT Fee Key LaunchLab — voir [`products/launchlab/creator-fees`](/fr/products/launchlab/creator-fees)).
+
+<Tip>
+  **Note sur le nom de l'enum `AmmCreatorFeeOn`.** Le code source Rust appelle cet enum `AmmCreatorFeeOn` avec des variantes `QuoteToken` et `BothToken`. Le nom est trompeur : dans la pratique opérationnelle actuelle, la variante ne contrôle pas seulement le côté à partir duquel les frais créateur sont collectés sur le pool CPMM post-graduation — elle sélectionne également le **programme cible** de graduation (AMM v4 vs CPMM) et s'apparie avec `migrate_type` sur le `PoolState` du lancement. Traitez le champ comme « cible de migration + côté frais créateur post-graduation » regroupés en un. Le nom de l'enum sur chaîne n'a pas été refactorisé, mais le raisonner comme `MigrationTarget` correspond plus étroitement à la réalité.
+</Tip>
+
+## `Initialize`
+
+Crée un nouveau lancement.
+
+**Arguments**
+
+```
+launch_params: {
+    curve_type:                 u8,
+    base_supply_max:            u64,
+    base_supply_graduation:     u64,
+    k:                          u128,              // ou initial_virtual_quote_reserve pour curve_type=1
+    open_time:                  u64,
+    quote_mint:                 Pubkey,
+    base_token_metadata: {                         // nom/symbole/uri en ligne ; le programme CPI vers Metaplex
+        name:   String,
+        symbol: String,
+        uri:    String,
+    },
+    fees: {
+        buy_numerator:   u64,
+        buy_denominator: u64,
+        sell_numerator:  u64,
+        sell_denominator: u64,
+        lp_share:        u64,
+        creator_share:   u64,
+        protocol_share:  u64,
+        total_share:     u64,
+    },
+    post_graduation_lp_policy:  u8,                // 0 = Burn, 1 = Lock, 2 = ToCreator
+}
+```
+
+**Comptes** (abrégé)
+
+| # | Nom | W | S | Notes |
+|---|------|---|---|-------|
+| 1 | `creator` | W | S | Paie le loyer + création de mint base. |
+| 2 | `launch_config` |   |   | Liaison de config protocole. |
+| 3 | `launch_state` | W |   | Nouveau compte. |
+| 4 | `launch_authority` |   |   | PDA. |
+| 5 | `base_mint` | W | S | Keypair frais (ou PDA) — cette instruction l'initialise. |
+| 6 | `base_vault` | W |   | ATA de `launch_authority` sur `base_mint`. |
+| 7 | `quote_mint` |   |   | |
+| 8 | `quote_vault` | W |   | ATA de `launch_authority` sur `quote_mint`. |
+| 9 | `metadata` | W |   | PDA métadonnées Metaplex. |
+| 10 | `metaplex_program` |   |   | |
+| 11 | `token_program` |   |   | SPL Token uniquement. |
+| 12 | `system_program` |   |   | |
+| 13 | `rent` |   |   | |
+
+**Préconditions**
+
+- `quote_mint ∈ launch_config.allowed_quote_mints`.
+- `base_supply_graduation ≤ base_supply_max`.
+- Les paramètres de frais réussissent les vérifications `launch_config.max_*_fee_rate`.
+- `open_time ≥ now − slop` (le SDK applique `≥ now` ; le programme tolère une antidatation légère).
+- `curve_type` est reconnu.
+
+**Postconditions**
+
+- `base_mint` a `supply = base_supply_max`, tout dans `base_vault`.
+- `base_mint.mint_authority = launch_authority`, `freeze_authority = None`.
+- `LaunchState` initialisé avec `status = Active`, `base_sold = 0`, `quote_reserve_real = 0`.
+- `quote_reserve_target` calculé à partir des paramètres courbe + `base_supply_graduation` + `buy_numerator` (approximativement).
+
+**Erreurs courantes** — `InvalidQuoteMint`, `FeeRateTooHigh`, `InvalidCurveParams`, `MathOverflow`.
+
+## `Buy` (variante canonique : `BuyExactIn`)
+
+L'utilisateur fournit un `quote_in` fixe ; la courbe calcule `base_out`.
+
+**Arguments**
+
+```
+quote_in:          u64
+minimum_base_out:  u64
+```
+
+**Comptes**
+
+| # | Nom | W | S |
+|---|------|---|---|
+| 1 | `user` | W | S |
+| 2 | `launch_state` | W |   |
+| 3 | `launch_authority` |   |   |
+| 4 | `base_vault` | W |   |
+| 5 | `quote_vault` | W |   |
+| 6 | `user_base_ata` | W |   |
+| 7 | `user_quote_ata` | W |   |
+| 8 | `base_mint` |   |   |
+| 9 | `quote_mint` |   |   |
+| 10 | `token_program` |   |   |
+| 11 | `associated_token_program` |   |   |
+| 12 | `system_program` |   |   |
+
+**Préconditions**
+
+- `launch_state.status == Active`.
+- `now ≥ open_time`.
+- `user_quote_ata.balance ≥ quote_in`.
+- `quote_in > 0`.
+
+**Effet**
+
+1. Divise `quote_in` en `quote_in_after_fee` et les parts de frais.
+2. Résout la courbe par Newton pour `base_out` donnés le devis post-frais.
+3. `require(base_out ≥ minimum_base_out)` sinon revert `ExceededSlippage`.
+4. Déplace `quote_in` utilisateur → vault. Déplace `base_out` vault → utilisateur.
+5. Met à jour `base_sold += base_out`, `quote_reserve_real += quote_in_after_fee × (lp_share / total_share)`.
+6. Met à jour les compteurs de frais (`protocol_fees_quote`, `creator_fees_quote`).
+7. `state_data.num_buys += 1`.
+8. Si `quote_reserve_real ≥ quote_reserve_target` après la mise à jour, le SDK enchaîne généralement une ix `Graduate` dans la même transaction. Le programme ne fait pas de graduation auto à l'intérieur de `Buy` — une `Graduate` ultérieure est requise.
+
+## `BuyExactOut`
+
+L'utilisateur spécifie exactement le `base_out` ; le programme calcule `quote_in`.
+
+**Arguments**
+
+```
+base_out:      u64
+maximum_quote_in: u64
+```
+
+Mêmes comptes que `BuyExactIn`. Utilise l'intégrale quadratique sous forme fermée (ou l'inverse CPMM, pour curve_type 1) plutôt que l'itération Newton.
+
+## `Sell` / `SellExactIn` / `SellExactOut`
+
+Miroir de `Buy`. L'utilisateur retourne `base_in` à la courbe et reçoit `quote_out`. Les frais sont déduits de `quote_out`, donc l'utilisateur reçoit moins que les produits bruts intégrés.
+
+**Préconditions** —
+
+- `user_base_ata.balance ≥ base_in`.
+- La vente ne peut pas pousser `base_sold` en dessous de 0 (redondant avec ce qui précède étant donné que la comptabilité est cohérente).
+- Le lancement est `Active`.
+
+**Effet** — symétrique à `Buy`. `base_sold` diminue, `quote_reserve_real` diminue. Les frais s'accumulent toujours.
+
+## `MigrateToAmm` / `MigrateToCpswap`
+
+Graduate un lancement dans un pool AMM négociable une fois que la courbe a atteint `total_quote_fund_raising`. Les deux instructions correspondent aux deux cibles de graduation — AMM v4 et CPMM — et **une seule d'elles est valide pour un lancement donné**, déterminée par `pool_state.migrate_type` (défini au moment de `Initialize`).
+
+**Qui signe**
+
+- `MigrateToAmm` — le `migrate_to_amm_wallet` enregistré sur le `GlobalConfig` de liaison.
+- `MigrateToCpswap` — le `migrate_to_cpswap_wallet` enregistré sur le `GlobalConfig` de liaison.
+
+Ces portefeuilles sont généralement tenus par la manivelle de graduation opérée par Raydium ; en pratique, la graduation se produit quelques secondes après le franchissement du seuil, peu importe qui a déclenché l'achat final.
+
+**Arguments**
+
+`MigrateToAmm` prend trois arguments (principalement des paramètres du marché OpenBook que le programme transmet à AMM v4) :
+
+```
+base_lot_size:               u64
+quote_lot_size:              u64
+market_vault_signer_nonce:   u8
+```
+
+`MigrateToCpswap` n'en prend aucun.
+
+**Effet (commun aux deux)**
+
+1. Vérifie que `pool_state.status == Migrate` (c.-à-d., `quote_reserve_target` a été atteint). Sinon revert avec `PoolMigrated` (le statut était déjà `Migrated`) ou `PoolFunding` (toujours en financement).
+2. Vérifie que `pool_state.migrate_type` correspond à l'instruction (`0` pour AMM, `1` pour CPMM). Sinon revert avec `MigrateTypeNotMatch`.
+3. Calcule les réserves post-graduation :
+   - `base_amount_out = base_vault.amount − vesting_schedule.total_locked_amount`
+   - `quote_amount_out = quote_vault.amount − quote_protocol_fee − migrate_fee − platform_fee`
+4. CPI dans le programme cible (`AMM v4 Initialize2` ou `CPMM InitializeWithPermission`) avec ces réserves pour créer le pool post-graduation.
+5. Divise le LP résultant selon le `PlatformConfig.{platform_scale, creator_scale, burn_scale}` de liaison (CPMM uniquement) — un morceau mintée vers `platform_nft_wallet`, un vers un NFT créateur enrobé par le programme LP-Lock, un brûlé via Burn & Earn. Pour la graduation AMM v4, la disposition du LP est gouvernée par les propres paramètres d'initialisation d'AMM v4.
+6. Révoque `base_mint.mint_authority` (défini sur `None`).
+7. Bascule `pool_state.status = Migrated`, définit `vesting_schedule.start_time = block_time + cliff_period`.
+
+**Postconditions** — `BuyExactIn`, `BuyExactOut`, `SellExactIn`, `SellExactOut` rejetteront à partir de ce moment avec `PoolMigrated`. Le pool AMM résultant est canonique et se négocie comme n'importe quel autre pool AMM v4 / CPMM.
+
+**Erreurs courantes** — `PoolFunding`, `PoolMigrated`, `MigrateTypeNotMatch`, `InvalidCpSwapConfig`, `MathOverflow`.
+
+## `CollectFee`
+
+Prélèvement admin des frais commerciaux accumulés du protocole sur un seul lancement.
+
+**Arguments** — aucun.
+
+**Comptes**
+
+| # | Nom | W | S | Notes |
+|---|------|---|---|-------|
+| 1 | `protocol_fee_owner` |   | S | Doit être égal à `global_config.protocol_fee_owner`. |
+| 2 | `authority` |   |   | PDA `[b"vault_auth_seed"]` ; signe le transfert de vault. |
+| 3 | `pool_state` | W |   | Muté pour mettre à zéro `quote_protocol_fee`. |
+| 4 | `global_config` |   |   | Source de vérité pour le signataire. |
+| 5 | `quote_vault` | W |   | Vidé par `quote_protocol_fee`. |
+| 6 | `recipient_token_account` | W |   | ATA de `protocol_fee_owner` sur `quote_mint`. |
+| 7 | `quote_mint` |   |   | |
+| 8 | `token_program` |   |   | SPL Token (le mint de devis est toujours SPL Token). |
+
+**Effet** — transfère `pool_state.quote_protocol_fee` du `quote_vault` vers `recipient_token_account`, puis met le compteur à zéro. Peut être appelé n'importe quand après le premier achat.
+
+## `CollectMigrateFee`
+
+Prélèvement admin des frais de migration accumulés à la graduation. Même forme de compte que `CollectFee` avec `migrate_fee_owner` comme signataire (au lieu de `protocol_fee_owner`) et `pool_state.migrate_fee` comme compteur vidé.
+
+## `ClaimCreatorFee`
+
+Prélèvement par créateur des frais créateur accumulés sur **chaque lancement que le créateur possède** utilisant le même mint de devis. Vide le vault de frais par créateur, pas celui par pool.
+
+**Arguments** — aucun.
+
+**Comptes**
+
+| # | Nom | W | S | Notes |
+|---|------|---|---|-------|
+| 1 | `creator` | W | S | Le créateur du pool. |
+| 2 | `fee_vault_authority` |   |   | PDA `[b"creator_fee_vault_auth_seed"]`. |
+| 3 | `creator_fee_vault` | W |   | PDA aux graines `[creator, quote_mint]` ; le vault créateur agrégé. |
+| 4 | `recipient_token_account` | W |   | `init_if_needed` ; ATA du `creator` sur `quote_mint`. |
+| 5 | `quote_mint` |   |   | |
+| 6 | `token_program` |   |   | |
+| 7 | `system_program` |   |   | Pour la création d'ATA si nécessaire. |
+| 8 | `associated_token_program` |   |   | |
+
+**Effet** — transfère le solde entier de `creator_fee_vault` vers `recipient_token_account`. Revert avec une vérification supérieure à zéro si le vault est vide.
+
+## `ClaimPlatformFee`
+
+Prélèvement par plateforme qui vide directement le vault de devis d'un lancement. Utilisez ceci quand une plateforme veut réclamer sa part pour un lancement spécifique sans passer par le vault de plateforme agrégé.
+
+**Arguments** — aucun.
+
+**Comptes**
+
+| # | Nom | W | S | Notes |
+|---|------|---|---|-------|
+| 1 | `platform_fee_wallet` | W | S | Doit être égal à `platform_config.platform_fee_wallet`. |
+| 2 | `authority` |   |   | PDA `[b"vault_auth_seed"]`. |
+| 3 | `pool_state` | W |   | Vidé par `pool_state.platform_fee`. |
+| 4 | `platform_config` |   |   | Source de vérité pour le signataire. |
+| 5 | `quote_vault` | W |   | Vidé. |
+| 6 | `recipient_token_account` | W |   | `init_if_needed` ; ATA de `platform_fee_wallet`. |
+| 7 | `quote_mint` |   |   | |
+| 8 | `token_program` |   |   | |
+| 9 | `system_program` |   |   | |
+| 10 | `associated_token_program` |   |   | |
+
+**Effet** — transfère `pool_state.platform_fee` du `quote_vault` vers `recipient_token_account`, met le compteur à zéro.
+
+## `ClaimPlatformFeeFromVault`
+
+Prélèvement agrégé par plateforme. Vide le vault de frais par-quote-mint de la plateforme qui accumule les frais de chaque lancement acheminé via la plateforme.
+
+**Arguments** — aucun.
+
+**Comptes**
+
+| # | Nom | W | S | Notes |
+|---|------|---|---|-------|
+| 1 | `platform_fee_wallet` | W | S | Doit être égal à `platform_config.platform_fee_wallet`. |
+| 2 | `fee_vault_authority` |   |   | PDA `[b"platform_fee_vault_auth_seed"]`. |
+| 3 | `platform_config` |   |   | |
+| 4 | `platform_fee_vault` | W |   | PDA aux graines `[platform_config, quote_mint]`. |
+| 5 | `recipient_token_account` | W |   | `init_if_needed` ; ATA de `platform_fee_wallet`. |
+| 6 | `quote_mint` |   |   | |
+| 7 | `token_program` |   |   | |
+| 8 | `system_program` |   |   | |
+| 9 | `associated_token_program` |   |   | |
+
+**Effet** — transfère le solde entier de `platform_fee_vault` vers `recipient_token_account`. Revert si le vault est vide.
+
+## Instructions de vesting et de config de plateforme
+
+Celles-ci sont documentées sur des pages dédiées car chacune a son propre modèle d'état :
+
+- [`CreateVestingAccount`, `CreatePlatformVestingAccount`, `ClaimVestedToken`](/fr/products/launchlab/vesting)
+- [`CreatePlatformConfig`, `UpdatePlatformConfig`, `UpdatePlatformCurveParam`, `RemovePlatformCurveParam`, `CreatePlatformGlobalAccess`, `ClosePlatformGlobalAccess`](/fr/products/launchlab/platform-config)
+- [`CreateConfig`, `UpdateConfig`](/fr/products/launchlab/global-config)
+
+## Matrice de changement d'état
+
+| Instruction | `status` | `real_base` | `real_quote` | Compteurs de frais | Pool post-état |
+|-------------|----------|-------------|--------------|--------------|------------------|
+| `Initialize{V2,WithToken2022}` | Funding | 0 | 0 | 0 | — |
+| `BuyExactIn(q_in)` | Funding | +∆ | +∆q_after_fee | `quote_protocol_fee += ∆`, `platform_fee += ∆` | — |
+| `SellExactIn(b_in)` | Funding | −∆ | −∆q_before_fee | (pareil) | — |
+| Seuil atteint | → Migrate | — | — | — | — |
+| `MigrateToAmm` / `MigrateToCpswap` | → Migrated | (gelé) | (gelé) | `migrate_fee` défini | créé, LP divisé selon `PlatformConfig` |
+| `CollectFee` / `CollectMigrateFee` | toute | — | — | compteur mis à zéro | — |
+| `ClaimCreatorFee` / `ClaimPlatformFee*` | toute | — | — | vault vidé | — |
+| `CreateVestingAccount` | Funding | — | — | — | augmente `allocated_share_amount` |
+| `ClaimVestedToken` | Migrated | — | — | — | vide `base_vault` |
+
+## Où aller ensuite
+
+- [`products/launchlab/code-demos`](/fr/products/launchlab/code-demos) — Exemples TypeScript pour chaque instruction.
+- [`products/launchlab/accounts`](/fr/products/launchlab/accounts) — forme d'état complète.
+- [`reference/error-codes`](/fr/reference/error-codes) — Enum d'erreur LaunchLab.
+
+Sources :
+
+- [Module `LaunchLab` du SDK Raydium v2](https://github.com/raydium-io/raydium-sdk-V2)
+- Code source du programme Raydium LaunchLab

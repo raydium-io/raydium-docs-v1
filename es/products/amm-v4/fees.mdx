@@ -1,0 +1,112 @@
+---
+title: "Comisiones de AMM v4"
+description: "La comisión comercial del 0,25%, su división LP/protocolo, generación de PnL a partir de ejecuciones en OpenBook, y cómo el administrador retira las comisiones de protocolo acumuladas."
+---
+
+<Info>
+  **Esta página fue traducida automáticamente por IA. La versión en inglés es la fuente autorizada.**
+
+  [Ver versión en inglés →](/products/amm-v4/fees)
+</Info>
+
+## El único nivel publicado
+
+A diferencia de CPMM y CLMM, AMM v4 **no tiene cuenta `AmmConfig`**. Las comisiones se almacenan directamente en la estructura `AmmInfo.fees` de cada pool y son fijas al crear el pool. Los valores predeterminados que cubren esencialmente todos los pools AMM v4 en vivo:
+
+| Campo en cadena | Valor predeterminado | Significado |
+|---|---|---|
+| `swap_fee_numerator / swap_fee_denominator` | `25 / 10_000` | **Comisión comercial bruta en swaps por ruta AMM: 0,25% del volumen de entrada.** |
+| `trade_fee_numerator / trade_fee_denominator` | `25 / 10_000` | Utilizado por la integración con OpenBook para calcular los precios de órdenes limitadas inclusivas de comisiones. Por defecto, igual a `swap_fee` (0,25%). |
+| `pnl_numerator / pnl_denominator` | `12 / 100` | **Parte del protocolo de la comisión de swap: 12%** — es decir, `0,25% × 12% = 0,03%` del volumen. Se acumula en contadores `need_take_pnl_*`. |
+| `min_separate_numerator / min_separate_denominator` | `5 / 10_000` | Límite de precisión interna usado por la lógica de redondeo de división de comisiones. |
+
+Nótese que `pnl_numerator / pnl_denominator` es una fracción **de la comisión de swap**, no del volumen comercial — una interpretación errónea común. La parte de LP es el complemento (`88%` de la comisión = `0,22%` del volumen) e implícita; no hay un numerador separado para "parte de LP".
+
+Un pequeño número de pools antiguos fueron creados con diferentes numeradores; siempre lee `AmmInfo.fees` antes de citar valores.
+
+**No hay comisión de fondo** ni **comisión de creador**: estos son inventos de CPMM/CLMM que no existían en el modelo de comisiones original de AMM v4.
+
+## Cómo se calcula la división
+
+En cada swap, el pool cobra la comisión comercial bruta del monto de entrada, luego distribuye:
+
+```
+gross_fee   = ceil(amount_in * swap_fee_numerator / swap_fee_denominator)        // 0.25% of amount_in
+pnl_portion = gross_fee * pnl_numerator / pnl_denominator                        // 12% of gross_fee
+lp_portion  = gross_fee − pnl_portion                                            // 88% of gross_fee
+```
+
+- `lp_portion` se queda en la bóveda y contribuye al siguiente `k`. Los LP la capturan canjeando tokens LP más tarde.
+- `pnl_portion` incrementa `AmmInfo.state_data.need_take_pnl_coin` o `need_take_pnl_pc` dependiendo de qué lado sea la entrada del swap.
+
+El mismo truco de preservación de invariantes que CPMM: el monto de PnL físicamente permanece en la bóveda pero se resta de las reservas usadas en la curva, así que `TakePnl` mueve tokens sin cambiar el precio.
+
+## PnL desde OpenBook (histórico)
+
+<Note>
+  **Ya no se acumula.** La integración con OpenBook está desactivada, por lo que el *segundo* flujo de PnL descrito en esta sección ya no se genera. Los contadores `total_pnl_{coin,pc}` en pools existentes pueden contener valores históricos, pero no se añaden nuevas cantidades. La ruta de comisión del protocolo del 0,03% (arriba) no se ve afectada y sigue activa.
+</Note>
+
+Históricamente, AMM v4 tenía un *segundo* flujo de ingresos similar a una comisión: cuando sus órdenes limitadas en OpenBook se ejecutaban, el pool podía estar del lado tomador de la ejecución y ganar o pagar el diferencial maker/taker del mercado. Estos eventos de PnL se liquidaban en las bóvedas del pool durante `MonitorStep` y el programa los acreditaba a `state_data.total_pnl_{coin,pc}` como contadores informativos.
+
+- Cuando la red publicada del pool estaba correctamente calibrada alrededor del precio de la curva, las ejecuciones de OpenBook tendían a ser **positivas en comisiones** para el pool — el AMM estaba efectivamente haciendo market-making en OpenBook y ganando rebajas de maker.
+- Cuando OpenBook se detenía o la cola de eventos se llenaba, el pool podía quedarse con órdenes antiguas que se ejecutaban a precios desfavorables, produciendo PnL negativo. Este acoplamiento operacional fue una de las motivaciones para alejarse del diseño híbrido.
+
+Este PnL de OpenBook **no era** lo mismo que la comisión de protocolo del 0,03%. El PnL de OpenBook inflaba directamente las reservas del pool (beneficiando a los LP + protocolo proporcionalmente a la división de comisiones), mientras que la comisión de protocolo del 0,03% estaba etiquetada específicamente para retiro administrativo. Con el lado de OpenBook desactivado, el único acúmulo de comisiones hoy es el 0,25% en swaps AMM y su división 22/3.
+
+## Recolección
+
+El administrador (multisig de Raydium) llama a `WithdrawPnl` / `TakePnl` para retirar `need_take_pnl_*` hacia las cuentas "propietarias de PnL" a nivel de pool configuradas en el `AmmConfig` del programa (una configuración diferente, con alcance de programa — no el `AmmConfig` de estilo CPMM por pool). El retiro:
+
+1. Primero liquida cualquier ejecución pendiente de OpenBook. *(Sin efecto ahora que OpenBook está inactivo.)*
+2. Transfiere `need_take_pnl_coin` / `need_take_pnl_pc` de las bóvedas del pool al destino de PnL.
+3. Pone a cero los contadores.
+
+La operación no mueve la curva. Los LP no deberían ver ningún cambio de precio después de una llamada a `TakePnl`.
+
+## Redención de comisiones de LP
+
+No hay instrucción dedicada para "recolectar comisiones de LP". Las comisiones de LP se acumulan en las bóvedas e inflan `k` con el tiempo; los LP las realizan quemando tokens LP mediante `Withdraw`. El valor de un token LP crece monótonamente a medida que `(coin_reserve_effective, pc_reserve_effective)` crece.
+
+## Visualización: hacia dónde van \$1000 de volumen
+
+En un swap pesado en USDC de \$1000 contra un pool con parámetros predeterminados:
+
+```
+Comisión comercial bruta (0,25%):  $2,50
+  Parte de LP   (0,22%):            $2,20   → permanece en el pool, aumenta k
+  Parte de PnL  (0,03%):            $0,30   → need_take_pnl_pc, retirado por TakePnl
+Restante enviado al usuario:      $997,50   (menos impacto de precio impulsado por la curva)
+```
+
+Compara con CPMM `AmmConfig[0]` (nivel 0,25%, sin comisión de creador): LP obtiene \$2,10, protocolo \$0,30, fondo \$0,10. CPMM introduce la línea de fondo extrayéndola de lo que habría sido la parte de LP en el nivel equivalente de AMM v4.
+
+## Tabla de comparación
+
+| | AMM v4 | CPMM `index=0` | CLMM `index=2` |
+|---|---|---|---|
+| Comisión comercial | 0,25% | 0,25% | 0,25% |
+| LP | 0,22% | 0,21% | Varía según emisiones |
+| Protocolo | 0,03% | 0,03% | Por nivel |
+| Fondo | N/A | 0,01% | Por nivel |
+| Creador (opcional) | N/A | 0 por defecto | N/A |
+| Dónde se sit sitúan las comisiones | Bóveda de pool + need_take_pnl_* | Bóveda de pool + protocol_fees_* + fund_fees_* | Global + por tick + por posición |
+
+Matriz completa en [`reference/fee-comparison`](/es/reference/fee-comparison).
+
+## Notas para integradores
+
+- **Cotización.** Obtén `AmmInfo` a través del SDK o `api-v3.raydium.io/pools/info/ids`. **No** calcules tu propio presupuesto contra saldos de bóveda brutos — los montos en depósito de OpenBook y la exclusión de PnL alejan las reservas efectivas de lo que `getTokenAccountBalance` muestra.
+- **Parámetros de comisión anticuados.** En principio, `SetParams` podría cambiar `swap_fee_numerator`, pero en la práctica el multisig de Raydium no ha cambiado los valores predeterminados para ningún pool en vivo. Aún así, siempre lee del estado en cadena en lugar de codificar valores.
+- **Sin recompensas.** AMM v4 no soporta emisiones de recompensas en pool. Las granjas del ecosistema heredadas (Farm v3 / v5 / v6) son el equivalente de la capa de staking — véase [`products/farm-staking`](/es/products/farm-staking).
+
+## Siguientes pasos
+
+- [`products/amm-v4/math`](/es/products/amm-v4/math) — la derivación de la comisión comercial dentro de la curva.
+- [`products/amm-v4/instructions`](/es/products/amm-v4/instructions) — listas de cuentas para `WithdrawPnl` / `SetParams`.
+- [`reference/fee-comparison`](/es/reference/fee-comparison) — matriz lado a lado.
+
+Fuentes:
+
+- [Programa Raydium AMM — `raydium-io/raydium-amm`](https://github.com/raydium-io/raydium-amm)
+- Campos de numerador/denominador de comisiones AMM v4 en cadena (verificados contra cuentas `AmmInfo` de mainnet).

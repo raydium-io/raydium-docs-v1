@@ -1,0 +1,279 @@
+---
+title: "PDA と CPI"
+description: "プログラム導出アドレス（PDA）とクロスプログラム呼び出し（CPI）— Raydium が状態を決定論的に管理し、他のプログラムと合成するための 2 つのプリミティブ。シード、バンプ、invoke と invoke_signed、Raydium のコードが従うパターンについて。"
+---
+
+<Info>
+  **このページは AI による自動翻訳です。すべての内容は英語版を正とします。**
+
+  [英語版を表示 →](/solana-fundamentals/pdas-and-cpis)
+</Info>
+
+<Info>
+  **PDA**（プログラム導出アドレス）と **CPI**（クロスプログラム呼び出し）は、Raydium を可能にする 2 つのプリミティブです。PDA により、プログラムは秘密鍵を持たずに決定論的なアドレスを「所有」できます。これはプール権限とボールトの仕組みです。CPI により、あるプログラムが別のプログラムを呼び出せます。これは Raydium が SPL Token プログラムを経由してトークンをスワップする方法であり、インテグレーターが Raydium を独自のフローに合成する方法です。Raydium のソースコードを読む前に、両者を理解することをお勧めします。
+</Info>
+
+## PDA：鍵なしのアドレス
+
+**プログラム導出アドレス（Program-Derived Address）**は、以下の特性を持つ公開鍵です：
+
+- ed25519 曲線上にない（それに対応する秘密鍵が存在しない）。
+- プログラム ID とシードのセットから決定論的に導出される。
+- 導出プログラム *のみ* が `invoke_signed` を介して署名できる。
+
+すべての Raydium プール権限、すべてのプール状態アカウント、すべてのボールト、すべてのファーム状態 — これらはすべて PDA です。
+
+### 導出
+
+PDA は、プログラム ID とシードをハッシュ化し、結果を曲線外に強制する「バンプ」バイトを見つけることで計算されます。オフカーブアドレスを生成する最初のバンプ（通常は 255 から開始して減少）が **正規バンプ** となります。
+
+```ts
+import { PublicKey } from "@solana/web3.js";
+
+const [poolAuthority, bump] = PublicKey.findProgramAddressSync(
+  [Buffer.from("authority"), poolId.toBuffer()],
+  CPMM_PROGRAM_ID,
+);
+```
+
+シードは任意の値です。文字列、他の公開鍵、`u64` 値をリトルエンディアンのバイト列として表現したものなど。Raydium の慣例は、人間が読める接頭辞の後に一意の識別子を付けることです。
+
+### Raydium PDA パターン
+
+Raydium のプログラムで一般的な PDA：
+
+| PDA | シード | プログラム |
+|-----|-------|---------|
+| AMM 権限（AMM v4） | `[b"amm authority"]` + バンプ | AMM v4 |
+| プール状態（CPMM） | `[b"pool", amm_config, mint_a, mint_b]` | CPMM |
+| プールボールト（CPMM） | `[b"pool_vault", pool, mint]` | CPMM |
+| 権限（CPMM） | `[b"vault_and_lp_mint_auth_seed"]` | CPMM |
+| プール状態（CLMM） | `[b"pool", amm_config, mint_0, mint_1]` | CLMM |
+| ティック配列（CLMM） | `[b"tick_array", pool, start_tick_index]` | CLMM |
+| オブザーベーション（CLMM） | `[b"observation", pool]` | CLMM |
+| パーソナルポジション（CLMM） | `[b"position", position_nft_mint]` | CLMM |
+| ファーム状態（Farm v6） | `[b"pool_farm_state", farm_id]` | Farm v6 |
+| ユーザーレッジャー（Farm v6） | `[b"user_ledger", farm, user]` | Farm v6 |
+
+ユーザーとインテグレーターは、何も取得することなくこれらを計算できます。公開入力（プール ID、ファーム ID、ユーザーキー）が与えられれば、PDA は決定論的です。
+
+### 正規バンプ
+
+原則的には複数のバンプがオフカーブアドレスを生成する可能性がありますが、Raydium のプログラムは常に **正規バンプ** を使用します（255 から減少させて見つけたもの）。これは PDA のアカウントデータに保存されているため、後続のトランザクションはそれを渡して（計算コストが高い）導出ループをスキップできます：
+
+```rust
+#[account]
+pub struct PoolState {
+    pub bump: [u8; 1],
+    // ... 残りのプール状態
+}
+```
+
+後続のトランザクションでは、バンプは再計算されるのではなく、プール状態から読み取られます。
+
+## CPI：他のプログラムの呼び出し
+
+**クロスプログラム呼び出し（Cross-Program Invocation）**により、プログラムは単一のトランザクション内で別のプログラムの命令をインラインで呼び出せます。Raydium は CPI を広範に使用しています：
+
+- スワップ命令は SPL Token プログラムを呼び出してトークンを移動させる。
+- CLMM は Metaplex を呼び出してポジション NFT をミントする。
+- プール作成はシステムプログラムを呼び出してアカウントを割り当てる。
+- Farm v6 は SPL Token を呼び出して報酬を転送する。
+
+インテグレーターは CPI を使用して Raydium *に呼び出す* こともできます。これはボール戦略、レバレッジ LP プロトコル、オートコンパウンダーの動作方式です。詳細は [`integration-guides/cpi-integration`](/ja/integration-guides/cpi-integration) を参照してください。
+
+### invoke と invoke_signed
+
+Solana ランタイムは 2 つの CPI プリミティブを提供します：
+
+- **`invoke`**：別のプログラムを呼び出す。呼び出されたプログラムは外側のトランザクションの署名者を継承する。
+- **`invoke_signed`**：別のプログラムを PDA *の代わりに* 呼び出す。ランタイムは PDA のシードを検証し、署名を認可する。
+
+`invoke_signed` は、プログラムが秘密鍵を管理することなくアカウントの権限を保持することを可能にする魔法です。
+
+### 例：Raydium がプールボールトから転送する場合
+
+プールボールトは、権限がプールプログラムの PDA である Token Account です。スワップ中にトークンを転送するには、プールプログラムはその PDA として署名する必要があります：
+
+```rust
+// プール権限のシード
+let authority_seeds: &[&[u8]] = &[
+    b"vault_and_lp_mint_auth_seed",
+    &[authority_bump],
+];
+let signer_seeds: &[&[&[u8]]] = &[authority_seeds];
+
+// CPI コンテキストを構築
+let cpi_accounts = Transfer {
+    from:      input_vault.to_account_info(),
+    to:        user_ata.to_account_info(),
+    authority: pool_authority.to_account_info(),
+};
+let cpi_program = token_program.to_account_info();
+let cpi_ctx     = CpiContext::new_with_signer(cpi_program, cpi_accounts, signer_seeds);
+
+// 実行
+token::transfer(cpi_ctx, amount)?;
+```
+
+ランタイムは `invoke_signed` が CPMM プログラムによって呼び出されていることを確認し、`vault_and_lp_mint_auth_seed + バンプ` が CPMM プログラム ID でハッシュ化されたとき `pool_authority` のアドレスに導出されることを検証し、トークン転送の権限署名を許可します。秘密鍵は関係ありません。
+
+### 例：インテグレーターが Raydium CPMM を呼び出す場合
+
+インテグレータープログラム（例：エスクロー）は、CPI を経由して Raydium の `swap_base_input` を呼び出すことができます：
+
+```rust
+use raydium_cpmm::cpi::{self, accounts::Swap};
+
+let cpi_accounts = Swap {
+    payer:                order.to_account_info(),      // PDA、署名する
+    authority:            pool_authority_info,
+    amm_config:           amm_config_info,
+    pool_state:           pool_info,
+    input_token_account:  order_input_ata,
+    output_token_account: order_output_ata,
+    input_vault:          input_vault_info,
+    output_vault:         output_vault_info,
+    input_token_program:  input_token_program_info,
+    output_token_program: output_token_program_info,
+    input_token_mint:     input_mint_info,
+    output_token_mint:    output_mint_info,
+    observation_state:    observation_info,
+};
+
+let seeds = &[b"order", user.key.as_ref(), &[order.bump]];
+let cpi_ctx = CpiContext::new_with_signer(
+    cpmm_program.to_account_info(),
+    cpi_accounts,
+    &[seeds],
+);
+
+cpi::swap_base_input(cpi_ctx, amount_in, min_out)?;
+```
+
+これは標準的なインテグレーションパターンです。完全なエスクロー例については [`integration-guides/cpi-integration`](/ja/integration-guides/cpi-integration) を参照してください。
+
+## CPI 深度制限
+
+Solana は CPI の深度を **4 レベル** に制限しています。トランザクションの最上位命令は深度 0 としてカウントされ、各 CPI 呼び出しで深度が 1 つインクリメントされます。
+
+実用的な影響：Raydium 自体のスワップは既に 1～2 レベルの CPI を使用しています（Raydium → SPL Token）。Raydium を呼び出すインテグレーターは 2 を使用します。そのインテグレーターが別のインテグレーターによって呼び出される場合、それは 3 です。4 番目のレベルが上限です。
+
+ほとんどの組み合わせはこれを簡単に下回りますが、深いネスト（アグリゲーター → ルーター → Raydium → フック）では上限に達する可能性があります。深くではなく、平坦な設計にしましょう。
+
+## 残りのアカウント
+
+Raydium 命令が可変数のアカウントを必要とする場合（例えば、不明な数のティック配列を交差する CLMM スワップ）、追加のアカウントは **残りのアカウント** として渡されます。固定アカウントリストに追加され、位置によって解釈されます。
+
+CPMM の `SwapV2` は、転送フック プログラムの追加の必要なアカウントのために残りのアカウントを使用しています。クライアントは必要なアカウントを取得して追加します：
+
+```ts
+const swapIx = await raydium.cpmm.swap({
+  /* ... */
+  // SDK は残りのアカウントを自動的に処理します
+});
+```
+
+CPI レベルでは、インテグレーターは独自の命令を通じて残りのアカウントを転送する必要があります：
+
+```rust
+pub struct Swap<'info> {
+    // ... 固定アカウント
+    // + ctx.remaining_accounts を経由して転送された残りのアカウント
+}
+
+// CPI に remaining_accounts を転送
+cpi::swap_base_input(
+    cpi_ctx.with_remaining_accounts(ctx.remaining_accounts.to_vec()),
+    amount_in,
+    min_out,
+)?;
+```
+
+## PDA のピットフォール
+
+### シードが間違っている → アドレスが間違っている
+
+シードが正しい順序にない、正しくエンコードされていない、または余分なバイトを含む、あるいは除外するバグがある場合、サイレントに異なる PDA が生成されます。トランザクションは曖昧に失敗します（プログラムは存在しないアカウントを読み込もうとします）。シード導出の単体テストを常に既知のゴールデン値に対して実施してください。
+
+### バンプを保存しない
+
+すべてのトランザクションでバンプを再導出すると、導出ループの計算コストがかかります。正規バンプを PDA のデータに保存し、そこから読み取ってください。
+
+### 正規バンプと非正規バンプの混同
+
+非正規バンプ（オフカーブを生成するものが見つかった場合）は `invoke_signed` によって許可されますが、`assert_eq!(bump, canonical_bump)` を通じて Raydium のプログラムによって拒否されます。誰かが非正規バンプで PDA を請求しようとすると、トランザクションは失敗します。
+
+### あなたが所有プログラムではないときに PDA を署名者として渡す
+
+PDA の導出に含まれるプログラム ID を持つプログラムのみが、そのシードで `invoke_signed` できます。試みると、ランタイムが拒否します。
+
+## CPI のピットフォール
+
+### `remaining_accounts` を転送し忘れる
+
+外側の命令が `remaining_accounts` に転送フックアカウントを渡しますが、CPI が Raydium に転送しない場合、Raydium はフックアカウントを見つけられないため失敗します。CPI が必要な場合は常に `with_remaining_accounts` を含めてください。
+
+### 書き込み可能フラグの不一致
+
+外側の命令が書き込み可能とマークするアカウントは、呼び出されたプログラムが書き込むつもりの場合、CPI 呼び出しでも書き込み可能である必要があります。不一致 → ランタイム拒否。
+
+### レント対応を考慮していない
+
+アカウントを作成するプログラムへの CPI（例：ATA 作成）には、ペイヤーがレントのための十分な SOL を必要とします。失敗したレントチェックは不明瞭なエラーとして表示されます。
+
+## 実装例：Raydium CPMM PDA の計算
+
+```ts
+import { PublicKey } from "@solana/web3.js";
+
+const CPMM_PROGRAM_ID = new PublicKey("CPMMoo8L3F4NbTegBCKVNunggL7H1Zpdmwpwh8KMoZ0F");
+
+function computeCpmmPdas(ammConfig, mintA, mintB) {
+  const [poolState, poolBump] = PublicKey.findProgramAddressSync(
+    [
+      Buffer.from("pool"),
+      ammConfig.toBuffer(),
+      mintA.toBuffer(),
+      mintB.toBuffer(),
+    ],
+    CPMM_PROGRAM_ID,
+  );
+
+  const [authority] = PublicKey.findProgramAddressSync(
+    [Buffer.from("vault_and_lp_mint_auth_seed")],
+    CPMM_PROGRAM_ID,
+  );
+
+  const [vaultA] = PublicKey.findProgramAddressSync(
+    [Buffer.from("pool_vault"), poolState.toBuffer(), mintA.toBuffer()],
+    CPMM_PROGRAM_ID,
+  );
+
+  const [vaultB] = PublicKey.findProgramAddressSync(
+    [Buffer.from("pool_vault"), poolState.toBuffer(), mintB.toBuffer()],
+    CPMM_PROGRAM_ID,
+  );
+
+  const [observation] = PublicKey.findProgramAddressSync(
+    [Buffer.from("observation"), poolState.toBuffer()],
+    CPMM_PROGRAM_ID,
+  );
+
+  return { poolState, authority, vaultA, vaultB, observation, poolBump };
+}
+```
+
+これはまさに Raydium SDK が `getPoolInfoFromRpc({ poolId })` を呼び出すときの内部動作です。ラウンドトリップなしに関連 PDA を導出します。
+
+## 参照
+
+- [`solana-fundamentals/account-model`](/ja/solana-fundamentals/account-model) — PDA がアカウントモデルにどのように適合するか。
+- [`solana-fundamentals/programs-and-anchor`](/ja/solana-fundamentals/programs-and-anchor) — PDA の宣言に関する Anchor のヘルパー。
+- [`integration-guides/cpi-integration`](/ja/integration-guides/cpi-integration) — Raydium に CPI する統合の構築。
+- [`sdk-api/rust-cpi`](/ja/sdk-api/rust-cpi) — Raydium の Rust CPI 型。
+
+出典：
+
+- [Solana PDA ドキュメント](https://docs.solana.com/developing/programming-model/calling-between-programs)
+- [Anchor PDA & CPI ドキュメント](https://www.anchor-lang.com/docs/pdas-and-cpis)

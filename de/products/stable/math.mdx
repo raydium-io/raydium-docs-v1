@@ -1,0 +1,143 @@
+---
+title: "Stable-AMM-Mathematik"
+description: "Binäre Suche und lineare Interpolation zur Quotierung von Preisen aus der Nachschlagetabelle. Gebührenanwendung identisch mit AMM v4. OpenBook-Integration und MonitorStep."
+---
+
+<Info>
+  **Diese Seite wurde mit KI automatisch übersetzt. Maßgeblich ist stets die englische Version.**
+
+  [Englische Version ansehen →](/products/stable/math)
+</Info>
+
+## Die Nachschlagetabellen-Kurve
+
+Stable AMM ersetzt die Formel x·y=k durch eine **sparsame Nachschlagetabelle** von (x, y, price)-Tupeln. Beim Quotieren eines Swaps führt das Programm Folgendes durch:
+
+1. Berechnet das aktuelle Verhältnis des Pools aus den Reserven.
+2. **Binäre Suche** in der Tabelle, um die zwei Einträge zu finden, die dieses Verhältnis einrahmen.
+3. **Lineare Interpolation** zwischen ihnen, um einen Zwischenpreis zu erhalten.
+4. Wendet Gebühren an und gibt das Angebot zurück.
+
+Dieser Ansatz tauscht die Determiniertheit einer Formel gegen **Administrator-Flexibilität** bei der Preisgestaltung ein und ist effizient genug, um in Solanas Rechenbudget zu passen.
+
+## Tabellen-Layout und binäre Suche
+
+`ModelDataInfo` enthält bis zu 50.000 `DataElement`-Einträge, indiziert durch den Administrator. Nur die ersten `valid_data_count` sind aktiv. Jeder Eintrag:
+
+```
+DataElement {
+  x: u64,      // X-Koordinate (Coin-seitige Menge, skaliert)
+  y: u64,      // Y-Koordinate (PC-seitige Menge, skaliert)
+  price: u64,  // price = x/y, skaliert nach Multiplikator
+}
+```
+
+Um einen Preis bei den aktuellen Pool-Reserven (x_real, y_real) zu finden:
+
+1. Berechnen Sie das Verhältnis: `target_ratio = (x_real * multiplier) / y_real`.
+2. Binäre Suche nach Einträgen, wobei `(element.x * multiplier) / element.y` das `target_ratio` einklammmert.
+3. Wenn eine Klammer `[min_idx, max_idx]` gefunden wird, interpolieren Sie.
+
+Der binäre Suchcode des Programms erstreckt sich über ~150 Zeilen in `state.rs::ModelDataInfo::get_mininum_range_by_xy_real`. Die wichtige Invariante: **Einträge müssen sortiert sein** (x aufsteigend, y absteigend, price aufsteigend), damit die Suche funktioniert.
+
+## Lineare Interpolation
+
+Sobald zwei Tabellenpunkte das Verhältnis einklammmern, berechnet die Interpolation einen Zwischenpreis und ein Reservenpaar:
+
+```
+target = (x_real * multiplier) / y_real
+
+[x1, y1, p1] = table[min_idx]
+[x2, y2, p2] = table[max_idx]
+
+// Preis interpolieren
+p = p1 + (p2 - p1) * (target - ratio1) / (ratio2 - ratio1)
+
+// Reserve interpolieren
+x = x1 + (x2 - x1) * (target - ratio1) / (ratio2 - ratio1)
+y = y1 + (y2 - y1) * (target - ratio1) / (ratio2 - ratio1)
+```
+
+Das Ergebnis ist eine stückweise-lineare Kurve, die die Tabellenpunkte sanft verbindet.
+
+## Skalierung: der Multiplikator
+
+Pool-Reserven und Preise werden in unterschiedlichen Maßstäben gespeichert. Das Feld `multiplier` auf `ModelDataInfo` berücksichtigt dies. Ein übliches Muster:
+
+- Coin hat 6 Dezimalstellen, PC hat 18 Dezimalstellen.
+- Multiplikator = 10^6 (oder ähnlich).
+- Tabelleneinträge werden in reduziertem Maßstab gespeichert, um u64-Grenzen einzuhalten.
+
+Das Programm skaliert beim Lesen/Schreiben um:
+
+```
+real_value = table_value * ratio / multiplier
+table_value = real_value * multiplier / ratio
+```
+
+## Swap-Preisgestaltung: `SwapBaseIn` und `SwapBaseOut`
+
+### SwapBaseIn (exakte Eingabe)
+
+Gegeben eine Eingabemenge `amount_in`:
+
+1. Holen Sie sich das aktuelle Verhältnis aus `(coin_vault, pc_vault)`.
+2. Suchen Sie einrahmende Tabelleneinträge und interpolieren Sie, um das Tabellenraum-Verhältnis zu erhalten.
+3. Konvertieren Sie die Eingabe in Tabellenraum: `dx_table = amount_in * multiplier / ratio`.
+4. Fragen Sie die Tabelle bei der neuen X-Koordinate ab, um die neue Y zu finden.
+5. `dy_table = y_old - y_new`.
+6. Konvertieren Sie zurück: `dy_real = dy_table * ratio / multiplier`.
+7. Wenden Sie die Handelsgebühr an: `dy_output = dy_real - (dy_real * trade_fee_numerator / trade_fee_denominator)`.
+8. Geben Sie `dy_output` zurück.
+
+### SwapBaseOut (exakte Ausgabe)
+
+Symmetrisch: Gegeben die gewünschte `amount_out`, lösen Sie das erforderliche `amount_in`.
+
+Beide Pfade settlen zuerst erfüllte OpenBook-Aufträge (über interne `MonitorStep`-ähnliche Logik), sodass die effektiven Reserven alle Erfüllungen aus dem vorherigen Block widerspiegeln.
+
+## Gebührenanwendung
+
+Identisch mit AMM v4: siehe [`products/amm-v4/math`](/de/products/amm-v4/math) für die vollständige Ableitung.
+
+```
+gross_fee = amount_in * (swap_fee_numerator / swap_fee_denominator)    // z. B. 0,25%
+lp_portion = gross_fee - (gross_fee * pnl_numerator / pnl_denominator) // z. B. 0,22%
+pnl_portion = gross_fee * (pnl_numerator / pnl_denominator)            // z. B. 0,03%
+```
+
+Der `pnl_portion` geht an `need_take_pnl_*` und wird vom Administrator über `WithdrawPnl` abgeräumt. Der `lp_portion` bleibt im Tresor und erhöht `k`, was LP-Token-Inhabern zugute kommt.
+
+## MonitorStep und OpenBook
+
+Wie AMM v4 ist `MonitorStep` eine **Crank-Anweisung**, die:
+
+1. Ausstehende OpenBook-Auftragserfüllungen settelt (verschiebt Token von Tresoren in den Pool).
+2. `AmmInfo.target_orders` mit einem neuen Raster von Limit-Order-Slots aktualisiert.
+3. Das neue Raster auf OpenBook postet.
+
+Das Raster wird aus der Tabelle berechnet: Das Programm nutzt die Nachschlagetabelle, um Preispunkte zu finden und übersetzt sie in OpenBook-Aufträge.
+
+**Rechenkosten** von `MonitorStep`: ~150k–180k CU (ähnlich wie AMM v4).
+
+## Zusammenfassung: warum dies funktioniert
+
+Das Nachschlagetabellen- + Interpolations-Design ist **effizient und flexibel**:
+
+- **Effizienz:** Binäre Suche ist O(log 50.000) ≈ 16 Iterationen, jeweils ~ 300–500 CU. Interpolation sind wenige Multiplikationen/Divisionen. Die Gesamtquotierungskosten betragen ~5k–15k CU, viel günstiger als die Neuberechnung einer Formel bei jedem Swap.
+- **Flexibilität:** Der Administrator kann jede stückweise-lineare Kurve codieren. Stablecoin-Paare erhalten hohe Dichte um 1:1; besicherte Paare erhalten benutzerdefinierte Kurven.
+- **OpenBook-Komposabilität:** Die gleiche `MonitorStep` / `TargetOrders`-Logik von AMM v4 gilt. Die Preiserkennung über die Tabelle fließt in die Order-Grid-Generierung.
+
+Für tiefere Einblicke in die Interpolationslogik siehe `raydium-stable/program/src/state.rs`, Methoden `get_data_by_x`, `get_data_by_y`, `get_dy_by_dx_base_in` usw.
+
+## Wo geht es weiter
+
+- [Accounts](/de/products/stable/accounts) — `ModelDataInfo` und `DataElement`-Feldverweis.
+- [Instructions](/de/products/stable/instructions) — `InitModelData`, `UpdateModelData` zum Befüllen der Tabelle.
+- [Fees](/de/products/stable/fees) — Gebührenanwendung und `WithdrawPnl`.
+- [`products/amm-v4/math`](/de/products/amm-v4/math) — für die OpenBook-gebühreninklusive Order-Preislogik.
+
+Quellen:
+
+- `raydium-stable/program/src/state.rs` (Implementierungen der Interpolation und binären Suche)
+- `raydium-stable/program/src/math.rs` (Calculator-Dienstprogramme)

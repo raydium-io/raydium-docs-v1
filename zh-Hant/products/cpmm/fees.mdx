@@ -1,0 +1,264 @@
+---
+title: "CPMM 手續費"
+description: "CPMM 如何收取交易手續費與獨立的創作者手續費、將交易手續費分配給流動性提供者、協議國庫與基金多簽、以及各方何時收取的詳細說明。"
+---
+
+<Info>
+  **本頁內容由 AI 自動翻譯，所有內容以英文版本為準。**
+
+  [查看英文版 →](/products/cpmm/fees)
+</Info>
+
+## 兩筆獨立手續費，四個目的地
+
+CPMM 針對每筆交換收取**兩筆獨立費率的手續費**：
+
+1. **交易手續費** — 按照 `AmmConfig.trade_fee_rate` 收取，分配至三個目的地：
+   - **LP 份額** — 留存在金庫中並增加 `k`。透過燒毀 LP 代幣隱式領取。
+   - **協議份額** — 累積至 `PoolState.protocol_fees_token*`；由 `protocol_owner` 透過 `CollectProtocolFee` 領取。
+   - **基金份額** — 累積至 `PoolState.fund_fees_token*`；由 `fund_owner` 透過 `CollectFundFee` 領取。
+2. **創作者手續費**（選擇性，每個池） — 按照 `AmmConfig.creator_fee_rate` 收取，**獨立於**交易手續費，累積至 `PoolState.creator_fees_token*`，由 `pool_state.pool_creator` 透過 `CollectCreatorFee` 領取。僅在池以 `enable_creator_fee = true` 創建時有效。
+
+創作者手續費**不是**交易手續費的一部分。這兩筆費率在交換輸入時是相加的，但各自構成獨立的桶 — 協議與基金份額永遠只來自 `trade_fee`，絕不來自 `creator_fee`。一個池若 `creator_fee_rate = 1000`（0.10%）且 `trade_fee_rate = 2500`（0.25%），在創作者手續費從輸入側收取的交換中，將對輸入收取合計 0.35%，其中創作者保留 0.10%，交易手續費桶獲得 0.25%。
+
+交易手續費費率（`trade_fee_rate`、`protocol_fee_rate`、`fund_fee_rate`）與 `creator_fee_rate` 都位於 `AmmConfig`。每個池的 `enable_creator_fee` 旗標與 `creator_fee_on` 模式（創作者手續費從交易的哪一側收取）位於 `PoolState`。參見 [`products/cpmm/accounts`](/zh-Hant/products/cpmm/accounts)。
+
+## 費率與單位
+
+所有費率都是 `u64`，以 `1 / FEE_RATE_DENOMINATOR` 為單位計算，其中 `FEE_RATE_DENOMINATOR = 1_000_000`。
+
+- **`trade_fee_rate`** 是**交換量**的分數。`2500` ⇒ 相關側（輸入或輸出，取決於 `creator_fee_on` — 參見下方「手續費從交易的哪一側收取」）的 0.25%。
+- **`creator_fee_rate`** 是**交換量**的分數，**獨立於**交易手續費收取。`1000` ⇒ 相關側的 0.10%。
+- **`protocol_fee_rate`** 與 **`fund_fee_rate`** 是**交易手續費**的分數，而非交換量的分數。`120_000` ⇒ 交易手續費的 12%。
+
+主網上 `AmmConfig[index=0]`（「標準」0.25% 池）的預設參數，供參考：
+
+| 欄位 | 值 | 有效百分比 |
+|-------|-------|-------------------|
+| `trade_fee_rate` | `2500` | 交換量的 0.25%（交易手續費桶） |
+| `protocol_fee_rate` | `120000` | 交易手續費的 12% ≈ **交換量的 0.030%** |
+| `fund_fee_rate` | `40000` | 交易手續費的 4% ≈ **交換量的 0.010%** |
+| `creator_fee_rate` | `0`（預設） | 0%（獨立桶） |
+| → LP 份額有效 | | **交換量的 0.210%** |
+
+因此在對 `AmmConfig[0]` 進行 \$1,000 交換且 `enable_creator_fee = false` 時：總交易手續費 \$2.50，其中 \$2.10 留給 LP，\$0.30 流向協議，\$0.10 流向基金。創作者桶為 0，因為創作者手續費已停用。
+
+如果同一池有 `enable_creator_fee = true` 和 `creator_fee_rate = 1000`（0.10%），使用者額外支付 \$1.00 給創作者桶 — 從 `creator_fee_on` 設定的同一側收取 — 總手續費為 \$3.50。交易手續費桶及其協議/基金分配保持不變。
+
+確認目前的主網數值：`GET https://api-v3.raydium.io/main/cpmm-config` — 費率可由管理員修改，應該重新取得而非硬編碼。
+
+## 程式碼中的分配
+
+```rust
+// 改寫自 raydium-cp-swap/programs/cp-swap/src/curve/{calculator,fees}.rs。
+// 實際程式碼根據 `is_creator_fee_on_input` 分支；兩個分支都保持
+// creator_fee 是獨立費率（永不為 trade_fee 的一部分）的不變式。
+
+const FEE_RATE_DENOMINATOR_VALUE: u64 = 1_000_000;
+
+pub struct FeeBreakdown {
+    pub amount_in_after_fees: u64,    // 輸入減去在輸入側收取的所有手續費
+    pub amount_out_after_fees: u64,   // 輸出減去在輸出側收取的任何創作者手續費
+    pub trade_fee:    u64,            // → 分配至下面 LP / 協議 / 基金桶
+    pub protocol_fee: u64,            // 交易手續費的份額
+    pub fund_fee:     u64,            // 交易手續費的份額
+    pub creator_fee:  u64,            // 獨立桶（輸入或輸出側）
+}
+
+fn take_fees_on_input(
+    amount_in: u64,
+    trade_rate: u64,
+    creator_rate: u64,
+    protocol_rate: u64,
+    fund_rate: u64,
+) -> (u64 /* trade_fee */, u64 /* creator_fee */, u64 /* amount_in_after_fees */) {
+    // 兩筆費率相加，以便在合計手續費上只進行一次四捨五入，然後按比例分配
+    // — 這純粹是一個四捨五入/效率技巧。分配遵守費率確切值：
+    // creator_fee/trade_fee == creator_rate/trade_rate。
+    let total_fee = ((amount_in as u128) * ((trade_rate + creator_rate) as u128))
+        .div_ceil(FEE_RATE_DENOMINATOR_VALUE as u128) as u64;
+
+    let creator_fee = ((total_fee as u128) * (creator_rate as u128)
+                       / ((trade_rate + creator_rate) as u128)) as u64;
+    let trade_fee   = total_fee - creator_fee;
+
+    (trade_fee, creator_fee, amount_in - total_fee)
+}
+
+fn take_creator_fee_on_output(amount_out_swapped: u64, creator_rate: u64) -> (u64, u64) {
+    // 當 creator_fee_on 將創作者手續費路由至輸出側時，
+    // trade_fee 以單一費率從輸入收取，creator_fee
+    // 根據曲線輸出計算。
+    let creator_fee = ((amount_out_swapped as u128) * (creator_rate as u128))
+        .div_ceil(FEE_RATE_DENOMINATOR_VALUE as u128) as u64;
+    (amount_out_swapped - creator_fee, creator_fee)
+}
+
+fn split_trade_fee(
+    trade_fee: u64,
+    protocol_rate: u64,
+    fund_rate: u64,
+) -> (u64 /* protocol_fee */, u64 /* fund_fee */) {
+    let protocol_fee = (trade_fee as u128 * protocol_rate as u128
+                        / FEE_RATE_DENOMINATOR_VALUE as u128) as u64;
+    let fund_fee     = (trade_fee as u128 * fund_rate as u128
+                        / FEE_RATE_DENOMINATOR_VALUE as u128) as u64;
+    (protocol_fee, fund_fee)
+}
+```
+
+注意事項：
+
+- 輸入上的總手續費向上四捨五入，以便池不會少收。
+- `trade_fee` 的子分配（協議、基金）向下四捨五入，使其總和永不超過 `trade_fee`；剩餘部分是 LP 份額。
+- `lp_share = trade_fee − protocol_fee − fund_fee`（creator_fee **不會**在此扣除，因為它是獨立桶）。
+- 創作者手續費根據 `PoolState.creator_fee_on` 從輸入或輸出側收取（參見下一章節）。費率無論哪種方式都不變。
+
+## 手續費從交易的哪一側收取
+
+CPMM 有一個每池的 `creator_fee_on` 設定（`BothToken` / `OnlyToken0` / `OnlyToken1`），決定創作者手續費是從給定交換的**輸入**側還是**輸出**側收取。執行時輔助函式 `is_creator_fee_on_input(direction)` 將其折疊為每筆交換的布林值：
+
+| `creator_fee_on` | 交換 `0 → 1` | 交換 `1 → 0` |
+|------------------|---------------|---------------|
+| `BothToken` (`0`) | 輸入側 | 輸入側 |
+| `OnlyToken0` (`1`) | 輸入側 | 輸出側 |
+| `OnlyToken1` (`2`) | 輸出側 | 輸入側 |
+
+當創作者手續費在**輸入**側時，交易手續費與創作者手續費都在曲線執行前從 `amount_in` 扣除。報價數學：從輸入取出合計 `trade_rate + creator_rate`。
+
+當創作者手續費在**輸出**側時，只有交易手續費從 `amount_in` 扣除；曲線產生未收費的輸出，然後從該輸出扣除創作者手續費。報價數學：從輸入取出 `trade_rate`；從輸出取出 `creator_rate`。
+
+交易手續費本身永遠從輸入側收取（標準 Uniswap-V2 模式）。只有創作者手續費可以在輸出側。
+
+## 「累積」手續費如何與曲線互動
+
+一個重要的微妙之處：**協議、基金與創作者手續費實際上停留在金庫中**，直到各自的 `Collect*` 指令被呼叫。但它們被排除在曲線對金庫餘額的檢視之外。
+
+一次交換後的具體情況：
+
+```
+raw_vault_0_balance = getTokenAccountBalance(vault_0).amount
+                    = lp_entitled + protocol_fees_token0
+                      + fund_fees_token0 + creator_fees_token0
+
+curve_x = raw_vault_0_balance − (protocol_fees_token0
+                                  + fund_fees_token0
+                                  + creator_fees_token0)
+```
+
+當強制執行 `k' ≥ k` 時，程式使用 `curve_x`（及類似的 `curve_y`）。這就是非 LP 手續費到達其目的地**而不**增加 LP 池份額的方式。
+
+您應該圍繞此設計的後果：
+
+- **從原始餘額報價是錯誤的。** 如果您基於 `getTokenAccountBalance` 建立報價工具，您會持續高估池將履行的價格。請務必扣除累積手續費或透過 `SwapBaseInput` / API 模擬。
+- **`CollectProtocolFee` 不會改變價格。** 它將代幣移出金庫*並*將 `protocol_fees_token*` 計數器清零，所以 `curve_x` 與 `curve_y` 不變。
+- **LP 手續費不累積至計數器。** 它們隱含在金庫餘額中。LP 對累積 LP 手續費的權利透過燒毀 LP 代幣（即透過 `Withdraw`）行使 — 沒有 `CollectLpFee`。
+
+## 與 Token-2022 轉帳手續費的互動
+
+Token-2022 轉帳手續費由**鑄幣廠**應用，不是由 CPMM 應用。它們作用於每筆代幣轉帳 — 交換、存入、提取與 `Collect*` 領取。CPMM 的交易手續費數學是根據**實際到達金庫**的金額計算，即淨扣除輸入鑄幣廠的轉帳手續費（如有）。
+
+因此在最壞的情況下，使用者在輸入精確交換上支付三筆不同的稅：
+
+1. 輸入鑄幣廠在 `amount_in` 上的轉帳手續費（流向鑄幣廠的手續費權限持有者）。
+2. 池在其餘額上的 `trade_fee`（按上述分配）。
+3. 輸出鑄幣廠在 `amount_out` 上的轉帳手續費（流向鑄幣廠的手續費權限持有者）。
+
+SDK 的報價工具考慮所有三筆，所以 `minimum_amount_out` 以使用者實際收到的金額計算。如果您正在編寫自己的報價工具，請鏡像該行為，否則您的滑點檢查將系統性地過於寬鬆。
+
+詳見 [`algorithms/token-2022-transfer-fees`](/zh-Hant/algorithms/token-2022-transfer-fees)。
+
+## 創作者手續費
+
+創作者手續費是可選的，且每池一次。**費率**位於 `AmmConfig.creator_fee_rate`；**啟用旗標**與**側別**（`creator_fee_on`）位於 `PoolState`：
+
+- **在池創建時啟用。** `Initialize` 預設設定 `enable_creator_fee = false`；透過 `InitializeWithPermission` 創建的池（由 LaunchLab 畢業與其他有門檻的路徑使用）可以傳遞 `enable_creator_fee = true` 並選擇 `creator_fee_on`。
+- **費率與費率層級共享。** 費率本身是 `AmmConfig.creator_fee_rate`，在與該設定綁定的每個池中都是相同值。每個池隨後決定是否收取它（`enable_creator_fee`）以及從交換的哪一側收取它（`creator_fee_on`）。當 `enable_creator_fee = false` 時，無論設定值如何，池的有效創作者手續費率都是零（參見來源中的 `PoolState::adjust_creator_fee_rate`）。
+- **獨立於交易手續費。** 創作者手續費絕不會減少 LP / 協議 / 基金份額 — 它是自己的費率，單獨應用，累積在自己的計數器中。
+- **透過 `CollectCreatorFee` 領取**，由 `PoolState.pool_creator` 簽署。
+- **創建後無法重新啟用或重新路由。** 以 `enable_creator_fee = false` 初始化的池將永不收取創作者手續費；以特定 `creator_fee_on` 初始化的池無法切換側別。
+
+創作者手續費是 Raydium 「燒毀與賺取」模式背後的機制：LP 代幣在 [LP Lock](/zh-Hant/reference/program-addresses) 程式下被鎖定，所以創作者無法提取流動性，但可以無限期地領取 `CollectCreatorFee`。
+
+## 收集操作流程
+
+| 簽署者 | 指令 | 清零的來源計數器 | 典型頻率 |
+|--------|-------------|------------------------|-----------------|
+| `amm_config.protocol_owner` | `CollectProtocolFee` | `protocol_fees_token{0,1}` | 每週或程式化 |
+| `amm_config.fund_owner` | `CollectFundFee` | `fund_fees_token{0,1}` | 每週或程式化 |
+| `pool_state.pool_creator` | `CollectCreatorFee` | `creator_fees_token{0,1}` | 任何時間 |
+
+協議與基金擁有者是主網上的 Raydium 多簽；參見 [`security/admin-and-multisig`](/zh-Hant/security/admin-and-multisig)。創作者簽署者是執行 `Initialize` 的帳戶。
+
+## 更改費率層級
+
+費率可由管理員透過 `UpdateAmmConfig` 更改（參見 [`products/cpmm/instructions`](/zh-Hant/products/cpmm/instructions)）。變更在**下筆交換**時對與該 `AmmConfig` 綁定的每個池生效 — 沒有遷移，因為池在每筆交換時載入設定。
+
+管理員無法做的事：
+
+- 將池從一個 `AmmConfig` 移動至另一個。
+- 回溯重新定價已累積的手續費。
+- 在沒有 `protocol_owner` / `fund_owner` 簽署者的情況下收集手續費。
+
+## 從執行中的池讀取手續費
+
+```ts
+// 鏈下：每個桶中目前累積的手續費
+const pool = await connection.getAccountInfo(poolStatePda);
+const decoded = PoolState.decode(pool.data);
+console.log(
+  "Protocol accrued:",
+  decoded.protocolFeesToken0.toString(),
+  decoded.protocolFeesToken1.toString(),
+);
+console.log(
+  "Fund accrued:",
+  decoded.fundFeesToken0.toString(),
+  decoded.fundFeesToken1.toString(),
+);
+console.log(
+  "Creator accrued:",
+  decoded.creatorFeesToken0.toString(),
+  decoded.creatorFeesToken1.toString(),
+);
+
+// 鏈下：今日有效費率。
+// trade_fee_rate、creator_fee_rate 是交換量的分數（分母 1e6）。
+// protocol_fee_rate、fund_fee_rate 是*交易手續費*的分數（相同分母）。
+const config = await fetch("https://api-v3.raydium.io/main/cpmm-config")
+  .then((r) => r.json());
+const tier = config.data.find((t) => t.index === decoded.ammConfigIndex);
+
+const tradeFeeOfVolume   = tier.tradeFeeRate / 1_000_000;
+const protocolOfTradeFee = tier.protocolFeeRate / 1_000_000;
+const fundOfTradeFee     = tier.fundFeeRate / 1_000_000;
+const lpOfTradeFee       = 1 - protocolOfTradeFee - fundOfTradeFee;
+
+console.log("LP fee effective:",       (tradeFeeOfVolume * lpOfTradeFee * 100).toFixed(4), "%");
+console.log("Protocol fee effective:", (tradeFeeOfVolume * protocolOfTradeFee * 100).toFixed(4), "%");
+console.log("Fund fee effective:",     (tradeFeeOfVolume * fundOfTradeFee * 100).toFixed(4), "%");
+console.log(
+  "Creator fee effective:",
+  decoded.enableCreatorFee
+    ? ((tier.creatorFeeRate / 1_000_000) * 100).toFixed(4) + " %"
+    : "0 % (disabled on this pool)",
+);
+```
+
+## 與 CLMM 和 AMM v4 的比較
+
+參見 [`reference/fee-comparison`](/zh-Hant/reference/fee-comparison) 以取得並列矩陣。摘要：
+
+- **AMM v4** 使用固定 0.25% 交易手續費，具有不同的 LP/協議分配，無基金手續費。
+- **CLMM** 手續費按每個刻度間距層級計算，按每個位置累積（不是按池），並透過 `DecreaseLiquidity` 或 `CollectFees` 領取。
+
+## 接下來去哪裡
+
+- [`products/cpmm/math`](/zh-Hant/products/cpmm/math) — 交易手續費扣除如何嵌入曲線。
+- [`products/cpmm/instructions`](/zh-Hant/products/cpmm/instructions) — `Collect*` 指令帳戶清單。
+- [`algorithms/token-2022-transfer-fees`](/zh-Hant/algorithms/token-2022-transfer-fees) — 如何正確合併池交易手續費與鑄幣廠轉帳手續費。
+
+來源：
+
+- [`raydium-io/raydium-cp-swap` — `states/config.rs`、`states/pool.rs`、`states/curve.rs`](https://github.com/raydium-io/raydium-cp-swap)
+- [Raydium API — `GET /main/cpmm-config`](https://api-v3.raydium.io/main/cpmm-config)

@@ -1,0 +1,113 @@
+---
+title: "CLMM overview"
+description: "What Raydium's CLMM is, how concentrated liquidity differs from a constant-product pool, and when to pick it over CPMM or AMM v4."
+---
+
+## One-paragraph summary
+
+CLMM — **C**oncentrated **L**iquidity **M**arket **M**aker — is Raydium's Uniswap-v3-style AMM. Instead of spreading a liquidity provider's deposit across the entire price curve, CLMM lets LPs deposit into a **specific price range**. Inside that range, every dollar of deposit is many times more productive than it would be in a CPMM pool; outside the range, the deposit earns nothing and sits as a single-sided balance. The program tracks liquidity per-**tick** (a discretized price bucket), prices pool state by the square root of the price encoded as a Q64.64 fixed-point number (`sqrt_price_x64`), and mints an **NFT** for each LP position rather than a fungible LP token.
+
+## What's new
+
+The latest CLMM release ships three additions on top of the Uniswap-v3-style core. They are opt-in at pool-creation time and backwards-compatible with existing pools and positions:
+
+- **Limit orders.** LPs can now park a single-tick order at a specific price and have the swap path fill it FIFO when the swap crosses that tick. Orders settle into the owner's ATA at the limit price; an off-chain keeper (`limit_order_admin`) can sweep filled orders without the owner being online. See [Instructions → OpenLimitOrder / SettleLimitOrder](/products/clmm/instructions) and [Math → Limit-order matching during swap](/products/clmm/math).
+- **Single-sided fee (`CollectFeeOn`).** Pools can be configured to take swap fees from the input side (legacy behaviour, mode `0`), or always from `token_0` (`1`), or always from `token_1` (`2`). Useful when one side of the pair is the canonical accounting token (e.g., USDC). See [Fees → Single-sided fee](/products/clmm/fees).
+- **Dynamic fee.** Pools can opt into a volatility-tracking fee surcharge that rises with rapid tick movement and decays over time. Calibrated by a per-tier `DynamicFeeConfig` and a per-pool `DynamicFeeInfo`. See [Fees → Dynamic fee](/products/clmm/fees) and [Math → Dynamic fee derivation](/products/clmm/math).
+
+A new instruction, `CreateCustomizablePool`, exposes all three knobs at pool-creation time. The classic `CreatePool` continues to work for default-fee pools without limit orders or dynamic fees.
+
+## What CLMM gives you
+
+- **Capital efficiency.** A stablecoin-stablecoin LP concentrating liquidity in a ±0.1% band around parity can earn 100×+ the fees per dollar of TVL compared to a CPMM pool of the same pair.
+- **Position-level fee accounting.** Fees accrue per-position, not per-LP-mint. Two positions on the same pool earn different fee amounts based on their ranges and the path the price has taken.
+- **Multiple fee tiers per pair.** A pair can have several CLMM pools, each bound to a different `AmmConfig` with its own trade-fee rate and tick-spacing. The web UI and routers surface whichever tier has the most liquidity at the current price.
+- **Incentivizable directly on the pool.** Up to three reward token streams can be attached to a pool; positions collect rewards pro-rata based on the seconds × in-range-liquidity they contribute. See [`products/clmm/fees`](/products/clmm/fees).
+- **NFT positions.** Each position is a non-fungible token with mint equal to a deterministic PDA. Transferring the NFT transfers the position; wallets and UIs can display positions the same way they display collectibles.
+- **Token-2022 support** on both sides of the pair, with the same extension restrictions as CPMM.
+
+## What CLMM is not
+
+- **Not set-it-and-forget-it.** A range set while SOL is \$160 will earn nothing if SOL moves to \$80, unless you actively adjust. CLMM rewards active LPs; passive LPs should stay with CPMM.
+- **Not zero-cost to open.** Each new tick-array the position crosses must be initialized, costing rent. Wide ranges are cheaper; narrow ones are not.
+- **Not a CLOB.** Unlike AMM v4, CLMM has no OpenBook dependency. All liquidity sits on the tick map.
+- **Not a superset of CPMM.** A CLMM position spanning `[tick_min, tick_max]` at maximum range behaves *similarly* to CPMM, but with different gas costs, a different fee accounting model, and no fungible LP token. If you want a simple fungible-LP pool, use CPMM.
+
+## How CLMM differs from CPMM and AMM v4
+
+| Dimension | AMM v4 | CPMM | CLMM |
+|-----------|--------|------|------|
+| Curve | Constant product | Constant product | Concentrated (tick-based) |
+| LP share | Fungible LP mint | Fungible LP mint | Per-position NFT |
+| Liquidity lives… | Across all prices | Across all prices | In a user-chosen range |
+| Fee tiers | Fixed 0.25% | Per `AmmConfig` (e.g., 0.25%, 1%) | Per `AmmConfig` × tick-spacing |
+| Active management | Not applicable | Not applicable | **Required** |
+| Fee accounting | Pool-level | Pool-level | Per-position |
+| Reward farms | Separate Farm program | Separate Farm program | Built-in (up to 3 rewards) |
+| Token-2022 | No | Yes | Yes |
+| On-chain oracle | No | `observation` ring | `observation` array per pool |
+
+## Mental model
+
+Think of a CLMM pool as three overlaid data structures:
+
+1. **A continuous curve in `sqrt_price` space.** The pool's price is represented as `sqrt_price_x64`, a Q64.64 fixed-point. Swaps walk along this curve; within a tick boundary, the math is standard concentrated-liquidity AMM math (see [`algorithms/clmm-math`](/algorithms/clmm-math)).
+2. **A discrete tick map.** Prices are quantized into ticks — integer powers of `1.0001`. Each tick has a known `sqrt_price`. Positions reference their endpoints as integer tick indices. Tick indices are grouped into fixed-size **tick arrays** for storage.
+3. **Per-position fee and reward bookkeeping.** Each position stores the global `fee_growth_inside` at the time of its last update. When the LP touches the position (open, close, adjust, collect), the program subtracts the stored value from the current global to compute what's owed. This is the Uniswap-v3 `feeGrowthInside0X128 / feeGrowthInside1X128` pattern.
+
+Every user action decomposes into state transitions on these three structures:
+
+- **Open position:** pick tick range, deposit tokens, mint NFT, insert liquidity into the tick map within the range, initialize any previously empty tick-arrays.
+- **Increase / decrease liquidity:** adjust the amount stored in the NFT's associated position account and in the tick map; collect accumulated fees at the same time.
+- **Swap:** walk from the current `sqrt_price_x64` in the direction of trade, consuming active liquidity until the input is exhausted or the next initialized tick is reached; cross the tick and pick up or drop liquidity on the new side.
+- **Collect fees / rewards:** compute `fee_growth_inside_now − fee_growth_inside_last` × `position_liquidity` for each side and each reward stream; transfer out.
+
+The pool is otherwise indifferent to which positions are open. Two LPs in the same range see the same fee-growth path, scaled by their individual `liquidity` amounts.
+
+## When to choose CLMM
+
+Pick CLMM when:
+
+- You are providing liquidity to a **stable or mean-reverting pair** (USDC/USDT, jitoSOL/SOL, wBTC/BTC) and want to concentrate near parity.
+- You are a **market maker** willing to monitor price and rebalance.
+- You specifically need **per-pool incentive emissions** without standing up a separate farm.
+- You need **per-position accounting** for your own LP product (vault, structured product, etc.).
+
+Prefer [CPMM](/products/cpmm) when:
+
+- You are launching a new token with unknown price discovery.
+- You want a single fungible LP token you can stake, lock, or compose with.
+- You want a passive LP experience.
+
+Prefer [AMM v4](/products/amm-v4) when:
+
+- You specifically need the hybrid-CLOB depth AMM v4 places on OpenBook.
+- You are migrating existing AMM v4 integrations and are not opening new positions.
+
+## Positions are NFTs
+
+A CLMM position is represented on-chain by two accounts:
+
+- A **position NFT mint** with supply 1.
+- A **personal-position state** account keyed to the NFT mint, holding the position's ticks, liquidity, and last-observed fee-growth values.
+
+Transferring the NFT transfers the position — the personal-position account's authority is the NFT owner. This is the same pattern Uniswap v3 pioneered, implemented in Solana's account model. A detailed treatment is in [`products/clmm/ticks-and-positions`](/products/clmm/ticks-and-positions).
+
+<Note>
+  Older CLMM releases also created a `ProtocolPositionState` account per `(pool, tick_lower, tick_upper)` to aggregate liquidity for that range. **Newer releases no longer create or use it** — the field still appears on `OpenPosition` / `IncreaseLiquidity` / `DecreaseLiquidity` account lists as an `UncheckedAccount` for ABI compatibility, but the program does not read or write it. Aggregate range bookkeeping lives on the tick endpoints (`liquidity_gross`, `liquidity_net`) directly.
+</Note>
+
+## Where to go next
+
+- [Accounts](/products/clmm/accounts) — the pool, config, tick-array, and position account layouts.
+- [Ticks and positions](/products/clmm/ticks-and-positions) — the tick map, tick-spacing, tick-array sizing, NFT-based positions.
+- [Math](/products/clmm/math) — `sqrt_price_x64`, swap step-through, `fee_growth_inside` derivation.
+- [Instructions](/products/clmm/instructions) — `OpenPosition`, `IncreaseLiquidity`, `Swap`, `CollectRewards`, the limit-order family, and `CreateCustomizablePool`.
+- [Fees and rewards](/products/clmm/fees) — the per-position fee model, single-sided fee modes, dynamic fee, and the three reward slots.
+- [Code demos](/products/clmm/code-demos) — open / adjust / swap / collect / limit-order / customizable-pool walkthroughs in TypeScript.
+
+Sources:
+
+- [Raydium CLMM source — `raydium-io/raydium-clmm`](https://github.com/raydium-io/raydium-clmm)
+- Uniswap v3 whitepaper ("Uniswap v3 Core") for the math that CLMM directly inherits
+- [`reference/program-addresses`](/reference/program-addresses) for canonical program IDs

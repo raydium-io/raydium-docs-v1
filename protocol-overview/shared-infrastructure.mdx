@@ -1,0 +1,181 @@
+---
+title: "Shared infrastructure"
+description: "The primitives every Raydium program shares — authority PDAs, AmmConfig accounts, the protocol/fund/creator fee split, observation accounts, and the public REST API surface — defined once so per-product chapters can refer back here."
+---
+
+<Info>
+  Raydium's product programs are independent codebases, but they were designed against a shared set of conventions. This page is the canonical reference for those conventions. Per-product chapters describe how the conventions are *instantiated* in their accounts; this page describes the conventions themselves.
+</Info>
+
+## What "shared" means here
+
+Three flavors of sharing run through the codebase:
+
+- **Convention sharing.** Every program uses the same PDA-derivation pattern, the same fee-split shape, and the same observation-account idea — but each implements them in its own program with its own seeds.
+- **Account sharing.** A handful of accounts are *literally* the same record across many pools (the global authority PDA in CPMM, the AmmConfig accounts).
+- **Off-chain sharing.** One REST API and one TypeScript SDK front all four programs. Integrators interact with one HTTP host and one NPM package regardless of which program they end up calling.
+
+The five primitives below cover everything that crosses program boundaries.
+
+## 1. Authority PDAs
+
+Every Raydium program has exactly one PDA that owns its token vaults. Users never hold vault authority directly — the authority PDA is the only signer that can move funds out, and it only signs when a valid program instruction tells it to.
+
+The pattern is identical across products; the seeds differ:
+
+| Program | Authority PDA seeds | Notes |
+|---------|---------------------|-------|
+| **AMM v4** | `[poolId]` | Per-pool authority. Same shape as v4's per-pool design. |
+| **CPMM** | `[b"vault_and_lp_mint_auth_seed"]` | **Single PDA shared by all CPMM pools.** No pool-specific seed. |
+| **CLMM** | `[b"pool_vault_and_lp_mint_auth_seed"]` | Single PDA shared across all CLMM pools. |
+| **Farm v3 / v5 / v6** | `[farmId]` | Per-farm. The PDA owns staking + reward vaults for that farm. |
+| **LaunchLab** | `[b"vault_auth", launchId]` | Per-launch. Owns base + quote vaults pre-graduation. |
+
+A few things follow from this:
+
+- For CPMM and CLMM, the authority PDA is **a global account** — every pool of that type uses it. If you are CPI-ing into CPMM you need it once, not per pool.
+- For per-pool / per-farm authorities, you derive the PDA from the pool/farm ID. The SDK does this in `getPoolKeys` / `getFarmKeys`; if you are integrating directly, you derive with `findProgramAddressSync`.
+- **Vault ownership cannot be changed.** Once a token account is created with the authority PDA as owner, only that PDA — invoked by the program — can transfer out. There is no admin override.
+
+For the exact seeds and ATA layouts per program, see [`products/cpmm/accounts`](/products/cpmm/accounts), [`products/clmm/accounts`](/products/clmm/accounts), [`products/amm-v4/accounts`](/products/amm-v4/accounts), [`products/farm-staking/accounts`](/products/farm-staking/accounts), [`products/launchlab/accounts`](/products/launchlab/accounts).
+
+## 2. Admin and config accounts
+
+CPMM and CLMM share a config-account pattern called **`AmmConfig`**: a small global account, indexed by a `u16`, holding the fee rates and admin destinations that apply to a whole *fee tier*. Pools bind to a config at creation and never re-bind.
+
+```rust
+// CPMM AmmConfig (abridged — the CLMM version is structurally similar)
+pub struct AmmConfig {
+    pub bump: u8,
+    pub disable_create_pool: bool,        // gate new pool creation in this tier
+    pub index: u16,                       // tier index
+    pub trade_fee_rate: u64,              // fraction of trade going to fees
+    pub protocol_fee_rate: u64,           // fraction of trade fee to protocol
+    pub fund_fee_rate: u64,               // fraction of trade fee to fund
+    pub create_pool_fee: u64,             // one-time per-pool creation fee
+    pub protocol_owner: Pubkey,           // signer for CollectProtocolFee
+    pub fund_owner: Pubkey,               // signer for CollectFundFee
+    pub padding: [u64; 16],
+}
+```
+
+**Rules of the road:**
+
+- **Fee tiers are global.** When a pool says "this is a 0.25% pool", it means it binds to the AmmConfig whose `trade_fee_rate` was 0.25% at creation time. There is no per-pool rate override.
+- **A config can be changed but pools don't follow.** If the config authority edits an AmmConfig, every existing pool bound to that config picks up the new rate immediately. This is a feature, not a bug; it is how protocol-level economic changes propagate without per-pool migrations.
+- **`disable_create_pool` is the deprecation lever.** When a fee tier is sunset, the protocol multisig sets this flag — existing pools keep working but no new pools can choose the tier.
+- **`protocol_owner` / `fund_owner`** are the *signers* for fee-collection calls. Setting them to a multisig is what gates fee withdrawal. They are NOT the destination addresses for the fees themselves; that is `protocol_fee_destination` / `fund_fee_destination` on the same account.
+
+AMM v4 has no `AmmConfig` — its fee parameters are per-pool, hardcoded at creation. Farm and LaunchLab have their own equivalents (`FarmConfig`, `LaunchConfig`) covered in their respective chapters.
+
+A complete table of who can change what is in [`security/admin-and-multisig`](/security/admin-and-multisig). Current user-facing fee splits are in [`ray/protocol-fees`](/ray/protocol-fees).
+
+## 3. The protocol / fund / creator fee split
+
+Every CPMM and CLMM swap fee is split across up to four destinations on the way out:
+
+```
+                         total swap fee
+                              │
+              ┌───────────────┼───────────────┬──────────────┐
+              ▼               ▼               ▼              ▼
+        LP pool side     Protocol         Fund         Creator
+        (raises k)       treasury         multisig     (LaunchLab pools)
+```
+
+Mechanically:
+
+1. **Trade fee accrues into the pool.** The fee is removed from the input side of the swap and the *post-fee* amount is what the constant-product math sees. This is what "the LP earns the fee" means — `k` rises and so does the implied per-LP token value.
+2. **Protocol/fund/creator portions are deducted from that LP-side accrual into per-pool counter accounts.** They sit on the pool state (`protocol_fees_token{0,1}`, `fund_fees_token{0,1}`, etc.) until somebody calls `CollectProtocolFee` / `CollectFundFee` / `CollectCreatorFee`. They do not leave the pool's vaults until then; from a swap's perspective they are still "in the pool".
+3. **Collection moves them out.** The respective signer (the `protocol_owner` / `fund_owner` keys on AmmConfig, or the launch creator for LaunchLab pools) calls the collect instruction and the program transfers from the pool vault to a destination ATA.
+
+A few load-bearing observations:
+
+- **The split percentages are off the trade fee, not off the trade.** A 0.25% trade fee with a 12% protocol share means the protocol gets `0.25% × 12% = 0.03%` of the trade — not 12% of the trade.
+- **Creator fees only exist on LaunchLab-graduated pools.** Standard CPMM/CLMM pools have a 3-way split (LP / protocol / fund). LaunchLab adds a fourth slot routed to whoever launched the token, configured at `Initialize` and immutable.
+- **AMM v4 splits two ways only**, hardcoded per-pool: LP and protocol. No fund slot, no creator slot.
+- **Fund vs protocol** — both are protocol-treasury destinations, but they have different signers and different intended uses. `protocol` historically funds operations; `fund` is the longer-term treasury. The split between the two is itself a tunable.
+
+Specific rates are in [`reference/fee-comparison`](/reference/fee-comparison) and [`ray/protocol-fees`](/ray/protocol-fees).
+
+## 4. Observation accounts (TWAP ring buffer)
+
+Both CPMM and CLMM maintain an **observation account** per pool — a fixed-size ring buffer of `(timestamp, cumulative_price)` samples that other contracts can use to derive a manipulation-resistant TWAP.
+
+```rust
+// CPMM ObservationState (abridged)
+pub struct ObservationState {
+    pub initialized: bool,
+    pub observation_index: u16,            // next slot to overwrite
+    pub pool_id: Pubkey,
+    pub observations: [Observation; OBSERVATION_NUM],
+    pub padding: [u64; 4],
+}
+
+pub struct Observation {
+    pub block_timestamp: u64,
+    pub cumulative_token_0_price_x32: u128,  // sum of (price × dt) since init
+    pub cumulative_token_1_price_x32: u128,
+}
+```
+
+How it works:
+
+- **Every swap calls `update_observation`.** The program reads the current price, multiplies by the elapsed seconds since the previous observation, and adds it into the cumulative counter. The new entry overwrites the oldest slot (ring-buffer style).
+- **TWAP over a window** = `(cumul[end] − cumul[start]) / (timestamp[end] − timestamp[start])`. Consumers pick two observations bracketing the desired window and divide.
+- **Raydium itself does not use the TWAP for pricing.** The AMM math reads the spot reserves directly. Observations are an externality — Raydium pays the cost of writing them so other contracts can read.
+- **AMM v4 has no observation account.** It is older than the ObservationState design; integrators wanting a v4 TWAP have to compute one off-chain from log history.
+
+Layout details and indexing math are in [`products/cpmm/accounts`](/products/cpmm/accounts) and [`products/clmm/accounts`](/products/clmm/accounts).
+
+## 5. REST API + SDK + IDL
+
+The off-chain surface is a single trio used by every product:
+
+- **REST API** — `https://api-v3.raydium.io`. A read-mostly indexed view of all on-chain state plus a quote engine. One host, one schema.
+- **TypeScript SDK** — `@raydium-io/raydium-sdk-v2` on NPM. Builds and signs transactions for every program. Talks to the API for quotes/metadata, talks to a Solana RPC for pre-sign state refreshes.
+- **IDL registry** — Anchor IDLs for every published program live in the [`raydium-idl`](https://github.com/raydium-io/raydium-idl) repo (one JSON per program: CPMM, CLMM, LaunchLab). The TypeScript SDK consumes these IDLs internally; downstream Rust / Python clients regenerate from the same files.
+
+The boundary between them is sharp:
+
+| Piece | Reads from | Writes to | Stale tolerance |
+|-------|-----------|-----------|-----------------|
+| REST API | Indexer (parses chain logs) | — (read-only for integrators) | A few seconds |
+| SDK | API + RPC | Builds transactions; doesn't broadcast | None — must re-fetch state pre-sign |
+| IDL | Program source | — | Versioned per program upgrade |
+
+A common mistake is to feed REST API output directly into a transaction. Don't — re-fetch the relevant pool/position state from a Solana RPC in the slot you are signing against. The SDK does this automatically for first-party flows; if you bypass the SDK you have to do it yourself.
+
+The full reference is in [`sdk-api/`](/sdk-api), with the IDL surface specifically in [`sdk-api/anchor-idl`](/sdk-api/anchor-idl).
+
+## 6. Indexers and price feeds
+
+The REST API is fed by Raydium's own indexer, which subscribes to program logs from a fleet of Solana RPCs and writes denormalized records into a SQL store. Two consequences for integrators:
+
+- **The indexer is the only thing that "knows about" cross-program state.** Mapping a CPMM pool to its CLMM counterpart, computing a 24h-volume number across program versions, picking up a farm associated with an LP mint — all of that is indexer work. Programs themselves don't do it.
+- **Indexer downtime is API downtime.** If the API returns stale or empty data, the indexer is the suspect. The on-chain state is unaffected; integrators with their own RPC and SDK can keep transacting.
+
+Price feeds are a separate concern. The API publishes a `priceUsd` field on most pool responses; this is computed off-chain from a snapshot of the indexer's view of the pool reserves and a quoted reference price (USDC pools as the common pivot). It is good enough for UI; it is not safe to use as an on-chain oracle. Use the observation TWAP for that.
+
+## What is not shared
+
+Worth listing explicitly, because new readers often assume more sharing than exists:
+
+- **Programs do not call each other.** A CPMM swap never CPIs into CLMM or AMM v4. The only program that composes multiple AMMs is the AMM Routing program — and that one is itself thin, just emitting CPIs into each AMM in sequence.
+- **No shared upgrade authority across programs.** Each on-chain program has its own program-upgrade key (a 3/4 multisig plus a 24h timelock). They are not linked.
+- **No shared state between farms and AMMs.** A farm doesn't know which LP it stakes is from a CPMM pool, a CLMM-position-NFT-mint, or an unrelated SPL token. The farm program treats the staking mint as opaque.
+- **No oracle dependency.** Pricing is on-chain reserves. There is no Pyth/Switchboard fallback; the AMM does not check an oracle before clearing.
+
+## Pointers
+
+- [`protocol-overview/architecture`](/protocol-overview/architecture) — the canonical diagram showing how these pieces compose.
+- [`protocol-overview/versions-and-migration`](/protocol-overview/versions-and-migration) — how the conventions evolved across program versions.
+- [`security/admin-and-multisig`](/security/admin-and-multisig) — who controls the keys behind the AmmConfigs.
+- [`reference/fee-comparison`](/reference/fee-comparison) — fee-rate matrix per product.
+- [`reference/program-addresses`](/reference/program-addresses) — canonical program IDs.
+
+Sources:
+
+- [Raydium SDK v2](https://github.com/raydium-io/raydium-sdk-V2) — the source of truth for PDA seeds, account layouts, and IDL definitions.
+- [Raydium IDL registry](https://github.com/raydium-io/raydium-idl) — Anchor IDLs.
+- Per-product accounts pages cited inline above.

@@ -1,0 +1,282 @@
+---
+title: "AMM v4 代码示例"
+description: "TypeScript 示例：与现有 AMM v4 池交互（交换、提供流动性）。新池创建不在本范围内——改用 CPMM。"
+---
+
+<Info>
+  **本页内容由 AI 自动翻译，所有内容以英文版本为准。**
+
+  [查看英文版 →](/products/amm-v4/code-demos)
+</Info>
+
+<Info>
+  **版本声明。** 所有示例针对 `@raydium-io/raydium-sdk-v2@0.2.42-alpha`，运行在 Solana mainnet-beta，已验证至 2026-04。程序 ID：`675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8`（参见 [`reference/program-addresses`](/zh/reference/program-addresses)）。
+</Info>
+
+<Info>
+  **本文不涵盖新池创建。** Raydium UI 已停止支持 AMM v4 池创建——新交易对默认使用 [CPMM](/zh/products/cpmm/code-demos)。AMM v4 程序本身仍接受链上 `Initialize2` 调用，但已不是推荐方案。下文示例覆盖每个集成方都需要的活池操作：交换、存入、提取。
+</Info>
+
+## 初始化设置
+
+```ts
+import { Connection, Keypair, clusterApiUrl } from "@solana/web3.js";
+import { Raydium, TxVersion } from "@raydium-io/raydium-sdk-v2";
+import fs from "node:fs";
+
+const connection = new Connection(process.env.RPC_URL ?? clusterApiUrl("mainnet-beta"));
+const owner = Keypair.fromSecretKey(
+  new Uint8Array(JSON.parse(fs.readFileSync(process.env.KEYPAIR!, "utf8"))),
+);
+const raydium = await Raydium.load({ owner, connection, cluster: "mainnet" });
+```
+
+## 按 ID 获取池信息
+
+```ts
+import { PublicKey } from "@solana/web3.js";
+
+const poolId = new PublicKey("<AMM_V4_POOL_ID>");
+
+// 获取 SDK 规范化的池对象。对于 AMM v4，这包含指令构造函数所需的 OpenBook 账户。
+const data = await raydium.liquidity.getPoolInfoFromRpc({ poolId });
+const { poolInfo, poolKeys, poolRpcData } = data;
+
+console.log("交易对:", poolInfo.mintA.symbol, "/", poolInfo.mintB.symbol);
+console.log("版本:", poolInfo.version);       // AMM v4 返回 4
+console.log("市场:", poolKeys.marketId.toBase58());
+```
+
+`poolKeys` 是指令构造函数使用的结构体，包含所有 AMM v4 和 OpenBook 账户，按程序期望的顺序排列。
+
+## 交换（固定输入）
+
+```ts
+import BN from "bn.js";
+
+const amountIn = new BN(1_000_000);            // 1 USDC（6 位小数的报价资产）
+const inputMint = new PublicKey(poolInfo.mintB.address);  // USDC
+const slippage  = 0.005;
+
+const computed = raydium.liquidity.computeAmountOut({
+  poolInfo,
+  amountIn,
+  mintIn: inputMint,
+  mintOut: new PublicKey(poolInfo.mintA.address),
+  slippage,
+});
+
+const { execute } = await raydium.liquidity.swap({
+  poolInfo,
+  poolKeys,
+  amountIn,
+  amountOut: computed.minAmountOut,
+  fixedSide: "in",
+  inputMint,
+  txVersion: TxVersion.V0,
+});
+
+const { txId } = await execute({ sendAndConfirm: true });
+console.log("交换交易:", txId);
+```
+
+SDK 会自动添加所有 OpenBook 账户。不要尝试手动替换它们——程序会验证每个槽位。
+
+## 交换（固定输出）
+
+```ts
+const amountOut = new BN(1_000_000_000);       // 1 SOL（9 位小数的基础资产）
+const slippage  = 0.005;
+
+const computed = raydium.liquidity.computeAmountIn({
+  poolInfo,
+  amountOut,
+  mintOut: new PublicKey(poolInfo.mintA.address),
+  mintIn: new PublicKey(poolInfo.mintB.address),
+  slippage,
+});
+
+const { execute } = await raydium.liquidity.swap({
+  poolInfo,
+  poolKeys,
+  amountIn: computed.maxAmountIn,
+  amountOut,
+  fixedSide: "out",
+  inputMint: new PublicKey(poolInfo.mintB.address),
+  txVersion: TxVersion.V0,
+});
+
+await execute({ sendAndConfirm: true });
+```
+
+## 提供流动性
+
+```ts
+const amountA = new BN(100_000_000);           // 0.1 SOL
+
+const { anotherAmount, maxAnotherAmount } = raydium.liquidity.computePairAmount({
+  poolInfo,
+  amount: amountA,
+  baseIn: true,
+  slippage: 0.01,
+});
+
+const { execute } = await raydium.liquidity.addLiquidity({
+  poolInfo,
+  poolKeys,
+  amountInA: amountA,
+  amountInB: maxAnotherAmount,
+  fixedSide: "a",
+  txVersion: TxVersion.V0,
+});
+
+await execute({ sendAndConfirm: true });
+```
+
+`fixedSide: "a"` 告诉 SDK 你提供的 `amountInA` 是精确值，`amountInB` 最多为 `maxAnotherAmount`。池的链上流动性在计算比例前进行结算，确保存入比例匹配最新的储备量。
+
+## 移除流动性
+
+```ts
+const lpAmount = new BN(50_000);               // 要销毁的 LP 代币
+
+const { execute } = await raydium.liquidity.removeLiquidity({
+  poolInfo,
+  poolKeys,
+  lpAmount,
+  baseAmountMin: new BN(0),
+  quoteAmountMin: new BN(0),
+  txVersion: TxVersion.V0,
+});
+
+await execute({ sendAndConfirm: true });
+```
+
+滑点最小值保护你的查询和交易上链之间的池状态变化。
+
+## 计算单位 / 优先费调整
+
+AMM v4 交换因需验证完整 OpenBook 状态而消耗大量计算。典型交换使用 180k–250k CU，具体取决于需结算的未平仓订单数。始终传递计算单位限制：
+
+```ts
+import { ComputeBudgetProgram } from "@solana/web3.js";
+
+const { execute, innerTransactions } = await raydium.liquidity.swap({
+  /* ...参数... */
+  computeBudgetConfig: {
+    units: 400_000,
+    microLamports: 50_000,       // 优先费
+  },
+});
+```
+
+如果省略 `computeBudgetConfig`，SDK 可能仍会使用默认值；检查 `innerTransactions` 确认。参见 [`integration-guides/priority-fee-tuning`](/zh/integration-guides/priority-fee-tuning)。
+
+## 直接 Rust CPI
+
+如果你必须从自己的 Anchor 程序 CPI 到 AMM v4，需要逐字复现 `SwapBaseIn` 的账户列表。最小示意：
+
+```rust
+use anchor_lang::prelude::*;
+use anchor_lang::solana_program::program::invoke_signed;
+use anchor_lang::solana_program::instruction::Instruction;
+
+const AMM_V4_PROGRAM_ID: Pubkey = pubkey!("675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8");
+
+#[derive(Accounts)]
+pub struct ProxyAmmV4Swap<'info> {
+    /// CHECK:
+    pub token_program: UncheckedAccount<'info>,
+    #[account(mut)] /// CHECK:
+    pub amm:          UncheckedAccount<'info>,
+    /// CHECK:
+    pub amm_authority: UncheckedAccount<'info>,
+    #[account(mut)] /// CHECK:
+    pub amm_open_orders: UncheckedAccount<'info>,
+    #[account(mut)] /// CHECK:
+    pub amm_target_orders: UncheckedAccount<'info>,
+    #[account(mut)] /// CHECK:
+    pub pool_coin_token_account: UncheckedAccount<'info>,
+    #[account(mut)] /// CHECK:
+    pub pool_pc_token_account: UncheckedAccount<'info>,
+    /// CHECK:
+    pub market_program: UncheckedAccount<'info>,
+    #[account(mut)] /// CHECK:
+    pub market: UncheckedAccount<'info>,
+    #[account(mut)] /// CHECK:
+    pub market_bids: UncheckedAccount<'info>,
+    #[account(mut)] /// CHECK:
+    pub market_asks: UncheckedAccount<'info>,
+    #[account(mut)] /// CHECK:
+    pub market_event_queue: UncheckedAccount<'info>,
+    #[account(mut)] /// CHECK:
+    pub market_coin_vault: UncheckedAccount<'info>,
+    #[account(mut)] /// CHECK:
+    pub market_pc_vault: UncheckedAccount<'info>,
+    /// CHECK:
+    pub market_vault_signer: UncheckedAccount<'info>,
+    #[account(mut)] /// CHECK:
+    pub user_source: UncheckedAccount<'info>,
+    #[account(mut)] /// CHECK:
+    pub user_dest: UncheckedAccount<'info>,
+    pub user_owner: Signer<'info>,
+}
+
+pub fn proxy_swap(
+    ctx: Context<ProxyAmmV4Swap>,
+    amount_in: u64,
+    minimum_amount_out: u64,
+) -> Result<()> {
+    // SwapBaseIn 的指令鉴别器在 AMM v4 上是 9。
+    let mut data = vec![9u8];
+    data.extend_from_slice(&amount_in.to_le_bytes());
+    data.extend_from_slice(&minimum_amount_out.to_le_bytes());
+
+    let ix = Instruction {
+        program_id: AMM_V4_PROGRAM_ID,
+        accounts: vec![
+            AccountMeta::new_readonly(ctx.accounts.token_program.key(), false),
+            AccountMeta::new(ctx.accounts.amm.key(), false),
+            AccountMeta::new_readonly(ctx.accounts.amm_authority.key(), false),
+            AccountMeta::new(ctx.accounts.amm_open_orders.key(), false),
+            AccountMeta::new(ctx.accounts.amm_target_orders.key(), false),
+            AccountMeta::new(ctx.accounts.pool_coin_token_account.key(), false),
+            AccountMeta::new(ctx.accounts.pool_pc_token_account.key(), false),
+            AccountMeta::new_readonly(ctx.accounts.market_program.key(), false),
+            AccountMeta::new(ctx.accounts.market.key(), false),
+            AccountMeta::new(ctx.accounts.market_bids.key(), false),
+            AccountMeta::new(ctx.accounts.market_asks.key(), false),
+            AccountMeta::new(ctx.accounts.market_event_queue.key(), false),
+            AccountMeta::new(ctx.accounts.market_coin_vault.key(), false),
+            AccountMeta::new(ctx.accounts.market_pc_vault.key(), false),
+            AccountMeta::new_readonly(ctx.accounts.market_vault_signer.key(), false),
+            AccountMeta::new(ctx.accounts.user_source.key(), false),
+            AccountMeta::new(ctx.accounts.user_dest.key(), false),
+            AccountMeta::new_readonly(ctx.accounts.user_owner.key(), true),
+        ],
+        data,
+    };
+    invoke_signed(&ix, &ctx.accounts.to_account_infos(), &[])?;
+    Ok(())
+}
+```
+
+AMM v4 不提供 CPI 的 Anchor crate。上述示意使用手工构造的 `Instruction`。
+
+## 常见陷阱
+
+- **缺少 OpenBook 账户。** 每次交换、存入、提取都需要全部 8 个 OpenBook 账户；SDK 会自动处理，但手工构造的指令通常不会。
+- **读取原始保险库余额。** 不反映链上托管的金额或累积的损益。使用 SDK 的报价或 `api-v3.raydium.io/pools/info/ids`。
+- **OpenBook 事件队列满。** 当市场的事件队列需要处理时，池可能以 `SerumOrderError` 回退交换。处理事件队列是无需许可的（在市场 OpenBook 账户上调用 `MonitorStep`）。
+- **Token-2022 代币。** 不支持。无法在 Token-2022 代币上创建 AMM v4 池；任何 Token-2022 交易对应使用 CPMM 或 CLMM。
+
+## 后续阅读
+
+- [`products/amm-v4/instructions`](/zh/products/amm-v4/instructions) — 这些示例背后的指令级接口。
+- [`user-flows/migrate-amm-v4-to-cpmm`](/zh/user-flows/migrate-amm-v4-to-cpmm) — 如果你是考虑迁移的 LP。
+- [`integration-guides/priority-fee-tuning`](/zh/integration-guides/priority-fee-tuning) — 大量 AMM v4 交换的优先费调整。
+
+源代码：
+
+- [Raydium SDK v2](https://github.com/raydium-io/raydium-sdk-V2)
+- [Raydium AMM program](https://github.com/raydium-io/raydium-amm)

@@ -1,0 +1,440 @@
+---
+title: "路由代碼範例"
+description: "TypeScript 範例：基於 SDK 的多跳交換（通過路由器）以及原始指令建構。"
+---
+
+<Info>
+  **本頁內容由 AI 自動翻譯，所有內容以英文版本為準。**
+
+  [查看英文版 →](/products/routing/code-demos)
+</Info>
+
+## 版本資訊
+
+- **SDK：** `@raydium-io/raydium-sdk-v2@0.2.42-alpha`
+- **網路：** mainnet-beta
+- **路由程式 ID：** `routeUGWgWzqBWFcrCfv8tritsqukccJPu3q5GPP3xS`
+- **驗證時間：** 2026 年 4 月
+
+## 範例 1：基於 SDK 的路由
+
+來源：[`src/trade/routeSwap.ts`](https://github.com/raydium-io/raydium-sdk-V2-demo/blob/master/src/trade/routeSwap.ts)
+
+Raydium SDK 會自動處理路由構建。使用 SDK 的交易函式來組合多跳路由，並自動通過路由器執行。
+
+### 設定
+
+```typescript
+import {
+  Raydium,
+  Router,
+  Token,
+  TokenAmount,
+  toApiV3Token,
+  toFeeConfig,
+  TxVersion,
+} from "@raydium-io/raydium-sdk-v2";
+import {
+  Connection,
+  Keypair,
+  PublicKey,
+} from "@solana/web3.js";
+import { NATIVE_MINT, TOKEN_2022_PROGRAM_ID } from "@solana/spl-token";
+
+const connection = new Connection("https://api.mainnet-beta.solana.com", "confirmed");
+const wallet = Keypair.fromSecretKey(/* your key bytes */);
+
+const raydium = await Raydium.load({
+  connection,
+  owner: wallet,                 // SDK 會用此 Keypair 簽署
+  cluster: "mainnet",
+  disableFeatureCheck: true,
+  blockhashCommitment: "finalized",
+});
+
+// 路由器需要鏈時間錨點來支援 CLMM 跳。
+await raydium.fetchChainTime();
+```
+
+### 建構多跳交換
+
+`@raydium-io/raydium-sdk-v2` 中的路由功能在 `raydium.tradeV2` 上公開。下面展示完整的流程——獲取流動性池資料、計算路由、按輸出量排名以及建構交換交易——這與 [`raydium-sdk-V2-demo/src/trade/routeSwap.ts`](https://github.com/raydium-io/raydium-sdk-V2-demo/blob/master/src/trade/routeSwap.ts) 中的規範範例相符。
+
+```typescript
+// 1. 選擇輸入/輸出 mint 和數量。
+const inputMint = NATIVE_MINT;                                     // wSOL
+const outputMint = new PublicKey("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"); // USDC
+const inputAmount = "8000000";                                     // 0.008 SOL（lamports）
+
+// 2. 獲取所有流動性池基本資訊。應該積極快取——這是大量的 RPC 呼叫。
+const poolData = await raydium.tradeV2.fetchRoutePoolBasicInfo();
+
+// 3. 列舉跨 AMM v4、CPMM、CLMM 和穩定 AMM 的所有可行路由。
+const routes = raydium.tradeV2.getAllRoute({
+  inputMint,
+  outputMint,
+  ...poolData,
+});
+
+// 4. 用實時 RPC 狀態（儲備、ticks、mint 資訊）填充路由。
+const {
+  routePathDict,
+  mintInfos,
+  ammPoolsRpcInfo,
+  ammSimulateCache,
+  clmmPoolsRpcInfo,
+  computeClmmPoolInfo,
+  computePoolTickData,
+  computeCpmmData,
+} = await raydium.tradeV2.fetchSwapRoutesData({
+  routes,
+  inputMint,
+  outputMint,
+});
+
+// 5. 計算每條候選路由的輸出數量。結果按輸出量降序排列。
+const swapRoutes = raydium.tradeV2.getAllRouteComputeAmountOut({
+  inputTokenAmount: new TokenAmount(
+    new Token({
+      mint: inputMint.toBase58(),
+      decimals: mintInfos[inputMint.toBase58()].decimals,
+      isToken2022: mintInfos[inputMint.toBase58()].programId.equals(TOKEN_2022_PROGRAM_ID),
+    }),
+    inputAmount,
+  ),
+  directPath: routes.directPath.map(
+    (p) =>
+      ammSimulateCache[p.id.toBase58()] ||
+      computeClmmPoolInfo[p.id.toBase58()] ||
+      computeCpmmData[p.id.toBase58()],
+  ),
+  routePathDict,
+  simulateCache: ammSimulateCache,
+  tickCache: computePoolTickData,
+  mintInfos,
+  outputToken: toApiV3Token({
+    ...mintInfos[outputMint.toBase58()],
+    programId: mintInfos[outputMint.toBase58()].programId.toBase58(),
+    address: outputMint.toBase58(),
+    freezeAuthority: undefined,
+    mintAuthority: undefined,
+    extensions: { feeConfig: toFeeConfig(mintInfos[outputMint.toBase58()].feeConfig) },
+  }),
+  chainTime: Math.floor(raydium.chainTimeData?.chainTime ?? Date.now() / 1000),
+  slippage: 0.005, // 0.5%
+  epochInfo: await raydium.connection.getEpochInfo(),
+});
+
+const targetRoute = swapRoutes[0];
+if (!targetRoute) throw new Error("no swap routes were found");
+
+// 6. 解析所選路由的流動性池金鑰。
+const poolKeys = await raydium.tradeV2.computePoolToPoolKeys({
+  pools: targetRoute.poolInfoList,
+  ammRpcData: ammPoolsRpcInfo,
+  clmmRpcData: clmmPoolsRpcInfo,
+});
+
+// 7. 建構、簽署並執行交換交易。
+const { execute, transactions } = await raydium.tradeV2.swap({
+  routeProgram: Router,
+  txVersion: TxVersion.V0,
+  swapInfo: targetRoute,
+  swapPoolKeys: poolKeys,
+  ownerInfo: {
+    associatedOnly: true,
+    checkCreateATAOwner: true,
+  },
+  computeBudgetConfig: {
+    units: 600_000,
+    microLamports: 465_915,
+  },
+});
+
+// `sequentially: true` 很重要——第一筆交易可能需要建立
+// 後續交易依賴的中間 ATA。
+const { txIds } = await execute({ sequentially: true });
+console.log("txIds:", txIds);
+```
+
+### 預期行為
+
+SDK 會處理：
+
+- 跨 AMM v4、CPMM、CLMM 和穩定 AMM 的路由探索。
+- 帳戶派生（流動性池狀態、資金庫、觀察帳戶、ATA 預建立）。
+- 路由為多跳時的指令打包（給路由程式 `Router` 使用），或單一流動性池已提供最佳價格時的直接交換。
+- 透過 `getAllRouteComputeAmountOut` 上的 `slippage` 參數實施滑點保護。
+
+`raydium.tradeV2.swap` 可能會傳回一個以上的 `transaction`——第一個通常會初始化中間 ATA，第二個會執行交換。務必向 `execute()` 傳遞 `sequentially: true` 以確保它們按順序確認。
+
+---
+
+## 範例 2：原始指令建構（Rust 式虛擬碼）
+
+如果你需要更細緻的控制，或正在建構一個 CPI 到路由器的程式，可以手動建構指令。下面的範例使用 **標籤 8（`SwapBaseIn`）**——推薦的當前變體——並通過使用者所有的 ATA 端到端路由。
+
+### 場景：USDC → SOL（CPMM）→ mSOL（CPMM）
+
+#### 步驟 1：派生使用者的 ATA
+
+```typescript
+import { getAssociatedTokenAddressSync } from "@solana/spl-token";
+import { PublicKey } from "@solana/web3.js";
+
+const ROUTER_PROGRAM_ID = new PublicKey(
+  "routeUGWgWzqBWFcrCfv8tritsqukccJPu3q5GPP3xS"
+);
+
+const USDC_MINT = new PublicKey(
+  "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+);
+const SOL_MINT = new PublicKey(
+  "So11111111111111111111111111111111111111112"
+);
+const MSOL_MINT = new PublicKey(
+  "mSoL1MK4LCEDcTYVhPnD6DHK4PMGQ8WyXDEMXbnQAaW"
+);
+
+// 使用者輸入／中間／輸出 ATA——全部由呼叫者擁有。
+const user_usdc_ata = getAssociatedTokenAddressSync(USDC_MINT, wallet.publicKey);
+const user_sol_ata  = getAssociatedTokenAddressSync(SOL_MINT,  wallet.publicKey, true); // wSOL：allowOwnerOffCurve
+const user_msol_ata = getAssociatedTokenAddressSync(MSOL_MINT, wallet.publicKey);
+
+// 如果使用者的中間／輸出 ATA 尚不存在，請事先通過
+// 相關聯令牌帳戶程式建立它們（或對 wSOL ATA
+// 在標籤 5 上使用 CreateSyncNative）。
+```
+
+#### 步驟 2：為每個跳蒐集帳戶
+
+跳 1 是 CPMM 上的 USDC/SOL。跳 2 是 CPMM 上的 SOL/mSOL。
+
+```typescript
+// 跳 1：CPMM 上的 USDC/SOL 交換
+const CPMM_PROGRAM_ID = new PublicKey(
+  "CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C"
+);
+
+// 獲取 USDC/SOL 流動性池狀態
+const usdc_sol_pool = await connection.getParsedAccountInfo(
+  USDC_SOL_POOL_STATE
+);
+
+// 流動性池狀態、授權、資金庫、mint、令牌程式等。
+// （見 products/cpmm/accounts 獲取完整的 11 帳戶列表）
+const hop1_accounts = [
+  CPMM_PROGRAM_ID,           // 識別為 CPMM
+  USDC_SOL_POOL_STATE,
+  CPMM_AUTHORITY,
+  USDC_SOL_VAULT_TOKEN0,
+  USDC_SOL_VAULT_TOKEN1,
+  USDC_MINT,
+  SOL_MINT,
+  LP_MINT,
+  OBSERVATION_STATE,
+  TOKEN_PROGRAM,
+  ASSOCIATED_TOKEN_PROGRAM,
+  SYSTEM_PROGRAM,
+];
+
+// 跳 2：CPMM 上的 SOL/mSOL 交換
+const sol_msol_pool = await connection.getParsedAccountInfo(
+  SOL_MSOL_POOL_STATE
+);
+
+const hop2_accounts = [
+  CPMM_PROGRAM_ID,           // 識別為 CPMM
+  SOL_MSOL_POOL_STATE,
+  CPMM_AUTHORITY,
+  SOL_MSOL_VAULT_TOKEN0,
+  SOL_MSOL_VAULT_TOKEN1,
+  SOL_MINT,
+  MSOL_MINT,
+  LP_MINT_2,
+  OBSERVATION_STATE_2,
+  TOKEN_PROGRAM,
+  ASSOCIATED_TOKEN_PROGRAM,
+  SYSTEM_PROGRAM,
+];
+```
+
+#### 步驟 3：建構指令
+
+```typescript
+import BN from "bn.js";
+
+// 參數
+const amount_in = new BN(1_000_000_000); // 1000 USDC（6 位小數）
+const minimum_amount_out = new BN(500_000_000_000); // 500 mSOL（9 位小數）
+
+// 沒有 CLMM 跳，所以 limit_prices 為空
+const limit_prices: BN[] = [];
+
+// 打包參數
+let data = Buffer.alloc(1024);
+let offset = 0;
+
+// 標籤 8：SwapBaseIn（當前變體；允許空的 limit_prices）
+data[offset++] = 8;
+
+// amount_in（u64）
+data.writeBigUInt64LE(BigInt(amount_in.toString()), offset);
+offset += 8;
+
+// minimum_amount_out（u64）
+data.writeBigUInt64LE(BigInt(minimum_amount_out.toString()), offset);
+offset += 8;
+
+// limit_prices（VecDeque<u128>）——空的（此路由中沒有 CLMM 跳）。
+// 標籤 8 接受空的雙端佇列而無錯誤。不寫 u128（零個條目）。
+
+data = data.slice(0, offset);
+
+// 建構帳戶列表——每個中間 ATA 都由使用者擁有。
+const accounts = [
+  { pubkey: user_usdc_ata, isSigner: true,  isWritable: true },
+  { pubkey: user_sol_ata,  isSigner: false, isWritable: true },
+  { pubkey: user_msol_ata, isSigner: false, isWritable: true },
+  ...hop1_accounts.map((pk, i) => ({
+    pubkey: pk,
+    isSigner: false,
+    isWritable: i === 0 ? false : true, // 程式 ID 不可寫
+  })),
+  ...hop2_accounts.map((pk, i) => ({
+    pubkey: pk,
+    isSigner: false,
+    isWritable: i === 0 ? false : true,
+  })),
+];
+
+const instruction = new TransactionInstruction({
+  programId: ROUTER_PROGRAM_ID,
+  keys: accounts,
+  data,
+});
+```
+
+#### 步驟 4：發送交易
+
+```typescript
+const { blockhash } = await connection.getLatestBlockhash();
+
+const tx = new VersionedTransaction(
+  new TransactionMessage({
+    instructions: [instruction],
+    payerKey: wallet.publicKey,
+    recentBlockhash: blockhash,
+  }).compileToV0Message()
+);
+
+tx.sign([wallet]);
+const sig = await connection.sendTransaction(tx);
+await connection.confirmTransaction(sig);
+```
+
+---
+
+## 範例 3：錯誤處理
+
+常見的錯誤及其恢復方式：
+
+### ExceededSlippage
+
+輸出小於 `minimum_amount_out`。使用更高的滑點容限重試或重新報價路由。
+
+```typescript
+try {
+  const sig = await connection.sendTransaction(tx);
+} catch (error) {
+  if (error.message.includes("ExceededSlippage")) {
+    console.log(
+      "路由價格已移動。重新報價並重建交易。"
+    );
+  }
+}
+```
+
+### SqrtPriceX64（CLMM）
+
+CLMM 跳的價格偏離了 `limit_prices` 邊界。更新邊界並重試。
+
+### InvalidOwner
+
+中間或輸出 ATA 不由呼叫者擁有。路由器會在每個時段驗證所有權；確保你傳遞的每個 ATA 都是從使用者的錢包派生的（而不是從任何其他授權派生的）。
+
+---
+
+## 提示和最佳實踐
+
+### 預建立中間 ATA
+
+在第一次通過新的中間令牌進行路由前，建立使用者的 ATA，以便路由不會因驗證而失敗：
+
+```typescript
+import { createAssociatedTokenAccountInstruction } from "@solana/spl-token";
+
+const createAtaIx = createAssociatedTokenAccountInstruction(
+  wallet.publicKey,  // 付費者
+  user_sol_ata,      // 要建立的 ATA
+  wallet.publicKey,  // 擁有者——始終是使用者
+  SOL_MINT,
+);
+
+// 將 createAtaIx 合併到與第一個路由相同的交易中，或
+// 事先發送一次；租金（~0.002 SOL）稍後可通過標籤 6
+// （CloseTokenAccount）在 ATA 為空後回收。
+```
+
+對於 wSOL 特別地，優先使用 [`CreateSyncNative`](/zh-Hant/products/routing/instructions#createsyncnative-tag-5)（標籤 5）——它建立 ATA、轉移 SOL 並在一個指令中同步。
+
+### 執行前報價
+
+總是在建構指令前查詢流動性池並計算預期輸出：
+
+```typescript
+// 虛擬碼：獲取當前流動性池狀態並計算價格
+const pool1State = await connection.getAccountInfo(USDC_SOL_POOL_STATE);
+const amount_out_hop1 = computeSwapOutput(
+  amount_in,
+  pool1State,
+  USDC_MINT,
+  SOL_MINT
+);
+
+const pool2State = await connection.getAccountInfo(SOL_MSOL_POOL_STATE);
+const amount_out_hop2 = computeSwapOutput(
+  amount_out_hop1,
+  pool2State,
+  SOL_MINT,
+  MSOL_MINT
+);
+
+const minimum_amount_out = amount_out_hop2 * 0.99; // 1% 滑點
+```
+
+### 使用較新的指令變體（8–9）
+
+標籤 8 和 9（`SwapBaseIn` 和 `SwapBaseOut`）對 `limit_prices` 更寬容。如果你不需要 CLMM 價格驗證，優先於舊變體使用它們。
+
+```typescript
+// 標籤 8：SwapBaseIn，可選 limit_prices
+data[offset++] = 8;
+// ... 打包的其餘部分；limit_prices 雙端佇列可以為空
+```
+
+---
+
+## 後續步驟
+
+- [`products/routing/instructions`](/zh-Hant/products/routing/instructions)——完整的指令參考。
+- [`products/routing/accounts`](/zh-Hant/products/routing/accounts)——帳戶派生詳情。
+- [`products/cpmm/code-demos`](/zh-Hant/products/cpmm/code-demos)——CPMM 交換範例以供比較。
+- [`reference/program-addresses`](/zh-Hant/reference/program-addresses)——規範的程式 ID 和 devnet 位址。
+
+來源：
+
+- [`@raydium-io/raydium-sdk-v2` on npm](https://www.npmjs.com/package/@raydium-io/raydium-sdk-v2)
+- [`raydium-io/raydium-sdk-V2`](https://github.com/raydium-io/raydium-sdk-V2)（開源）
+- [`raydium-io/raydium-sdk-V2-demo`](https://github.com/raydium-io/raydium-sdk-V2-demo)——官方端到端範例，包括 `routeSwap.ts`
+- AMM 路由程式原始碼未公開；根據實時 API 和鏈上位元組碼驗證程式 ID

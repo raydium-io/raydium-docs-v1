@@ -1,0 +1,412 @@
+---
+title: "カスタムプログラムからの CPI"
+description: "オンチェーンプログラムから Raydium を呼び出すコンポジションパターン — エスクロー、アグリゲータープロキシ、自動複利運用ヴォルト — アカウント構成、PDA サイナー、残りのアカウント、コンピュート予算を含む完全な実装例。"
+---
+
+<Info>
+  **このページは AI による自動翻訳です。すべての内容は英語版を正とします。**
+
+  [英語版を表示 →](/integration-guides/cpi-integration)
+</Info>
+
+## CPI が適切なツールの場合
+
+カスタムプログラムは、トレードがあなたのプログラムのみが実行できるオンチェーン状態変更と共にアトミックに発生する必要がある場合に意味があります。一般的なケース：
+
+- **エスクロー・リミットオーダープログラム** — ユーザーはミントをエスクロー内にデポジットし、あなたのプログラムは価格条件を監視し、トリガー時にあなたのプログラムは Raydium を通じてアトミックにスワップし、ユーザーのアカウントをクレジットします。
+- **アグリゲータープロキシ** — Raydium と 1 つ以上の他の DEX を通じてスワップをルーティングする単一の命令で、すべてのホップがあなたのプログラムが所有する単一のスリップページチェック下にあります。
+- **自動複利運用ヴォルト** — LP またはファームステーキングをあなたのヴォルトにデポジット、ヴォルトは定期的にリワードを収穫し、リクイディティを再提供し、シェアトークンを発行します。
+- **ストラテジーヴォルト** — CLMM を通じてスワップして再バランスするレバレッジ LP ポジション、ポジションをクローズし 1 つのトランザクションでコラテラルをスワップする清算人。
+- **カスタムベスティング付きトークン起動プラットフォーム** — あなたのプログラムはベスティングトークンを保有し、スケジュールに基づいて Raydium プールにリリースします。
+
+オフチェーンコードからスワップを送信したいだけなら、CPI は過度です — SDK を使用してください。CPI は、あなた自身の状態とのアトミック性が要件の場合にのみ、その複雑さを正当化します。
+
+## コンポジションパターン
+
+### パターン 1：シンプロキシ
+
+あなたのプログラムは、何らかのポリシーを検証する単一の命令（例：ホワイトリストに登録されたミントペア、検証済みユーザーの手数料割引）を公開してから、Raydium に転送します。
+
+```
+┌──────────────┐   user tx    ┌────────────────┐  CPI  ┌──────────┐
+│ user         │─────────────▶│ your program   │──────▶│ Raydium  │
+└──────────────┘              │  (validate)    │       │  (CPMM)  │
+                              └────────────────┘       └──────────┘
+```
+
+状態はユーザーの ATA に存在します。あなたのプログラムはトークンを所有しません。最小限の信頼フットプリント。
+
+### パターン 2：エスクロー
+
+あなたのプログラムはユーザーの入力ミントを保有する PDA を所有しています。トリガー時、PDA は Raydium へのスワップをするために CPI に署名します。
+
+```
+           deposit                   trigger
+   user ───────────▶  PDA vault  ───────────────▶  Raydium swap
+                     (your prog)                    (signed by PDA)
+                                                            │
+                                                            ▼
+                                                    PDA vault (output mint)
+                                                            │
+                                                     withdraw ▼
+                                                         user
+```
+
+重要な詳細：PDA は `CpiContext::new_with_signer` を経由して署名します。[PDA サイナーシード](#pda-サイナーシード)を参照。
+
+### パターン 3：複合マルチホップ
+
+あなたのプログラムは 1 つの命令で複数の CPI を発行し、すべてのホップ全体で単一のスリップページ境界を強制します。Raydium スワップ命令にはそれぞれ独自の `minimum_amount_out` がありますが、それらを 0（または非常に緩いフロア）に設定し、最後のホップの後に自分自身で厳密な最終最小値を強制します。
+
+```
+instruction:
+  CPI swap: tokenA → tokenB   (raydium, loose min)
+  CPI swap: tokenB → tokenC   (raydium / third-party, loose min)
+  CPI swap: tokenC → tokenD   (raydium, loose min)
+  require(user.tokenD_ata.amount - pre_balance >= user_min_out)
+```
+
+これにより、全体のルートに対して単一のリバートゲートが得られます。すべてのホップがスリップページセーフであると信頼できる場合にのみこのパターンを使用してください。そうでない場合は、各ホップに独自の最小値を強制させてください。
+
+### パターン 4：ヴォルト・ストラテジー
+
+あなたのプログラムは LP トークンまたはファームステーキングを PDA に保有しています。キーパー（またはユーザー）が `compound()` を呼び出し、次のことを行います：
+
+1. ファームからリワードを収穫します。
+2. リワードをプールトークンにスワップします（CPMM または CLMM への CPI）。
+3. 収益を LP に戻します（別の CPI）。
+4. 新しい LP をステーキングします（別の CPI）。
+
+すべて 1 つのトランザクション内なので、ヴォルトの NAV がアトミックに移動します。コンピュート予算は通常 600k～1M CU です。アドレスルックアップテーブルは必須です。
+
+## アカウントリスト構成
+
+呼び出し元プログラムの `Accounts` 構造体は Raydium プログラムのアカウント順序をミラーリングしますが、ほとんどの Raydium 側アカウントは `UncheckedAccount` です。なぜなら Raydium はそれ自体を検証するためです。あなたが所有するアカウントにのみ制約を追加します：
+
+```rust
+use anchor_lang::prelude::*;
+use anchor_spl::token::{Token, TokenAccount};
+
+#[derive(Accounts)]
+pub struct EscrowSwap<'info> {
+    /// エスクロー PDA、入力ミントを保有し CPI に署名します。
+    #[account(
+        mut,
+        seeds = [b"escrow", user.key().as_ref()],
+        bump = escrow.bump,
+    )]
+    pub escrow: Account<'info, Escrow>,
+
+    #[account(mut)]
+    pub user: Signer<'info>,
+
+    // ----- Raydium 側アカウント、ほとんどチェック不要 -----
+
+    /// CHECK: CPMM によって検証
+    #[account(mut)] pub pool_state: UncheckedAccount<'info>,
+    /// CHECK: CPMM によって検証
+    pub amm_config: UncheckedAccount<'info>,
+    /// CHECK: CPMM によって検証
+    pub pool_authority: UncheckedAccount<'info>,
+    #[account(mut)] pub input_vault:  Account<'info, TokenAccount>,
+    #[account(mut)] pub output_vault: Account<'info, TokenAccount>,
+    /// CHECK: CPMM によって検証
+    #[account(mut)] pub observation_state: UncheckedAccount<'info>,
+
+    /// エスクロー入力 ATA — エスクロー PDA によって所有。
+    #[account(
+        mut,
+        associated_token::mint = input_mint,
+        associated_token::authority = escrow,
+    )]
+    pub escrow_input_ata: Account<'info, TokenAccount>,
+
+    /// エスクロー出力 ATA。
+    #[account(
+        mut,
+        associated_token::mint = output_mint,
+        associated_token::authority = escrow,
+    )]
+    pub escrow_output_ata: Account<'info, TokenAccount>,
+
+    pub input_mint:  Account<'info, anchor_spl::token::Mint>,
+    pub output_mint: Account<'info, anchor_spl::token::Mint>,
+
+    pub cpmm_program:       Program<'info, raydium_cp_swap::program::RaydiumCpSwap>,
+    pub token_program:      Program<'info, Token>,
+    pub token_program_2022: Program<'info, anchor_spl::token_2022::Token2022>,
+}
+```
+
+非対称性 — あなたのアカウントに厳密な検証、Raydium のアカウントに `UncheckedAccount` — は怠慢ではありません。受信者はそれ自体を検証します。呼び出し元で二重検証するだけで CU を燃やし、Raydium が新しい構造体レイアウトフィールドを出荷するときに同期が外れるリスクがあります。
+
+## CPI 呼び出し自体
+
+```rust
+use raydium_cp_swap::cpi::{self, accounts::Swap as CpmmSwap};
+
+pub fn escrow_swap(
+    ctx: Context<EscrowSwap>,
+    amount_in: u64,
+    minimum_amount_out: u64,
+) -> Result<()> {
+    let user_key = ctx.accounts.user.key();
+    let bump     = ctx.accounts.escrow.bump;
+    let seeds: &[&[u8]] = &[b"escrow", user_key.as_ref(), &[bump]];
+    let signer: &[&[&[u8]]] = &[seeds];
+
+    let cpi_accounts = CpmmSwap {
+        payer:                ctx.accounts.user.to_account_info(),
+        authority:            ctx.accounts.escrow.to_account_info(),
+        amm_config:           ctx.accounts.amm_config.to_account_info(),
+        pool_state:           ctx.accounts.pool_state.to_account_info(),
+        input_token_account:  ctx.accounts.escrow_input_ata.to_account_info(),
+        output_token_account: ctx.accounts.escrow_output_ata.to_account_info(),
+        input_vault:          ctx.accounts.input_vault.to_account_info(),
+        output_vault:         ctx.accounts.output_vault.to_account_info(),
+        input_token_program:  ctx.accounts.token_program.to_account_info(),
+        output_token_program: ctx.accounts.token_program.to_account_info(),
+        input_token_mint:     ctx.accounts.input_mint.to_account_info(),
+        output_token_mint:    ctx.accounts.output_mint.to_account_info(),
+        observation_state:    ctx.accounts.observation_state.to_account_info(),
+    };
+
+    let cpi_ctx = CpiContext::new_with_signer(
+        ctx.accounts.cpmm_program.to_account_info(),
+        cpi_accounts,
+        signer,
+    );
+
+    cpi::swap_base_input(cpi_ctx, amount_in, minimum_amount_out)?;
+    Ok(())
+}
+```
+
+### PDA サイナーシード
+
+CPI は、`authority` として渡される PDA が呼び出し元が主張する導出と一致した場合にのみ成功します。2 つは以下に同意する必要があります：
+
+1. シードバイト列（ここでは `[b"escrow", user.key().as_ref()]`）。
+2. バンプ。
+3. 呼び出し元プログラム ID（あなたのプログラム、Raydium ではない）。
+
+Raydium は authority が誰であるかは気にしません — トランザクションをカバーする `authority` 署名と入力 ATA がその authority によって所有されることのみが重要です。検証は `anchor_spl::token::transfer` で発生します：ATA の `authority` フィールドがサイナーと等しい必要があります。
+
+一般的なバグ：`user` を authority として渡す（そしてエスクロー PDA によって所有されている `escrow_input_ata` から転送）。SPL Token プログラムは `owner mismatch` で拒否します。常に `authority` フィールドが ATA 所有者と一致するようにしてください。
+
+## 残りのアカウント
+
+複数の Raydium 命令は固定されたもの後に付加されるアカウントの可変長リストを取ります — **残りのアカウント**。
+
+- **CLMM `SwapV2`**：スワップが走査する可能性のあるティック配列の 1～8 個の `TickArrayState` アカウント、スワップ方向で。
+- **Farm v6 `Deposit` / `Harvest` / `Withdraw`**：`(reward_vault, user_reward_ata)` ペア、有効なリワードスロットごとに 1 ペア。
+- **Token-2022 トランスファーフック ミント**：トランスファーフックプログラムおよびフックが必要とするアカウント。
+
+Anchor CPI ヘルパーは残りのアカウントを型チェックしません。それらをパススルーします：
+
+```rust
+let cpi_ctx = CpiContext::new_with_signer(program, accounts, signer)
+    .with_remaining_accounts(ctx.remaining_accounts.to_vec());
+```
+
+**順序が重要です。** CLMM の場合：
+
+```
+remaining = [
+    tick_array_in_direction_0,    // 最初に交差
+    tick_array_in_direction_1,
+    ...,
+]
+```
+
+Farm v6 収穫の場合：
+
+```
+remaining = [
+    reward_vault_0, user_reward_ata_0,
+    reward_vault_1, user_reward_ata_1,
+    // reward_state が Uninitialized のスロットはすべて省略
+]
+```
+
+呼び出し元プログラムはクライアントから受け取る残りのアカウントを変更せずにパススルーする必要があります。フィルタリングや並び替えを試みないでください。
+
+## 複合呼び出しのコンピュート予算
+
+CPI は呼び出しフレーム自体に約 1,500 CU を消費します。被呼び出し側の独自の CU 使用がその上に積み重なります。Raydium CPI ごとの大まかな予算：
+
+| 呼び出し | CU (SPL Token) | CU (Token-2022) |
+|---------|----------------|-----------------|
+| CPMM swap_base_input | ~150,000 | ~200,000 |
+| CLMM swap_v2 (単一ティック配列) | ~180,000 | ~230,000 |
+| CLMM swap_v2 (2 ティックを越える) | ~220,000 | ~270,000 |
+| Farm v6 deposit | ~120,000 | ~150,000 |
+| Farm v6 harvest (リワードスロットごと) | +30,000 | +40,000 |
+| AMM v4 swap_base_in | ~140,000 | n/a |
+
+各 CPI フレームに約 1,500 を、あなた自身のプログラムのオーバーヘッドに約 20,000 を追加します。`harvest → swap A → swap B → deposit LP → stake LP` を行う自動複利運用機は簡単に 700k CU に達します。
+
+常に明示的な `ComputeBudgetProgram::set_compute_unit_limit` を設定します：
+
+```ts
+import { ComputeBudgetProgram } from "@solana/web3.js";
+
+const tx = new Transaction().add(
+  ComputeBudgetProgram.setComputeUnitLimit({ units: 900_000 }),
+  ComputeBudgetProgram.setComputeUnitPrice({ microLamports: priorityFeeMicroLamports }),
+  yourInstruction,
+);
+```
+
+デフォルト 200k CU 上限は複合呼び出しが完了する前に静かに枯渇します。
+
+## エラープロパゲーション
+
+Raydium のプログラムは安定したエラーコード付きの Anchor エラーを返します。あなたの呼び出し元プログラムはそれらを `Err(ProgramError::Custom(code))` として見ます。デフォルトでバブルアップします：
+
+```rust
+cpi::swap_base_input(cpi_ctx, amount_in, minimum_amount_out)?;
+```
+
+または特定のコードをインターセプト：
+
+```rust
+use raydium_cp_swap::error::ErrorCode as CpmmErr;
+
+match cpi::swap_base_input(cpi_ctx, amount_in, minimum_amount_out) {
+    Ok(_) => {},
+    Err(err) if is_err(err, CpmmErr::ExceededSlippage) => {
+        // あなたのプログラムはより大きなスリップページで再試行したい、
+        // または状態をアンワインドしたいかもしれません。
+        return err!(YourErr::PoolTooVolatile);
+    }
+    Err(err) => return Err(err),
+}
+```
+
+エラーコード・意味マッピングは IDL ポリシーごとに安定です（[`sdk-api/anchor-idl`](/ja/sdk-api/anchor-idl)）；新しいコードは最後に追加され、既存のコードは意味を変更しません。
+
+## 完全な実装例：リミットオーダーエスクロー
+
+フロー：
+
+1. **`open_order`** — ユーザーは `input_mint` の `amount_in` をエスクロー PDA にデポジット、ターゲット `min_amount_out` と有効期限を記録します。
+2. **`execute_order`** — 誰でも（キーパー）現在のプールアカウントで呼び出します。プログラムは現在の見積りが `min_amount_out` 以上であることを確認し、Raydium スワップへの CPI を実行し、出力をエスクロー内に保持します。
+3. **`claim`** — ユーザーはエスクロー内の出力ミントを引き出します。
+
+```rust
+#[account]
+pub struct LimitOrder {
+    pub user:          Pubkey,
+    pub input_mint:    Pubkey,
+    pub output_mint:   Pubkey,
+    pub amount_in:     u64,
+    pub min_out:       u64,
+    pub expiry_unix:   i64,
+    pub state:         u8,    // 0 open, 1 filled, 2 cancelled, 3 expired
+    pub bump:          u8,
+}
+
+#[program]
+pub mod limit_orders {
+    use super::*;
+
+    pub fn execute_order(
+        ctx: Context<ExecuteOrder>,
+    ) -> Result<()> {
+        let order = &ctx.accounts.order;
+        require!(order.state == 0, OrderErr::NotOpen);
+        require!(Clock::get()?.unix_timestamp < order.expiry_unix, OrderErr::Expired);
+
+        let user_key = order.user;
+        let seeds: &[&[u8]] = &[b"order", user_key.as_ref(), &[order.bump]];
+        let signer: &[&[&[u8]]] = &[seeds];
+
+        let pre_out_balance = ctx.accounts.escrow_output_ata.amount;
+
+        let cpi_accounts = CpmmSwap {
+            payer:                ctx.accounts.keeper.to_account_info(),
+            authority:            ctx.accounts.order.to_account_info(),
+            amm_config:           ctx.accounts.amm_config.to_account_info(),
+            pool_state:           ctx.accounts.pool_state.to_account_info(),
+            input_token_account:  ctx.accounts.escrow_input_ata.to_account_info(),
+            output_token_account: ctx.accounts.escrow_output_ata.to_account_info(),
+            input_vault:          ctx.accounts.input_vault.to_account_info(),
+            output_vault:         ctx.accounts.output_vault.to_account_info(),
+            input_token_program:  ctx.accounts.token_program.to_account_info(),
+            output_token_program: ctx.accounts.token_program.to_account_info(),
+            input_token_mint:     ctx.accounts.input_mint.to_account_info(),
+            output_token_mint:    ctx.accounts.output_mint.to_account_info(),
+            observation_state:    ctx.accounts.observation_state.to_account_info(),
+        };
+
+        let cpi_ctx = CpiContext::new_with_signer(
+            ctx.accounts.cpmm_program.to_account_info(),
+            cpi_accounts,
+            signer,
+        );
+
+        // エスクロー側の最小値を強制 — Raydium のスリップページを信頼しますが、
+        // 将来の変更がそれを緩和した場合に備えて、自身のスワップ後デルタも再確認します。
+        cpi::swap_base_input(cpi_ctx, order.amount_in, order.min_out)?;
+
+        ctx.accounts.escrow_output_ata.reload()?;
+        let delta = ctx.accounts.escrow_output_ata.amount
+            .checked_sub(pre_out_balance)
+            .ok_or(error!(OrderErr::AccountingError))?;
+        require!(delta >= order.min_out, OrderErr::InsufficientOutput);
+
+        let order = &mut ctx.accounts.order;
+        order.state = 1;
+        Ok(())
+    }
+}
+```
+
+キーパーはトランザクション手数料を支払います（他の場所でキーパー手数料を取得します — 表示されていません）。エスクロー PDA は CPI に署名します。Raydium 側スリップページチェックとエスクロー自身のデルタチェック両方がフロアを強制します — 二重のセーフティ。
+
+## テスト
+
+Raydium プログラムをローカルバリデータにプルして統計テストを行う（`Anchor.toml` から）：
+
+```toml
+[test.validator]
+clone = [
+  { address = "CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK" }, # CPMM
+  { address = "CLMM...." },                                     # CLMM
+  { address = "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8" }, # AMM v4
+  { address = "FarmqiPv5eAj3j1GMdMCMUGXqPUvmquZtMy86QH6rzhG" }, # Farm v6
+]
+```
+
+プール状態アカウントも複製して、テストが実際にスワップを実行できるようにします。`anchor test` はスタートアップ時にメインネットからそれらをフェッチします。[`sdk-api/rust-cpi`](/ja/sdk-api/rust-cpi#testing-a-cpi-flow)を参照。
+
+## コンポジション固有の落とし穴
+
+### リエントランシー
+
+Solana に真のリエントランシーはありません — CPI は同じ呼び出しで発信元プログラムにコールバックできません。しかし、あなたは論理的なリエントランシーを自分自身に組み込むことはできます：CPI があなたの状態を読み、その後あなたのコードが CPI がそれを変更しなかったと仮定してそれを再び読みます。Raydium の場合、CPI はあなたの状態に触れないため、これは例えばフラッシュローンコンテキストのような懸念事項は少ないです。しかし Raydium をレンディングプロトコルと組み合わせる場合は、注意してください。
+
+### アカウント可変性ドリフト
+
+あなたのプログラムがアカウントを `mut` として渡すが、Raydium が読み取り専用として期待する場合（またはその逆）、ランタイムは `InvalidAccountData` で呼び出しを拒否します。常に IDL の Raydium 命令の期待される可変性を確認してください；`anchor_cp_swap::cpi::accounts::Swap` はそのフィールド型でこれを強制します。
+
+### Token-2022 プログラムフィールド
+
+入力ミントと出力ミントは異なるトークンプログラム下にあるかもしれません — 1 つ SPL Token、1 つ Token-2022。CPI がこのため別の `input_token_program` と `output_token_program` フィールドを持っています。常に各ミントの `owner` フィールドを確認し、正しいプログラムを各スロットにルーティングしてください。
+
+### バージョン付きトランザクション
+
+2 つ以上の Raydium CPI に加えて ATA 作成を行う複合 tx は、レガシー（v0 なし LUT）トランザクションにはめったに適合しません。V0 をアドレスルックアップテーブルで使用してください；`raydium.getRaydiumLutAddresses()` で Raydium の公開 LUT をプルしてください。
+
+## ポインタ
+
+- [`sdk-api/rust-cpi`](/ja/sdk-api/rust-cpi) — 低レベル CPI メカニクス。
+- [`integration-guides/priority-fee-tuning`](/ja/integration-guides/priority-fee-tuning) — コンピュート予算サイジング。
+- [`products/cpmm/code-demos`](/ja/products/cpmm/code-demos)、[`products/clmm/code-demos`](/ja/products/clmm/code-demos)、[`products/farm-staking/code-demos`](/ja/products/farm-staking/code-demos) — 製品ごとの CPI スニペット。
+
+ソース：
+
+- [raydium-cp-swap CPI crate](https://github.com/raydium-io/raydium-cp-swap)
+- [raydium-clmm CPI crate](https://github.com/raydium-io/raydium-clmm)
+- [Anchor CPI docs](https://www.anchor-lang.com/docs/cross-program-invocations)

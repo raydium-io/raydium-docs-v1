@@ -1,0 +1,224 @@
+---
+title: "Маршрутизация и MEV"
+description: "Разделение маршрутов между продуктами Raydium, паттерны защиты от sandwich-атак, интеграция Jito bundle и компромиссы между приватной и публичной передачей транзакций."
+---
+
+<Info>
+  **Эта страница переведена с помощью ИИ. За эталон принимается английская версия.**
+
+  [Открыть английскую версию →](/integration-guides/routing-and-mev)
+</Info>
+
+<Info>
+  MEV на Solana отличается от MEV в Ethereum, основанного на мемпуле. Лидеры блоков видят пакеты транзакций по мере их поступления, а не как упорядоченный мемпул. Front-running происходит через переупорядочение на стороне лидера или через co-located поисковиков, а sandwich-атаки выполняются ботами, которые следят за состоянием пула и посылают вашу транзакцию с более высокой комиссией. Способы защиты соответственно различаются.
+</Info>
+
+## Введение в split routing
+
+«Split routing» означает разделение одного логического своппа между несколькими пулами так, чтобы маржинальные цены выровнялись — такой же выход, как если бы каждый кусок менялся по цене своего пула. Это снижает эффективный ценовой импакт, когда какой-либо отдельный пул мелкий относительно размера торговли.
+
+Формулировка задачи: дано пулов `P_1, ..., P_n` с функциями `f_i(x)`, которые преобразуют вход `x` в выход, найти разделение `x_1 + ... + x_n = X`, которое максимизирует `Σ f_i(x_i)`. Поскольку каждое `f_i` вогнутое, оптимум удовлетворяет `f'_1(x_1) = f'_2(x_2) = ... = f'_n(x_n)` (равные маржинальные цены).
+
+### Жадная реализация
+
+Простой подход, который на практике дает результат в пределах ~1% от оптимального:
+
+```
+remaining = X
+routes    = []
+step      = X / 1000     // размер среза
+while remaining > 0:
+    best_pool = argmax over i of f'_i(current_x_i + step)
+    x_i += step
+    routes.append((best_pool, step))
+    remaining -= step
+```
+
+Меньший `step` → ближе к оптимальному, больше итераций. На практике 100–500 срезов — разумная золотая середина.
+
+### Реализация через выпуклую оптимизацию
+
+Для production-grade агрегаторов решайте задачу оптимизации напрямую. Каждый пул имеет закрытую форму `f'_i(x)`:
+
+- **Constant-product (CPMM / AMM v4)**: `f'(x) = y * R_y / (R_x + x)^2`, где `R_x, R_y` — резервы и `y = R_x * R_y / (R_x + x) - R_y` ... (более простая производная: маржинальная цена — это `R_y / (R_x + x)`, поэтому разделение для выравнивания маржинальных цен — это одномерный поиск).
+- **CLMM**: кусочно-гладкая — внутри одного тика `f'(x)` — это рациональная функция `sqrt_price`; между тиками она скачет дискретно. Разделяйте с решателем малого шага или рассматривайте каждый смежный тик как собственный «пул».
+
+Выход split routing — это вектор `[(pool_1, x_1), (pool_2, x_2), ...]`, который этап сборки транзакции преобразует в последовательность инструкций swopp.
+
+### Когда split routing помогает
+
+| Размер торговли относительно TVL | Split помогает? |
+|----------------------------------|-----------------|
+| `<0.1%` | Нет — один пул доминирует |
+| 0.1–1% | Незначительно |
+| 1–5% | Да, улучшение на 10–50 bps |
+| `>5%` | Да, значительное улучшение |
+
+Если вы запускаете in-UI swap кошелька для розничного пользователя, торгующего `<$10k` на глубоком пуле, не тратьте время на split — накладные расходы gas превышают улучшение. Для агрегатора, котирующего институциональный поток, всегда разделяйте.
+
+## Multi-hop маршруты
+
+Когда прямого пула не существует или импакт прямого пула огромен, переходите через промежуточный токен:
+
+```
+tokenA → tokenHub → tokenB
+```
+
+Распространённые хабы: USDC, SOL, RAY. Каждый hop имеет:
+
+- Свой слиппедж-лимит (ниже на прямых hop-ах; per-hop на multi-hop).
+- Свою комиссию.
+- Свой ценовой импакт.
+
+Общий импакт компонуется: `(1 - impact_1) * (1 - impact_2)`. Импакт 1% twice — это 1.99% всего, не 2%.
+
+**Никогда не переходите через один и тот же пул дважды.** Прохождение `A → B → A → B` через один и тот же CLMM просто сжигает комиссии и слиппедж. Агрегаторы должны фильтровать такие маршруты при генерации. (Примечание: это *зацикливание одной и той же пары*, а не multi-hop в целом — маршрутизация `A → USDC → B` через разные пулы — это стандартный, полезный паттерн, одобренный выше.)
+
+**Per-hop vs end-to-end минимум.** С CPI composition ([`integration-guides/cpi-integration`](/ru/integration-guides/cpi-integration)), вы можете установить для каждого hop `minimum_amount_out` на 0 и обеспечить один end-to-end минимум в вашем proxy. Без CPI каждый hop обеспечивает свой минимум, что требует вычисления разумных промежуточных границ — обычно `quote_i * (1 - slippage_bps/10000)` per hop.
+
+## Sandwich-атаки
+
+### Механизм
+
+Бот следит за потоком транзакций в сети. Когда он видит ваш своп:
+
+1. Front-run: бот покупает тот же токен *перед вами*, поднимая цену пула.
+2. Ваша транзакция: вы меняете по худшей цене.
+3. Back-run: бот продаёт по повышенной цене, захватывая спред.
+
+Бот платит priority fees за обе свои транзакции; прибыль — это разница sandwich минус двойной priority fee. Прибыльно только на пулах, где ваша торговля значимо движет цену.
+
+### Защита
+
+**Плотный слиппедж.** Если ваш minimum-out на 0.5% ниже котировки, sandwich, который движет цену более чем на 0.5%, revert вашу транзакцию, но pre-trade бота уже прошёл по вашей старой цене. Они теряют деньги. Sandwich-боты ориентируются на широкий слиппедж (≥1–2%); слиппедж &lt;0.3% в основном защищён.
+
+**Private-mempool submission (Jito).** Отправьте транзакцию как часть Jito bundle. Bundle не появляются в публичном потоке gossip; боты не могут видеть торговлю в полёте и front-run её. Компромисс: bundle требуют tip на стороне валидатора, и не все лидеры включают Jito (хотя большинство включают).
+
+**Меньшие размеры торговли.** Разделите торговлю на несколько транзакций, чтобы ни одна не двигала цену достаточно, чтобы быть выгодной целью sandwich. Увеличивает общие расходы gas.
+
+**Randomization по времени.** Отправляйте во время низких объёмов, если возможно. Недоступно для интерактивных user swap, но жизнеспособно для scheduled bot flow.
+
+CLMM пулы Raydium обычно видят меньше sandwich-активности, чем CPMM, потому что структура single-tick ликвидности означает, что небольшие торговли не двигают цену вообще (они остаются внутри тика). Глубокие CLMM пулы — органически лучшее место для sandwich-защиты.
+
+## Jito bundles
+
+Jito — это модифицированный Solana валидатор-клиент, который принимает **bundles** — упорядоченные группы транзакций, приземляющихся атомарно. Боты используют Jito для извлечения MEV; обычные пользователи используют Jito для защиты от этих же ботов.
+
+### Как работают bundles
+
+- Подключитесь к Jito block engine endpoint (например `https://mainnet.block-engine.jito.wtf`).
+- Отправьте bundle из 1–5 транзакций плюс tip на один из Jito tip аккаунтов.
+- Если текущий лидер запускает Jito, ваш bundle рассматривается. Bundle-победитель по аукциону этого слота (bundle с самым высоким tip-per-CU) приземляется; остальные отваливаются.
+
+### Размер tip
+
+Размеры tip следуют распределению recent-bundle. Jito публикует real-time процентили:
+
+```ts
+const tipRes = await fetch("https://worker.jito.wtf/api/v1/bundles/tip_floor");
+const tips   = await tipRes.json();
+// { ema_landed_tips_25th_percentile, 50th, 75th, 95th, 99th }
+
+// User-facing swap в обычный день — 50th процентиль достаточно.
+const tipSol = tips.ema_landed_tips_50th_percentile_lamports / 1e9;
+
+// Time-sensitive bot trade при congestion — 75–95th процентиль.
+```
+
+Типичные диапазоны: 0.0001–0.001 SOL для non-urgent user swap; 0.01–0.1 SOL при congestion для high-priority ботов.
+
+### Конструирование bundle
+
+```ts
+import { SearcherClient } from "jito-ts";
+
+const client = new SearcherClient("https://mainnet.block-engine.jito.wtf");
+
+const tipIx = SystemProgram.transfer({
+  fromPubkey: user.publicKey,
+  toPubkey:   JITO_TIP_ACCOUNTS[Math.floor(Math.random() * 8)],  // 8 tip аккаунтов
+  lamports:   tipLamports,
+});
+
+const tx1 = new VersionedTransaction(...);  // своп
+tx1.sign([user]);
+
+const bundleUuid = await client.sendBundle([tx1], tipLamports);
+// Опционально: await confirmation via client.getBundleStatuses([bundleUuid])
+```
+
+Подводные камни:
+
+- **Tip должен быть в bundle.** Включите `SystemProgram.transfer` на Jito tip аккаунт как инструкцию внутри одной из транзакций bundle (обычно последнюю). Отдельная tip транзакция, не являющаяся частью bundle, игнорируется.
+- **Лидер не включает Jito.** ~75% лидеров запускают Jito; ~25% нет. Bundle, отправленные, когда non-Jito лидер держит слот, отваливаются. Клиент автоматически повторит попытку.
+- **Expiry.** Bundle используют ту же модель blockhash-expiry, что и обычные транзакции. Собирайте и отправляйте быстро; ~60s окно.
+
+### Bundle vs priority fees
+
+Priority fees подкупают лидера, чтобы он включил вашу транзакцию раньше. Jito bundle дополнительно скрывают транзакцию из публичного мемпула. Используйте priority fees для срочности; используйте bundle для sandwich-защиты. Оба средства вместе: используйте оба на high-value user swap.
+
+Смотрите [`integration-guides/priority-fee-tuning`](/ru/integration-guides/priority-fee-tuning) для sizing priority fees.
+
+## MEV-share / revert-protected RPC
+
+Некоторые RPC провайдеры предлагают «MEV-share» или «revert-protected» endpoints, которые внутренне маршрутизируют вашу транзакцию через Jito bundle или эквивалентные приватные пути:
+
+- **Helius** — staked соединения с bundle поддержкой.
+- **QuickNode** — «Revert Protect» endpoint; автоматически формирует bundle вокруг отправленных транзакций.
+- **Triton** — private-flow tier.
+
+Использование одного из этих — самый простой путь для проектов, которые не хотят управлять logic bundle сами. Компромисс: непрозрачные internals; вы доверяете construction bundle провайдера.
+
+## Обработка congestion
+
+Во время windows высокого объёма (mainnet launch, major listing, sustained rally), очереди пакетов лидера переполняются. Признаки:
+
+- Транзакции остаются unconfirmed 60+ секунд, затем expires с "blockhash not found".
+- Priority fees, которые работали вчера, недостаточны сегодня.
+- Simulation успешна, но execution никогда не приземляется.
+
+Стратегии:
+
+1. **Агрессивный retry при expiry.** На `TransactionExpiredBlockheightExceeded`, переб постройте с fresh blockhash и переотправьте. *Не* retry на revert — reverts детерминированы.
+2. **Multi-RPC broadcast.** Отправьте одну и ту же транзакцию на несколько RPC параллельно; какая бы достигла лидера первой, побеждает.
+3. **Priority fee ramping.** Начните с 50th процентиля; если первая попытка expires, retry на 75th, затем 95th.
+4. **Jito bundle как fallback.** Jito лидеры обычно менее congested, потому что block engine сортирует bundle по tip-per-CU; high-tip bundle получают приоритет.
+5. **Simulate less.** При congestion симулируйте один раз в начале; не re-simulate при retry, так как pool state всё равно сдвинется. Re-simulation при congestion часто падает spuriously.
+
+## Per-product MEV соображения
+
+**CPMM.** Высоко sandwichable на low-TVL пулах. Constant-product кривая амплифицирует даже небольшие bot pre-trade. Рекомендуем Jito bundle для любого CPMM trade >0.5% pool TVL.
+
+**CLMM.** Менее sandwichable на глубоких пулах, потому что within-tick торговля не двигает цену. Но cross-tick торговля абсолютно двигает; sandwich на tick crossing — известный паттерн. Плотный слиппедж (`<0.3%`) — лучшая защита.
+
+**AMM v4 + OpenBook.** OpenBook orderbook fills работают через одну транзакцию, поэтому sandwich-боты, которые не знают orderbook state, недооценивают ценовой импакт и часто fail. Органически low-MEV venue по этой причине.
+
+**LaunchLab.** Во время early-bonding-curve фазы front-running распространён на hyped launch. Кривые двигаются быстро и слиппедж широк. Jito bundle сильно рекомендуются. После graduation результирующий CPMM следует обычной CPMM динамике.
+
+**Farms.** Harvest и stake операции — не своп и не sandwichable. Нет специальной обработки.
+
+## Контрольный список
+
+Для production агрегатора / wallet swap UI:
+
+- [ ] Слиппедж по умолчанию ≤0.5% на обычных парах; пользователь может переопределить.
+- [ ] Jito bundle submission включён по умолчанию для swap >\$1k USD значение.
+- [ ] Priority fee взят из live estimate (не hard-coded).
+- [ ] Retry логика различает revert (не retry) от expiry (retry с новым blockhash).
+- [ ] Multi-hop маршруты устанавливают per-hop минимумы, не end-to-end.
+- [ ] Split routing активен для торговли >1% TVL любого отдельного пула.
+- [ ] Pool freshness: re-fetch состояние прямо перед submission; re-quote если stale.
+- [ ] Sandwich-resistant на shallow пулах: либо Jito-only, либо reject если слиппедж >1%.
+
+## Указатели
+
+- [`integration-guides/aggregator`](/ru/integration-guides/aggregator) — pool discovery, quoting, transaction assembly.
+- [`integration-guides/priority-fee-tuning`](/ru/integration-guides/priority-fee-tuning) — CU и priority fee sizing.
+- [`integration-guides/cpi-integration`](/ru/integration-guides/cpi-integration) — single-slippage-gate multi-hop composition.
+- [`algorithms/slippage-and-price-impact`](/ru/algorithms/slippage-and-price-impact) — formal definitions.
+
+Источники:
+
+- [Jito docs](https://docs.jito.wtf)
+- [Solana validator docs on priority fees](https://docs.solana.com/transaction_fees)
+- [jito-ts](https://github.com/jito-labs/jito-ts) — TypeScript bundle client.

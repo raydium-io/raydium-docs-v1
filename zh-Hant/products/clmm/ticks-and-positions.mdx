@@ -1,0 +1,159 @@
+---
+title: "刻度與流動性部位"
+description: "CLMM 如何將價格離散化為刻度、刻度陣列如何壓縮儲存，以及規範部位可以存在位置的規則。"
+---
+
+<Info>
+  **本頁內容由 AI 自動翻譯，所有內容以英文版本為準。**
+
+  [查看英文版 →](/products/clmm/ticks-and-positions)
+</Info>
+
+## 為什麼存在刻度
+
+CLMM 的流動性集中在價格範圍內。為了在鏈上使範圍易於處理，價格被量化為整數 **刻度（ticks）**，其中每個刻度是前一個的常數倍：
+
+$$
+\text{price}(i) = 1.0001^{\,i}
+$$
+
+一個刻度對應 0.01% 的價格變動，或約 1 個基點。映射關係如下：
+
+| 刻度索引 `i` | 價格倍數 |
+|---|---|
+| `0` | `1.0000` |
+| `100` | `1.0100`（≈ +1.00%） |
+| `-100` | `0.9900`（≈ −0.99%） |
+| `10000` | `2.7181`（≈ e） |
+| `MAX_TICK = 443636` | ≈ `1.84e19` |
+| `MIN_TICK = -443636` | ≈ `5.42e-20` |
+
+選擇 `MIN_TICK` 和 `MAX_TICK` 使得 `sqrt_price_x64` 在兩端都能適配 `u128`。每個池都會強制 `tick_lower >= MIN_TICK` 和 `tick_upper <= MAX_TICK`。在實踐中，網頁 UI 會將範圍限制在更小的範圍內，以防止使用者將流動性鎖定在無法訪問的刻度。
+
+## 刻度間距
+
+一個池的 `AmmConfig` 固定了 **刻度間距（tick spacing）**—— 部位唯一被允許用作端點的刻度。如果 `tick_spacing = 60`，則只有刻度 `…, −120, −60, 0, 60, 120, …` 才是有效的。嘗試以端點 `31` 開啟部位將回滾並拋出 `InvalidTickIndex` 錯誤。
+
+常見的已發佈間距：
+
+| 費用等級 | `trade_fee_rate` | 刻度間距 | 每個刻度部位的最粗價格步長 |
+|----------|------------------|--------------|---------------------------------------|
+| 0.01% | `100` | 1 | 0.01% |
+| 0.05% | `500` | 10 | 0.10% |
+| 0.25% | `2500` | 60 | 0.60% |
+| 1.00% | `10000` | 120 | 1.21% |
+
+間距越粗，需要初始化的刻度陣列越少，開啟寬幅部位的成本越低，價格邊界也就越模糊。波動性強的交易對通常存在於 120 間距等級；穩定幣對通常存在於 1 間距等級。
+
+## 刻度陣列
+
+該池不會在單獨的帳戶中儲存每個刻度的狀態。相反，`TICK_ARRAY_SIZE` 個相鄰的刻度（Raydium CLMM 目前為 60 個）被打包到單個 `TickArrayState` 中。陣列的第一個刻度是它的 `start_tick_index`，它覆蓋恰好 `TICK_ARRAY_SIZE * tick_spacing` 個整數刻度單位。
+
+對於 `tick_spacing = 60` 和 `TICK_ARRAY_SIZE = 60`：
+
+- 每個刻度陣列跨越 `60 × 60 = 3600` 個整數刻度。
+- `start_tick_index` 是 3600 的倍數：`…, -7200, -3600, 0, 3600, 7200, …`。
+
+在 `tick_spacing = 60` 時，部位端點 `t = 2040` 存在於 `start_tick_index = 0` 的刻度陣列中。部位端點 `t = 4200` 存在於 `start_tick_index = 3600` 的陣列中。
+
+### 陣列何時被建立
+
+刻度陣列是懶初始化的：**第一個** 引用其內部任何刻度的部位會初始化該陣列，並支付租金。交換不會初始化刻度陣列—— 它們使用位圖跳過未初始化的陣列。SDK 的開啟部位流程會檢查所選範圍，計算它涉及的刻度陣列列表，並在與 `OpenPosition` 相同的交易中添加 `init_tick_array` 指令（如果有任何缺失）。
+
+### 刻度陣列不會被關閉
+
+一旦刻度陣列被初始化，它就會在池的整個生命週期內持續存在。該程序 **不會** 暴露關閉刻度陣列的路徑，即使 `initialized_tick_count` 回到零。刻度陣列沒有租金恢復；觸及陣列的第一個部位支付的租金會被永久鎖定在該帳戶中。這是一個刻意的權衡：對於後續的每個部位，重新使用現有刻度陣列都是免費的，因此一個流量大的池每個 `(pool, start_tick_index)` 槽位只需支付一次租金成本，無論使用者有多頻繁地更替。
+
+### 位圖
+
+尋找「當前刻度左邊/右邊的下一個已初始化刻度」必須很快—— 交換可能會跨越許多刻度。該池在 `PoolState` 中儲存了一個 1 比特每刻度陣列的位圖，用於刻度 0 周圍 ±1,024 個陣列的範圍。超出該範圍的區域（全範圍部位、特殊設置），`TickArrayBitmapExtension` 提供溢出空間。
+
+交換遍歷位圖：`lowest_set_bit_above(tick_current_array_index)` 給出下一個在交換跨越方向上具有已初始化刻度的陣列。在該陣列內，類似的位掃描定位下一個已初始化的刻度。
+
+## `liquidity_gross` 和 `liquidity_net`
+
+每個 **已初始化** 的刻度儲存兩個流動性值：
+
+- **`liquidity_gross`** —— 所有引用此刻度作為任一端點的部位的 `L` 之和。當 `liquidity_gross` 達到零時，刻度變為未初始化，可以從位圖中刪除。
+- **`liquidity_net`** —— 當價格 **向上跨越** 此刻度（在刻度空間中從左到右）時，池級 `liquidity` 的 *帶符號* 變化。如果此刻度是大小為 `L` 的部位的下界，它會貢獻 `+L`；如果它是該部位的上界，它會貢獻 `−L`。
+
+實例：同一池上的兩個部位。
+
+- 部位 A：`tick_lower = -120`，`tick_upper = 0`，流動性 `L_A = 100`。
+- 部位 B：`tick_lower = -60`，`tick_upper = 60`，流動性 `L_B = 50`。
+
+逐刻度狀態：
+
+| 刻度 | 涉及 | `liquidity_gross` | `liquidity_net` |
+|------|------------|-------------------|------------------|
+| `-120` | A 下界 | 100 | +100 |
+| `-60` | B 下界 | 50 | +50 |
+| `0` | A 上界 | 100 | −100 |
+| `60` | B 上界 | 50 | −50 |
+
+不同 `tick_current` 值的池級 `liquidity`：
+
+- `tick_current = -180`：`liquidity = 0`（任何部位之前）
+- `tick_current = -90`：`liquidity = 100`（僅在 A 內）
+- `tick_current = -30`：`liquidity = 150`（在 A 和 B 內）
+- `tick_current = 30`：`liquidity = 50`（僅在 B 內）
+- `tick_current = 90`：`liquidity = 0`（兩者都超過）
+
+在交換期間的每次刻度跨越時，程序將 `liquidity_net`（可能為負）添加到 `PoolState.liquidity`。這正是 Uniswap v3 的機制。
+
+## 作為 NFT 的部位
+
+Raydium CLMM 部位是一個 NFT。開啟部位會鑄造一個全新的、供應量為 1 的 mint 到呼叫者的錢包中，該 mint 的授權人是 CLMM 程序。程序將部位所有權鏈接到 **在 CPI 時在該 mint 的 ATA 中持有餘額的人** 身上。
+
+結果：
+
+- **部位是可轉移的。** 一個錢包可以通過轉移 NFT 來出售或空投部位。新持有者隨後可以調用 `CollectRewards`、`IncreaseLiquidity` 等。
+- **部位在 CLMM 外是可尋址的。** 市場和錢包像展示其他 NFT 一樣展示部位。SDK 在 mint 的元資料上設置了合理的 `name`/`symbol`。
+- **部位的 PDA 是從 NFT mint 派生的。** 你可以找到 `PersonalPositionState` 而無需知道當前誰持有它。
+
+### Token-2022 部位
+
+較新的 CLMM 池可以在 Token-2022 下而不是經典 SPL Token 下鑄造部位。該程序暴露兩個平行的開啟指令 —— `OpenPosition` 和 `OpenPositionWithToken22Nft` —— 除了哪個代幣程序擁有 NFT mint 外，語義完全相同。錢包和市場的相容性有所不同；Raydium 的 UI 追蹤兩者。
+
+## 允許範圍規則
+
+在 `OpenPosition` 時，程序會強制執行：
+
+1. `tick_lower < tick_upper`。
+2. `tick_lower % tick_spacing == 0` 和 `tick_upper % tick_spacing == 0`。
+3. `MIN_TICK <= tick_lower` 和 `tick_upper <= MAX_TICK`。
+4. 呼叫者已提供包含 `tick_lower` 和 `tick_upper` 的刻度陣列—— 要麼已初始化，要麼通過同一交易中的 `init_tick_array`。
+5. 位圖擴展帳戶（如果此部位延伸到擴展範圍）。
+
+如果任何檢查失敗，該指令將根據違反的約束回滾並拋出 `InvalidTickIndex`、`NotApproved` 或 `InsufficientLiquidity`。見 [`reference/error-codes`](/zh-Hant/reference/error-codes)。
+
+## 「範圍內」與「範圍外」
+
+部位在 `tick_lower <= tick_current < tick_upper` 時處於 **範圍內**。只有範圍內的部位有助於 `PoolState.liquidity`，因此只有它們賺取交換費。
+
+範圍外的部位：
+
+- 持有 *一種* 代幣的 100%（其範圍已走過的代幣）。具體來說，如果 `tick_current < tick_lower`，部位只持有 token1（它已被價格移動「售出」）；如果 `tick_current >= tick_upper`，它只持有 token0。
+- **不會** 賺取交換費。
+- **確實** 如果池的獎勵流發出到範圍外流動性，則繼續累積獎勵—— 但 Raydium 的預設行為是「僅發出到範圍內」，與 Uniswap v3 約定相匹配。見 [`products/clmm/fees`](/zh-Hant/products/clmm/fees)。
+
+管理 CLMM 部位的流動性提供者將他們的大部分注意力花在隨著價格變動來保持部位在範圍內。
+
+## 常見集成陷阱
+
+- **偏離間距的端點。** 從目標價格計算刻度的程式碼必須在將其傳遞給 `OpenPosition` 之前快速調整到 `tick_spacing` 的倍數。SDK 幫助函數（`TickUtils.getTickWithPriceAndTickspacing`）會執行此操作；自製的數學通常不會。
+- **缺失刻度陣列。** 開啟寬幅部位可能需要初始化多個刻度陣列；忘記將它們作為可寫帳戶傳遞會導致回滾。SDK 的 `openPositionFromBase` 會為你返回列表。
+- **交換後過期的刻度。** `tick_current` 可以在一次交換中跨越許多刻度。如果你的 UX 展示來自一個 RPC 呼叫的「當前刻度」，然後在稍後的一個呼叫中開啟部位，該部位相對於實時價格的相對位置可能會相差數十個刻度。在簽名之前重新獲取。
+- **帶有額外元資料的部位 NFT。** 如果你建立一個識別 Raydium 部位的錢包，通過它們的 mint 授權人（= CLMM 程序的 PDA）來檢測它們，而不是通過硬編碼的元資料欄位。
+
+## 後續步驟
+
+- [數學](/zh-Hant/products/clmm/math) —— 交換逐步解析和刻度邊界參與的費用增長推導。
+- [帳戶](/zh-Hant/products/clmm/accounts) —— `TickArrayState` 和 `PositionState` 佈局。
+- [費用與獎勵](/zh-Hant/products/clmm/fees) —— 範圍內性如何控制費用累積。
+- [`algorithms/clmm-math`](/zh-Hant/algorithms/clmm-math) —— 集中流動性公式的共享推導。
+
+資源：
+
+- [`raydium-io/raydium-clmm` — `tick_array`、`tick`、`position` 模組](https://github.com/raydium-io/raydium-clmm)
+- "Uniswap v3 Core" 白皮書，§6（刻度）、§7（費用增長）

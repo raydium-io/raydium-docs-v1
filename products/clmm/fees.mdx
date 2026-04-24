@@ -1,0 +1,260 @@
+---
+title: "CLMM fees and rewards"
+description: "How CLMM splits a trade fee across LPs, protocol, and fund; how the three-slot reward system emits to in-range positions; and how both settle into per-position balances."
+---
+
+## Fee tiers
+
+CLMM pools bind to an `AmmConfig` at creation; the config decides the trade-fee rate, the protocol and fund shares, and the **tick spacing** (see [`products/clmm/ticks-and-positions`](/products/clmm/ticks-and-positions)). Typical published tiers (confirm live against `GET https://api-v3.raydium.io/main/clmm-config`):
+
+| `AmmConfig` index | `trade_fee_rate` | Tick spacing | Typical use |
+|---|---|---|---|
+| 0 | `100` (0.01%) | 1 | Stable pairs |
+| 1 | `500` (0.05%) | 10 | Correlated blue-chips |
+| 2 | `2_500` (0.25%) | 60 | Standard pairs |
+| 3 | `10_000` (1.00%) | 120 | Volatile or long-tail |
+
+The trade-fee rate is in units of `1/FEE_RATE_DENOMINATOR = 1/1_000_000` of volume. The protocol and fund rates are in the same denominator but applied to the **trade fee**, not to volume — the same convention as CPMM.
+
+## Per-swap fee split
+
+On each step of a swap (see [`products/clmm/math`](/products/clmm/math)):
+
+```
+step_trade_fee   = ceil(step_input * trade_fee_rate / 1_000_000)
+step_protocol    = floor(step_trade_fee * protocol_fee_rate / 1_000_000)
+step_fund        = floor(step_trade_fee * fund_fee_rate     / 1_000_000)
+step_lp          = step_trade_fee - step_protocol - step_fund
+```
+
+- `step_lp` flows into `fee_growth_global_{input_side}_x64` scaled by current active liquidity: `fee_growth_global += step_lp × 2^64 / pool.liquidity`.
+- `step_protocol` accrues into `PoolState.protocol_fees_token_{input_side}` — swept with `CollectProtocolFee`.
+- `step_fund` accrues into `PoolState.fund_fees_token_{input_side}` — swept with `CollectFundFee`.
+
+Just like CPMM, the protocol and fund portions sit in the vaults but are **excluded from the curve's liquidity view**: the swap math reads `pool.liquidity`, which is not inflated by pending-but-unswept fees.
+
+## Why fees are per-side
+
+Unlike CPMM (where a swap's fee is always charged in the input token and the other side of the pool never sees the protocol/fund accrual for this swap), in CLMM the same rule applies at each step: **fees accrue in whichever token is the input for that step**. Since a multi-tick swap has a consistent direction, all steps charge fees in the same token — so in practice fees on any given swap go to *one* side.
+
+If a user swaps token0 → token1, `fee_growth_global_0_x64` rises; `fee_growth_global_1_x64` does not. Positions earn fees in token0 on that swap. The next swap may go the other direction and credit `fee_growth_global_1_x64` instead. Over time, a balanced pool accrues on both sides.
+
+## Single-sided fee (`CollectFeeOn`)
+
+Pools created via [`CreateCustomizablePool`](/products/clmm/instructions) can opt into a non-default fee-collection mode. The mode is fixed at pool creation and stored in `PoolState.fee_on`.
+
+| `CollectFeeOn` value | `fee_on` byte | Behavior |
+|---|---|---|
+| `FromInput` (default) | `0` | Classic Uniswap-V3 — fee is always deducted from the input token of each swap step. The input token alternates with swap direction. |
+| `Token0Only` | `1` | Fee is always denominated in token0. For 0→1 swaps, the fee is the input token (same as `FromInput`). For 1→0 swaps, the fee is taken from the swap's output (token0). |
+| `Token1Only` | `2` | Symmetric to `Token0Only` — fee always in token1. |
+
+**Why a pool would choose `Token0Only` or `Token1Only`** — to give LPs a single, predictable accrual currency. Pairs like `MEMECOIN / USDC` where LPs are dollar-denominated benefit from `Token1Only` (fees always settle to USDC); LP P&L is then unaffected by which side trades dominate. The trade-off is that on directions where the fee comes out of swap output, the user receives `out − fee` rather than `out − ε` from the input, so quote logic must subtract the fee from the output side. The SDK's `computeAmountOut` handles this branching from `fee_on`; client code that reads `pool.fee_on` directly should mirror the helper functions on `PoolState`:
+
+```rust
+pool.is_fee_on_input(zero_for_one: bool) -> bool   // true → fee is deducted from input
+pool.is_fee_on_token0(zero_for_one: bool) -> bool  // for telemetry / accounting
+```
+
+**LP-level effect** — the fee is still routed through the standard `fee_growth_global_{0,1}_x64` accumulators per swap step, so positions still settle fees with the same `fee_growth_inside` formula. The asymmetry is only on the *direction* of side accrual, not on the math.
+
+`fee_on` is **not** mutable post-creation. Pools created via legacy `CreatePool` are permanently `FromInput`.
+
+## Dynamic fee
+
+Pools created with `enable_dynamic_fee = true` apply a volatility-driven surcharge on top of `AmmConfig.trade_fee_rate`. The mechanism is a simplified port of the Trader Joe / Meteora dynamic-fee design.
+
+### State
+
+`PoolState.dynamic_fee_info` carries five calibration parameters (snapshot of `DynamicFeeConfig` at pool creation) plus four state fields updated by every swap. See [`products/clmm/accounts`](/products/clmm/accounts#dynamicfeeconfig-and-dynamicfeeinfo) for the byte layout.
+
+### Per-swap update
+
+On every swap step the program runs three sub-steps:
+
+1. **Decay reference**. If `now - last_update_timestamp > filter_period`, the volatility reference decays:
+
+    ```
+    if elapsed > decay_period:
+        volatility_reference = 0
+    elif elapsed > filter_period:
+        volatility_reference = volatility_accumulator * reduction_factor / 10_000
+    # else: hold the previous reference
+    ```
+
+2. **Update accumulator**. The new accumulator is the reference plus the absolute distance traversed (in `tick_spacing`-units), multiplied by a granularity scale, capped at the configured maximum:
+
+    ```
+    delta_idx     = abs(tick_spacing_index_reference - current_tick_spacing_index)
+    accumulator   = volatility_reference + delta_idx * 10_000   // VOLATILITY_ACCUMULATOR_SCALE
+    accumulator   = min(accumulator, max_volatility_accumulator)
+    ```
+
+3. **Compute surcharge**. The surcharge is parabolic in the accumulator (since the swap "tick distance" is squared in the canonical formula), gain-scaled by `dynamic_fee_control`:
+
+    ```
+    fee_increment_rate = dynamic_fee_control * (accumulator * tick_spacing)^2
+                       / (100_000 * 10_000^2)
+    fee_rate           = AmmConfig.trade_fee_rate + fee_increment_rate
+    fee_rate           = min(fee_rate, 100_000)              // 10% cap
+    ```
+
+The 10% cap (`MAX_FEE_RATE_NUMERATOR = 100_000` in `1e6`-units) is hard-coded as a safety rail; in practice well-tuned configs land well below.
+
+### Choosing parameters
+
+Default ranges that have worked in pilot pools:
+
+| Parameter | Typical range | Notes |
+|---|---|---|
+| `filter_period` | 30 – 60 s | Holds the reference through micro-volatility; lower = more reactive |
+| `decay_period` | 300 – 1800 s | After this window of quiet, fee returns to base |
+| `reduction_factor` | 4_000 – 8_000 | Of `10_000`. Higher = stickier elevated fee |
+| `dynamic_fee_control` | 1_000 – 50_000 | Of `100_000`. Gain on the curve |
+| `max_volatility_accumulator` | 100_000 – 10_000_000 | Saturates how high the surcharge can climb |
+
+Calibrate by replaying historical swaps offline against the formula, then tuning `dynamic_fee_control` so that the resulting average fee matches a target (e.g., 1.5× base on 1σ days, 5× on 3σ days).
+
+### What LPs see
+
+Dynamic fee revenue flows through the same accumulators as the base fee — `fee_growth_global_{0,1}_x64`. There is no separate "dynamic fee growth" field. LPs in volatile pools simply earn higher fees during volatile periods, with no extra claim or settlement instruction needed.
+
+### What integrators need to know
+
+- The fee a quote returns can change between block N and block N+1 even if pool reserves haven't moved — every swap shifts the volatility accumulator. The Trade API quotes are valid at block-of-quote and may be off by a few bps if a reactive pool is fired between quote and execution.
+- `volatility_accumulator` and `last_update_timestamp` are public on-chain — clients can replicate the formula client-side for offline simulations.
+
+## Per-position fee accounting
+
+Each position stores, at its last touch time:
+
+- `fee_growth_inside_0_last_x64` and `fee_growth_inside_1_last_x64` — the range-specific fee growth at that snapshot.
+
+On every subsequent touch (`IncreaseLiquidity`, `DecreaseLiquidity`, and implicitly any state transition that updates the tick-bound fee growth):
+
+1. The program recomputes `fee_growth_inside_{0,1}_x64` from the **global** fee growth and the two endpoint ticks' `fee_growth_outside_*`.
+2. Δ is added to `tokens_fees_owed_{0,1}` weighted by the position's liquidity:
+
+   ```
+   Δ_fee_growth_inside_0 = fee_growth_inside_now_0 - fee_growth_inside_last_0
+   tokens_fees_owed_0  += Δ_fee_growth_inside_0 * position.liquidity / 2^64
+   ```
+
+3. `fee_growth_inside_{0,1}_last_x64` is updated.
+
+Tokens physically move only on `DecreaseLiquidity` or the dedicated `CollectFees` path (in Raydium's current instruction set, fees are swept as part of `DecreaseLiquidity`). Setting `liquidity = 0` in a `DecreaseLiquidity` call is the canonical "collect only" idiom.
+
+### Out-of-range positions earn nothing
+
+If a position's range does not contain `tick_current`, the `fee_growth_inside` computed for it is **bounded from above** and does not move while the price sits outside. The position stops accruing fees until the price returns to its range. This is a feature, not a bug — it is how concentrated liquidity concentrates *fee yield* as well as capital.
+
+## Reward streams
+
+A CLMM pool can have up to **three** reward streams concurrently active. Each stream is a (reward mint, emissions rate, start time, end time) tuple stored in `PoolState.reward_infos[i]`.
+
+```rust
+pub struct RewardInfo {
+    pub reward_state: u8,               // Uninitialized | Initialized | Open | Ended
+    pub open_time: u64,
+    pub end_time: u64,
+    pub last_update_time: u64,
+    pub emissions_per_second_x64: u128, // Q64.64 reward tokens per second
+    pub reward_total_emissioned: u64,
+    pub reward_claimed: u64,
+    pub token_mint:    Pubkey,
+    pub token_vault:   Pubkey,
+    pub authority:     Pubkey,           // who can SetRewardParams / fund
+    pub reward_growth_global_x64: u128,  // accumulator, Q64.64
+}
+```
+
+### Settlement loop
+
+Every liquidity-touching instruction (and `UpdateRewardInfos` as a standalone) advances all active streams to `now`:
+
+```
+for each reward_info with state in {Open, Ended within grace}:
+    elapsed         = min(now, end_time) − last_update_time
+    if elapsed > 0 && pool.liquidity > 0:
+        reward_growth_global_x64 += emissions_per_second_x64 × elapsed × 2^64 / pool.liquidity
+        reward_total_emissioned  += emissions_per_second × elapsed
+    last_update_time = min(now, end_time)
+```
+
+If `pool.liquidity == 0` across some interval, emissions for that interval are **not** distributed (they cannot be; there is no in-range liquidity to pay). The remaining budget stays in the reward vault. Protocols that mint and forget can top up or end the stream via `SetRewardParams`.
+
+### Per-position reward accrual
+
+Exactly like fees, with an additional dimension per stream:
+
+```
+for each stream i:
+    reward_growth_inside_now_i   = compute_inside_i(pool, tick_lower, tick_upper)
+    Δ_i = reward_growth_inside_now_i - personal_position.reward_infos[i].growth_inside_last_x64
+    personal_position.reward_infos[i].reward_amount_owed += Δ_i * personal_position.liquidity / 2^64
+    personal_position.reward_infos[i].growth_inside_last_x64 = reward_growth_inside_now_i
+```
+
+Users claim via `CollectReward`, which transfers `reward_amount_owed` from the stream's vault to the user and zeros the counter.
+
+### Only in-range positions earn rewards
+
+`reward_growth_inside` uses the same formula as `fee_growth_inside` — via the tick-outside accumulators — so positions outside the current price range do not accrue rewards. This mirrors Uniswap v3's "incentives go to active liquidity" design choice and aligns LP interest with spot price coverage.
+
+### Funding and ending streams
+
+A stream is created via `InitializeReward`, which deposits the total budget (`emissions_per_second × (end_time − open_time)`) into the stream's reward vault up-front. The program rejects `InitializeReward` if the funder's balance is short. `SetRewardParams` can extend `end_time` or raise the emission rate; shrinking either is blocked to avoid rug-pulling emissions already promised to LPs.
+
+When `now > end_time` the stream transitions to `Ended` but its `reward_growth_global_x64` continues to be read — LPs can still `CollectReward` for historically earned amounts long after emissions stop.
+
+## Admin collection
+
+| Signer | Instruction | Effect |
+|--------|-------------|--------|
+| `amm_config.owner` | `CollectProtocolFee` | Sweep `protocol_fees_token_{0,1}` to a recipient. |
+| `amm_config.fund_owner` | `CollectFundFee` | Sweep `fund_fees_token_{0,1}` to a recipient. |
+
+Neither moves the curve — accrued amounts sit outside `pool.liquidity` already. See [`security/admin-and-multisig`](/security/admin-and-multisig) for who holds these signers on mainnet.
+
+## Token-2022 interactions
+
+Fees and rewards are all denominated in one of the pool's or stream's tokens. Token-2022 extensions behave the same way they do in CPMM:
+
+- **Transfer fee on the input mint of a swap.** The pool receives `amount_in − mint_transfer_fee`. The CLMM program's step input is computed against the net amount, so the pool's fee accumulators reflect real-in-the-vault tokens.
+- **Transfer fee on the output mint.** The pool sends `amount_out`; the user receives `amount_out − mint_transfer_fee`. Slippage checks should be done against the user-receive amount.
+- **Transfer fee on a reward mint.** Emissions are denominated in "into-the-vault" units at `InitializeReward` time (the funder pays the mint transfer fee into the vault). Withdrawals at `CollectReward` then incur another mint transfer fee; LPs should expect a slight haircut on transfer-fee reward tokens.
+- **Non-transferable / confidential / group-member mints.** Rejected at `CreatePool` / `InitializeReward`.
+
+The combined effect on a multi-hop transfer-fee swap can be substantial. Quoters that ignore it will over-promise; see [`algorithms/token-2022-transfer-fees`](/algorithms/token-2022-transfer-fees) for the reference calculation.
+
+## Reading fees and rewards off-chain
+
+```ts
+const pool = await raydium.clmm.getPoolInfoFromRpc(poolId);
+const position = await raydium.clmm.getOwnerPositionInfo({
+  wallet: owner.publicKey,
+});
+
+for (const p of position) {
+  console.log("Position", p.nftMint.toBase58(),
+              "range", p.tickLower, "→", p.tickUpper,
+              "L", p.liquidity.toString(),
+              "fees owed:", p.tokenFeesOwed0.toString(),
+              p.tokenFeesOwed1.toString(),
+              "rewards owed:", p.rewardInfos.map(r => r.rewardAmountOwed.toString()));
+}
+```
+
+`tokenFeesOwed*` and `rewardAmountOwed` are snapshots from the last time the position was touched. To see the **current** values (reflecting growth since then), call `IncreaseLiquidity` with zero liquidity in a simulation, or simply recompute using the global `fee_growth_*` and the two tick-outside snapshots.
+
+## Where to go next
+
+- [`products/clmm/math`](/products/clmm/math) — full derivation of `fee_growth_inside`.
+- [`products/clmm/instructions`](/products/clmm/instructions) — `CollectReward`, `InitializeReward`, `SetRewardParams` account lists.
+- [`algorithms/token-2022-transfer-fees`](/algorithms/token-2022-transfer-fees) — quoting with transfer-fee mints.
+- [`reference/fee-comparison`](/reference/fee-comparison) — side-by-side CLMM/CPMM/AMM-v4 fee matrix.
+
+Sources:
+
+- [`raydium-io/raydium-clmm` — `states/pool.rs`, `libraries/fixed_point_64.rs`](https://github.com/raydium-io/raydium-clmm)
+- "Uniswap v3 Core" whitepaper, §7 (fee growth)

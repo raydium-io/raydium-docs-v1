@@ -1,0 +1,280 @@
+---
+title: "Programlar ve Anchor"
+description: "Solana programlarının nasıl dağıtıldığı ve yükseltildiği, Anchor çerçevesinin ham Solana üstüne neler eklediği ve kendi istemcilerinizi oluşturmak için Raydium'un IDL'sini nasıl okuyacağınız."
+---
+
+<Info>
+  **Bu sayfa yapay zekâ tarafından otomatik olarak çevrilmiştir. İngilizce sürüm esas alınır.**
+
+  [İngilizce sürümü görüntüle →](/solana-fundamentals/programs-and-anchor)
+</Info>
+
+<Info>
+  Raydium'un daha yeni programları (CPMM, CLMM, Farm v6, LaunchLab) **Anchor** kullanılarak yazılmıştır — Solana'nın yerleşik program modelinin üstüne hesap doğrulaması, hata işleme ve IDL (arayüz açıklaması) sağlayan bir Rust çerçevesi. AMM v4 ve eski farmlar Anchor'dan önceye aittir. Her iki paradigmayı anlamak, kodu okumanıza, IDL'den istemciler oluşturmanıza ve beklenmeyen hataları ayıklamanıza yardımcı olur.
+</Info>
+
+## Program dağıtım modeli
+
+Her Solana programı bir `Pubkey`de yer alır. Programın bytecode'u **BPF Yükseltebilir Yükleyici** (`BPFLoaderUpgradeab1e11111111111111111111111`) tarafından sahiplenilen bir **çalıştırılabilir** hesapta depolanır.
+
+Bir program dağıtımı üç hesaptan oluşur:
+
+1. **Program hesabı**: programın kimliğinde küçük bir metadata hesabı. Sahibi: BPF Yükseltebilir Yükleyici.
+2. **ProgramData hesabı**: asıl bytecode'u tutar. `[program_id, "programdata"]` olarak türetilir.
+3. **Buffer hesabı** (geçici): yükseltme sırasında yeni bytecode'u tutar. Yükseltmeden sonra silinir.
+
+ProgramData hesabının bir **yükseltme yetkisi** vardır — bytecode'u yeni bir sürümle değiştirebilen bir anahtar. Raydium'un yükseltme yetkisi, 24 saatlik bir zaman kilidi arkasında bir çok-imza cüzdanıdır; bkz. [`security/admin-and-multisig`](/tr/security/admin-and-multisig).
+
+### Dağıtılmış bir programı doğrulama
+
+Zincir üstündekinin denetim onaylı kaynakla eşleştiğini doğrulamak için:
+
+```bash
+# Programı mainnet'ten döküp çıkar
+solana program dump CPMMoo8L3F4NbTegBCKVNunggL7H1Zpdmwpwh8KMoZ0F cpmm-onchain.so
+
+# Bilinen kaynaktan derle
+cargo build-bpf --manifest-path raydium-cp-swap/programs/cp-amm/Cargo.toml
+cp target/deploy/raydium_cp_swap.so cpmm-source.so
+
+# Karşılaştır
+sha256sum cpmm-onchain.so cpmm-source.so
+```
+
+Eşleşen hash'ler, etkileşim kurmakta olduğunuz kaynağın doğru olduğunu kanıtlar. Raydium, sürüm notlarında doğrulanmış yapı talimatlarını yayınlar.
+
+## Anchor: Solana'nın üstünde bir çerçeve
+
+Ham Solana programları bu imzaya sahip Rust işlevleridir:
+
+```rust
+pub fn process_instruction(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    instruction_data: &[u8],
+) -> ProgramResult {
+    // Manually parse instruction_data
+    // Manually validate accounts
+    // Manually deserialize account data
+    // Manually check signer/writable flags
+    // ... then do the actual work
+}
+```
+
+Anchor tüm boilerplate'i sarar ve şunu yazmanızı sağlar:
+
+```rust
+#[program]
+pub mod cpmm {
+    use super::*;
+
+    pub fn swap_base_input(
+        ctx: Context<Swap>,
+        amount_in: u64,
+        min_out: u64,
+    ) -> Result<()> {
+        // Just the business logic — ctx is pre-validated
+    }
+}
+
+#[derive(Accounts)]
+pub struct Swap<'info> {
+    pub payer: Signer<'info>,
+    #[account(mut, seeds = [b"pool", config.key().as_ref(), ...], bump)]
+    pub pool_state: AccountLoader<'info, PoolState>,
+    #[account(mut)]
+    pub input_vault: Box<Account<'info, TokenAccount>>,
+    // ... more accounts
+}
+```
+
+Anchor:
+
+- Her talimat ve her hesap türü için belirlenimci 8 baytlık bir **ayırt edici** otomatik olarak oluşturur.
+- Hesap kısıtlamalarını (sahibi, seeds, yazılabilir, imzalayan, mint-eşleşme, token-program-eşleşme) kodunuz çalışmadan önce doğrular.
+- İstemcilerin programı çağırmak için kullandığı bir **IDL** — arayüz açıklaması dosyası oluşturur.
+- Rust, TypeScript ve Python istemci tarafı kütüphaneleriyle birlikte gelir.
+
+### 8 baytlık ayırt edici
+
+Her Anchor hesabı ve her Anchor talimatı, 8 baytlık bir ayırt edicinin ilk 8 baytı olarak başlar — sabit bir dizenin SHA-256'sının ilk 8 baytı:
+
+```
+Account discriminator:     sha256("account:PoolState")[0..8]
+Instruction discriminator: sha256("global:swap_base_input")[0..8]
+```
+
+Bir Anchor talimatını çağırdığınızda, talimat verilerinin ilk 8 baytı bu ayırt edicilerdir; Anchor bunları arayarak doğru işleyiciye gönderir.
+
+Bir Anchor hesabını okuduğunuzda, ilk 8 bayt onun türünü söyler — `getProgramAccounts` gibi bir türün tüm hesaplarını sıralayan araçlar için çok önemlidir.
+
+### Hatalar
+
+Anchor programları `#[error_code]` aracılığıyla hataları tanımlar:
+
+```rust
+#[error_code]
+pub enum ErrorCode {
+    #[msg("Slippage tolerance exceeded")]
+    SlippageExceeded,
+    #[msg("Pool is disabled")]
+    PoolDisabled,
+    // ...
+}
+```
+
+Anchor bunlara 6000'den başlayarak (0x1770) otomatik olarak sayısal kodlar atar. Raydium'un tam hata kodu tablosu [`reference/error-codes`](/tr/reference/error-codes)'da bulunur.
+
+## IDL
+
+Bir Anchor **IDL** (Arayüz Açıklama Dili) dosyası, bir programın JSON açıklamasıdır: talimatları, hesapları, türleri, hataları ve olayları. Ethereum ABI'nin eşdeğeridir.
+
+Raydium tüm Anchor programları için IDL'ler yayınlar. Zincir üstünden canlı olarak getir:
+
+```bash
+anchor idl fetch CPMMoo8L3F4NbTegBCKVNunggL7H1Zpdmwpwh8KMoZ0F -o cpmm.idl.json
+```
+
+Veya SDK kaynağından: `src/raydium/*/idl/*.json`.
+
+### IDL yapısı
+
+```json
+{
+  "version":      "0.1.0",
+  "name":         "raydium_cp_swap",
+  "instructions": [ { "name": "swap_base_input", "accounts": [ ... ], "args": [ ... ] }, ... ],
+  "accounts":     [ { "name": "PoolState", "type": { ... } }, ... ],
+  "types":        [ { "name": "AmmConfig", "type": { ... } }, ... ],
+  "errors":       [ { "code": 6000, "name": "SlippageExceeded", "msg": "..." }, ... ],
+  "events":       [ { "name": "SwapEvent", "fields": [ ... ] }, ... ]
+}
+```
+
+### IDL'den istemci oluşturma
+
+Anchor'un `anchor` CLI'si TypeScript ve Rust türleri oluşturur:
+
+```bash
+anchor idl build -o target/idl/cpmm.json
+# TypeScript types auto-generated by Anchor's ts-client
+# Raydium SDK already includes these
+```
+
+[Kinobi](https://github.com/metaplex-foundation/kinobi) gibi üçüncü taraf araçlar bir IDL'den Rust, Python, C veya Go istemcileri oluşturabilir.
+
+### IDL'nin arkadaş olduğu zaman
+
+Raydium SDK'sı kullanmayan özel bir entegrasyon oluşturmak istiyorsanız:
+
+1. IDL'yi getir (zincir üstünden canlı veya SDK kaynağından).
+2. İstediğiniz talimatı ara (örn. `swap_base_input`).
+3. Talimat verilerini oluştur: 8 baytlık ayırt edici + kodlanmış argümanlar.
+4. Hesapları IDL'nin belirttiği sırada geç.
+
+Çalışan örnekler için [`sdk-api/anchor-idl`](/tr/sdk-api/anchor-idl) bölümüne bakın.
+
+## Anchor Öncesi Programlar: AMM v4 ve Farm v3/v5
+
+Bu programlar Anchor'dan öncedir. Kullanırlar:
+
+- **Manuel talimat gönderimi**: `instruction_data`da bir `u8` etiketi ve bir `match` ifadesi ile.
+- **Manuel hesap doğrulaması**: `if accounts[0].owner != &expected_program { ... }`.
+- **Borsh-serileştirilmiş talimat argümanları**: ayırt edici yok, sadece `instruction_data[1..]`.
+- **`#[repr(C, packed)]` aracılığıyla düzen**: C-struct ikili düzeni.
+
+Raydium SDK v2, Anchor'suz istemcilerin kodlanması/çözülmesi için Anchor olmayan AMM v4 talimatlarının TypeScript düzenlerini taşır:
+
+```ts
+import { liquidityStateV4Layout, swapInstructionData }
+  from "@raydium-io/raydium-sdk-v2";
+
+const data = swapInstructionData.encode({
+  instruction: 9,   // swap
+  amountIn:    1_000_000n,
+  minAmountOut: 950_000n,
+});
+```
+
+Entegrasyon deseni aynıdır — sadece Anchor'un IDL odaklı otomatik üretimini elde etmezsiniz.
+
+## Program yükseltme mekaniği
+
+Sadece ProgramData'nın `upgrade_authority`'si yükseltebilir. Adımlar:
+
+1. Yeni bytecode'u derle.
+2. Bunu bir buffer hesabına yaz (`solana program write-buffer`).
+3. Bir yükseltme talimatı gönder: `BpfLoaderUpgradeable::Upgrade { buffer, program, authority }`.
+4. Çalışma zamanı atomik olarak programın bytecode'unu buffer'ın içeriğiyle değiştirir.
+
+Raydium bunu Squads çok-imza cüzdanının ayarlarında uygulanan bir **24 saatlik zaman kilidi** arkasında kapılar. Bir yükseltme işlemi, çok-imza onayından sonra yürütülmeden önce 24 saat beklemek zorundadır. Bu, acele edilen / zorlanan yükseltmelere karşı koruma sağlar.
+
+[`security/admin-and-multisig`](/tr/security/admin-and-multisig) bölümüne bakın.
+
+### Bir programı değişmez hale getirme
+
+Yükseltme yetkisi `None` olarak ayarlanabilir, bu noktada program kalıcı olarak değişmez hale gelir. Raydium bunu herhangi bir ürün için yapmamıştır — ekip güvenlik düzeltmeleri itme kabiliyetini korur. Ödün: kullanıcılar çok-imza + zaman kilidi sürecine güven vermelidir.
+
+## Programlar ve kira
+
+Bir programı dağıtmak kira muaf lamportları tüketir:
+
+- 50 KB program: ~0.35 SOL kira.
+- 200 KB program: ~1.4 SOL kira.
+
+Bir programı kapatmak (`solana program close` aracılığıyla) lamportları geri verir. Raydium programları aktif kalır ve kapatılmak için planlanmamıştır.
+
+## Anchor Programlarının Hata Ayıklaması
+
+### Günlük çıktısı
+
+Anchor'un `msg!` makrosu işlemin günlüğüne yazar. Günlükleri görmek için bir işlemi simüle edin:
+
+```ts
+const sim = await connection.simulateTransaction(tx);
+console.log(sim.value.logs);
+```
+
+Günlükleri içerir:
+
+- Program çağrısı (`Program CPMMoo8... invoke [1]`).
+- Program kodundan `msg!` çağrıları.
+- İşlem birimi tüketimi (`consumed 137842 of 400000 compute units`).
+- Program başarısı veya hatası.
+
+### Hata kodları
+
+Bir Anchor programı hata fırlatırsa, günlük şunu gösterir:
+
+```
+Program CPMMoo8... failed: custom program error: 0x1770
+```
+
+0x1770 = 6000 ondalık = ilk Anchor hatası (örn. `SlippageExceeded`). IDL'nin `errors` dizisi ile çapraz referans alın.
+
+Raydium'un tam hata tablosu için [`reference/error-codes`](/tr/reference/error-codes) bölümüne bakın.
+
+### Hesap düzeni uyuşmazlıkları
+
+Yanlış hesabı yanlış yuvaya geçirirseniz, Anchor'un hesap doğrulama makroları şöyle hatalar döndürür:
+
+```
+AnchorError: AccountNotInitialized. Error Number: 3012
+```
+
+6000'in altındaki hata numaraları Anchor'un yerleşik hataları (Anchor'un `ErrorCode` numaralandırması görmek için); ≥6000 hataları programın özel kodlarıdır.
+
+## İşaretçiler
+
+- [`solana-fundamentals/account-model`](/tr/solana-fundamentals/account-model) — programlar hesapları nasıl sahip alır.
+- [`solana-fundamentals/pdas-and-cpis`](/tr/solana-fundamentals/pdas-and-cpis) — Anchor'un beyan ettiği PDA'lar.
+- [`sdk-api/anchor-idl`](/tr/sdk-api/anchor-idl) — Raydium'un IDL'lerini getirmek ve kullanmak.
+- [`reference/program-addresses`](/tr/reference/program-addresses) — program kimlikleri.
+- [`reference/error-codes`](/tr/reference/error-codes) — hata kodu başvurusu.
+- [`security/admin-and-multisig`](/tr/security/admin-and-multisig) — yükseltme yetkisi kontrolleri.
+
+Kaynaklar:
+
+- [Anchor kitabı](https://book.anchor-lang.com).
+- [Solana program dağıtımı](https://docs.solana.com/cli/deploy-a-program).
+- Raydium IDL'leri (SDK'da `src/raydium/*/idl/*.json` içinde yayınlanmıştır).

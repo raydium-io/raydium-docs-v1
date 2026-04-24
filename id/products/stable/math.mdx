@@ -1,0 +1,143 @@
+---
+title: "Matematika Stable AMM"
+description: "Pencarian biner dan interpolasi linear untuk mengutip harga dari tabel pencarian. Penerapan biaya identik dengan AMM v4. Integrasi OpenBook dan MonitorStep."
+---
+
+<Info>
+  **Halaman ini diterjemahkan secara otomatis oleh AI. Versi bahasa Inggris adalah acuan resmi.**
+
+  [Lihat versi bahasa Inggris →](/products/stable/math)
+</Info>
+
+## Kurva tabel pencarian
+
+Stable AMM menggantikan formula x·y=k dengan **tabel pencarian sparse** berisi tuple (x, y, price). Saat menentukan harga swap, program:
+
+1. Menghitung rasio pool saat ini dari cadangan.
+2. **Mencari biner** tabel untuk menemukan dua entri yang membatasi rasio tersebut.
+3. **Menginterpolasi linear** di antara keduanya untuk mendapatkan harga perantara.
+4. Menerapkan biaya dan mengembalikan kutipan.
+
+Pendekatan ini menukarkan determinisme formula dengan **fleksibilitas admin** dalam pembentukan harga, dan cukup efisien untuk muat dalam anggaran komputasi Solana.
+
+## Tata letak tabel dan pencarian biner
+
+`ModelDataInfo` menyimpan hingga 50.000 entri `DataElement`, diindeks oleh admin. Hanya `valid_data_count` pertama yang aktif. Setiap entri:
+
+```
+DataElement {
+  x: u64,      // Koordinat X (jumlah sisi coin, diskalakan)
+  y: u64,      // Koordinat Y (jumlah sisi pc, diskalakan)
+  price: u64,  // price = x/y, diskalakan oleh multiplier
+}
+```
+
+Untuk menemukan harga pada cadangan pool saat ini (x_real, y_real):
+
+1. Hitung rasio: `target_ratio = (x_real * multiplier) / y_real`.
+2. Cari biner entri yang membatasi `(element.x * multiplier) / element.y` terhadap `target_ratio`.
+3. Ketika braket `[min_idx, max_idx]` ditemukan, lakukan interpolasi.
+
+Kode pencarian biner program mencakup ~150 baris dalam `state.rs::ModelDataInfo::get_mininum_range_by_xy_real`. Invarian kunci: **entri harus diurutkan** (x naik, y turun, price naik) agar pencarian berfungsi.
+
+## Interpolasi linear
+
+Setelah dua titik tabel membatasi rasio, interpolasi menghitung harga dan pasangan cadangan perantara:
+
+```
+target = (x_real * multiplier) / y_real
+
+[x1, y1, p1] = table[min_idx]
+[x2, y2, p2] = table[max_idx]
+
+// Interpolasi harga
+p = p1 + (p2 - p1) * (target - ratio1) / (ratio2 - ratio1)
+
+// Interpolasi cadangan
+x = x1 + (x2 - x1) * (target - ratio1) / (ratio2 - ratio1)
+y = y1 + (y2 - y1) * (target - ratio1) / (ratio2 - ratio1)
+```
+
+Hasilnya adalah kurva piecewise-linear yang menghubungkan titik-titik tabel dengan mulus.
+
+## Penskalaan: multiplier
+
+Cadangan pool dan harga disimpan pada skala berbeda. Bidang `multiplier` pada `ModelDataInfo` memperhitungkan hal ini. Pola umum:
+
+- Coin memiliki 6 desimal, PC memiliki 18 desimal.
+- Multiplier = 10^6 (atau serupa).
+- Entri tabel disimpan pada skala tereduksi agar sesuai dengan batas u64.
+
+Program menskalakan ulang pada read/write melalui:
+
+```
+real_value = table_value * ratio / multiplier
+table_value = real_value * multiplier / ratio
+```
+
+## Penetapan harga swap: `SwapBaseIn` dan `SwapBaseOut`
+
+### SwapBaseIn (input pasti)
+
+Diberikan jumlah input `amount_in`:
+
+1. Dapatkan rasio saat ini dari `(coin_vault, pc_vault)`.
+2. Temukan entri tabel yang membatasi dan interpolasi untuk mendapatkan rasio ruang tabel.
+3. Konversi input ke ruang tabel: `dx_table = amount_in * multiplier / ratio`.
+4. Kueri tabel pada koordinat X baru untuk menemukan Y baru.
+5. `dy_table = y_old - y_new`.
+6. Konversi kembali: `dy_real = dy_table * ratio / multiplier`.
+7. Terapkan biaya perdagangan: `dy_output = dy_real - (dy_real * trade_fee_numerator / trade_fee_denominator)`.
+8. Kembalikan `dy_output`.
+
+### SwapBaseOut (output pasti)
+
+Simetris: diberikan `amount_out` yang diinginkan, selesaikan `amount_in` yang diperlukan.
+
+Kedua jalur menyelesaikan pesanan OpenBook yang terisi terlebih dahulu (melalui logika seperti `MonitorStep` internal), sehingga cadangan efektif mencerminkan pengisian apa pun dari blok sebelumnya.
+
+## Penerapan biaya
+
+Identik dengan AMM v4: lihat [`products/amm-v4/math`](/id/products/amm-v4/math) untuk derivasi lengkap.
+
+```
+gross_fee = amount_in * (swap_fee_numerator / swap_fee_denominator)    // misalnya, 0,25%
+lp_portion = gross_fee - (gross_fee * pnl_numerator / pnl_denominator) // misalnya, 0,22%
+pnl_portion = gross_fee * (pnl_numerator / pnl_denominator)            // misalnya, 0,03%
+```
+
+`pnl_portion` masuk ke `need_take_pnl_*` dan disapu oleh admin melalui `WithdrawPnl`. `lp_portion` tetap di vault, menginflasi `k` dan menguntungkan pemegang token LP.
+
+## MonitorStep dan OpenBook
+
+Seperti AMM v4, `MonitorStep` adalah **instruksi crank** yang:
+
+1. Menyelesaikan pengisian pesanan OpenBook yang tertunda (memindahkan token dari vault ke pool).
+2. Memperbarui `AmmInfo.target_orders` dengan grid slot pesanan limit baru.
+3. Memposting grid baru ke OpenBook.
+
+Grid dihitung dari tabel: program menggunakan tabel pencarian untuk menemukan titik harga dan menerjemahkannya menjadi pesanan OpenBook.
+
+**Biaya komputasi** `MonitorStep`: ~150k–180k CU (mirip dengan AMM v4).
+
+## Ringkasan: mengapa ini berfungsi
+
+Desain tabel pencarian + interpolasi adalah **efisien dan fleksibel**:
+
+- **Efisiensi:** Pencarian biner adalah O(log 50.000) ≈ 16 iterasi, masing-masing ~ 300–500 CU. Interpolasi adalah beberapa perkalian/pembagian. Total biaya kutipan adalah ~5k–15k CU, jauh lebih murah daripada menghitung ulang formula pada setiap swap.
+- **Fleksibilitas:** Admin dapat menyandikan kurva piecewise-linear apa pun. Pasangan stablecoin mendapat kepadatan tinggi di sekitar 1:1; pasangan yang dijaminkan mendapat kurva khusus.
+- **Komposabilitas OpenBook:** Logika `MonitorStep` / `TargetOrders` yang sama dari AMM v4 berlaku. Penemuan harga melalui tabel masuk ke pembuatan grid pesanan.
+
+Untuk penggalian mendalam tentang logika interpolasi, lihat `raydium-stable/program/src/state.rs`, metode `get_data_by_x`, `get_data_by_y`, `get_dy_by_dx_base_in`, dll.
+
+## Langkah berikutnya
+
+- [Akun](/id/products/stable/accounts) — referensi bidang `ModelDataInfo` dan `DataElement`.
+- [Instruksi](/id/products/stable/instructions) — `InitModelData`, `UpdateModelData` untuk mengisi tabel.
+- [Biaya](/id/products/stable/fees) — penerapan biaya dan `WithdrawPnl`.
+- [`products/amm-v4/math`](/id/products/amm-v4/math) — untuk logika penetapan harga pesanan inklusif biaya OpenBook.
+
+Sumber:
+
+- `raydium-stable/program/src/state.rs` (implementasi interpolasi dan pencarian biner)
+- `raydium-stable/program/src/math.rs` (utilitas kalkulator)

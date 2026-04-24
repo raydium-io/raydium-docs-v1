@@ -1,0 +1,232 @@
+---
+title: "Trade API"
+description: "Raydium's server-built swap transaction endpoint: quote, build, sign, send. The integration pattern for apps that want Raydium routing without shipping the SDK — what it returns, how it differs from the SDK, and how aggregators consume it."
+---
+
+<Info>
+  The **Trade API** is a thin set of endpoints on `transaction-v1.raydium.io` (and some mirrored paths on `api-v3.raydium.io`) that quote a swap, build a signed-ready Solana transaction, and return it in one round trip. It is the same surface the Raydium UI uses. Use it when you want Raydium routing without bundling the TS SDK — backends, Blinks handlers, Telegram bots, third-party apps.
+</Info>
+
+## When to use the Trade API vs the SDK
+
+| You want to… | Use |
+|---|---|
+| Integrate swaps into a backend that cannot bundle npm packages (e.g. Python bot, Go service, Rust service) | **Trade API** |
+| Render a swap Blink in a social post | **Trade API** |
+| Build a browser app where shaving kilobytes matters | **Trade API** |
+| Embed routing logic inside another Solana program (CPI) | Neither — use [`sdk-api/rust-cpi`](/sdk-api/rust-cpi) |
+| Build a full DEX-like client with custom route preview, chart overlays, priority-fee heuristics | **TS SDK** |
+| Need deterministic offline quoting without a network round trip | **TS SDK** (with local pool state) |
+
+The SDK is richer; the Trade API is simpler. Both wrap the same underlying CPMM/CLMM/AMM v4 programs, so the resulting on-chain swap is identical.
+
+## The three endpoints
+
+### 1. `GET /compute/swap-base-in`
+
+Given an input amount, pick a route and return a quote.
+
+```
+GET https://transaction-v1.raydium.io/compute/swap-base-in
+  ?inputMint=So11111111111111111111111111111111111111112
+  &outputMint=EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v
+  &amount=1000000000
+  &slippageBps=50
+  &txVersion=V0
+```
+
+Response:
+
+```json
+{
+  "id": "b2e4...",
+  "success": true,
+  "version": "V1",
+  "data": {
+    "swapType": "BaseIn",
+    "inputMint":  "So11111111111111111111111111111111111111112",
+    "inputAmount":  "1000000000",
+    "outputMint": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+    "outputAmount": "165234567",
+    "otherAmountThreshold": "164408394",
+    "slippageBps": 50,
+    "priceImpactPct": 0.0012,
+    "referrerAmount": "0",
+    "routePlan": [
+      { "poolId": "58oQ...", "inputMint": "So11...", "outputMint": "USDC...", "feeAmount": "2500000", "feeMint": "So11..." }
+    ]
+  }
+}
+```
+
+The `id` field is an opaque quote handle passed to the next endpoint. The quote is stable for ~30 seconds; beyond that, re-quote.
+
+### 2. `GET /compute/swap-base-out`
+
+Inverted form: "I want to receive exactly N of the output; quote me the required input."
+
+```
+GET /compute/swap-base-out
+  ?inputMint=<MINT_IN>
+  &outputMint=<MINT_OUT>
+  &amount=<DESIRED_OUTPUT_AMOUNT>
+  &slippageBps=50
+  &txVersion=V0
+```
+
+Symmetric response shape to `swap-base-in`; `amount` field semantics flip.
+
+### 3. `POST /transaction/swap-base-in` and `/transaction/swap-base-out`
+
+Takes the quote from step 1 and returns a signed-ready versioned transaction:
+
+```
+POST https://transaction-v1.raydium.io/transaction/swap-base-in
+Content-Type: application/json
+
+{
+  "computeUnitPriceMicroLamports": "50000",
+  "swapResponse": { ... paste the data object from swap-base-in ... },
+  "txVersion": "V0",
+  "wallet": "<user_pubkey>",
+  "wrapSol": true,
+  "unwrapSol": false,
+  "inputAccount": "<optional_token_account>",
+  "outputAccount": "<optional_token_account>"
+}
+```
+
+Response:
+
+```json
+{
+  "id": "9f1c...",
+  "success": true,
+  "version": "V1",
+  "data": [
+    { "transaction": "<base64-encoded-versioned-transaction>" }
+  ]
+}
+```
+
+Multiple transactions may be returned if the swap requires setup (e.g. creating ATAs, wrapping SOL). Sign and send them in order.
+
+## Minimal end-to-end example (Python)
+
+```python
+import base64, requests
+from solders.transaction import VersionedTransaction
+from solders.keypair import Keypair
+from solana.rpc.api import Client
+
+rpc = Client("https://api.mainnet-beta.solana.com")
+kp = Keypair.from_bytes(bytes([...]))    # your signer
+
+SOL  = "So11111111111111111111111111111111111111112"
+USDC = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+
+quote = requests.get(
+    "https://transaction-v1.raydium.io/compute/swap-base-in",
+    params={
+        "inputMint": SOL, "outputMint": USDC,
+        "amount": 1_000_000_000, "slippageBps": 50, "txVersion": "V0",
+    },
+).json()
+
+built = requests.post(
+    "https://transaction-v1.raydium.io/transaction/swap-base-in",
+    json={
+        "computeUnitPriceMicroLamports": "50000",
+        "swapResponse": quote,
+        "txVersion": "V0",
+        "wallet": str(kp.pubkey()),
+        "wrapSol": True,
+        "unwrapSol": False,
+    },
+).json()
+
+for entry in built["data"]:
+    raw = base64.b64decode(entry["transaction"])
+    tx = VersionedTransaction.from_bytes(raw)
+    tx.sign([kp])
+    sig = rpc.send_raw_transaction(bytes(tx)).value
+    print(f"Sent: {sig}")
+```
+
+This is ~20 lines. The equivalent with the TS SDK is ~30 but gives you richer control (custom route picker, Compute Unit budgeting per pool, detailed error metadata).
+
+## Routing and pool selection
+
+The Trade API routes across **all** Raydium programs (CPMM, CLMM, AMM v4) and picks the best execution for the quoted size. Characteristics:
+
+- **Multi-hop supported.** A SOL→USDC swap can route through wSOL→JUP→USDC if that's cheaper.
+- **Same-program multi-pool splitting not supported.** A single quote goes through exactly one path; if you want to split size across pools, do it client-side (two quotes, two txs).
+- **Stable vs concentrated.** The router preferentially uses CLMM when in-range liquidity is adequate, falling back to CPMM for long-tail pairs.
+- **AMM v4 inclusion.** AMM v4 pools are included in routing but only chosen when they offer better pricing than CPMM/CLMM alternatives.
+
+To force routing through a specific pool, use the SDK instead — Trade API does not expose a pool-pin parameter.
+
+## Referrer parameter
+
+Append `&referrer=<wallet_pubkey>` to the compute endpoint to take a 1% referral cut on the swap. See [`user-flows/referrals-and-blinks`](/user-flows/referrals-and-blinks) for semantics. When present:
+
+- `referrerAmount` in the quote response is the absolute amount (in input mint) that will be routed to the referrer.
+- The final transaction contains an extra SPL token transfer to the referrer's ATA.
+
+## Priority fees
+
+`computeUnitPriceMicroLamports` in the build request sets the priority fee for the returned transaction. Rule of thumb:
+
+- `50_000` (0.00005 lamports/CU × 200k CU ≈ 0.00001 SOL): minimal, fine for non-congested moments.
+- `200_000`: moderate congestion.
+- `1_000_000`: heavy congestion.
+
+For adaptive tuning, call `getRecentPrioritizationFees` on your RPC first and pass the median. See [`integration-guides/priority-fee-tuning`](/integration-guides/priority-fee-tuning).
+
+## Transaction versions
+
+- `"V0"` returns a versioned (`MessageV0`) transaction with a lookup table for common accounts. Smaller, faster. **Recommended.**
+- `"LEGACY"` returns a legacy transaction. Larger; only use if your wallet/infra doesn't handle V0.
+
+## Error shapes
+
+The API returns HTTP 200 with `success: false` for logical errors, HTTP 4xx/5xx for transport / infra errors.
+
+Common logical errors:
+
+- `"No route found"` — no path between the two mints at this size. Reduce `amount` or reconsider pair.
+- `"Insufficient liquidity"` — a route exists but would blow past `slippageBps`. Widen slippage.
+- `"Quote expired"` — `swapResponse` is >30s old. Re-quote.
+- `"Unsupported mint"` — mint is not in Raydium's universe (unlisted, or on a deprecated program).
+
+## Rate limits
+
+- **Quote endpoints:** 120 req/min per IP.
+- **Build endpoints:** 60 req/min per IP (higher cost on the server).
+- Exceeding limits returns HTTP 429 with `Retry-After` header.
+
+For higher throughput contact Raydium developer relations; aggregator-tier keys are available.
+
+## Architectural pattern for integrators
+
+```
+┌─────────────┐   quote   ┌───────────────┐   build   ┌───────────────┐   sign/send   ┌──────────┐
+│ Your front  │──────────►│ Trade API     │──────────►│ Trade API     │──────────────►│ Solana   │
+│   end       │◄──────────│ /compute/...  │◄──────────│ /transaction/ │               │   RPC    │
+└─────────────┘           └───────────────┘           └───────────────┘               └──────────┘
+                              (stateless)                 (stateless)
+```
+
+Everything is stateless — the only thing you need to thread between the quote call and the build call is the quote response body itself.
+
+## Where to go next
+
+- [`sdk-api/typescript-sdk`](/sdk-api/typescript-sdk) — richer programmatic interface with the same underlying programs.
+- [`sdk-api/rest-api`](/sdk-api/rest-api) — read-side endpoints (pool info, mint info) to complement Trade API's write side.
+- [`user-flows/swap`](/user-flows/swap) — end-to-end UI swap flow.
+- [`integration-guides/aggregator`](/integration-guides/aggregator) — pattern for aggregators that route across many DEXes.
+
+Sources:
+
+- `transaction-v1.raydium.io` live endpoints.
+- Raydium UI network-tab inspection (same surface consumed).

@@ -1,0 +1,369 @@
+---
+title: "Toán học CLMM"
+description: "Biểu diễn căn bậc hai của giá, chuyển đổi giữa liquidity ↔ lượng token, bước swap theo tick đơn, lặp lại qua nhiều tick, và tính toán tích lũy phí."
+---
+
+<Info>
+  **Trang này được dịch tự động bằng AI. Phiên bản tiếng Anh là bản chính thức.**
+
+  [Xem bản tiếng Anh →](/products/clmm/math)
+</Info>
+
+## Biểu diễn căn bậc hai của giá
+
+CLMM lưu trữ giá dưới dạng `sqrt_price_x64` — căn bậc hai của giá token1 trên token0, được biểu diễn dưới dạng số cố định Q64.64:
+
+$$
+\text{sqrt\_price\_x64} = \lfloor \sqrt{p} \cdot 2^{64} \rfloor
+$$
+
+trong đó `p = token1_amount / token0_amount`. Việc làm việc với `sqrt` thay vì `p` tuyến tính hóa toán học swap (những thay đổi lượng token trở thành tuyến tính theo `Δsqrt_price`), và số cố định `x64` duy trì độ chính xác qua nhiều lần swap qua các tick.
+
+Chuyển đổi giữa Tick ↔ căn bậc hai của giá được tính toán trước thông qua xấp xỉ logarithm `bit-by-bit`:
+
+$$
+\text{sqrt\_price\_x64}(t) \approx 2^{64} \cdot (1.0001)^{t/2}
+$$
+
+được thực hiện dưới dạng phép tính mũ dựa trên bảng tra cứu trong `tick_math::get_sqrt_price_at_tick`.
+
+## Liquidity như một đơn vị chính
+
+Bên trong một phạm vi `[sqrt_a, sqrt_b]` (với `sqrt_a < sqrt_b`), một vị trí có **liquidity `L`** ánh xạ tới các lượng token như sau. Gọi `sqrt_c = sqrt_price_x64` là giá hiện tại của pool.
+
+| Trường hợp | `amount0` | `amount1` |
+|------|-----------|-----------|
+| `sqrt_c <= sqrt_a` (giá pool dưới phạm vi) | `L · (sqrt_b - sqrt_a) / (sqrt_a · sqrt_b)` | `0` |
+| `sqrt_a < sqrt_c < sqrt_b` (trong phạm vi) | `L · (sqrt_b - sqrt_c) / (sqrt_c · sqrt_b)` | `L · (sqrt_c - sqrt_a)` |
+| `sqrt_c >= sqrt_b` (giá pool trên phạm vi) | `0` | `L · (sqrt_b - sqrt_a)` |
+
+Cả ba đẳng thức đều xuất phát từ bất biến `x = L / sqrt_p`, `y = L · sqrt_p` mà liquidity tập trung thỏa mãn trong một phạm vi.
+
+Những người tích hợp thường muốn phép nghịch đảo: có một khoản gửi `amount0` / `amount1`, hãy tính `L` tối đa phù hợp với phạm vi. SDK của `LiquidityMath.getLiquidityFromTokenAmounts` thực hiện điều này. Công thức cho trường hợp trong phạm vi:
+
+$$
+L_0 = \text{amount0} \cdot \frac{\text{sqrt\_c} \cdot \text{sqrt\_b}}{\text{sqrt\_b} - \text{sqrt\_c}},
+\qquad
+L_1 = \frac{\text{amount1}}{\text{sqrt\_c} - \text{sqrt\_a}},
+\qquad
+L = \min(L_0, L_1)
+$$
+
+Phía nào bị ràng buộc sẽ quyết định tỷ lệ thực tế được tiêu thụ; phía còn lại có thể có dư.
+
+## Bước swap theo tick đơn
+
+Một swap tiến hành theo **các bước**. Mỗi bước hoặc (a) tiêu thụ tất cả các khoản nhập liệu khả dụng trong phạm vi tick hiện tại mà không vượt qua một tick, hoặc (b) di chuyển giá đến chính xác tick được khởi tạo tiếp theo.
+
+Cho trạng thái hiện tại `(sqrt_c, L)` và swap **lên** (token0 vào, token1 ra, `sqrt_price` tăng), khoảng cách đến tick được khởi tạo tiếp theo là `sqrt_t`. Bên trong khoảng nhỏ này, mối quan hệ giữa đầu vào và giá là:
+
+$$
+\Delta\text{amount0} = L \cdot \left( \frac{1}{\text{sqrt\_c}} - \frac{1}{\text{sqrt\_t}} \right)
+= \frac{L \cdot (\text{sqrt\_t} - \text{sqrt\_c})}{\text{sqrt\_c} \cdot \text{sqrt\_t}}
+$$
+
+và
+
+$$
+\Delta\text{amount1} = L \cdot (\text{sqrt\_t} - \text{sqrt\_c})
+$$
+
+Chương trình thực hiện một trong hai điều:
+
+- **Toàn bộ đầu vào có phù hợp không?** Nếu đầu vào còn lại (sau khi trừ phí) nhỏ hơn `Δamount0` để đạt `sqrt_t`, hãy giải quyết cho `sqrt_c'` mới chính xác:
+
+  $$
+  \text{sqrt\_c}' = \frac{L \cdot \text{sqrt\_c}}{L + \Delta\text{input} \cdot \text{sqrt\_c}}
+  $$
+
+  (cho một swap `token0 → token1` với đầu vào chính xác). Swap kết thúc trong bước này mà không vượt qua một tick.
+
+- **Đầu vào vượt quá `Δamount0`?** Đặt `sqrt_c' = sqrt_t`, vượt qua tick (áp dụng `liquidity_net`), giảm đầu vào còn lại bởi `Δamount0`, tăng đầu ra bởi `Δamount1`, và lặp lại.
+
+Đối với hướng ngược lại (`token1 → token0`, giá giảm), các công thức có `sqrt_c` và `sqrt_t` được hoán đổi và phép nghịch đảo ở vị trí khác.
+
+Việc triển khai Rust đầy đủ nằm trong `raydium-clmm/programs/amm/src/libraries/swap_math.rs`. Logic ở đó khớp với `SwapMath.computeSwapStep` của Uniswap v3 một cách chính xác.
+
+## Phí trên mỗi bước
+
+Phí giao dịch được lấy từ lượng **đầu vào** trong mỗi bước, cùng quy ước với CPMM:
+
+```
+step_fee_amount  = ceil(step_input * trade_fee_rate / 1_000_000)
+step_net_input   = step_input - step_fee_amount
+protocol_portion = floor(step_fee_amount * protocol_fee_rate / 1_000_000)
+fund_portion     = floor(step_fee_amount * fund_fee_rate     / 1_000_000)
+lp_portion       = step_fee_amount - protocol_portion - fund_portion
+```
+
+Phần LP được chia tỷ lệ giữa liquidity hiện đang trong phạm vi bằng cách cập nhật bộ tích lũy phí toàn cầu:
+
+$$
+\text{fee\_growth\_global}_{\text{in}} \mathrel{+}= \text{lp\_portion} \cdot \frac{2^{64}}{L}
+$$
+
+— hay nói cách khác, nó được biểu thị dưới dạng *phí trên một đơn vị liquidity*, Q64.64, sao cho một vị trí có kích thước `L_i` vẫn trong phạm vi trong suốt swap này sẽ sau đó đọc lại `L_i · Δfee_growth_global / 2^{64}` token phải trả.
+
+Các phần protocol và fund tích lũy vào `PoolState.protocol_fees_token_{0,1}` và `PoolState.fund_fees_token_{0,1}` tương ứng, giống hệt như CPMM. Chúng được quét bởi `CollectProtocolFee` / `CollectFundFee`.
+
+## Phí tích lũy bên ngoài và bên trong
+
+Phần phức tạp của tính toán phí CLMM: một vị trí chỉ kiếm được phí khi giá của pool **bên trong** phạm vi của nó. Pool theo dõi các phí tích lũy toàn cầu; vị trí cần phải biết các phí tích lũy *khi bên trong phạm vi cụ thể của nó*.
+
+Giải pháp là một bộ tích lũy **dựa trên tick**. Mỗi tick lưu trữ:
+
+```
+fee_growth_outside_0_x64
+fee_growth_outside_1_x64
+```
+
+Vào lúc khởi tạo tick:
+
+- Nếu giá của pool **trên** tick này (`tick_current >= this_tick`), `fee_growth_outside = fee_growth_global`. (Tất cả những phí kiếm được cho đến nay là "bên ngoài" — hay nói cách khác, dưới — tick này, so với giá hiện tại.)
+- Nếu không thì `fee_growth_outside = 0`.
+
+Khi giá vượt qua một tick, chương trình **lật** `fee_growth_outside` của tick đó:
+
+$$
+\text{fee\_growth\_outside} \gets \text{fee\_growth\_global} - \text{fee\_growth\_outside}
+$$
+
+Bất biến mà điều này bảo toàn: đối với bất kỳ tick `t` nào, `fee_growth_outside(t)` bằng các phí tích lũy khi `tick_current` ở phía đối diện của `t`.
+
+**Phí tích lũy bên trong một phạm vi `[tick_lower, tick_upper]`** được suy ra:
+
+```
+if tick_current >= tick_upper:
+    fee_growth_below = fee_growth_outside(tick_lower)
+    fee_growth_above = fee_growth_global - fee_growth_outside(tick_upper)
+elif tick_current >= tick_lower:
+    fee_growth_below = fee_growth_outside(tick_lower)
+    fee_growth_above = fee_growth_outside(tick_upper)
+else:
+    fee_growth_below = fee_growth_global - fee_growth_outside(tick_lower)
+    fee_growth_above = fee_growth_outside(tick_upper)
+
+fee_growth_inside = fee_growth_global - fee_growth_below - fee_growth_above
+```
+
+Đây là công thức phí tích lũy của Uniswap v3, không thay đổi.
+
+## Một vị trí lưu trữ gì và nó đọc gì
+
+`PersonalPositionState` lưu trữ `fee_growth_inside_0_last_x64` và `fee_growth_inside_1_last_x64`: các giá trị `fee_growth_inside` vào lần cuối cùng vị trí được chạm đến.
+
+Trong bất kỳ lần chạm tiếp theo nào (tăng, giảm, thu thập), chương trình:
+
+1. Tính toán `fee_growth_inside_{0,1}_x64` hiện tại bằng công thức trên.
+2. Tính toán `Δ = fee_growth_inside_now − fee_growth_inside_last` (trừ môđun trên u128).
+3. Thêm `Δ × position.liquidity / 2^{64}` vào `tokens_fees_owed_{0,1}`.
+4. Cập nhật `fee_growth_inside_last` thành giá trị mới.
+
+Token chỉ thực sự di chuyển ra khỏi vault khi gọi `CollectFees` / `DecreaseLiquidity`, dựa trên `tokens_fees_owed`.
+
+## Phần thưởng
+
+Mỗi luồng phần thưởng của pool (tối đa 3 luồng) sử dụng cơ chế tăng trưởng-bên-trong giống nhau, trong bộ tích lũy `reward_growth_global_x64` của chính nó. Vào lúc phát hành:
+
+$$
+\text{reward\_growth\_global} \mathrel{+}= \text{emission\_per\_second} \cdot \Delta t \cdot \frac{2^{64}}{L}
+$$
+
+— các phát hành tỷ lệ nghịch với liquidity hoạt động, vì vậy một pool dày đặc trả cho mỗi vị trí ít hơn mỗi giây, nhưng trên nhiều vị trí hơn. Phần thưởng mỗi vị trí phải trả là
+
+$$
+\text{reward\_owed} = (\text{reward\_growth\_inside}_{\text{now}} - \text{reward\_growth\_inside}_{\text{last}}) \cdot L / 2^{64}
+$$
+
+và được yêu cầu thông qua `CollectReward`. Xem [`products/clmm/fees`](/vi/products/clmm/fees).
+
+## Ví dụ thực tế: swap với đầu vào chính xác
+
+Giả sử:
+
+- `tick_spacing = 60`
+- `sqrt_price_x64 = 1 × 2^{64}` — giá = 1.0, vì vậy `tick_current = 0`.
+- Liquidity hoạt động `L = 1_000_000 × 2^{64}`.
+- Tick được khởi tạo tiếp theo phía trên: `t = 60` (sqrt_price_b ≈ `1.003004 × 2^{64}`).
+- Tỷ lệ phí giao dịch: 500 (0.05%).
+
+Người dùng: `SwapBaseInput` với đầu vào chính xác 1,000 token0.
+
+Bước 1 — phí:
+
+```
+trade_fee       = ceil(1000 * 500 / 1_000_000)  = 1
+step_net_input  = 999
+```
+
+Bước 2 — 999 có phù hợp trong phạm vi tick hiện tại không?
+
+```
+Δ to next tick (amount0):
+  L · (sqrt_t - sqrt_c) / (sqrt_c * sqrt_t)
+  ≈ 1_000_000 · (1.003004 − 1) / (1 · 1.003004)
+  ≈ 2995.5 token0
+```
+
+`999 < 2995.5`, vì vậy toàn bộ đầu vào phù hợp mà không vượt qua tick.
+
+Bước 3 — giá mới:
+
+```
+sqrt_c' = L · sqrt_c / (L + Δin · sqrt_c)
+        = 1_000_000 · 1 / (1_000_000 + 999 · 1)
+        ≈ 0.999001
+```
+
+hay nói cách khác, `sqrt_c'` hơi dưới `sqrt_c`. Lưu ý rằng công thức trên là cho một swap `token1 → token0`. Ví dụ ở đây là `token0 → token1`, điều này đẩy giá **lên**, không phải xuống — vì vậy chúng ta sử dụng dạng tương ứng cho `token0 vào`:
+
+```
+sqrt_c' = sqrt_c + Δin / L
+        = 1 + 999 / 1_000_000
+        = 1.000999
+```
+
+(điều này khớp với hướng swap dự kiến cho `token0 → token1`: `sqrt_c` tăng cùng với giá.)
+
+Bước 4 — lượng ra:
+
+```
+Δout token1 = L · (sqrt_c' − sqrt_c)
+            = 1_000_000 · 0.000999
+            = 999.00
+```
+
+Sau khi tính đến việc làm tròn, người dùng nhận được ≈ 999 token1. Phí (1 token0) được chia giữa LP, protocol, và fund bởi `trade_fee_rate × protocol_fee_rate / 1e6` (và tương tự cho fund); phần LP chảy vào `fee_growth_global_0_x64`.
+
+## Khớp lệnh giới hạn trong quá trình swap
+
+Khi một bước swap vượt qua một tick mà có các lệnh giới hạn mở, những lệnh đó tiêu thụ đầu vào swap **trước** đường cong LP thực hiện, ở mức giá chính xác của tick. Khớp là FIFO trong tick theo bộ cohort `order_phase`.
+
+### Trạng thái mỗi bộ cohort trên `TickState`
+
+```
+order_phase                  : u64    monotonic cohort id
+orders_amount                : u64    input-token total in the current (newest) cohort
+part_filled_orders_remaining : u64    remaining input of the cohort that swap is currently filling
+unfilled_ratio_x64           : u128   Q64.64 fill ratio for the partially-filled cohort
+```
+
+Bố trí hai bộ cohort tồn tại vì các lệnh mới có thể được mở trên một tick *trong khi* một bộ cohort cũ hơn vẫn đang được điền đầy. Các lệnh mới tham gia `orders_amount` và kế thừa `order_phase` tiếp theo; chúng không thể điền cho đến khi bộ cohort trước đó được tiêu thụ hoàn toàn.
+
+### Bước khớp
+
+Mã giả cho khớp xảy ra ở mỗi lần vượt qua tick trong quá trình swap:
+
+```
+fn match_limit_orders_at_tick(tick, swap_input_remaining, sqrt_p):
+    # 1. Try to fill the partially-filled cohort first.
+    if tick.part_filled_orders_remaining > 0:
+        consume = min(tick.part_filled_orders_remaining, swap_input_remaining)
+        # Update the unfilled-ratio for that cohort.
+        tick.unfilled_ratio_x64 *= (1 - consume / tick.part_filled_orders_remaining)
+        tick.part_filled_orders_remaining -= consume
+        swap_input_remaining -= consume
+        if tick.part_filled_orders_remaining == 0:
+            tick.unfilled_ratio_x64 = 0
+        if swap_input_remaining == 0: return
+
+    # 2. Promote the active cohort.
+    if tick.orders_amount > 0:
+        tick.part_filled_orders_remaining = tick.orders_amount
+        tick.orders_amount = 0
+        tick.order_phase += 1
+        tick.unfilled_ratio_x64 = ONE_X64
+        # Recurse with the freshly-promoted cohort.
+        return match_limit_orders_at_tick(tick, swap_input_remaining, sqrt_p)
+
+    return  # tick has no more limit orders
+```
+
+Token đầu ra dành cho các chủ sở hữu lệnh giới hạn **không** được chuyển giao cho mỗi swap. Chúng nằm ảo trong vault đầu ra của pool cho đến khi chủ sở hữu lệnh gọi `SettleLimitOrder` (hoặc `DecreaseLimitOrder`). Pool chỉ đơn giản theo dõi bao nhiêu phần của bộ cohort được điền đầy thông qua `unfilled_ratio_x64`. Mỗi `LimitOrderState` lưu trữ ảnh chụp `(order_phase, unfilled_ratio_x64)` của riêng nó vào thời điểm mở, vì vậy quyết toán rút gọn thành:
+
+```
+filled_amount  = total_amount × (1 − tick_now.unfilled_ratio_x64 / order.unfilled_ratio_x64)
+                if tick_now.order_phase > order.order_phase
+                else 0
+output_amount  = price_at(tick_index) × filled_amount   # adjusted for direction
+```
+
+Quyết toán O(1) này là toàn bộ ý tưởng của thiết kế bộ cohort — một tick có thể điền đầy số lượng lệnh tùy ý mà không mất khí cho mỗi lệnh.
+
+### Tương tác với đường cong LP
+
+Trong một bước swap, khớp lệnh giới hạn xảy ra **tại** tick (không `Δsqrt_price`); tiêu thụ đường cong LP xảy ra **giữa** các tick. Thứ tự do đó:
+
+1. Vượt qua tick `t_cross` (áp dụng thay đổi LP `liquidity_net` trước tiên, vì đây là cách Uniswap-V3 thực hiện).
+2. Điền các lệnh giới hạn nằm ở `t_cross`.
+3. Tiếp tục dọc theo đường cong LP đến tick được khởi tạo tiếp theo hoặc đến việc `swap_input` bị cạn kiệt.
+
+Do đó, các lệnh giới hạn mang đến cho nhà giao dịch *nhiều* liquidity hiệu quả hơn ở giá tick chính xác của lệnh (một hiệu ứng cải thiện giá), với giá là các LP không kiếm được phí trên phần đó của khối lượng swap — phần lệnh giới hạn của giao dịch miễn phí cho người swap, vì người đặt lệnh giới hạn đang hoạt động như một người tạo lập thị trường. Phụ phí phí động (nếu được kích hoạt) vẫn áp dụng cho phần LP của cùng một swap.
+
+## Suy dẫn phí động
+
+`PoolState.dynamic_fee_info` mang lại trạng thái biến động. Mỗi bước swap tính toán tỷ lệ phí mỗi bước là:
+
+$$
+\text{fee\_rate}_{\text{total}} = \text{trade\_fee\_rate}_{\text{config}} +
+\underbrace{\frac{\text{dynamic\_fee\_control} \cdot (\text{vol\_acc} \cdot \text{tick\_spacing})^2}
+{D_{\text{ctrl}} \cdot S_{\text{vol}}^2}}_{\text{dynamic surcharge}}
+$$
+
+trong đó:
+
+- $D_{\text{ctrl}} = 100{,}000$ — `DYNAMIC_FEE_CONTROL_DENOMINATOR`
+- $S_{\text{vol}} = 10{,}000$ — `VOLATILITY_ACCUMULATOR_SCALE`
+- `vol_acc` là bộ tích lũy mỗi swap sau khi quy tắc cập nhật dưới đây
+- `tick_spacing` từ `PoolState.tick_spacing`
+
+Kết quả được giới hạn ở $100{,}000 / 10^6 = 10\%$.
+
+### Cập nhật bộ tích lũy
+
+Hai quy tắc được áp dụng mỗi swap, theo thứ tự:
+
+**Phân rã.** Mức sàn tham chiếu phân rã dựa trên thời gian kể từ lần cập nhật cuối:
+
+$$
+\text{vol\_ref} = \begin{cases}
+0 & \text{if } \Delta t > \text{decay\_period} \\
+\text{vol\_acc}_{\text{prev}} \cdot \dfrac{\text{reduction\_factor}}{10{,}000} & \text{if } \text{filter\_period} < \Delta t \le \text{decay\_period} \\
+\text{vol\_ref}_{\text{prev}} & \text{if } \Delta t \le \text{filter\_period}
+\end{cases}
+$$
+
+**Tích lũy.** Bộ tích lũy mới là tham chiếu cộng với khoảng cách tick được duyệt qua kể từ chỉ số tham chiếu trước đó:
+
+$$
+\text{vol\_acc} = \min\left(
+    \text{vol\_ref} + \left| t_{\text{ref}} - t_{\text{now}} \right| \cdot S_{\text{vol}},
+    \text{max\_vol\_acc}
+\right)
+$$
+
+`tick_spacing_index_reference` ($t_{\text{ref}}$) tính bằng đơn vị tick-spacing, không phải tick thô: $t_{\text{ref}} = \lfloor \text{tick\_current} / \text{tick\_spacing} \rfloor$.
+
+### Tại sao lại parabol về khoảng cách tick
+
+Bình phương bộ tích lũy có nghĩa là phí tăng lên theo *bình phương* của khoảng cách giá đã đi từ điểm tham chiếu của nó. Thực nghiệm điều này khớp với tỷ lệ phương sai của giá dưới áp lực đi bộ ngẫu nhiên: một phöng đi 2 lần tick ngụ ý 4 lần biến động ngụ ý, vì vậy tính phí 4 lần phụ phí. Tham số `dynamic_fee_control` hiệu chỉnh mức tuyệt đối.
+
+Cửa sổ `filter_period` ngăn chặn các dao động cực nhỏ dưới một giây (ví dụ: bot MEV sandwich) khỏi làm tăng bộ tích lũy. Cửa sổ `decay_period` ngăn chặn một xung tăng đột ngột trong quá khứ khỏi việc tính phí vô hạn sau khi thị trường đã bình tĩnh.
+
+## Mạnh mẽ về mặt số học
+
+- Tất cả các sản phẩm trung gian đi qua số học hình dạng `u128` hoặc `u256`. CLMM sử dụng các trợ giúp `U128Sqrt` và các mẫu `FullMath::mulDiv` được chuyển cổng trực tiếp từ Uniswap v3.
+- Làm tròn phép chia được chọn mỗi bước để thực thi bất biến `k' ≥ k` cục bộ. `SwapBaseInput` làm tròn đầu ra **xuống**; `SwapBaseOutput` làm tròn đầu vào **lên**.
+- Những lần vượt qua tick làm giảm `PoolState.liquidity` về 0 được cho phép (giá có thể duyệt qua một "lỗ liquidity") nhưng swap chỉ đơn giản nâng cao đến tick được khởi tạo tiếp theo mà không tiêu thụ đầu vào, không tính phí.
+- Bảo vệ tràn: `sqrt_price_x64` được giữ trong phạm vi bao gồm `[MIN_SQRT_PRICE_X64, MAX_SQRT_PRICE_X64]` tương ứng với `[MIN_TICK, MAX_TICK]`. Một swap sẽ đẩy quá bất kỳ ranh giới nào hoàn tác với `SqrtPriceLimitOverflow`.
+
+## Tiếp theo đi đâu
+
+- [`products/clmm/ticks-and-positions`](/vi/products/clmm/ticks-and-positions) cho cách bản đồ tick tham gia vào lần đi bộ.
+- [`products/clmm/fees`](/vi/products/clmm/fees) cho phía phí/phần thưởng của toán học chi tiết.
+- [`algorithms/clmm-math`](/vi/algorithms/clmm-math) cho các suy dẫn đằng sau `L = sqrt(x · y)` và các công thức phạm vi so với liquidity.
+
+Nguồn:
+
+- [`raydium-io/raydium-clmm` — `libraries/swap_math.rs`, `libraries/tick_math.rs`](https://github.com/raydium-io/raydium-clmm)
+- "Uniswap v3 Core" whitepaper, §6–7

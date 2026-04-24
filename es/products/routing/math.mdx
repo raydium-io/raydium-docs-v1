@@ -1,0 +1,161 @@
+---
+title: "Matemáticas del enrutamiento"
+description: "El enrutador no realiza cálculos de precios; cada salto se delega al programa de su pool. El slippage de múltiples saltos se compone; los saltos CLMM usan limit_prices."
+---
+
+<Info>
+  **Esta página fue traducida automáticamente por IA. La versión en inglés es la fuente autorizada.**
+
+  [Ver versión en inglés →](/products/routing/math)
+</Info>
+
+## El enrutador no realiza cálculos
+
+El programa de enrutamiento **no implementa lógica de precios**. Es un orquestador puro: acepta una ruta, pasa cuentas a programas secundarios y encadena flujos de tokens.
+
+Cada salto fija el precio según la curva de su propio programa de pool:
+
+- **Saltos AMM v4:** utilizan la fórmula de producto constante (`x · y = k`) con precios híbridos de OpenBook. Ver [`products/amm-v4/math`](/es/products/amm-v4/math).
+- **Saltos CPMM:** utilizan la fórmula de producto constante con niveles de comisión configurables. Ver [`products/cpmm/math`](/es/products/cpmm/math).
+- **Saltos CLMM:** utilizan matemáticas de ticks de liquidez concentrada. Ver [`algorithms/clmm-math`](/es/algorithms/clmm-math).
+- **Saltos estables:** utilizan la curva de intercambio estable para activos similares. Ver [`products/stable/math`](/es/products/stable/math).
+
+La única participación del enrutador es:
+
+1. Llamar a la instrucción de intercambio de cada pool mediante CPI.
+2. Recopilar el monto de salida.
+3. Pasarlo como monto de entrada al siguiente salto.
+4. Verificar la salida final contra el límite de slippage del llamador.
+
+## Composición del slippage
+
+En una ruta con múltiples saltos, el slippage en cada salto se compone. Un pequeño slippage en el salto 1 se convierte en un slippage más grande en el salto 2 porque el volumen hacia el salto 2 ya se ha reducido.
+
+**Ejemplo:**
+
+```
+Ruta: USDC → SOL → STEP
+
+Pool 1 (USDC / SOL):
+  Entrada: 1000 USDC
+  Slippage: 1% (el precio spot daría 0.5 SOL, pero obtienes 0.495 SOL)
+  Salida: 0.495 SOL
+
+Pool 2 (SOL / STEP):
+  Entrada: 0.495 SOL (ya reducida)
+  Slippage: 1% (el precio spot daría 495 STEP, pero obtienes 490 STEP)
+  Salida: 490 STEP
+
+Slippage efectivo total en USDC → STEP: 1.99%, no 1% + 1% = 2%.
+```
+
+Cuando proporcionas `minimum_amount_out`, el enrutador verifica tu salida final contra este límite global. Cada salto también verifica su propio intercambio contra su estructura de comisión local, pero el enrutador no vuelve a cotizar en medio de la ruta; debes precalcular la ruta e incluir suficiente tolerancia de slippage.
+
+## Saltos CLMM y limit_prices
+
+Para cada salto hacia un pool CLMM, el enrutador verifica que el `sqrt_price_x64` actual del pool esté dentro de un límite especificado. Los límites se pasan como un `VecDeque<u128>` llamado `limit_prices`:
+
+- Un `sqrt_price_x64` por cada salto CLMM en la ruta.
+- `sqrt_price_x64` es la representación de precio basada en ticks utilizada por CLMM. Ver [`algorithms/clmm-math`](/es/algorithms/clmm-math) para la definición.
+- El enrutador impone:
+
+```
+  sqrt_price_lower <= pool.sqrt_price_x64 <= sqrt_price_upper
+```
+
+para cada salto CLMM, rechazando el intercambio si el precio está fuera de los límites.
+
+### Variantes de instrucción y limit_prices
+
+- **`SwapBaseInWithUserAccount`, `SwapBaseOutWithUserAccount` (Legado, etiquetas 0 y 1):** el VecDeque de `limit_prices` es **requerido**. Se rechaza un deque vacío con un error si algún salto es un pool CLMM. Debes proporcionar un precio por cada salto CLMM, en orden.
+
+- **`SwapBaseIn`, `SwapBaseOut` (Actual, etiquetas 8 y 9):** el VecDeque de `limit_prices` es **opcional**. Un deque vacío se ignora silenciosamente; no se realiza ninguna verificación de precio. El código nuevo debe usar estos.
+
+### Construir limit_prices
+
+Para una ruta con M saltos CLMM, el deque debe contener exactamente M entradas. Ordénalas por salto:
+
+```
+limit_prices = [
+  sqrt_price_for_first_clmm_hop,
+  sqrt_price_for_second_clmm_hop,
+  ...
+]
+```
+
+### Cuándo verificar limit_prices
+
+El `sqrt_price_x64` es una instantánea del precio actual del pool. Cambia continuamente a medida que se ejecutan los intercambios. Deberías:
+
+1. Obtener el estado actual del pool de la cadena.
+2. Calcular límites aceptables (por ejemplo, ±0.5% del precio actual).
+3. Codificar esos límites en `limit_prices`.
+4. Incluir los límites en tu instrucción del enrutador.
+
+Si el precio del pool se desvía más allá de tus límites antes de que la transacción se registre, el enrutador la rechazará.
+
+## Manejo de comisiones
+
+Cada pool cobra su propia comisión según su configuración:
+
+- **AMM v4:** 0.25% (fijo) dividido entre LP, protocolo y fondo.
+- **CPMM:** configurable por `AmmConfig` (predeterminado 0.25%, la división varía según el nivel).
+- **CLMM:** configurable por pool, deducido del monto de entrada.
+- **Estable:** como AMM v4, 0.25% dividido.
+
+El enrutador **no cobra comisión propia**. Todo el manejo de comisiones se delega a cada pool secundario. La salida del salto N ya tiene deducida la comisión de ese salto.
+
+Consulta la documentación de comisiones del pool individual:
+
+- [`products/amm-v4/fees`](/es/products/amm-v4/fees)
+- [`products/cpmm/fees`](/es/products/cpmm/fees)
+- [`products/clmm/fees`](/es/products/clmm/fees) (si está disponible)
+- [`products/stable/fees`](/es/products/stable/fees) (si está disponible)
+
+## Ejemplo de contabilidad de múltiples saltos
+
+Supongamos que enrutas USDC → SOL → STEP a través de dos pools de producto constante, cada uno con una comisión de 0.25%:
+
+```
+Entrada: 1000 USDC
+Pool 1 (USDC/SOL):
+  Comisión deducida: ceil(1000 * 0.25%) = 2.5 USDC
+  Entrada neta a la curva: 997.5 USDC
+  Salida de la curva (antes del slippage): 0.5 SOL
+  Margen de slippage: supongamos 1%, así obtienes ~0.495 SOL
+
+Pool 2 (SOL/STEP):
+  Entrada: 0.495 SOL
+  Comisión deducida: ceil(0.495 * 0.25%) ≈ 0.001 SOL
+  Entrada neta a la curva: 0.494 SOL
+  Salida de la curva: ~494 STEP
+  Margen de slippage: 1%, así obtienes ~489 STEP
+
+Salida final: ~489 STEP
+```
+
+El enrutador verifica:
+
+```
+489 >= minimum_amount_out  // especificado por el llamador
+```
+
+Si es falso, toda la ruta falla de forma atómica.
+
+## Consideraciones de precisión
+
+Como todos los programas en Solana, el enrutador utiliza aritmética de enteros:
+
+- Todos los montos son `u64` (lamports o unidades más pequeñas de token).
+- Los cálculos de curva utilizan intermedios `u128` donde es necesario para evitar desbordamiento.
+- Las convenciones de redondeo dependen del programa secundario. El enrutador no redondea de nuevo.
+
+Si un salto produce un monto cero debido a relaciones de precio extremas (por ejemplo, intercambiar 1 lamport en un pool 1B:1), el enrutador propaga ese cero al siguiente salto, que puede rechazarlo como insuficiente. Consulta los códigos de error del pool individual.
+
+## Próximos pasos
+
+- [`products/amm-v4/math`](/es/products/amm-v4/math) — matemáticas de producto constante.
+- [`products/cpmm/math`](/es/products/cpmm/math) — CPMM de producto constante con Token-2022.
+- [`algorithms/clmm-math`](/es/algorithms/clmm-math) — precios de liquidez concentrada.
+- [`products/stable/math`](/es/products/stable/math) — curva de intercambio estable.
+- [`products/routing/code-demos`](/es/products/routing/code-demos) — ejemplos de cotización antes de enrutamiento.

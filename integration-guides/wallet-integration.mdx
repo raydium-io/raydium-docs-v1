@@ -1,0 +1,207 @@
+---
+title: "Wallet integration"
+description: "Displaying Raydium positions, pool shares, farm stakes, and pending rewards in a wallet UI — detection patterns, simulation for transaction preview, and Token-2022 display specifics."
+---
+
+<Info>
+  Wallets integrating Raydium typically need to answer four questions per user: what pools does this user have LP in? what positions (CLMM NFTs) do they hold? what farms are they staked in? how much is it all worth? This page documents each.
+</Info>
+
+## Detecting Raydium positions
+
+### Classic LP tokens (CPMM, AMM v4)
+
+These look like any other SPL Token: the user's ATA holds a balance. A wallet shows this as just another token by default. To reveal it as a Raydium LP position:
+
+1. Enumerate user's token accounts: `connection.getParsedTokenAccountsByOwner(user, { programId: TOKEN_PROGRAM_ID })`.
+2. For each mint, check Raydium's mint list: `GET https://api-v3.raydium.io/pools/info/lps?lps=<LP_MINT>,...` (batch up to ~50 LP mints per call).
+3. For mints that match, the API returns the pool reference. Use it to compute the position's token-denominated value:
+
+```
+token_a_owned = user_lp_balance * poolReserves.A / lpMint.supply
+token_b_owned = user_lp_balance * poolReserves.B / lpMint.supply
+usd_value     = token_a_owned * priceA_usd + token_b_owned * priceB_usd
+```
+
+Show both the LP balance and the unwrapped amounts — users think in underlying tokens, not LP units.
+
+### CLMM position NFTs
+
+CLMM positions are NFTs. Each position's `PersonalPositionState` PDA is derived from the NFT mint. To detect:
+
+1. Enumerate user's NFTs. For legacy Metaplex NFTs: filter token accounts to those with supply 1 and decimals 0.
+2. For each NFT mint, try to derive the PersonalPositionState PDA:
+
+```ts
+import { CLMM_PROGRAM_ID } from "@raydium-io/raydium-sdk-v2";
+
+const [positionPda] = PublicKey.findProgramAddressSync(
+  [Buffer.from("position"), nftMint.toBuffer()],
+  CLMM_PROGRAM_ID,
+);
+
+const accountInfo = await connection.getAccountInfo(positionPda);
+if (!accountInfo || !accountInfo.owner.equals(CLMM_PROGRAM_ID)) return null;
+// It's a Raydium CLMM position — decode.
+```
+
+3. Decode via `raydium.clmm.getPositionInfo({ positionPda })` to get:
+   - `poolId` → fetch pool to resolve mints
+   - `tickLower`, `tickUpper` → display range
+   - `liquidity`, `tokensOwedA/B` → compute position value + pending fees
+   - `rewardInfos` → pending per-stream rewards
+
+4. For position-NFTs issued under Token-2022 (`OpenPositionWithToken22Nft`), the NFT mint's program is Token-2022 rather than SPL Token. Enumerate both when scanning.
+
+### Farm stakes
+
+Farm v3 / v5 / v6 each have a per-user ledger PDA. Derivations:
+
+```ts
+// Try all three farm versions for each of the user's potential farm interactions.
+// Cheapest approach: ask the API first, which has indexed all user positions.
+
+const r = await fetch(
+  `https://api-v3.raydium.io/positions/staking?wallet=${user.toBase58()}`
+).then(r => r.json());
+
+for (const s of r.data.stakings) {
+  // s.farmId, s.stakedAmount, s.pendingRewards[], s.poolApr, ...
+}
+```
+
+For wallets that prefer fully on-chain detection: iterate possible `UserLedger` PDAs by hashing the user with a curated list of "likely" farm IDs. Enumerating all farm IDs exhaustively is impractical (thousands exist); use the API.
+
+## Computing position value
+
+### CPMM / AMM v4 LP
+
+```ts
+const poolInfo = await raydium.<type>.getPoolInfoFromRpc({ poolId });
+const myShare  = userLpBalance / poolInfo.lpMint.supply;
+const tokensA  = BigInt(poolInfo.mintAmountA) * BigInt(userLpBalance)
+                / BigInt(poolInfo.lpMint.supply);
+const tokensB  = BigInt(poolInfo.mintAmountB) * BigInt(userLpBalance)
+                / BigInt(poolInfo.lpMint.supply);
+```
+
+Then multiply each by the mint's USD price (from `raydium.token` or a price oracle).
+
+### CLMM position
+
+```ts
+const position = await raydium.clmm.getPositionInfo({ positionPda });
+const pool     = await raydium.clmm.getPoolInfoFromRpc({ poolId: position.poolId });
+
+const { amountA, amountB } = PoolUtils.getAmountsFromLiquidity({
+  sqrtPriceX64:  pool.sqrtPriceX64,
+  tickLower:     position.tickLower,
+  tickUpper:     position.tickUpper,
+  liquidity:     position.liquidity,
+  slippage:      0,  // for display, no slippage
+});
+
+// Pending fees — display separately as "uncollected"
+const fees = {
+  A: position.tokenFeesOwedA,
+  B: position.tokenFeesOwedB,
+};
+
+// Pending rewards — a CLMM pool has 0–3 reward streams.
+const rewards = position.rewardInfos.map(r => ({
+  mint:          r.rewardMint,
+  rewardAmount:  r.rewardAmountOwed,
+}));
+```
+
+Render as:
+
+- Liquidity value (current price)
+- Uncollected fees
+- Pending rewards per stream
+- Range: `[tickLower_price, tickUpper_price]` with a visual bar showing whether current price is in-range
+
+### Farm stake
+
+```ts
+// The API response already includes pending rewards; use it directly.
+const apr       = stakingFarm.apr;               // %, annualized
+const staked    = stakingFarm.stakedAmount;      // smallest units of staking mint
+const rewards   = stakingFarm.pendingRewards;    // array of { mint, amount }
+```
+
+For on-chain computation, mirror the farm's accounting:
+
+```
+pending_reward_i = user.deposited
+                 * farm.reward_per_share_x64[i] / 2^64
+                 - user.reward_debts[i]
+```
+
+Make sure to refresh `reward_per_share_x64` with the lazy-update formula before computing (elapsed time × emission rate ÷ total_staked).
+
+## Transaction simulation for preview
+
+Before a user signs, wallets usually preview the balance changes. Use `simulateTransaction`:
+
+```ts
+const sim = await connection.simulateTransaction(tx, {
+  sigVerify: false,
+  commitment: "confirmed",
+  accounts: {
+    encoding: "base64",
+    addresses: [userTokenAtaA, userTokenAtaB, userLpAta].map(a => a.toBase58()),
+  },
+});
+
+// Decode each returned account's balance and diff against pre-tx balances.
+for (const [i, acctData] of sim.value.accounts!.entries()) {
+  const newBalance = decodeTokenAccount(acctData!.data[0]).amount;
+  // compare to pre-tx balance, show Δ
+}
+```
+
+The `accounts` parameter asks the validator to return post-simulation account state for listed addresses. Much more accurate than trying to predict the balance change from the instruction shape alone.
+
+### Simulation pitfalls
+
+- **CLMM swaps need valid tick arrays.** If the user's input size would cross into an uninitialized tick array, simulation reverts (same as execution). Surface this clearly in the UI.
+- **Priority fee.** Simulation runs without the compute-budget instructions applied. For a large transaction that would exceed the default 200k CU, simulation fails but actual execution with an explicit CU limit succeeds. Always set the CU limit on the simulated tx too.
+- **Fresh blockhash.** Simulation uses the current blockhash; if signing takes >60s the tx becomes invalid. Re-simulate if the user hesitates.
+
+## Token-2022 display
+
+Tokens under the Token-2022 program should be labeled as such in the wallet's token list, since they have different risk surfaces:
+
+- **Transfer-fee mints**: display the current `transferFeeBasisPoints` as "Transfer fee: X%" next to the balance. Warn when receiving — users may not realize they will receive less than the sender sent.
+- **Transfer-hook mints**: surface the hook program ID. A malicious hook can block outbound transfers; users should verify the hook is the one they expect.
+- **Non-transferable mints**: display "Non-transferable" and disable swap/send. These are typically soulbound tokens or credentials.
+- **Interest-bearing mints**: the UI balance derived from `TokenAccount.amount` does **not** reflect accrued interest. Use `amountToUiAmount` from `@solana/spl-token` (which applies the scaling factor) for the displayed value.
+
+## Farm APR display
+
+APR displayed to users should combine all live reward streams, converted to USD, and annualized:
+
+```ts
+let apr = 0;
+for (const r of farm.rewardInfos) {
+  if (r.rewardState !== 1) continue;   // skip not-running
+  const annualRewardTokens = Number(r.emissionPerSecond) * 86400 * 365 / 1e<decimals>;
+  const annualRewardValue  = annualRewardTokens * priceUsd(r.rewardMint);
+  const tvlValue           = Number(farm.totalStaked) * priceUsd(farm.stakingMint) / 1e<decimals>;
+  apr += annualRewardValue / tvlValue;
+}
+```
+
+Display as `APR: X.Y%`. If the staking mint is an LP token, also compute the underlying LP's base fee APR and label the sum as "Total APR" or "APR + fees".
+
+## Pointers
+
+- [`products/clmm/ticks-and-positions`](/products/clmm/ticks-and-positions) — position-value derivation.
+- [`products/farm-staking/accounts`](/products/farm-staking/accounts) — farm state fields.
+- [`algorithms/token-2022-transfer-fees`](/algorithms/token-2022-transfer-fees) — display semantics for transfer-fee tokens.
+
+Sources:
+
+- Raydium SDK v2 — position/farm helpers.
+- User-position endpoints on `api-v3.raydium.io`.

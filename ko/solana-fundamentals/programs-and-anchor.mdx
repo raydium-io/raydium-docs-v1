@@ -1,0 +1,280 @@
+---
+title: "프로그램과 Anchor"
+description: "솔라나 프로그램이 배포 및 업그레이드되는 방식, Anchor 프레임워크가 원시 솔라나 위에 제공하는 기능, Raydium의 IDL을 읽어 자신의 클라이언트를 생성하는 방법에 대해 알아봅니다."
+---
+
+<Info>
+  **이 페이지는 AI 자동 번역입니다. 모든 내용은 영문판을 기준으로 합니다.**
+
+  [영문판 보기 →](/solana-fundamentals/programs-and-anchor)
+</Info>
+
+<Info>
+  Raydium의 최신 프로그램(CPMM, CLMM, Farm v6, LaunchLab)은 **Anchor**로 작성되었습니다. Anchor는 솔라나의 원시 프로그램 모델을 기반으로 계정 검증, 에러 처리, IDL(인터페이스 설명) 기능을 제공하는 Rust 프레임워크입니다. AMM v4 및 이전 버전의 farm은 Anchor 이전에 만들어졌습니다. 두 가지 패러다임을 모두 이해하면 코드를 읽고, IDL에서 클라이언트를 생성하며, 예상치 못한 에러를 디버그할 수 있습니다.
+</Info>
+
+## 프로그램 배포 모델
+
+모든 솔라나 프로그램은 `Pubkey`에 존재합니다. 프로그램의 바이트코드는 **BPF Upgradable Loader**(`BPFLoaderUpgradeab1e11111111111111111111111`)가 소유한 **executable** 계정에 저장됩니다.
+
+프로그램 배포는 세 개의 계정으로 구성됩니다:
+
+1. **Program 계정**: 프로그램의 ID에 있는 작은 메타데이터 계정입니다. 소유자: BPF Upgradable Loader.
+2. **ProgramData 계정**: 실제 바이트코드를 보유합니다. `[program_id, "programdata"]`로 도출됩니다.
+3. **Buffer 계정** (임시): 업그레이드 중에 새로운 바이트코드를 보유합니다. 업그레이드 후 폐기됩니다.
+
+ProgramData 계정은 **업그레이드 권한**을 가지고 있습니다. 이는 바이트코드를 새 버전으로 교체할 수 있는 키입니다. Raydium의 업그레이드 권한은 24시간 타임락 뒤의 멀티시그입니다. 자세한 내용은 [`security/admin-and-multisig`](/ko/security/admin-and-multisig)를 참조하세요.
+
+### 배포된 프로그램 검증
+
+온체인에 있는 것이 감사 승인된 소스와 일치하는지 확인하려면:
+
+```bash
+# 메인넷에서 프로그램 다운로드
+solana program dump CPMMoo8L3F4NbTegBCKVNunggL7H1Zpdmwpwh8KMoZ0F cpmm-onchain.so
+
+# 알려진 소스에서 빌드
+cargo build-bpf --manifest-path raydium-cp-swap/programs/cp-amm/Cargo.toml
+cp target/deploy/raydium_cp_swap.so cpmm-source.so
+
+# 비교
+sha256sum cpmm-onchain.so cpmm-source.so
+```
+
+해시가 일치하면 당신이 생각하는 소스와 상호작용하고 있다는 것이 증명됩니다. Raydium은 릴리스 노트에서 검증된 빌드 지침을 공개합니다.
+
+## Anchor: 솔라나 위의 프레임워크
+
+원시 솔라나 프로그램은 다음 시그니처를 가진 Rust 함수입니다:
+
+```rust
+pub fn process_instruction(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    instruction_data: &[u8],
+) -> ProgramResult {
+    // instruction_data를 수동으로 파싱
+    // 계정을 수동으로 검증
+    // 계정 데이터를 수동으로 역직렬화
+    // signer/writable 플래그를 수동으로 확인
+    // ... 그 다음 실제 작업 수행
+}
+```
+
+Anchor는 모든 보일러플레이트를 래핑하여 다음과 같이 작성할 수 있게 합니다:
+
+```rust
+#[program]
+pub mod cpmm {
+    use super::*;
+
+    pub fn swap_base_input(
+        ctx: Context<Swap>,
+        amount_in: u64,
+        min_out: u64,
+    ) -> Result<()> {
+        // 비즈니스 로직만 — ctx는 미리 검증됨
+    }
+}
+
+#[derive(Accounts)]
+pub struct Swap<'info> {
+    pub payer: Signer<'info>,
+    #[account(mut, seeds = [b"pool", config.key().as_ref(), ...], bump)]
+    pub pool_state: AccountLoader<'info, PoolState>,
+    #[account(mut)]
+    pub input_vault: Box<Account<'info, TokenAccount>>,
+    // ... 더 많은 계정
+}
+```
+
+Anchor는 다음을 제공합니다:
+
+- 각 명령어와 각 계정 타입에 대해 결정론적 8바이트 **discriminator**를 자동 생성합니다.
+- 계정 제약 조건(소유자, 시드, writable, signer, mint-matches, token-program-matches)을 코드 실행 전에 검증합니다.
+- 클라이언트가 프로그램을 호출할 때 사용하는 인터페이스 설명 파일인 **IDL**을 생성합니다.
+- Rust, TypeScript, Python 클라이언트 라이브러리와 함께 제공됩니다.
+
+### 8바이트 discriminator
+
+모든 Anchor 계정과 모든 Anchor 명령어는 8바이트 discriminator로 시작합니다. 이는 고정 문자열의 SHA-256 첫 8바이트입니다:
+
+```
+Account discriminator:     sha256("account:PoolState")[0..8]
+Instruction discriminator: sha256("global:swap_base_input")[0..8]
+```
+
+Anchor 명령어를 호출할 때, 명령어 데이터의 첫 8바이트가 이 discriminator입니다. Anchor는 이를 조회하여 올바른 핸들러로 디스패치합니다.
+
+Anchor 계정을 읽을 때, 첫 8바이트가 그 타입을 알려줍니다. 이는 `getProgramAccounts` 같은 도구가 타입의 모든 계정을 열거할 때 중요합니다.
+
+### 에러
+
+Anchor 프로그램은 `#[error_code]`를 통해 에러를 정의합니다:
+
+```rust
+#[error_code]
+pub enum ErrorCode {
+    #[msg("Slippage tolerance exceeded")]
+    SlippageExceeded,
+    #[msg("Pool is disabled")]
+    PoolDisabled,
+    // ...
+}
+```
+
+Anchor는 6000(0x1770)부터 시작해서 자동으로 숫자 코드를 할당합니다. Raydium의 전체 에러 코드 테이블은 [`reference/error-codes`](/ko/reference/error-codes)에 있습니다.
+
+## IDL
+
+Anchor **IDL**(Interface Description Language) 파일은 프로그램의 JSON 설명입니다. 명령어, 계정, 타입, 에러, 이벤트를 포함합니다. 이더리움의 ABI와 동등합니다.
+
+Raydium은 모든 Anchor 프로그램의 IDL을 공개합니다. 온체인에서 실시간으로 가져오기:
+
+```bash
+anchor idl fetch CPMMoo8L3F4NbTegBCKVNunggL7H1Zpdmwpwh8KMoZ0F -o cpmm.idl.json
+```
+
+또는 SDK 소스에서: `src/raydium/*/idl/*.json`.
+
+### IDL 구조
+
+```json
+{
+  "version":      "0.1.0",
+  "name":         "raydium_cp_swap",
+  "instructions": [ { "name": "swap_base_input", "accounts": [ ... ], "args": [ ... ] }, ... ],
+  "accounts":     [ { "name": "PoolState", "type": { ... } }, ... ],
+  "types":        [ { "name": "AmmConfig", "type": { ... } }, ... ],
+  "errors":       [ { "code": 6000, "name": "SlippageExceeded", "msg": "..." }, ... ],
+  "events":       [ { "name": "SwapEvent", "fields": [ ... ] }, ... ]
+}
+```
+
+### IDL에서 클라이언트 생성
+
+Anchor의 `anchor` CLI는 TypeScript 및 Rust 타입을 생성합니다:
+
+```bash
+anchor idl build -o target/idl/cpmm.json
+# TypeScript 타입은 Anchor의 ts-client에 의해 자동 생성됨
+# Raydium SDK에 이미 포함됨
+```
+
+[Kinobi](https://github.com/metaplex-foundation/kinobi) 같은 써드파티 도구는 IDL에서 Rust, Python, C 또는 Go 클라이언트를 생성할 수 있습니다.
+
+### IDL이 도움이 되는 경우
+
+Raydium SDK를 거치지 않는 커스텀 통합을 구축하려면:
+
+1. IDL을 가져옵니다(온체인 실시간 또는 SDK 소스).
+2. 원하는 명령어를 찾습니다(예: `swap_base_input`).
+3. 명령어 데이터를 구성합니다: 8바이트 discriminator + 인코딩된 인자.
+4. IDL이 지정하는 순서대로 계정을 전달합니다.
+
+작동 예제는 [`sdk-api/anchor-idl`](/ko/sdk-api/anchor-idl)을 참조하세요.
+
+## Anchor 이전 프로그램: AMM v4 및 Farm v3/v5
+
+이 프로그램들은 Anchor 이전에 만들어졌습니다. 다음을 사용합니다:
+
+- **수동 명령어 디스패치**: `instruction_data`의 `u8` 태그와 `match` 문.
+- **수동 계정 검증**: `if accounts[0].owner != &expected_program { ... }`.
+- **Borsh 직렬화 명령어 인자**: discriminator 없이, `instruction_data[1..]`만 사용.
+- **`#[repr(C, packed)]` 레이아웃**: C 구조체 바이너리 레이아웃.
+
+Raydium SDK v2는 Anchor 없이 클라이언트가 인코드/디코드할 수 있도록 non-Anchor AMM v4 명령어를 위한 TypeScript 레이아웃을 제공합니다:
+
+```ts
+import { liquidityStateV4Layout, swapInstructionData }
+  from "@raydium-io/raydium-sdk-v2";
+
+const data = swapInstructionData.encode({
+  instruction: 9,   // swap
+  amountIn:    1_000_000n,
+  minAmountOut: 950_000n,
+});
+```
+
+통합 패턴은 동일합니다. 단지 Anchor의 IDL 기반 자동 생성을 얻지 못할 뿐입니다.
+
+## 프로그램 업그레이드 메커니즘
+
+ProgramData의 `upgrade_authority`만이 업그레이드할 수 있습니다. 절차:
+
+1. 새로운 바이트코드를 컴파일합니다.
+2. 버퍼 계정에 작성합니다(`solana program write-buffer`).
+3. 업그레이드 명령어를 제출합니다: `BpfLoaderUpgradeable::Upgrade { buffer, program, authority }`.
+4. 런타임이 프로그램의 바이트코드를 버퍼의 내용으로 원자적으로 교체합니다.
+
+Raydium은 이를 Squads 멀티시그 설정에 구현된 **24시간 타임락** 뒤에 놓았습니다. 업그레이드 트랜잭션은 멀티시그 승인 후 실행되기까지 24시간을 기다려야 합니다. 이는 서둘러 하거나 강압된 업그레이드로부터 보호합니다.
+
+[`security/admin-and-multisig`](/ko/security/admin-and-multisig)를 참조하세요.
+
+### 프로그램을 불변으로 만들기
+
+업그레이드 권한을 `None`으로 설정할 수 있으며, 이 경우 프로그램은 영구적으로 불변이 됩니다. Raydium은 어떤 제품에 대해서도 이를 수행하지 않았습니다. 팀은 보안 수정 사항을 푸시할 수 있는 능력을 유지합니다. 절충: 사용자는 멀티시그 + 타임락 프로세스를 신뢰해야 합니다.
+
+## 프로그램과 렌트
+
+프로그램 배포는 렌트 면제 lamport를 소비합니다:
+
+- 50 KB 프로그램: ~0.35 SOL의 렌트.
+- 200 KB 프로그램: ~1.4 SOL의 렌트.
+
+프로그램을 닫기(`solana program close` 통해)는 lamport를 반환합니다. Raydium 프로그램은 활성 상태이며 폐쇄될 예정이 아닙니다.
+
+## Anchor 프로그램 디버깅
+
+### 로그 출력
+
+Anchor의 `msg!` 매크로는 트랜잭션의 로그에 씁니다. 트랜잭션을 시뮬레이트하여 로그를 보기:
+
+```ts
+const sim = await connection.simulateTransaction(tx);
+console.log(sim.value.logs);
+```
+
+로그에는 다음이 포함됩니다:
+
+- 프로그램 호출(`Program CPMMoo8... invoke [1]`).
+- 프로그램 코드의 `msg!` 호출.
+- 컴퓨트 단위 소비(`consumed 137842 of 400000 compute units`).
+- 프로그램 성공 또는 에러.
+
+### 에러 코드
+
+Anchor 프로그램이 던지면, 로그는 다음을 보여줍니다:
+
+```
+Program CPMMoo8... failed: custom program error: 0x1770
+```
+
+0x1770 = 6000 진법 = 첫 번째 Anchor 에러(예: `SlippageExceeded`). IDL의 `errors` 배열로 교차 참조하세요.
+
+Raydium의 전체 에러 테이블은 [`reference/error-codes`](/ko/reference/error-codes)를 참조하세요.
+
+### 계정 레이아웃 불일치
+
+잘못된 슬롯에 잘못된 계정을 전달하면, Anchor의 계정 검증 매크로는 다음과 같은 에러를 반환합니다:
+
+```
+AnchorError: AccountNotInitialized. Error Number: 3012
+```
+
+6000 미만의 에러 번호는 Anchor의 내장 에러입니다(Anchor의 `ErrorCode` enum 참조). 6000 이상은 프로그램의 커스텀 코드입니다.
+
+## 포인터
+
+- [`solana-fundamentals/account-model`](/ko/solana-fundamentals/account-model) — 프로그램이 계정을 소유하는 방식.
+- [`solana-fundamentals/pdas-and-cpis`](/ko/solana-fundamentals/pdas-and-cpis) — Anchor가 선언하는 PDA.
+- [`sdk-api/anchor-idl`](/ko/sdk-api/anchor-idl) — Raydium의 IDL 가져오기 및 사용.
+- [`reference/program-addresses`](/ko/reference/program-addresses) — 프로그램 ID.
+- [`reference/error-codes`](/ko/reference/error-codes) — 에러 코드 레퍼런스.
+- [`security/admin-and-multisig`](/ko/security/admin-and-multisig) — 업그레이드 권한 제어.
+
+소스:
+
+- [Anchor book](https://book.anchor-lang.com).
+- [Solana program deployment](https://docs.solana.com/cli/deploy-a-program).
+- Raydium IDL (SDK `src/raydium/*/idl/*.json`에 공개됨).

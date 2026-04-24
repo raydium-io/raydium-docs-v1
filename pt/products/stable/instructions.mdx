@@ -1,0 +1,349 @@
+---
+title: "Instruções do Stable AMM"
+description: "O conjunto completo de instruções: Initialize, InitModelData, UpdateModelData, Deposit, Withdraw, SwapBaseIn, SwapBaseOut, MonitorStep, SetParams, WithdrawPnl, WithdrawSrm, PreInitialize, SimulateInfo."
+---
+
+<Info>
+  **Esta página foi traduzida automaticamente por IA. A versão em inglês é a fonte oficial.**
+
+  [Ver versão em inglês →](/products/stable/instructions)
+</Info>
+
+<Info>
+  O Stable AMM compartilha a maioria da superfície de instruções com o AMM v4. As instruções únicas são `InitModelData` e `UpdateModelData`, que populam e atualizam a tabela de consulta. Todas as outras operações (swap, depósito, saque, crank) seguem o mesmo padrão do AMM v4.
+</Info>
+
+## Inventário de instruções
+
+| Instrução | Categoria | Notas |
+|-----------|-----------|-------|
+| `Initialize` | Ciclo de vida | Criar pool (requer conta model-data pré-alocada). |
+| `PreInitialize` | Ciclo de vida | Auxiliar de pré-alocação legado. |
+| `InitModelData` | Configuração de modelo | Criar e inicializar a tabela de consulta. |
+| `UpdateModelData` | Configuração de modelo | Popular até 5 elementos da tabela por chamada. |
+| `Deposit` | Liquidez | Adicionar liquidez, receber LP. |
+| `Withdraw` | Liquidez | Queimar LP, receber ambos os lados. |
+| `SwapBaseIn` | Swap | Swap com entrada exata. |
+| `SwapBaseOut` | Swap | Swap com saída exata. |
+| `MonitorStep` | Crank | Liquidar OpenBook, atualizar pedidos. |
+| `SetParams` | Admin | Alterar parâmetros do pool. |
+| `WithdrawPnl` | Admin | Coletar taxas de protocolo acumuladas. |
+| `WithdrawSrm` | Legado | Coletar rebates de SRM (**legado**). |
+| `SimulateInfo` | Diagnóstico | Auxiliar de cotação somente leitura. |
+
+## `Initialize`
+
+Criar um novo pool Stable AMM vinculado a um mercado OpenBook existente e uma conta `ModelDataInfo` pré-criada.
+
+**Argumentos**
+
+```
+nonce: u8
+open_time: u64
+```
+
+**Contas** (gravável `W`, signatário `S`)
+
+| # | Nome | W | S | Notas |
+|---|------|---|---|-------|
+| 1 | `token_program` |   |   | SPL Token. |
+| 2 | `system_program` |   |   | |
+| 3 | `rent` |   |   | |
+| 4 | `amm` | W |   | Conta `AmmInfo` do pool. |
+| 5 | `amm_authority` |   |   | PDA em nível de programa. |
+| 6 | `amm_open_orders` | W |   | `OpenOrders` do OpenBook. |
+| 7 | `lp_mint` | W |   | Mint do token LP fungível. |
+| 8 | `coin_mint` |   |   | |
+| 9 | `pc_mint` |   |   | |
+| 10 | `pool_coin_token_account` | W |   | Cofre de coin do pool. |
+| 11 | `pool_pc_token_account` | W |   | Cofre de pc do pool. |
+| 12 | `amm_target_orders` | W |   | Grade para pedidos do OpenBook. |
+| 13 | `model_data_account` |   |   | **A conta da tabela de consulta.** |
+| 14 | `serum_program` |   |   | Programa OpenBook. |
+| 15 | `serum_market` |   |   | Mercado OpenBook. |
+| 16 | `user_dest_lp_token` | W |   | ATA do LP do criador (recebe LP inicial). |
+| 17 | `user_wallet` | W | S | Criador; paga aluguel, financia depósito inicial. |
+| (opt) | `srm_token` | W |   | Conta de token SRM para descontos de taxa (legado). |
+
+**Pré-condições**
+
+- `model_data_account` deve já estar criada e inicializada por um `InitModelData` anterior.
+- `lp_mint` deve estar vazio (oferta zero).
+- Os cofres devem existir e ser de propriedade de `amm_authority`.
+
+**Pós-condições**
+
+- `AmmInfo` é inicializado com todas as referências.
+- `TargetOrders` é zerado e pronto para o primeiro `MonitorStep`.
+- Tokens LP iniciais são cunhados e enviados para `user_dest_lp_token`.
+- Pedidos do OpenBook **ainda não** foram postados; o primeiro `MonitorStep` os posta.
+
+## `InitModelData`
+
+Criar e inicializar a conta `ModelDataInfo`. Deve ser chamado uma vez antes de `Initialize`.
+
+**Argumentos**
+
+```
+multiplier: u64       // fator de escala (p. ex., 10^6)
+```
+
+**Contas** (gravável `W`, signatário `S`)
+
+| # | Nome | W | S | Notas |
+|---|------|---|---|-------|
+| 1 | `model_data_account` | W |   | A conta da tabela com 50k elementos. |
+| 2 | `amm_admin` |   | S | Admin do pool (deve assinar para provar autoridade). |
+
+**Pré-condições**
+
+- `model_data_account` deve ser suficientemente grande (~1,2 MB para 50k × 24 bytes).
+- `model_data_account` deve ser de propriedade do programa Stable.
+
+**Pós-condições**
+
+- `status = Initialized`.
+- `multiplier` é definido.
+- `valid_data_count = 0` (nenhum elemento populado ainda; chame `UpdateModelData` para adicioná-los).
+- Array `elements` é zerado.
+
+## `UpdateModelData`
+
+Popular até 5 elementos da tabela em uma única chamada. Deve ser chamado após `InitModelData` mas antes de os swaps começarem a usar a tabela.
+
+**Argumentos**
+
+```
+array_data: [UpdateModelData; 5]
+
+pub struct UpdateModelData {
+  pub index: u64,
+  pub data: DataElement,
+}
+```
+
+**Contas** (gravável `W`, signatário `S`)
+
+| # | Nome | W | S | Notas |
+|---|------|---|---|-------|
+| 1 | `amm_admin` |   | S | Signatário (deve ser o admin do pool). |
+| 2 | `model_data_account` | W |   | A conta da tabela. |
+
+**Pré-condições**
+
+- `amm_admin` deve corresponder a `AmmInfo.amm_admin`.
+- Cada índice em `array_data` deve ser válido (dentro de 50.000).
+- **As entradas devem estar ordenadas** (não validadas em cadeia por velocidade): x ascendente, y descendente, preço ascendente.
+
+**Pós-condições**
+
+- Elementos são escritos em `model_data_account.elements[index]` para cada entrada.
+- `valid_data_count` é atualizado para o máximo índice escrito + 1.
+
+**Nota de governança:** Não há reforço em cadeia da ordem de classificação ou consistência de preço. Um admin malicioso ou descuidado pode corromper a tabela e causar cotações incorretas. Na prática, o multisig do Raydium controla este endereço.
+
+## `Deposit`
+
+Adicionar liquidez, receber tokens LP.
+
+**Argumentos**
+
+```
+max_coin_amount: u64
+max_pc_amount: u64
+base_side: u64          // 0 = base em coin, 1 = base em pc
+```
+
+**Contas** — como AMM v4, ~13 contas. Deve incluir `model_data_account` como somente leitura.
+
+**Matemática** — pro-rata padrão usando a tabela de consulta para calcular a proporção. O SDK calcula o par coin/pc para a quantidade de LP desejada e verifica contra limites máximos.
+
+## `Withdraw`
+
+Queimar LP, receber ambos os lados pro-rata.
+
+**Argumentos**
+
+```
+amount: u64            // tokens LP a queimar
+```
+
+**Contas** — como AMM v4, com `model_data_account` como somente leitura.
+
+**Pré-condições**
+
+- `user_lp_token_account` contém pelo menos `amount`.
+
+**Pós-condições**
+
+- `amount` tokens LP são queimados.
+- Usuário recebe quantias de coin e pc de acordo com a pro-rata atual, ajustada para taxas acumuladas.
+
+## `SwapBaseIn`
+
+Swap com entrada exata usando a tabela de consulta para precificação.
+
+**Argumentos**
+
+```
+amount_in: u64
+minimum_amount_out: u64
+```
+
+**Contas** (~17 no total)
+
+| # | Nome | W | S | Notas |
+|---|------|---|---|-------|
+| 1 | `token_program` |   |   | |
+| 2 | `amm` | W |   | |
+| 3 | `amm_authority` |   |   | |
+| 4 | `amm_open_orders` | W |   | |
+| 5 | `amm_target_orders` | W |   | |
+| 6 | `pool_coin_token_account` | W |   | |
+| 7 | `pool_pc_token_account` | W |   | |
+| 8 | `model_data_account` |   |   | **Tabela de consulta somente leitura.** |
+| 9 | `serum_program` |   |   | |
+| 10 | `serum_market` | W |   | |
+| 11 | `serum_bids` | W |   | |
+| 12 | `serum_asks` | W |   | |
+| 13 | `serum_event_queue` | W |   | |
+| 14 | `serum_coin_vault` | W |   | |
+| 15 | `serum_pc_vault` | W |   | |
+| 16 | `serum_vault_signer` |   |   | |
+| 17 | `user_source_token` | W |   | Conta de token de entrada do usuário. |
+| 18 | `user_dest_token` | W |   | Conta de token de saída do usuário. |
+| 19 | `user_owner` |   | S | Usuário (signatário da transação). |
+
+**Pré-condições**
+
+- `amm.status` permite swap.
+- `user_source_token` contém ≥ `amount_in`.
+
+**Pós-condições**
+
+- Usuário perde `amount_in`, ganha `amount_out ≥ minimum_amount_out`.
+- Taxas do pool incrementam contadores `need_take_pnl_*`.
+- Pedidos do OpenBook podem ser liquidados se preenchidos.
+
+**Matemática** — Interpolação de tabela de consulta conforme descrito em [`products/stable/math`](/pt/products/stable/math).
+
+## `SwapBaseOut`
+
+Swap com saída exata (inverso de `SwapBaseIn`). Mesmas contas, direção de matemática diferente.
+
+**Argumentos**
+
+```
+max_amount_in: u64
+amount_out: u64
+```
+
+## `MonitorStep`
+
+Crank sem permissão: liquidar preenchimentos do OpenBook, atualizar a grade de pedidos de limite.
+
+**Argumentos**
+
+```
+plan_order_limit: u16
+place_order_limit: u16
+cancel_order_limit: u16
+```
+
+**Contas** (~18 no total) — mesmas do `MonitorStep` do AMM v4 mais `model_data_account` como somente leitura.
+
+**Pré-condições**
+
+- As referências de conta do OpenBook devem corresponder ao mercado vinculado do pool.
+
+**Pós-condições**
+
+- Preenchimentos pendentes do OpenBook são liquidados nos cofres do pool.
+- Novos pedidos de limite são postados no OpenBook com base na curva da tabela de consulta.
+- `TargetOrders` é atualizado.
+
+## `SetParams`
+
+Apenas admin. Alterar parâmetros do pool (status, estado, taxas, proprietário, chave model-data, etc.).
+
+**Argumentos**
+
+```
+param: u8              // qual parâmetro alterar (Status, State, Fees, etc.)
+value: Option<u64>    // novo valor (se param for numérico)
+new_pubkey: Option<Pubkey>  // novo endereço (se param for uma chave de conta)
+fees: Option<Fees>    // novas taxas (se param for Fees)
+```
+
+**Contas** — varia por param. Sempre requer `amm_admin` como signatário.
+
+**Parâmetros comuns:**
+
+- `param = 0` (Status) — alterar a máscara de operação.
+- `param = 9` (Fees) — alterar trade_fee, divisão de pnl, etc.
+- `param = 11` (ModelDataKey) — rebind à tabela de consulta (raro, requer ação do admin).
+
+## `WithdrawPnl`
+
+Apenas admin. Coletar taxas de protocolo acumuladas de `need_take_pnl_*` em contas de PnL designadas.
+
+**Argumentos** — nenhum (orientado por estado).
+
+**Contas** (~14 no total)
+
+| # | Nome | W | S | Notas |
+|---|------|---|---|-------|
+| 1 | `token_program` |   |   | |
+| 2 | `amm` | W |   | |
+| 3 | `amm_authority` |   |   | |
+| 4 | `amm_open_orders` | W |   | |
+| 5 | `pool_coin_token_account` | W |   | |
+| 6 | `pool_pc_token_account` | W |   | |
+| 7 | `coin_pnl_dest` | W |   | Conta de coin do admin (recebe taxa). |
+| 8 | `pc_pnl_dest` | W |   | Conta de pc do admin (recebe taxa). |
+| 9 | `pnl_admin` |   | S | Signatário (deve corresponder à propriedade do pool). |
+| 10+ | Contas do OpenBook (~4) |   |   | Liquidar preenchimentos pendentes primeiro. |
+
+**Pré-condições**
+
+- `pnl_admin` deve estar autorizado.
+
+**Pós-condições**
+
+- `need_take_pnl_coin` e `need_take_pnl_pc` são transferidos para as contas do admin.
+- Os contadores são zerados.
+
+## `WithdrawSrm`
+
+**Legado** (**não use em novos pools**). Coleta rebates de token de desconto de taxa de SRM de pools da era Serum inicial.
+
+**Argumentos**
+
+```
+amount: u64
+```
+
+## `SimulateInfo`
+
+Auxiliar de cotação somente leitura para clientes e o SDK.
+
+**Argumentos**
+
+```
+param: u8              // PoolInfo, SwapBaseInInfo, SwapBaseOutInfo, RunCrankInfo
+swap_base_in_value: Option<SwapInstructionBaseIn>
+swap_base_out_value: Option<SwapInstructionBaseOut>
+```
+
+**Uso** — invocado via `simulateTransaction` para obter uma cotação sem executar um swap.
+
+## Próximos passos
+
+- [Contas](/pt/products/stable/accounts) — para layouts e tamanhos dos campos de conta.
+- [Matemática](/pt/products/stable/math) — para a lógica de interpolação da tabela de consulta.
+- [Demos de código](/pt/products/stable/code-demos) — para ver como chamar estas do SDK.
+
+Fontes:
+
+- `raydium-stable/program/src/instruction.rs` (enum e pack/unpack)
+- `raydium-stable/program/src/processor.rs` (lógica de execução)

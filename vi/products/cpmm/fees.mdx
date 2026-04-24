@@ -1,0 +1,264 @@
+---
+title: "Phí CPMM"
+description: "Cách CPMM tính một khoản phí giao dịch và phí nhà tạo riêng biệt, chia phí giao dịch giữa các LP, quỹ giao thức và quỹ đa chữ ký, và ai thu thập cái gì, khi nào."
+---
+
+<Info>
+  **Trang này được dịch tự động bằng AI. Phiên bản tiếng Anh là bản chính thức.**
+
+  [Xem bản tiếng Anh →](/products/cpmm/fees)
+</Info>
+
+## Hai khoản phí độc lập, bốn địa chỉ đích
+
+CPMM tính **hai khoản phí riêng biệt có tỷ lệ khác nhau** trên mọi swap:
+
+1. **Phí giao dịch** — được tính theo `AmmConfig.trade_fee_rate` và chia thành ba địa chỉ đích:
+   - **Phần LP** — nằm trong vault và tăng `k`. Được yêu cầu ngầm bằng cách đốt token LP.
+   - **Phần giao thức** — được tích lũy vào `PoolState.protocol_fees_token*`; được rút bởi `protocol_owner` thông qua `CollectProtocolFee`.
+   - **Phần quỹ** — được tích lũy vào `PoolState.fund_fees_token*`; được rút bởi `fund_owner` thông qua `CollectFundFee`.
+2. **Phí nhà tạo** (tùy chọn, cho mỗi pool) — được tính theo `AmmConfig.creator_fee_rate` **độc lập** với phí giao dịch, tích lũy vào `PoolState.creator_fees_token*`, được rút bởi `pool_state.pool_creator` thông qua `CollectCreatorFee`. Chỉ hoạt động khi pool được tạo với `enable_creator_fee = true`.
+
+Phí nhà tạo **không phải** là một phần của phí giao dịch. Hai tỷ lệ được cộng lại khi phí được tính trên đầu vào swap, nhưng mỗi tỷ lệ vẫn là một hạng mục riêng — các phần của giao thức và quỹ luôn được tính từ `trade_fee` mà thôi, không bao giờ từ `creator_fee`. Một pool với `creator_fee_rate = 1000` (0.10%) và `trade_fee_rate = 2500` (0.25%) sẽ tính một khoản phí kết hợp 0.35% của đầu vào trong swap có creator-fee-on-input, trong đó nhà tạo giữ 0.10% và hạng mục trade-fee nhận 0.25%.
+
+Các tỷ lệ phí giao dịch (`trade_fee_rate`, `protocol_fee_rate`, `fund_fee_rate`) và `creator_fee_rate` đều nằm trên `AmmConfig`. Cờ `enable_creator_fee` cho mỗi pool và chế độ `creator_fee_on` (phía nào của giao dịch được tính phí nhà tạo) nằm trên `PoolState`. Xem [`products/cpmm/accounts`](/vi/products/cpmm/accounts).
+
+## Tỷ lệ và đơn vị
+
+Tất cả tỷ lệ là `u64`s được biểu diễn bằng đơn vị `1 / FEE_RATE_DENOMINATOR` trong đó `FEE_RATE_DENOMINATOR = 1_000_000`.
+
+- **`trade_fee_rate`** là một phân số của **khối lượng swap**. `2500` ⇒ 0.25% của phía liên quan (đầu vào hoặc đầu ra, tùy thuộc vào `creator_fee_on` — xem "Phía nào của giao dịch được tính phí" dưới đây).
+- **`creator_fee_rate`** là một phân số của **khối lượng swap**, được tính **riêng biệt** từ phí giao dịch. `1000` ⇒ 0.10% của phía liên quan.
+- **`protocol_fee_rate`** và **`fund_fee_rate`** là các phân số của **phí giao dịch**, không phải của khối lượng. `120_000` ⇒ 12% của phí giao dịch.
+
+Các tham số mặc định cho `AmmConfig[index=0]` (pool 0.25% "tiêu chuẩn") trên mainnet, để tham khảo:
+
+| Trường | Giá trị | Tỷ lệ phần trăm hiệu dụng |
+|-------|--------|--------------------------|
+| `trade_fee_rate` | `2500` | 0.25% của khối lượng (hạng mục phí giao dịch) |
+| `protocol_fee_rate` | `120000` | 12% của phí giao dịch ≈ **0.030% của khối lượng** |
+| `fund_fee_rate` | `40000` | 4% của phí giao dịch ≈ **0.010% của khối lượng** |
+| `creator_fee_rate` | `0` (mặc định) | 0% (hạng mục riêng biệt) |
+| → Phần LP hiệu dụng | | **0.210% của khối lượng** |
+
+Vì vậy trên swap \$1,000 với `AmmConfig[0]` có `enable_creator_fee = false`: \$2.50 tổng phí giao dịch, trong đó \$2.10 ở lại với LP, \$0.30 đi đến giao thức, \$0.10 đến quỹ. Hạng mục nhà tạo là 0 vì phí nhà tạo bị vô hiệu hóa.
+
+Nếu cùng pool đó có `enable_creator_fee = true` và `creator_fee_rate = 1000` (0.10%), người dùng thanh toán thêm \$1.00 cho hạng mục nhà tạo — được tính trên phía giống như được cấu hình bởi `creator_fee_on` — để có \$3.50 phí tổng cộng. Hạng mục phí giao dịch và các phần chia của nó cho giao thức/quỹ vẫn không thay đổi.
+
+Xác nhận các giá trị mainnet hiện tại với `GET https://api-v3.raydium.io/main/cpmm-config` — các tỷ lệ có thể thay đổi được bởi admin và nên được đọc tươi mới hơn là hardcoded.
+
+## Cách chia, dưới dạng code
+
+```rust
+// Paraphrased from raydium-cp-swap/programs/cp-swap/src/curve/{calculator,fees}.rs.
+// The actual code branches on `is_creator_fee_on_input`; both branches preserve the
+// invariant that creator_fee is its own rate, never a slice of trade_fee.
+
+const FEE_RATE_DENOMINATOR_VALUE: u64 = 1_000_000;
+
+pub struct FeeBreakdown {
+    pub amount_in_after_fees: u64,    // input minus all fees taken on the input side
+    pub amount_out_after_fees: u64,   // output minus any creator fee taken on the output side
+    pub trade_fee:    u64,            // → split into LP / protocol / fund buckets below
+    pub protocol_fee: u64,            // share of trade_fee
+    pub fund_fee:     u64,            // share of trade_fee
+    pub creator_fee:  u64,            // independent bucket (input or output side)
+}
+
+fn take_fees_on_input(
+    amount_in: u64,
+    trade_rate: u64,
+    creator_rate: u64,
+    protocol_rate: u64,
+    fund_rate: u64,
+) -> (u64 /* trade_fee */, u64 /* creator_fee */, u64 /* amount_in_after_fees */) {
+    // The two rates are added so we round once on the combined fee, then split
+    // proportionally — this is purely a rounding/efficiency trick. The split
+    // honours the rates exactly: creator_fee/trade_fee == creator_rate/trade_rate.
+    let total_fee = ((amount_in as u128) * ((trade_rate + creator_rate) as u128))
+        .div_ceil(FEE_RATE_DENOMINATOR_VALUE as u128) as u64;
+
+    let creator_fee = ((total_fee as u128) * (creator_rate as u128)
+                       / ((trade_rate + creator_rate) as u128)) as u64;
+    let trade_fee   = total_fee - creator_fee;
+
+    (trade_fee, creator_fee, amount_in - total_fee)
+}
+
+fn take_creator_fee_on_output(amount_out_swapped: u64, creator_rate: u64) -> (u64, u64) {
+    // When creator_fee_on routes the creator fee to the output side,
+    // trade_fee is taken on input as a single rate, and creator_fee
+    // is computed against the curve output.
+    let creator_fee = ((amount_out_swapped as u128) * (creator_rate as u128))
+        .div_ceil(FEE_RATE_DENOMINATOR_VALUE as u128) as u64;
+    (amount_out_swapped - creator_fee, creator_fee)
+}
+
+fn split_trade_fee(
+    trade_fee: u64,
+    protocol_rate: u64,
+    fund_rate: u64,
+) -> (u64 /* protocol_fee */, u64 /* fund_fee */) {
+    let protocol_fee = (trade_fee as u128 * protocol_rate as u128
+                        / FEE_RATE_DENOMINATOR_VALUE as u128) as u64;
+    let fund_fee     = (trade_fee as u128 * fund_rate as u128
+                        / FEE_RATE_DENOMINATOR_VALUE as u128) as u64;
+    (protocol_fee, fund_fee)
+}
+```
+
+Ghi chú:
+
+- Tổng phí trên đầu vào làm tròn **lên** để pool không bao giờ tính phí thấp hơn.
+- Các phân chia phụ của `trade_fee` (giao thức, quỹ) làm tròn **xuống** để tổng của chúng không bao giờ vượt quá `trade_fee`; phần còn lại là phần LP.
+- `lp_share = trade_fee − protocol_fee − fund_fee` (creator_fee **không** bị trừ ở đây vì nó là hạng mục riêng).
+- Phí nhà tạo được tính từ đầu vào hoặc đầu ra tùy thuộc vào `PoolState.creator_fee_on` (xem phần tiếp theo). Tỷ lệ không thay đổi dù là trường hợp nào.
+
+## Phía nào của giao dịch được tính phí
+
+CPMM có cài đặt `creator_fee_on` cho mỗi pool (`BothToken` / `OnlyToken0` / `OnlyToken1`) xác định liệu phí nhà tạo được tính từ phía **đầu vào** hay **đầu ra** của một swap nhất định. Hàm trợ giúp runtime `is_creator_fee_on_input(direction)` rút gọn điều đó thành một boolean cho mỗi swap:
+
+| `creator_fee_on` | Swap `0 → 1` | Swap `1 → 0` |
+|------------------|---------------|---------------|
+| `BothToken` (`0`) | phía đầu vào | phía đầu vào |
+| `OnlyToken0` (`1`) | phía đầu vào | phía đầu ra |
+| `OnlyToken1` (`2`) | phía đầu ra | phía đầu vào |
+
+Khi phí nhà tạo ở phía **đầu vào**, cả phí giao dịch và phí nhà tạo đều được trừ từ `amount_in` trước khi đường cong chạy. Toán học trích dẫn: lấy `trade_rate + creator_rate` kết hợp từ đầu vào.
+
+Khi phí nhà tạo ở phía **đầu ra**, chỉ có phí giao dịch được trừ từ `amount_in`; đường cong tạo ra một đầu ra chưa tính phí, sau đó phí nhà tạo được trừ từ đầu ra đó. Toán học trích dẫn: lấy `trade_rate` từ đầu vào; lấy `creator_rate` từ đầu ra.
+
+Phí giao dịch tự nó luôn được tính từ phía đầu vào (mô hình tiêu chuẩn Uniswap-V2). Chỉ phí nhà tạo mới có thể ở phía đầu ra.
+
+## Cách các phí "tích lũy" tương tác với đường cong
+
+Một chi tiết quan trọng: **phí giao thức, quỹ và nhà tạo vẫn nằm vật lý trong vault** cho đến khi lệnh `Collect*` tương ứng được gọi. Nhưng chúng bị loại khỏi khung nhìn của đường cong đối với số dư vault.
+
+Một hình ảnh cụ thể sau một swap:
+
+```
+raw_vault_0_balance = getTokenAccountBalance(vault_0).amount
+                    = lp_entitled + protocol_fees_token0
+                      + fund_fees_token0 + creator_fees_token0
+
+curve_x = raw_vault_0_balance − (protocol_fees_token0
+                                  + fund_fees_token0
+                                  + creator_fees_token0)
+```
+
+Chương trình sử dụng `curve_x` (và `curve_y` tương tự) khi thực thi `k' ≥ k`. Đây là cách các phí không phải LP đạt đến các địa chỉ đích **mà không** làm tăng phần LP của pool.
+
+Hậu quả bạn nên thiết kế xung quanh:
+
+- **Trích dẫn từ số dư thô là sai.** Nếu bạn xây dựng một quoter từ `getTokenAccountBalance`, bạn sẽ liên tục nêu quá cao giá mà pool sẽ chấp nhận. Luôn trừ các phí tích lũy, hoặc mô phỏng qua `SwapBaseInput` / API.
+- **`CollectProtocolFee` không di chuyển giá.** Nó di chuyển token ra khỏi vault *và* làm không các bộ đếm `protocol_fees_token*`, nên `curve_x` và `curve_y` không thay đổi.
+- **Phí LP không tích lũy vào một bộ đếm.** Chúng ngầm trong số dư vault. Quyền của LP đối với phí LP tích lũy được thực hiện bằng cách đốt token LP (tức là qua `Withdraw`) — không có `CollectLpFee`.
+
+## Tương tác với phí chuyển Token-2022
+
+Phí chuyển Token-2022 được áp dụng bởi **mint**, không phải bởi CPMM. Chúng tác dụng trên mọi chuyển token — swap, gửi, rút và các lần rút `Collect*`. Toán học phí giao dịch của CPMM được tính dựa trên số tiền **thực sự hạ cánh trong vault**, tức là ròng theo phí chuyển của mint đầu vào (nếu có).
+
+Vì vậy trong trường hợp tồi tệ nhất, người dùng trả ba khoản thuế riêng biệt trên swap input-exact:
+
+1. Phí chuyển của mint đầu vào trên `amount_in` (cho nhà cung cấp phí của mint).
+2. `trade_fee` của pool trên phần còn lại (chia như trên).
+3. Phí chuyển của mint đầu ra trên `amount_out` (cho nhà cung cấp phí của mint).
+
+Quoter của SDK tính tất cả ba cái nên `minimum_amount_out` được biểu diễn bằng những gì người dùng thực sự nhận được. Nếu bạn đang viết quoter của riêng bạn, hãy phản chiếu hành vi đó, nếu không các kiểm tra slippage của bạn sẽ thường xuyên quá hào phóng.
+
+Xem [`algorithms/token-2022-transfer-fees`](/vi/algorithms/token-2022-transfer-fees) để biết tính đạo hàm chi tiết.
+
+## Phí nhà tạo
+
+Phí nhà tạo là tùy chọn và cho mỗi pool. **Tỷ lệ** nằm trên `AmmConfig.creator_fee_rate`; **cờ bật** và **phía** (`creator_fee_on`) nằm trên `PoolState`:
+
+- **Bật tại tạo pool.** `Initialize` đặt `enable_creator_fee = false` theo mặc định; các pool được tạo qua `InitializeWithPermission` (được sử dụng bởi các tốt nghiệp LaunchLab và các đường dẫn được cấu hình khác) có thể chuyển `enable_creator_fee = true` và chọn `creator_fee_on`.
+- **Tỷ lệ được chia sẻ với tiers phí.** Tỷ lệ tự nó là `AmmConfig.creator_fee_rate`, giá trị giống nhau trên mọi pool gắn với config đó. Mỗi pool sau đó quyết định có tính nó (`enable_creator_fee`) và phía nào của swap để tính nó (`creator_fee_on`). Khi `enable_creator_fee = false`, tỷ lệ phí nhà tạo hiệu dụng của pool là không có gì bất kể giá trị config (xem `PoolState::adjust_creator_fee_rate` trong source).
+- **Độc lập với phí giao dịch.** Phí nhà tạo không bao giờ giảm các phần LP / giao thức / quỹ — nó là tỷ lệ riêng, được áp dụng riêng, tích lũy trong các bộ đếm riêng.
+- **Được rút qua `CollectCreatorFee`**, ký bởi `PoolState.pool_creator`.
+- **Không thể được bật lại hoặc định tuyến lại sau tạo.** Một pool được khởi tạo với `enable_creator_fee = false` sẽ không bao giờ tính phí nhà tạo; một pool được khởi tạo với `creator_fee_on` cụ thể không thể chuyển đổi phía.
+
+Phí nhà tạo là cơ chế đằng sau mô hình "Burn & Earn" của Raydium: token LP được khóa dưới chương trình [LP Lock](/vi/reference/program-addresses) vì vậy nhà tạo không thể rút thanh khoản, nhưng vẫn có thể yêu cầu `CollectCreatorFee` vô thời hạn.
+
+## Luồng hoạt động bộ sưu tập
+
+| Người ký | Lệnh | Các bộ đếm nguồn được làm không | Tần suất điển hình |
+|--------|-------------|------------------------|-----------------|
+| `amm_config.protocol_owner` | `CollectProtocolFee` | `protocol_fees_token{0,1}` | Hàng tuần hoặc lập trình |
+| `amm_config.fund_owner` | `CollectFundFee` | `fund_fees_token{0,1}` | Hàng tuần hoặc lập trình |
+| `pool_state.pool_creator` | `CollectCreatorFee` | `creator_fees_token{0,1}` | Bất cứ lúc nào |
+
+Chủ sở hữu giao thức và quỹ là multisig Raydium trên mainnet; xem [`security/admin-and-multisig`](/vi/security/admin-and-multisig). Người ký nhà tạo là tài khoản đã chạy `Initialize`.
+
+## Thay đổi một tiers phí
+
+Các tỷ lệ phí có thể được thay đổi bởi admin thông qua `UpdateAmmConfig` (xem [`products/cpmm/instructions`](/vi/products/cpmm/instructions)). Các thay đổi có hiệu lực trên **swap tiếp theo** cho mọi pool gắn với `AmmConfig` đó — không có di chuyển, vì các pool tải config trên mỗi swap.
+
+Những gì admin không thể làm:
+
+- Di chuyển một pool từ `AmmConfig` này sang `AmmConfig` khác.
+- Tính giá lại các phí đã tích lũy.
+- Sưu tập phí mà không có `protocol_owner` / `fund_owner` signer.
+
+## Đọc phí từ một pool đang chạy
+
+```ts
+// Off-chain: current accrued fees in each bucket
+const pool = await connection.getAccountInfo(poolStatePda);
+const decoded = PoolState.decode(pool.data);
+console.log(
+  "Protocol accrued:",
+  decoded.protocolFeesToken0.toString(),
+  decoded.protocolFeesToken1.toString(),
+);
+console.log(
+  "Fund accrued:",
+  decoded.fundFeesToken0.toString(),
+  decoded.fundFeesToken1.toString(),
+);
+console.log(
+  "Creator accrued:",
+  decoded.creatorFeesToken0.toString(),
+  decoded.creatorFeesToken1.toString(),
+);
+
+// Off-chain: effective rates today.
+// trade_fee_rate, creator_fee_rate are fractions of volume (denominator 1e6).
+// protocol_fee_rate, fund_fee_rate are fractions of the *trade fee* (same denominator).
+const config = await fetch("https://api-v3.raydium.io/main/cpmm-config")
+  .then((r) => r.json());
+const tier = config.data.find((t) => t.index === decoded.ammConfigIndex);
+
+const tradeFeeOfVolume   = tier.tradeFeeRate / 1_000_000;
+const protocolOfTradeFee = tier.protocolFeeRate / 1_000_000;
+const fundOfTradeFee     = tier.fundFeeRate / 1_000_000;
+const lpOfTradeFee       = 1 - protocolOfTradeFee - fundOfTradeFee;
+
+console.log("LP fee effective:",       (tradeFeeOfVolume * lpOfTradeFee * 100).toFixed(4), "%");
+console.log("Protocol fee effective:", (tradeFeeOfVolume * protocolOfTradeFee * 100).toFixed(4), "%");
+console.log("Fund fee effective:",     (tradeFeeOfVolume * fundOfTradeFee * 100).toFixed(4), "%");
+console.log(
+  "Creator fee effective:",
+  decoded.enableCreatorFee
+    ? ((tier.creatorFeeRate / 1_000_000) * 100).toFixed(4) + " %"
+    : "0 % (disabled on this pool)",
+);
+```
+
+## So sánh với CLMM và AMM v4
+
+Xem [`reference/fee-comparison`](/vi/reference/fee-comparison) để xem ma trận so sánh cạnh-nhau. Tóm tắt:
+
+- **AMM v4** sử dụng phí giao dịch cố định 0.25% với một phân chia LP/giao thức khác và không có phí quỹ.
+- **CLMM** phí là cho mỗi tiers khoảng cách tick, tích lũy cho mỗi vị trí (không phải cho mỗi pool), và được yêu cầu qua `DecreaseLiquidity` hoặc `CollectFees`.
+
+## Đi đến đâu tiếp theo
+
+- [`products/cpmm/math`](/vi/products/cpmm/math) — nơi khấu trừ phí giao dịch kết nối với đường cong.
+- [`products/cpmm/instructions`](/vi/products/cpmm/instructions) — danh sách tài khoản hướng dẫn `Collect*`.
+- [`algorithms/token-2022-transfer-fees`](/vi/algorithms/token-2022-transfer-fees) — cách kết hợp chính xác phí giao dịch pool với phí chuyển mint.
+
+Nguồn:
+
+- [`raydium-io/raydium-cp-swap` — `states/config.rs`, `states/pool.rs`, `states/curve.rs`](https://github.com/raydium-io/raydium-cp-swap)
+- [Raydium API — `GET /main/cpmm-config`](https://api-v3.raydium.io/main/cpmm-config)

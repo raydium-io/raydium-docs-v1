@@ -1,0 +1,213 @@
+---
+title: "Integración de billetera"
+description: "Visualización de posiciones Raydium, participaciones en pools, apuestas en granjas y recompensas pendientes en una interfaz de billetera — patrones de detección, simulación para vista previa de transacciones y especificidades de visualización de Token-2022."
+---
+
+<Info>
+  **Esta página fue traducida automáticamente por IA. La versión en inglés es la fuente autorizada.**
+
+  [Ver versión en inglés →](/integration-guides/wallet-integration)
+</Info>
+
+<Info>
+  Las billeteras que integran Raydium suelen necesitar responder cuatro preguntas por usuario: ¿en qué pools tiene este usuario LP? ¿qué posiciones (NFTs de CLMM) posee? ¿en qué granjas tiene apuestas? ¿cuánto vale todo? Esta página documenta cada uno.
+</Info>
+
+## Detección de posiciones Raydium
+
+### Tokens LP clásicos (CPMM, AMM v4)
+
+Se ven como cualquier otro SPL Token: la ATA del usuario mantiene un saldo. Una billetera muestra esto como otro token más por defecto. Para revelarlo como una posición LP de Raydium:
+
+1. Enumera las cuentas de token del usuario: `connection.getParsedTokenAccountsByOwner(user, { programId: TOKEN_PROGRAM_ID })`.
+2. Para cada mint, consulta la lista de mints de Raydium: `GET https://api-v3.raydium.io/pools/info/lps?lps=<LP_MINT>,...` (agrupa hasta ~50 LP mints por llamada).
+3. Para los mints que coincidan, la API devuelve la referencia del pool. Úsala para calcular el valor denominado en tokens de la posición:
+
+```
+token_a_owned = user_lp_balance * poolReserves.A / lpMint.supply
+token_b_owned = user_lp_balance * poolReserves.B / lpMint.supply
+usd_value     = token_a_owned * priceA_usd + token_b_owned * priceB_usd
+```
+
+Muestra tanto el saldo de LP como los montos desenvueltos — los usuarios piensan en tokens subyacentes, no en unidades de LP.
+
+### NFTs de posición CLMM
+
+Las posiciones de CLMM son NFTs. El PDA `PersonalPositionState` de cada posición se deriva del mint del NFT. Para detectar:
+
+1. Enumera los NFTs del usuario. Para NFTs Metaplex heredados: filtra las cuentas de token a aquellas con oferta 1 y decimales 0.
+2. Para cada mint de NFT, intenta derivar el PDA PersonalPositionState:
+
+```ts
+import { CLMM_PROGRAM_ID } from "@raydium-io/raydium-sdk-v2";
+
+const [positionPda] = PublicKey.findProgramAddressSync(
+  [Buffer.from("position"), nftMint.toBuffer()],
+  CLMM_PROGRAM_ID,
+);
+
+const accountInfo = await connection.getAccountInfo(positionPda);
+if (!accountInfo || !accountInfo.owner.equals(CLMM_PROGRAM_ID)) return null;
+// Es una posición CLMM de Raydium — decodifica.
+```
+
+3. Decodifica vía `raydium.clmm.getPositionInfo({ positionPda })` para obtener:
+   - `poolId` → obtén el pool para resolver los mints
+   - `tickLower`, `tickUpper` → muestra el rango
+   - `liquidity`, `tokensOwedA/B` → calcula el valor de la posición + comisiones pendientes
+   - `rewardInfos` → recompensas pendientes por stream
+
+4. Para NFTs de posición emitidos bajo Token-2022 (`OpenPositionWithToken22Nft`), el programa del mint del NFT es Token-2022 en lugar de SPL Token. Enumera ambos al escanear.
+
+### Apuestas en granjas
+
+Farm v3 / v5 / v6 cada uno tienen un PDA de ledger por usuario. Derivaciones:
+
+```ts
+// Intenta las tres versiones de granjas para cada posible interacción de granja del usuario.
+// Enfoque más económico: pregunta primero a la API, que ha indexado todas las posiciones del usuario.
+
+const r = await fetch(
+  `https://api-v3.raydium.io/positions/staking?wallet=${user.toBase58()}`
+).then(r => r.json());
+
+for (const s of r.data.stakings) {
+  // s.farmId, s.stakedAmount, s.pendingRewards[], s.poolApr, ...
+}
+```
+
+Para billeteras que prefieren detección completamente en cadena: itera los PDAs `UserLedger` posibles hasheando el usuario con una lista seleccionada de IDs de granjas "probables". Enumerar exhaustivamente todos los IDs de granjas es impracticable (existen miles); usa la API.
+
+## Cálculo del valor de la posición
+
+### LP de CPMM / AMM v4
+
+```ts
+const poolInfo = await raydium.<type>.getPoolInfoFromRpc({ poolId });
+const myShare  = userLpBalance / poolInfo.lpMint.supply;
+const tokensA  = BigInt(poolInfo.mintAmountA) * BigInt(userLpBalance)
+                / BigInt(poolInfo.lpMint.supply);
+const tokensB  = BigInt(poolInfo.mintAmountB) * BigInt(userLpBalance)
+                / BigInt(poolInfo.lpMint.supply);
+```
+
+Luego multiplica cada uno por el precio USD del mint (desde `raydium.token` u un oráculo de precios).
+
+### Posición CLMM
+
+```ts
+const position = await raydium.clmm.getPositionInfo({ positionPda });
+const pool     = await raydium.clmm.getPoolInfoFromRpc({ poolId: position.poolId });
+
+const { amountA, amountB } = PoolUtils.getAmountsFromLiquidity({
+  sqrtPriceX64:  pool.sqrtPriceX64,
+  tickLower:     position.tickLower,
+  tickUpper:     position.tickUpper,
+  liquidity:     position.liquidity,
+  slippage:      0,  // para visualización, sin slippage
+});
+
+// Comisiones pendientes — muestra por separado como "no cobradas"
+const fees = {
+  A: position.tokenFeesOwedA,
+  B: position.tokenFeesOwedB,
+};
+
+// Recompensas pendientes — un pool de CLMM tiene 0–3 streams de recompensas.
+const rewards = position.rewardInfos.map(r => ({
+  mint:          r.rewardMint,
+  rewardAmount:  r.rewardAmountOwed,
+}));
+```
+
+Presenta como:
+
+- Valor de liquidez (precio actual)
+- Comisiones no cobradas
+- Recompensas pendientes por stream
+- Rango: `[tickLower_price, tickUpper_price]` con una barra visual que muestre si el precio actual está dentro del rango
+
+### Apuesta en granja
+
+```ts
+// La respuesta de la API ya incluye recompensas pendientes; úsala directamente.
+const apr       = stakingFarm.apr;               // %, anualizado
+const staked    = stakingFarm.stakedAmount;      // unidades más pequeñas del mint de apuestas
+const rewards   = stakingFarm.pendingRewards;    // array de { mint, amount }
+```
+
+Para cálculo en cadena, refleja la contabilidad de la granja:
+
+```
+pending_reward_i = user.deposited
+                 * farm.reward_per_share_x64[i] / 2^64
+                 - user.reward_debts[i]
+```
+
+Asegúrate de actualizar `reward_per_share_x64` con la fórmula de actualización perezosa antes de calcular (tiempo transcurrido × tasa de emisión ÷ total_apuestado).
+
+## Simulación de transacciones para vista previa
+
+Antes de que un usuario firme, las billeteras suelen previsualizar los cambios de saldo. Usa `simulateTransaction`:
+
+```ts
+const sim = await connection.simulateTransaction(tx, {
+  sigVerify: false,
+  commitment: "confirmed",
+  accounts: {
+    encoding: "base64",
+    addresses: [userTokenAtaA, userTokenAtaB, userLpAta].map(a => a.toBase58()),
+  },
+});
+
+// Decodifica el saldo de cada cuenta devuelta y compáralo con los saldos previos a la tx.
+for (const [i, acctData] of sim.value.accounts!.entries()) {
+  const newBalance = decodeTokenAccount(acctData!.data[0]).amount;
+  // compara con saldo previo a la tx, muestra Δ
+}
+```
+
+El parámetro `accounts` le pide al validador que devuelva el estado de la cuenta posterior a la simulación para las direcciones listadas. Mucho más preciso que intentar predecir el cambio de saldo únicamente por la forma de la instrucción.
+
+### Trampas de simulación
+
+- **Los swaps de CLMM necesitan arrays de ticks válidos.** Si el tamaño de entrada del usuario cruzaría hacia un array de ticks no inicializado, la simulación revierte (igual que la ejecución). Muestra esto claramente en la interfaz.
+- **Comisión de prioridad.** La simulación se ejecuta sin las instrucciones de presupuesto de cálculo aplicadas. Para una transacción grande que excedería el CU predeterminado de 200k, la simulación falla pero la ejecución real con un límite de CU explícito tiene éxito. Siempre establece el límite de CU en la tx simulada también.
+- **Blockhash fresco.** La simulación usa el blockhash actual; si la firma tarda >60s la tx se vuelve inválida. Resimula si el usuario duda.
+
+## Visualización de Token-2022
+
+Los tokens bajo el programa Token-2022 deben etiquetarse como tales en la lista de tokens de la billetera, ya que tienen superficies de riesgo diferentes:
+
+- **Mints de tarifa de transferencia**: muestra los actuales `transferFeeBasisPoints` como "Tarifa de transferencia: X%" junto al saldo. Advierte al recibir — los usuarios pueden no darse cuenta de que recibirán menos de lo que el remitente envió.
+- **Mints de gancho de transferencia**: expón el ID del programa del gancho. Un gancho malicioso puede bloquear transferencias salientes; los usuarios deben verificar que el gancho sea el que esperan.
+- **Mints no transferibles**: muestra "No transferible" e inhabilita swap/envío. Estos suelen ser tokens vinculados al alma o credenciales.
+- **Mints que generan interés**: el saldo de la interfaz derivado de `TokenAccount.amount` **no** refleja el interés acumulado. Usa `amountToUiAmount` desde `@solana/spl-token` (que aplica el factor de escala) para el valor mostrado.
+
+## Visualización de APR de granjas
+
+El APR mostrado a los usuarios debe combinar todos los streams de recompensas en vivo, convertidos a USD, y anualizados:
+
+```ts
+let apr = 0;
+for (const r of farm.rewardInfos) {
+  if (r.rewardState !== 1) continue;   // omite los que no están en ejecución
+  const annualRewardTokens = Number(r.emissionPerSecond) * 86400 * 365 / 1e<decimals>;
+  const annualRewardValue  = annualRewardTokens * priceUsd(r.rewardMint);
+  const tvlValue           = Number(farm.totalStaked) * priceUsd(farm.stakingMint) / 1e<decimals>;
+  apr += annualRewardValue / tvlValue;
+}
+```
+
+Muestra como `APR: X.Y%`. Si el mint de apuestas es un token de LP, también calcula el APR de tarifa base del LP subyacente y etiqueta la suma como "APR total" o "APR + comisiones".
+
+## Referencias
+
+- [`products/clmm/ticks-and-positions`](/es/products/clmm/ticks-and-positions) — derivación del valor de la posición.
+- [`products/farm-staking/accounts`](/es/products/farm-staking/accounts) — campos de estado de la granja.
+- [`algorithms/token-2022-transfer-fees`](/es/algorithms/token-2022-transfer-fees) — semántica de visualización para tokens con tarifa de transferencia.
+
+Fuentes:
+
+- Raydium SDK v2 — ayudantes de posición/granja.
+- Endpoints de posición de usuario en `api-v3.raydium.io`.

@@ -1,0 +1,288 @@
+---
+title: "优先费用和计算预算"
+description: "为 Raydium 交易合理分配计算单元限额和优先费用——按指令分类的基准、估算策略和拥堵处理模式。"
+---
+
+<Info>
+  **本页内容由 AI 自动翻译，所有内容以英文版本为准。**
+
+  [查看英文版 →](/integration-guides/priority-fee-tuning)
+</Info>
+
+<Info>
+  每笔 Solana 交易都会设置（隐式或显式）两个参数：**计算单元限额**（交易可消耗的最大计算单元，默认为 200,000 × 交易中指令数，但受每笔交易上限）和**优先费用**，单位为微拉波（micro-lamports）每计算单元。这两个参数设置不足都会导致交易失败——计算单元限额过低会引发 `ProgramFailedToComplete`；优先费用过低则交易会一直未确认直到过期。
+</Info>
+
+## 两项设置
+
+```ts
+import { ComputeBudgetProgram } from "@solana/web3.js";
+
+const tx = new Transaction()
+  .add(ComputeBudgetProgram.setComputeUnitLimit({ units: 250_000 }))
+  .add(ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 50_000 }))
+  .add(yourRaydiumSwapIx);
+```
+
+- `setComputeUnitLimit(units)` — 限制计算资源消耗；交易最多支付 `units` 个计算单元。
+- `setComputeUnitPrice(microLamports)` — 优先费用竞价，单位为微拉波每计算单元。总优先费用 = `units × microLamports × 1e-6` 拉波。
+
+费用计算：250k 计算单元限额加上 50k 微拉波/计算单元的价格，优先费用为 `250_000 × 50_000 / 1e6 = 12,500` 拉波 ≈ 0.0000125 SOL ≈ \$0.003（按 \$200 SOL 价格）。在这个规模上，优先费用对于大多数用户交换是微不足道的，但对于每天执行 1000 笔交易的机器人来说则是显著成本。
+
+## 每条指令的计算单元基准
+
+基准数据来自主网执行日志，取多次运行的平均值。数字均为近似值（±15%）；建议针对特定流程重新测量。
+
+| 指令 | SPL Token | Token-2022（简单） | Token-2022（转账费用） |
+|-------------|-----------|---------------------|---------------------------|
+| CPMM initialize_pool | 180,000 | 200,000 | — |
+| CPMM swap_base_input | 140,000 | 180,000 | 200,000 |
+| CPMM swap_base_output | 150,000 | 185,000 | 205,000 |
+| CPMM deposit | 130,000 | 160,000 | 180,000 |
+| CPMM withdraw | 120,000 | 150,000 | 170,000 |
+| CLMM create_pool | 70,000 | 85,000 | — |
+| CLMM open_position_v2 | 120,000 | 140,000 | 160,000 |
+| CLMM increase_liquidity_v2 | 150,000 | 175,000 | 195,000 |
+| CLMM decrease_liquidity_v2 | 140,000 | 165,000 | 185,000 |
+| CLMM swap_v2（0 个 tick 跨越） | 170,000 | 205,000 | 225,000 |
+| CLMM swap_v2（1 个 tick 跨越） | 220,000 | 255,000 | 275,000 |
+| CLMM swap_v2（3 个 tick 跨越） | 320,000 | 355,000 | 375,000 |
+| CLMM collect_fee | 80,000 | 95,000 | 105,000 |
+| AMM v4 swap_base_in | 140,000 | — | — |
+| AMM v4 deposit | 120,000 | — | — |
+| AMM v4 withdraw | 110,000 | — | — |
+| Farm v6 create_farm | 70,000 | 85,000 | — |
+| Farm v6 deposit（1 个奖励槽） | 130,000 | 155,000 | 175,000 |
+| Farm v6 deposit（3 个奖励槽） | 220,000 | 255,000 | 275,000 |
+| Farm v6 withdraw | 与 deposit 相同 |
+| Farm v6 harvest | 与 deposit 相同 |
+| Farm v3/v5 deposit | 100,000 | — | — |
+| LaunchLab initialize | 100,000 | — | — |
+| LaunchLab buy_exact_in | 140,000 | — | — |
+| LaunchLab graduate | 250,000 | — | — |
+
+CLMM 中"tick 跨越"行数是最大的计算单元变量。如果你不知道交换会跨越多少个 tick，应按最坏情况预算——8 个跨越是硬上限（程序最多加载 8 个 tick 数组）。
+
+### 组合交易
+
+将各个指令的预算相加，再加上：
+
+- **每个 CPI 帧 +1,500 计算单元** — 运行时对每次跨程序调用的固定开销。
+- **每次创建 ATA +20,000 计算单元** — `create_associated_token_account` 并非免费。
+- **`setComputeUnitLimit` / `setComputeUnitPrice` 各 +5,000 计算单元**。
+
+示例：一笔创建输出 ATA 并包裹原生 SOL 的用户交换：
+
+```
+wrap_sol（create_ata + system transfer + sync_native）   ≈ 30,000
+CPMM swap_base_input（SPL）                              ≈ 140,000
+close_account（unwrap）                                  ≈ 5,000
+ComputeBudget 指令                                       ≈ 10,000
+────────────────────────────────────────────────────────
+总计                                                    ≈ 185,000 → 预算 250,000
+```
+
+缓冲：将计算单元限额设置在预期用量的约 25% 以上。低估成本会导致整个交易失败；高估则只会按比例增加优先费用成本（优先费用 = `units × microLamports`，所以高出 25% 的预算就多花费 25% 的优先费用）。
+
+## 优先费用估算
+
+Solana 的本地费用市场意味着优先费用是**按可写账户**计算的。写入热账户（热门池状态）的交易费用高于写入冷账户的交易。全局费用水平不是 Raydium 交换的正确指标；你需要的是涉及的特定池的费用。
+
+### 策略 1：RPC 提供商估算器
+
+每个主要 RPC 提供商都发布优先费用估算器，可查询特定账户的最近费用：
+
+```ts
+// Helius
+const response = await fetch(`https://mainnet.helius-rpc.com/?api-key=${apiKey}`, {
+  method: "POST",
+  body: JSON.stringify({
+    jsonrpc: "2.0",
+    id:      "fee-estimate",
+    method:  "getPriorityFeeEstimate",
+    params: [{
+      accountKeys: [poolStatePubkey.toBase58()],
+      options:     { priorityLevel: "High" },
+    }],
+  }),
+});
+const { result } = await response.json();
+const microLamports = result.priorityFeeEstimate;
+```
+
+大多数提供商的优先级划分：`Min` / `Low` / `Medium` / `High` / `VeryHigh` / `UnsafeMax`，映射到百分位数：
+
+| 级别 | 百分位数 | 使用场景 |
+|-------|------------|----------|
+| Min | 第 25 百分位 | 后台、非紧急的机器人流量 |
+| Low | 第 50 百分位 | 普通用户交换 |
+| Medium | 第 60 百分位 | 钱包界面的默认值 |
+| High | 第 75 百分位 | 时间敏感的套利 |
+| VeryHigh | 第 95 百分位 | 清算、最后时刻的退出 |
+
+提供商：Helius（`getPriorityFeeEstimate`）、Triton（`getRecentPrioritizationFees` + 账户列表）、QuickNode（类似）。
+
+### 策略 2：直接 RPC 查询
+
+使用标准 `getRecentPrioritizationFees` RPC：
+
+```ts
+const fees = await connection.getRecentPrioritizationFees({
+  lockedWritableAccounts: [poolStatePubkey],
+});
+
+// fees: Array<{ slot, prioritizationFee }>
+// 最近 N 个 slot；默认约 150 个 slot。
+
+const median = percentile(fees.map(f => f.prioritizationFee), 0.5);
+```
+
+这是原生 Solana RPC 方法，适用于任何提供商。缺点：样本量小（150 个 slot ≈ 60 秒）且噪声大。为获得更平滑的估算，使用提供商的聚合服务。
+
+### 策略 3：历史自调优
+
+对于保持恒定流量的机器人，跟踪自身的成功率与过期率：
+
+```
+每个池的目标：在 <30 秒内 80% 的成功率
+如果 current_land_rate < 80%：priorityFee += 10%
+如果 current_land_rate > 95%：priorityFee -= 5%
+```
+
+这种方式比公共估算器调整得更快，并捕捉公共估算器不一定能看到的按池结构。
+
+## 处理计算单元耗尽失败
+
+症状：交易失败，错误信息为 `exceeded maximum number of instructions allowed (200000)` 或 `ProgramFailedToComplete`。
+
+诊断：
+
+```bash
+solana confirm <tx-sig> -v
+# 查找"consumed N of M compute units"以及哪条指令耗尽了资源。
+```
+
+修复：
+
+1. **提升计算单元限额。** 如果交易在 200k 预算中使用了 195k，提高到 300k。
+2. **分拆交易。** 如果达到了 1.4M 的每笔交易上限，分成两笔交易。Farm 的「harvest 然后 stake」是经典的需要分拆的场景（当奖励较多时）。
+3. **精简账户。** 每增加一个可写账户会增加约 2,000 计算单元。删除未使用的账户在边界情况下会有帮助。
+4. **使用查找表。** LUT 查找约 50 计算单元每解析地址，相比完整账户引用的 5,000 计算单元可节省成本。
+
+## 处理卡住的交易
+
+症状：交易已提交但从未确认，最终以 `BlockhashNotFound` 过期。
+
+诊断：
+
+- `getSignatureStatuses([sig])` 返回 `null` → 领导者从未看到。
+- 返回 `{ confirmationStatus: null }` → 领导者看到但未纳入。
+
+修复：
+
+1. **提升优先费用。** 用 2 倍的当前费用重新提交。
+2. **用新的最近区块哈希重建。** 区块哈希生命周期约 60 秒；超过这个时间交易不论费用多少都无效。
+3. **多 RPC 广播。** 某些 RPC 与领导者的连接更好。并行提交到 3–5 个 RPC。
+4. **切换到 Jito 束。** 见 [`/zh/integration-guides/routing-and-mev`](/zh/integration-guides/routing-and-mev)。束绕过公共数据包队列。
+
+重试逻辑框架：
+
+```ts
+async function submitWithRetry(buildTx, maxAttempts = 5) {
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    const tx = await buildTx({
+      priorityFee: basePriorityFee * Math.pow(1.5, attempt),
+      blockhash:   (await connection.getLatestBlockhash()).blockhash,
+    });
+
+    try {
+      const sig = await connection.sendRawTransaction(tx.serialize(), {
+        skipPreflight: attempt > 0,  // 首次尝试后跳过以节省延迟
+      });
+
+      const result = await connection.confirmTransaction(sig, "confirmed");
+      if (result.value.err) {
+        // 逻辑错误；不要重试。
+        throw result.value.err;
+      }
+      return sig;
+
+    } catch (e) {
+      if (isExpiredError(e)) continue;  // 重试
+      if (isRevertError(e)) throw e;    // 不要重试；确定性失败
+      throw e;
+    }
+  }
+  throw new Error("submit: exhausted retries");
+}
+```
+
+## 在网络拥堵下
+
+当网络拥堵时（Jupiter / Jito 束仪表板显示积压、RPC 延迟飙升、交易过期率攀升），调整：
+
+| 参数 | 正常情况 | 拥堵情况 |
+|-----------|-------------------|----------------------|
+| 计算单元限额 | 预计用量的 +25% | 预计用量的 +25%（不变） |
+| 优先费用百分位数 | 第 50 百分位 | 第 75–95 百分位 |
+| 重试次数 | 3 | 5–7 |
+| 重试退避 | 500ms | 1000ms |
+| 使用 Jito 束 | 可选 | 强烈推荐 |
+| 重试时刷新区块哈希 | 是 | 是，必须 |
+
+监视拥堵信号：
+
+- 优先费用第 75 百分位 > 500k 微拉波：拥堵。
+- Jito 第 50 百分位小费 > 0.001 SOL：拥堵。
+- RPC 响应 p99 > 2 秒：RPC 特定问题或拥堵。
+
+## 机器人费用预算
+
+每天运行约 1000 笔交易的交易机器人需要优先费用预算。粗略估计：
+
+```
+每笔交易平均计算单元：      ~250,000
+第 50 百分位费用：          ~20,000 微拉波/计算单元
+每笔交易成本：              250_000 × 20_000 × 1e-6 = 5_000 拉波 = 5e-6 SOL
+日费用（1000 笔交易）：      5e-3 SOL ≈ $1（按 \$200 SOL）
+月费用：                    ~$30
+```
+
+这是最低限度。在拥堵期间，乘以 5–10 倍。对于稳定流量的机器人，计划约 \$150–300/月 的优先费用成本。
+
+必须在特定 slot 中落地的机器人（清算、套利）持续支付第 95 百分位费用，花费约 10 倍。在这个规模下，Jito 束小费占主导——通常 \$1000+/月——但替代方案（被抢先或过期）更糟。
+
+## 陷阱
+
+### 1. 忘记设置计算单元限额
+
+默认是 200k 计算单元 × （交易中的指令数）。单条指令交换默认 200k；这足以满足 SPL Token 的 CPMM，但不足以满足有 tick 跨越的 CLMM 或任何 Token-2022。务必显式设置。
+
+### 2. 优先费用针对错误的账户
+
+如果根据代币铸币厂估算优先费用，但热账户是池状态，估算就太低了。对于 Raydium，池状态是正确的可写账户目标。
+
+### 3. 费用随计算单元限额缩放
+
+`total_priority_fee = units × microLamports`。将 `units` 从 200k 提升到 1M（50k 微拉波/计算单元）会将优先费用乘以 5 倍。不要为了以防万一而过度预算计算单元；要测量。
+
+### 4. 默认交易版本
+
+Legacy 交易的账户限制较低；V0 交易配合地址查找表解锁更大的路由。SDK 默认在 `txVersion: TxVersion.V0` 中使用 V0。除非需要钱包兼容性，否则不要降低到 legacy。
+
+### 5. `skipPreflight` 隐藏计算单元错误
+
+`skipPreflight: true` 发送交易时不进行本地模拟。节省约 100 毫秒但失去了计算单元耗尽的早期反馈。仅在重试时使用，不要在首次尝试时使用。
+
+## 参考资源
+
+- [`/zh/integration-guides/routing-and-mev`](/zh/integration-guides/routing-and-mev) — Jito 束策略。
+- [`/zh/integration-guides/aggregator`](/zh/integration-guides/aggregator) — 交易组装。
+- [`/zh/integration-guides/cpi-integration`](/zh/integration-guides/cpi-integration) — 跨组合 CPI 的计算单元堆叠。
+- [Solana 计算预算程序文档](https://docs.solana.com/developing/programming-model/runtime#compute-budget)
+
+来源：
+
+- [Solana `getRecentPrioritizationFees` RPC](https://docs.solana.com/api/http#getrecentprioritizationfees)
+- [Helius 优先费用 API](https://docs.helius.dev/solana-apis/priority-fee-api)
+- 基准：主网执行日志（Raydium SDK 集成测试，2026 年 4 月）。

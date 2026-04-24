@@ -1,0 +1,143 @@
+---
+title: "Stable AMM 数学"
+description: "ルックアップテーブルから価格を見積もるための二分探索と線形補間。フィー適用はAMM v4と同一。OpenBook統合とMonitorStep。"
+---
+
+<Info>
+  **このページは AI による自動翻訳です。すべての内容は英語版を正とします。**
+
+  [英語版を表示 →](/products/stable/math)
+</Info>
+
+## ルックアップテーブルカーブ
+
+Stable AMM は x·y=k という公式を、**(x, y, price) タプルのスパースルックアップテーブル**で置き換えます。スワップの価格見積もり時、プログラムは以下を実行します：
+
+1. リザーブから現在のプールの比率を計算します。
+2. **二分探索**でテーブルを検索し、その比率をブラケットする 2 つのエントリを見つけます。
+3. **線形補間**して中間価格を取得します。
+4. フィーを適用し、見積もりを返します。
+
+このアプローチは、公式の決定性と**管理者の柔軟性**による価格形成をトレードオフします。Solana のコンピュートバジェットに収まるほど効率的です。
+
+## テーブルレイアウトと二分探索
+
+`ModelDataInfo` には最大 50,000 個の `DataElement` エントリが保持され、管理者によってインデックスされます。最初の `valid_data_count` 個のみが有効です。各エントリ：
+
+```
+DataElement {
+  x: u64,      // X 座標（コイン側の金額、スケール済み）
+  y: u64,      // Y 座標（PC 側の金額、スケール済み）
+  price: u64,  // price = x/y、乗数でスケール済み
+}
+```
+
+現在のプールリザーブ (x_real, y_real) での価格を見つけるには：
+
+1. 比率を計算します：`target_ratio = (x_real * multiplier) / y_real`。
+2. `(element.x * multiplier) / element.y` が `target_ratio` をブラケットするエントリを二分探索します。
+3. ブラケット `[min_idx, max_idx]` が見つかったら、補間します。
+
+プログラムの二分探索コードは、`state.rs::ModelDataInfo::get_mininum_range_by_xy_real` に約 150 行にわたります。重要な不変量：**エントリは並べ替えられている必要があります**（x昇順、y降順、価格昇順）。検索が動作するためです。
+
+## 線形補間
+
+2 つのテーブルポイントが比率をブラケットすると、補間は中間価格とリザーブペアを計算します：
+
+```
+target = (x_real * multiplier) / y_real
+
+[x1, y1, p1] = table[min_idx]
+[x2, y2, p2] = table[max_idx]
+
+// 価格を補間
+p = p1 + (p2 - p1) * (target - ratio1) / (ratio2 - ratio1)
+
+// リザーブを補間
+x = x1 + (x2 - x1) * (target - ratio1) / (ratio2 - ratio1)
+y = y1 + (y2 - y1) * (target - ratio1) / (ratio2 - ratio1)
+```
+
+結果は、テーブルポイントをスムーズに接続する区分線形カーブです。
+
+## スケーリング：乗数
+
+プールリザーブと価格は異なるスケールで保存されます。`ModelDataInfo` の `multiplier` フィールドはこれを考慮します。一般的なパターン：
+
+- コインは 6 小数点、PC は 18 小数点。
+- 乗数 = 10^6（またはそれに類するもの）。
+- テーブルエントリは u64 の境界に収まるように、縮小スケールで保存されます。
+
+プログラムは以下を経由して読み取り/書き込み時に再スケーリングします：
+
+```
+real_value = table_value * ratio / multiplier
+table_value = real_value * multiplier / ratio
+```
+
+## スワップ価格見積もり：`SwapBaseIn` と `SwapBaseOut`
+
+### SwapBaseIn（確定入力）
+
+入力額 `amount_in` が与えられた場合：
+
+1. `(coin_vault, pc_vault)` から現在の比率を取得します。
+2. ブラケットするテーブルエントリを見つけて補間し、テーブル空間の比率を取得します。
+3. 入力をテーブル空間に変換：`dx_table = amount_in * multiplier / ratio`。
+4. 新しい X 座標でテーブルをクエリして、新しい Y を見つけます。
+5. `dy_table = y_old - y_new`。
+6. 戻す：`dy_real = dy_table * ratio / multiplier`。
+7. 取引手数料を適用：`dy_output = dy_real - (dy_real * trade_fee_numerator / trade_fee_denominator)`。
+8. `dy_output` を返します。
+
+### SwapBaseOut（確定出力）
+
+対称：望ましい `amount_out` が与えられたら、必要な `amount_in` を解きます。
+
+両方のパスは、最初に入力された OpenBook 注文を決済します（内部 `MonitorStep` のようなロジック経由）。そのため、実効リザーブは前のブロックからの埋め込みを反映します。
+
+## フィー適用
+
+AMM v4 と同一です：完全な導出については [`products/amm-v4/math`](/ja/products/amm-v4/math) を参照してください。
+
+```
+gross_fee = amount_in * (swap_fee_numerator / swap_fee_denominator)    // 例：0.25%
+lp_portion = gross_fee - (gross_fee * pnl_numerator / pnl_denominator) // 例：0.22%
+pnl_portion = gross_fee * (pnl_numerator / pnl_denominator)            // 例：0.03%
+```
+
+`pnl_portion` は `need_take_pnl_*` に移動し、管理者によって `WithdrawPnl` を経由して回収されます。`lp_portion` はヴォルトに残り、`k` を膨張させて、LP トークンホルダーに利益をもたらします。
+
+## MonitorStep と OpenBook
+
+AMM v4 と同様に、`MonitorStep` は**クランク命令**で：
+
+1. 保留中の OpenBook 注文埋め込みを決済（ヴォルトからトークンをプールに移動）。
+2. `AmmInfo.target_orders` を制限注文スロットの新しいグリッドで更新。
+3. 新しいグリッドを OpenBook にポストします。
+
+グリッドはテーブルから計算されます：プログラムはルックアップテーブルを使用して価格ポイントを見つけ、それを OpenBook 注文に変換します。
+
+**`MonitorStep` のコンピュートコスト**：約 150k–180k CU（AMM v4 と同様）。
+
+## まとめ：これが動作する理由
+
+ルックアップテーブル + 補間設計は**効率的かつ柔軟**です：
+
+- **効率性**：二分探索は O(log 50,000) ≈ 16 反復、各～300–500 CU です。補間は数回の乗算/除算です。見積もりコスト合計は～5k–15k CU で、スワップごとに公式を再計算するよりはるかに安価です。
+- **柔軟性**：管理者は任意の区分線形カーブをエンコードできます。ステーブルコインペアは 1:1 の周辺で高密度を得ます。担保ペアはカスタムカーブを得ます。
+- **OpenBook 合成可能性**：AMM v4 からの同じ `MonitorStep` / `TargetOrders` ロジックが適用されます。テーブルを経由した価格発見は、注文グリッド生成に流し込みます。
+
+補間ロジックへの深い潜り込みについては、`raydium-stable/program/src/state.rs`、メソッド `get_data_by_x`、`get_data_by_y`、`get_dy_by_dx_base_in` などを参照してください。
+
+## 次に進むべき場所
+
+- [アカウント](/ja/products/stable/accounts) — `ModelDataInfo` と `DataElement` フィールドリファレンス。
+- [命令](/ja/products/stable/instructions) — テーブルの入力に `InitModelData`、`UpdateModelData`。
+- [フィー](/ja/products/stable/fees) — フィー適用と `WithdrawPnl`。
+- [`products/amm-v4/math`](/ja/products/amm-v4/math) — OpenBook フィー込みの注文価格設定ロジック用。
+
+ソース：
+
+- `raydium-stable/program/src/state.rs`（補間と二分探索実装）
+- `raydium-stable/program/src/math.rs`（計算機ユーティリティ）

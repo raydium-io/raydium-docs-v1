@@ -1,0 +1,224 @@
+---
+title: "Định Tuyến và MEV"
+description: "Chia tuyến đường trên các sản phẩm Raydium, các mẫu kháng lại sandwich, tích hợp bundle Jito, và những đánh đổi giữa các đường đệ trình mempool riêng tư và công khai."
+---
+
+<Info>
+  **Trang này được dịch tự động bằng AI. Phiên bản tiếng Anh là bản chính thức.**
+
+  [Xem bản tiếng Anh →](/integration-guides/routing-and-mev)
+</Info>
+
+<Info>
+  "MEV" trên Solana không giống hệt với MEV chạy bởi mempool của Ethereum. Các block leader nhìn thấy gói tx khi chúng đến, chứ không phải một mempool có thứ tự; front-running xảy ra thông qua sắp xếp lại ở phía leader hoặc các searcher đặt cùng vị trí, và các cuộc tấn công sandwich được thực hiện bởi bot theo dõi trạng thái pool và đua xe tx của bạn với phí cao hơn. Các biện pháp giảm thiểu do đó khác nhau.
+</Info>
+
+## Hướng dẫn chia tuyến đường
+
+"Chia tuyến đường" có nghĩa là chia một swap logic thành nhiều pool sao cho giá biên đồng đều — kết quả giống nhau như giao dịch từng phần tại giá của chính pool đó. Nó giảm tác động giá hiệu quả khi bất kỳ pool nào quá cạn so với kích thước giao dịch.
+
+Mô tả vấn đề: cho các pool `P_1, ..., P_n` với các hàm `f_i(x)` ánh xạ đầu vào `x` thành đầu ra, tìm chia `x_1 + ... + x_n = X` tối đa hóa `Σ f_i(x_i)`. Vì mỗi `f_i` là lõm, tối ưu thoả mãn `f'_1(x_1) = f'_2(x_2) = ... = f'_n(x_n)` (giá biên bằng nhau).
+
+### Triển khai tham lam
+
+Một cách tiếp cận đơn giản có thể đạt trong ~1% tối ưu trong thực tế:
+
+```
+remaining = X
+routes    = []
+step      = X / 1000     // slice size
+while remaining > 0:
+    best_pool = argmax over i of f'_i(current_x_i + step)
+    x_i += step
+    routes.append((best_pool, step))
+    remaining -= step
+```
+
+`step` nhỏ hơn → gần tối ưu hơn, nhiều lần lặp hơn. Trong thực tế 100–500 lát là vị trí hợp lý.
+
+### Triển khai tối ưu hóa lồi
+
+Đối với các aggregator cấp production, giải quyết tối ưu hóa trực tiếp. Mỗi pool có `f'_i(x)` dạng đóng:
+
+- **Constant-product (CPMM / AMM v4)**: `f'(x) = y * R_y / (R_x + x)^2` trong đó `R_x, R_y` là các dự trữ và `y = R_x * R_y / (R_x + x) - R_y` ... (dẫn xuất đơn giản hơn: giá biên là `R_y / (R_x + x)`, vì vậy chia để đồng đều giá biên là tìm kiếm 1D).
+- **CLMM**: từng phần mượt — trong một tick, `f'(x)` là hàm hữu tỉ của `sqrt_price`; trên một tick, nó bước rời rạc. Chia với bộ giải các bước nhỏ hoặc coi mỗi tick liền kề như "pool" của chính nó.
+
+Kết quả của chia tuyến đường là một vector `[(pool_1, x_1), (pool_2, x_2), ...]` mà bước lắp ráp tx của bạn biến thành chuỗi các lệnh swap.
+
+### Khi chia tuyến đường có tác dụng
+
+| Kích thước giao dịch so với TVL | Chia có tác dụng? |
+|----------------------------------|-------------------|
+| `<0.1%` | Không — pool đơn chiếm ưu thế |
+| 0.1–1% | Một chút |
+| 1–5% | Có, cải thiện 10–50 bps |
+| `>5%` | Có, cải thiện lớn |
+
+Nếu bạn chạy swap UI trong ứng dụng cho người dùng bán lẻ làm `<$10k` trên một pool sâu, đừng bận tâm đến việc chia — chi phí gas vượt quá cải thiện. Đối với aggregator trích dẫn dòng khối lượng lớn, luôn chia.
+
+## Các tuyến đường đa bước
+
+Khi không tồn tại pool trực tiếp, hoặc tác động giá của pool trực tiếp quá lớn, nhảy qua trung gian:
+
+```
+tokenA → tokenHub → tokenB
+```
+
+Các hub phổ biến: USDC, SOL, RAY. Mỗi bước có:
+
+- Giới hạn slippage riêng của nó (thấp hơn trên các bước trực tiếp; mỗi bước trên đa bước).
+- Phí riêng của nó được trả.
+- Tác động giá riêng của nó.
+
+Tác động tổng hợp: `(1 - impact_1) * (1 - impact_2)`. Một bước tác động 1% hai lần là 1,99% tổng cộng, không phải 2%.
+
+**Không bao giờ nhảy qua cùng một pool hai lần.** Đi `A → B → A → B` qua cùng một CLMM chỉ đốt phí và slippage. Các aggregator nên lọc các tuyến đường như vậy trong quá trình tạo. (Lưu ý: đây là *chu kỳ cặp giống nhau*, không phải đa bước nói chung — định tuyến `A → USDC → B` qua các pool khác nhau là mẫu tiêu chuẩn, hữu ích được đề xuất ở trên.)
+
+**Mỗi bước so với cuối cùng tối thiểu.** Với thành phần CPI ([`integration-guides/cpi-integration`](/vi/integration-guides/cpi-integration)), bạn có thể đặt `minimum_amount_out` của mỗi bước thành 0 và thực thi một tối thiểu từ đầu đến cuối duy nhất trong proxy của bạn. Không có CPI, mỗi bước thực thi tối thiểu của chính nó, yêu cầu tính toán giới hạn trung gian hợp lý — thường là `quote_i * (1 - slippage_bps/10000)` mỗi bước.
+
+## Các cuộc tấn công sandwich
+
+### Cơ chế
+
+Bot theo dõi luồng gossip giao dịch. Khi nó thấy swap của bạn:
+
+1. Front-run: bot mua token giống nhau *trước* bạn, đẩy giá pool lên.
+2. Tx nạn nhân: bạn swap ở giá tồi tệ hơn.
+3. Back-run: bot bán vào giá được nâng cao, nắm bắt được chênh lệch.
+
+Bot trả phí ưu tiên cho cả hai tx của nó; lợi nhuận là delta sandwich trừ đi hai lần phí ưu tiên. Chỉ có lợi trên các pool nơi giao dịch của bạn di chuyển giá một cách có ý nghĩa.
+
+### Biện pháp giảm thiểu
+
+**Slippage chặt.** Nếu minimum-out của bạn là 0,5% dưới quote, sandwich di chuyển giá hơn 0,5% làm bạn revert nhưng giao dịch trước của bot vẫn thực hiện ở giá cũ của bạn. Họ mất tiền. Các bot sandwich nhắm mục tiêu slippage rộng (≥1–2%); slippage dưới 0,3% phần lớn miễn dịch.
+
+**Đệ trình mempool riêng tư (Jito).** Đệ trình tx của bạn như một phần của bundle Jito. Các bundle không xuất hiện trên luồng gossip công khai; bot không thể thấy giao dịch đang bay và front-run nó. Đánh đổi: các bundle yêu cầu một tip phía validator, và không phải mọi leader đều được bật Jito (mặc dù hầu hết đều có).
+
+**Kích thước giao dịch nhỏ hơn.** Chia giao dịch trên nhiều tx sao cho không có tx duy nhất nào di chuyển giá đủ để trở thành mục tiêu sandwich có lợi. Tăng tổng chi phí gas.
+
+**Ngẫu nhiên hóa thời gian.** Đệ trình trong thời gian lượng giao dịch thấp nếu có thể. Không có sẵn cho các swap tương tác của người dùng nhưng khả thi cho dòng bot lên lịch.
+
+Các pool CLMM của Raydium thường thấy ít hoạt động sandwich hơn CPMM vì cấu trúc thaninhtínhty tick duy nhất có nghĩa là những giao dịch nhỏ hoàn toàn không di chuyển giá (chúng ở trong tick). Các pool CLMM sâu là địa điểm kháng sandwich tốt nhất hữu cơ.
+
+## Các bundle Jito
+
+Jito là một client validator Solana được sửa đổi chấp nhận **các bundle** — nhóm giao dịch có thứ tự hạ cánh nguyên tử. Bot sử dụng Jito để trích xuất MEV; người dùng thông thường sử dụng Jito để bảo vệ khỏi các bot tương tự.
+
+### Các bundle hoạt động như thế nào
+
+- Kết nối với điểm cuối công cụ block Jito (ví dụ: `https://mainnet.block-engine.jito.wtf`).
+- Đệ trình một bundle gồm 1–5 giao dịch cộng với một tip cho một trong các tài khoản tip của Jito.
+- Nếu leader hiện tại đang chạy Jito, bundle của bạn được xem xét. Người chiến thắng đấu giá cho slot này (bundle có tip-per-CU cao nhất) hạ cánh; những người khác bỏ cuộc.
+
+### Kích thước tip
+
+Kích thước tip tuân theo phân phối gói gần đây. Jito công bố các phân vị thời gian thực:
+
+```ts
+const tipRes = await fetch("https://worker.jito.wtf/api/v1/bundles/tip_floor");
+const tips   = await tipRes.json();
+// { ema_landed_tips_25th_percentile, 50th, 75th, 95th, 99th }
+
+// Swap đối mặt với người dùng vào một ngày bình thường — phân vị 50 là được.
+const tipSol = tips.ema_landed_tips_50th_percentile_lamports / 1e9;
+
+// Giao dịch bot nhạy cảm với thời gian trong tắc nghẽn — phân vị 75–95.
+```
+
+Phạm vi điển hình: 0,0001–0,001 SOL cho các swap người dùng không khẩn cấp; 0,01–0,1 SOL trong tắc nghẽn cho bot ưu tiên cao.
+
+### Xây dựng một bundle
+
+```ts
+import { SearcherClient } from "jito-ts";
+
+const client = new SearcherClient("https://mainnet.block-engine.jito.wtf");
+
+const tipIx = SystemProgram.transfer({
+  fromPubkey: user.publicKey,
+  toPubkey:   JITO_TIP_ACCOUNTS[Math.floor(Math.random() * 8)],  // 8 tip accts
+  lamports:   tipLamports,
+});
+
+const tx1 = new VersionedTransaction(...);  // the swap
+tx1.sign([user]);
+
+const bundleUuid = await client.sendBundle([tx1], tipLamports);
+// Optionally: await confirmation via client.getBundleStatuses([bundleUuid])
+```
+
+Cạm bẫy:
+
+- **Tip phải là in-bundle.** Bao gồm `SystemProgram.transfer` vào tài khoản tip Jito dưới dạng hướng dẫn bên trong một trong các tx của bundle (thường là cái cuối cùng). Tx tip riêng biệt không phải là một phần của bundle bị bỏ qua.
+- **Leader không được bật Jito.** ~75% leader chạy Jito; ~25% không. Các bundle được gửi khi leader không Jito nắm giữ slot bị loại bỏ. Client sẽ tự động thử lại.
+- **Hết hạn.** Các bundle sử dụng mô hình hết hạn blockhash giống như tx thông thường. Lắp ráp và gửi nhanh chóng; cửa sổ ~60s.
+
+### Bundle so với phí ưu tiên
+
+Phí ưu tiên hối lộ leader để bao gồm tx của bạn sớm hơn. Các bundle Jito ngoài ra ẩn tx khỏi mempool công khai. Sử dụng phí ưu tiên cho tính khẩn cấp; sử dụng các bundle để bảo vệ sandwich. Cả hai đều: sử dụng cả hai trên các swap người dùng giá trị cao.
+
+Xem [`integration-guides/priority-fee-tuning`](/vi/integration-guides/priority-fee-tuning) để định kích thước phí ưu tiên.
+
+## MEV-share / RPC bảo vệ revert
+
+Một số nhà cung cấp RPC cung cấp các điểm cuối "MEV-share" hoặc "revert-protected" mà nội bộ định tuyến tx của bạn thông qua các bundle Jito hoặc đường dẫn riêng tư tương đương:
+
+- **Helius** — các kết nối được stake với hỗ trợ bundle.
+- **QuickNode** — điểm cuối "Revert Protect"; tự động tạo bundle xung quanh tx được gửi.
+- **Triton** — tầng luồng riêng tư.
+
+Sử dụng một trong số này là đường dẫn đơn giản nhất cho các dự án không muốn quản lý logic bundle bằng cách tự. Đánh đổi: nội bộ không rõ ràng; bạn tin tưởng xây dựng bundle của nhà cung cấp.
+
+## Xử lý tắc nghẽn
+
+Trong các cửa sổ âm lượng cao (khởi động mainnet, danh sách chính, thị trường tăng giá bền vững), các hàng đợi gói của leader lấp đầy. Các triệu chứng:
+
+- Tx ngồi không được xác nhận trong 60+ giây, sau đó hết hạn với "blockhash not found".
+- Phí ưu tiên hoạt động ngày hôm qua không đủ hôm nay.
+- Mô phỏng thành công nhưng thực thi không bao giờ hạ cánh.
+
+Các chiến lược:
+
+1. **Thử lại tích cực khi hết hạn.** Trên `TransactionExpiredBlockheightExceeded`, xây dựng lại với blockhash mới và gửi lại. Không *không* thử lại khi revert — reverts là xác định.
+2. **Phát sóng đa RPC.** Gửi tx tương tự đến nhiều RPC song song; cái nào đến leader trước tiên thắng.
+3. **Tăng phí ưu tiên.** Bắt đầu với phân vị 50; nếu lần đầu tiên hết hạn, thử lại ở 75, sau đó 95.
+4. **Các bundle Jito dự phòng.** Các leader Jito có xu hướng ít tắc nghẽn hơn vì công cụ block sắp xếp các bundle theo tip-per-CU; các bundle tip cao được ưu tiên.
+5. **Mô phỏng ít hơn.** Dưới tắc nghẽn, mô phỏng một lần ở phía trước; không mô phỏng lại khi thử lại vì trạng thái pool sẽ thay đổi bất kỳ cách nào. Mô phỏng lại trong tắc nghẽn thường thất bại giả.
+
+## Cân nhắc MEV cho mỗi sản phẩm
+
+**CPMM.** Dễ dàng bị sandwich trên các pool TVL thấp. Đường cong constant-product khuếch đại thậm chí nhỏ bot pre-trade. Khuyến nghị các bundle Jito cho bất kỳ giao dịch CPMM nào >0,5% TVL pool.
+
+**CLMM.** Ít dễ bị sandwich hơn trên các pool sâu vì giao dịch trong tick không di chuyển giá. Nhưng giao dịch cross-tick hoàn toàn di chuyển; các sandwich nhắm mục tiêu vượt tick là mẫu được biết đến. Slippage chặt (`<0,3%`) là phòng thủ tốt nhất.
+
+**AMM v4 + OpenBook.** Các lần điền orderbook OpenBook chạy qua tx tương tự, vì vậy các bot sandwich không biết trạng thái orderbook dưới ước tính sai tác động giá và thường thất bại. Địa điểm MEV thấp hữu cơ vì lý do này.
+
+**LaunchLab.** Trong giai đoạn bonding-curve sớm, front-running phổ biến trên các khởi động hyped. Các đường cong di chuyển nhanh và slippage rộng. Các bundle Jito được khuyến nghị mạnh mẽ. Sau khi tốt nghiệp, CPMM kết quả tuân theo động lực CPMM bình thường.
+
+**Farms.** Các hoạt động harvest và stake không phải là swap và không thể bị sandwich. Không cần xử lý đặc biệt.
+
+## Danh sách kiểm tra
+
+Đối với aggregator production / UI swap ví:
+
+- [ ] Slippage mặc định ≤0,5% trên các cặp bình thường; người dùng có thể ghi đè.
+- [ ] Đệ trình bundle Jito được bật theo mặc định cho swap >\$1k USD giá trị.
+- [ ] Phí ưu tiên được lấy từ ước tính trực tiếp (không cứng).
+- [ ] Logik thử lại phân biệt revert (không thử lại) từ hết hạn (thử lại với blockhash mới).
+- [ ] Các tuyến đường đa bước đặt tối thiểu mỗi bước, không từ đầu đến cuối.
+- [ ] Chia tuyến đường hoạt động cho giao dịch >1% TVL của bất kỳ pool nào.
+- [ ] Tươi pool: tái tính trạng thái ngay trước khi đệ trình; tái trích dẫn nếu cũ.
+- [ ] Kháng sandwich trên các pool cạn: Jito duy nhất, hoặc từ chối nếu slippage >1%.
+
+## Con trỏ
+
+- [`integration-guides/aggregator`](/vi/integration-guides/aggregator) — khám phá pool, trích dẫn, lắp ráp giao dịch.
+- [`integration-guides/priority-fee-tuning`](/vi/integration-guides/priority-fee-tuning) — định kích thước CU và phí ưu tiên.
+- [`integration-guides/cpi-integration`](/vi/integration-guides/cpi-integration) — thành phần đa bước gate slippage duy nhất.
+- [`algorithms/slippage-and-price-impact`](/vi/algorithms/slippage-and-price-impact) — định nghĩa chính thức.
+
+Nguồn:
+
+- [Tài liệu Jito](https://docs.jito.wtf)
+- [Tài liệu validator Solana về phí ưu tiên](https://docs.solana.com/transaction_fees)
+- [jito-ts](https://github.com/jito-labs/jito-ts) — Client bundle TypeScript.

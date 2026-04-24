@@ -1,0 +1,464 @@
+---
+title: "Демо-примеры кода CLMM"
+description: "Полные примеры на TypeScript: создание пула CLMM, открытие позиции в выбранном ценовом диапазоне, управление ликвидностью, swap, сбор комиссий и наград."
+---
+
+<Info>
+  **Эта страница переведена с помощью ИИ. За эталон принимается английская версия.**
+
+  [Открыть английскую версию →](/products/clmm/code-demos)
+</Info>
+
+<Info>
+  **Информация о версии.** Все демо ориентированы на `@raydium-io/raydium-sdk-v2@0.2.42-alpha` для Solana mainnet-beta, проверено в апреле 2026 г. Идентификаторы программ берутся из [`reference/program-addresses`](/ru/reference/program-addresses) через SDK.
+</Info>
+
+## Настройка
+
+```bash
+npm install @raydium-io/raydium-sdk-v2 @solana/web3.js @solana/spl-token bn.js decimal.js
+```
+
+Каждый демо-пример на этой странице соответствует файлу в [`raydium-sdk-V2-demo/src/clmm`](https://github.com/raydium-io/raydium-sdk-V2-demo/tree/master/src/clmm); ссылка на GitHub указана рядом с каждым разделом. Инициализация следует шаблону `config.ts.template` из репозитория демо ([исходник](https://github.com/raydium-io/raydium-sdk-V2-demo/blob/master/src/config.ts.template)) — `disableFeatureCheck: true` рекомендуется для любой нетривиальной интеграции:
+
+```ts
+import { Connection, Keypair, clusterApiUrl } from "@solana/web3.js";
+import { Raydium, TxVersion } from "@raydium-io/raydium-sdk-v2";
+import fs from "node:fs";
+
+const connection = new Connection(process.env.RPC_URL ?? clusterApiUrl("mainnet-beta"));
+const owner = Keypair.fromSecretKey(
+  new Uint8Array(JSON.parse(fs.readFileSync(process.env.KEYPAIR!, "utf8"))),
+);
+const raydium = await Raydium.load({
+  owner,
+  connection,
+  cluster: "mainnet",
+  disableFeatureCheck: true,
+  blockhashCommitment: "finalized",
+});
+export const txVersion = TxVersion.V0;
+```
+
+## Создание пула CLMM
+
+Исходник: [`src/clmm/createPool.ts`](https://github.com/raydium-io/raydium-sdk-V2-demo/blob/master/src/clmm/createPool.ts)
+
+```ts
+import { PublicKey } from "@solana/web3.js";
+import { CLMM_PROGRAM_ID } from "@raydium-io/raydium-sdk-v2";
+import BN from "bn.js";
+import Decimal from "decimal.js";
+
+const mintA = await raydium.token.getTokenInfo(
+  new PublicKey("So11111111111111111111111111111111111111112"));   // wSOL
+const mintB = await raydium.token.getTokenInfo(
+  new PublicKey("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"));   // USDC
+
+const ammConfigs = await raydium.api.getClmmConfigs();
+const ammConfig  = ammConfigs.find((c) => c.index === 1)!;        // 0.05% tier
+
+const initialPrice = new Decimal(160);        // 160 USDC per SOL
+const { execute, extInfo } = await raydium.clmm.createPool({
+  programId: CLMM_PROGRAM_ID,
+  mint1:     mintA,
+  mint2:     mintB,
+  ammConfig,
+  initialPrice,
+  startTime: new BN(0),
+  txVersion: TxVersion.V0,
+});
+
+const { txId } = await execute({ sendAndConfirm: true });
+console.log("Pool:", extInfo.address.id.toBase58(), "tx:", txId);
+```
+
+SDK выполняет следующие действия:
+
+- Сортирует `mint1`/`mint2` по байтовому порядку перед деривацией.
+- Вычисляет `sqrt_price_x64 = floor(sqrt(initialPrice × 10^(dB−dA)) × 2^64)`.
+- Создаёт аккаунты `observation` и `tick_array_bitmap_extension`.
+- Оплачивает комиссию за создание пула, определённую в `ammConfig`.
+
+## Открытие позиции в выбранном диапазоне
+
+Исходник: [`src/clmm/createPosition.ts`](https://github.com/raydium-io/raydium-sdk-V2-demo/blob/master/src/clmm/createPosition.ts)
+
+```ts
+import { PoolUtils, TickUtils } from "@raydium-io/raydium-sdk-v2";
+
+const poolId = new PublicKey("<POOL_ID>");
+const { poolInfo, poolKeys, rpcData } = await raydium.clmm.getPoolInfoFromRpc(poolId);
+
+// Choose a price range. Here: ±10% of current.
+const currentPrice = new Decimal(poolInfo.price);
+const lowerPrice   = currentPrice.mul(0.9);
+const upperPrice   = currentPrice.mul(1.1);
+
+// Snap to valid ticks for this pool's tick_spacing.
+const { tick: tickLower } = TickUtils.getPriceAndTick({
+  poolInfo, price: lowerPrice, baseIn: true,
+});
+const { tick: tickUpper } = TickUtils.getPriceAndTick({
+  poolInfo, price: upperPrice, baseIn: true,
+});
+
+// How much of each token to deposit.
+const inputAmount = new BN(10_000_000);  // 0.01 SOL
+const inputMint   = poolInfo.mintA.address;
+
+const res = PoolUtils.getLiquidityAmountOutFromAmountIn({
+  poolInfo,
+  slippage: 0.01,
+  inputA: true,
+  tickUpper,
+  tickLower,
+  amount: inputAmount,
+  add: true,
+  amountHasFee: true,
+  epochInfo: await raydium.fetchEpochInfo(),
+});
+
+const { execute } = await raydium.clmm.openPositionFromBase({
+  poolInfo,
+  poolKeys,
+  tickUpper,
+  tickLower,
+  base: "MintA",
+  ownerInfo: { useSOLBalance: true },
+  baseAmount: inputAmount,
+  otherAmountMax: res.amountSlippageB.amount,
+  txVersion: TxVersion.V0,
+});
+
+const { txId } = await execute({ sendAndConfirm: true });
+console.log("Position opened, tx:", txId);
+```
+
+SDK автоматически определяет, каких tick-массивов касается диапазон, и добавляет инструкции `InitTickArray` для тех из них, что ещё не инициализированы.
+
+## Увеличение ликвидности существующей позиции
+
+Исходник: [`src/clmm/increaseLiquidity.ts`](https://github.com/raydium-io/raydium-sdk-V2-demo/blob/master/src/clmm/increaseLiquidity.ts)
+
+```ts
+const positionNftMint = new PublicKey("<POSITION_NFT_MINT>");
+
+const positionAccount = await raydium.clmm.getPositionInfo({
+  nftMint: positionNftMint,
+});
+
+const { execute } = await raydium.clmm.increasePositionFromBase({
+  poolInfo,
+  poolKeys,
+  ownerPosition: positionAccount,
+  base: "MintA",
+  baseAmount: new BN(5_000_000),
+  otherAmountMax: new BN(1_000_000_000),
+  txVersion: TxVersion.V0,
+});
+
+await execute({ sendAndConfirm: true });
+```
+
+## Уменьшение ликвидности (с одновременным сбором комиссий)
+
+Исходники: [`src/clmm/decreaseLiquidity.ts`](https://github.com/raydium-io/raydium-sdk-V2-demo/blob/master/src/clmm/decreaseLiquidity.ts) и [`src/clmm/closePosition.ts`](https://github.com/raydium-io/raydium-sdk-V2-demo/blob/master/src/clmm/closePosition.ts)
+
+```ts
+const { execute } = await raydium.clmm.decreaseLiquidity({
+  poolInfo,
+  poolKeys,
+  ownerPosition: positionAccount,
+  liquidity: positionAccount.liquidity.divn(2),   // halve
+  amountMinA: new BN(0),
+  amountMinB: new BN(0),
+  closePosition: false,
+  txVersion: TxVersion.V0,
+});
+
+await execute({ sendAndConfirm: true });
+```
+
+Чтобы **только собрать комиссии**, вызовите `decreaseLiquidity` с `liquidity = new BN(0)`. Побочный эффект инструкции — погашение `tokens_fees_owed_{0,1}` и их перевод владельцу.
+
+Чтобы полностью закрыть позицию после обнуления ликвидности и сбора комиссий, передайте `closePosition: true` в финальный вызов `decreaseLiquidity`. SDK добавит `ClosePosition` и сожжёт NFT.
+
+## Сбор наград
+
+Исходник: [`src/clmm/harvestAllRewards.ts`](https://github.com/raydium-io/raydium-sdk-V2-demo/blob/master/src/clmm/harvestAllRewards.ts)
+
+```ts
+const { execute } = await raydium.clmm.harvestAllRewards({
+  ownerInfo: { useSOLBalance: true },
+  allPoolInfo: { [poolInfo.id]: poolInfo },
+  allPositions: { [poolInfo.id]: [positionAccount] },
+  txVersion: TxVersion.V0,
+});
+
+await execute({ sendAndConfirm: true });
+```
+
+`harvestAllRewards` перебирает все позиции во всех переданных пулах, пакует инструкции `CollectReward` (и `UpdateRewardInfos` при необходимости) и при нужде разбивает их на несколько транзакций.
+
+## Swap
+
+Исходник: [`src/clmm/swap.ts`](https://github.com/raydium-io/raydium-sdk-V2-demo/blob/master/src/clmm/swap.ts)
+
+```ts
+import { PoolUtils } from "@raydium-io/raydium-sdk-v2";
+
+const amountIn = new BN(10_000_000);
+const baseIn   = true;               // swap A (SOL) → B (USDC)
+const slippage = 0.005;
+
+const { minAmountOut, remainingAccounts, priceImpact } =
+  PoolUtils.computeAmountOutFormat({
+    poolInfo,
+    tickArrayCache: await raydium.clmm.fetchTickArrays({ poolInfo }),
+    amountIn,
+    tokenOut: poolInfo.mintB,
+    slippage,
+    epochInfo: await raydium.fetchEpochInfo(),
+  });
+
+const { execute } = await raydium.clmm.swap({
+  poolInfo,
+  poolKeys,
+  inputMint: new PublicKey(poolInfo.mintA.address),
+  amountIn,
+  amountOutMin: minAmountOut.amount,
+  observationId: poolKeys.observationId,
+  remainingAccounts,
+  txVersion: TxVersion.V0,
+});
+
+await execute({ sendAndConfirm: true });
+```
+
+`computeAmountOutFormat` обходит карту тиков офф-чейн по той же логике, что и программа на чейне, и возвращает:
+
+- ожидаемое количество выходных токенов,
+- минимальное количество выходных токенов с учётом slippage,
+- список аккаунтов tick-массивов, которые затронет реальный swap (`remainingAccounts`).
+
+Всегда передавайте `remainingAccounts`, полученный от симуляции: при нехватке аккаунтов swap упадёт на середине обхода с ошибкой `TickArrayNotFound`, а при передаче устаревших — впустую потратится compute budget.
+
+## Создание настраиваемого пула CLMM
+
+`createCustomizablePool` — новая точка входа, открывающая переключатели динамических комиссий и одностороннего сбора комиссий прямо при создании пула. Принимает те же параметры, что и `createPool`, плюс три дополнительных поля:
+
+```ts
+import { CLMM_PROGRAM_ID, CollectFeeOn } from "@raydium-io/raydium-sdk-v2";
+
+const dynamicFeeConfigs = await raydium.api.getClmmDynamicConfigs();    // GET /main/clmm-dynamic-config
+const dynamicFeeConfig  = dynamicFeeConfigs.find((c) => c.index === 0); // pick a calibration tier
+
+const { execute, extInfo } = await raydium.clmm.createCustomizablePool({
+  programId: CLMM_PROGRAM_ID,
+  mint1:     mintA,
+  mint2:     mintB,
+  ammConfig,
+  initialPrice,
+  startTime: new BN(0),
+  // New fields:
+  collectFeeOn:        CollectFeeOn.Token1Only,   // 0 = FromInput, 1 = Token0Only, 2 = Token1Only
+  enableDynamicFee:    true,
+  dynamicFeeConfigId:  dynamicFeeConfig?.id,      // omit when enableDynamicFee is false
+  txVersion: TxVersion.V0,
+});
+
+await execute({ sendAndConfirm: true });
+console.log("Customizable pool:", extInfo.address.id.toBase58());
+```
+
+`createPool` по-прежнему работает для пути с комиссией по умолчанию без лимитных ордеров и динамических комиссий. Используйте `createCustomizablePool`, когда нужен хотя бы один из трёх новых параметров. Список аккаунтов on-chain см. в [`products/clmm/instructions`](/ru/products/clmm/instructions).
+
+## Лимитные ордера
+
+Лимитный ордер размещает вводимые пользователем токены на одном тике и исполняется по принципу FIFO при пересечении этого тика swap-ом. Выходные токены переводятся на ATA владельца в момент расчёта; присутствие владельца онлайн для исполнения ордера не требуется.
+
+### Открытие лимитного ордера
+
+```ts
+import { TickUtils } from "@raydium-io/raydium-sdk-v2";
+
+const limitConfigs = await raydium.api.getClmmLimitOrderConfigs(); // GET /main/clmm-limit-order-config
+const limitConfig  = limitConfigs.find((c) => c.poolId === poolInfo.id);
+
+// Limit price MUST be quantized to tick_spacing.
+const targetPrice = new Decimal(180);                              // sell SOL at 180 USDC
+const { tick: limitTick } = TickUtils.getPriceAndTick({
+  poolInfo, price: targetPrice, baseIn: true,
+});
+
+const { execute } = await raydium.clmm.openLimitOrder({
+  poolInfo,
+  poolKeys,
+  limitOrderConfig: limitConfig,
+  inputMint: poolInfo.mintA.address,         // selling SOL
+  inputAmount: new BN(50_000_000),           // 0.05 SOL
+  tick: limitTick,
+  txVersion: TxVersion.V0,
+});
+
+const { txId } = await execute({ sendAndConfirm: true });
+console.log("Limit order opened, tx:", txId);
+```
+
+SDK выводит PDA `LimitOrderState` из `(pool, owner, tick, nonce)`, инкрементирует `LimitOrderNonce` для пары (pool, owner) и вставляет ордер в очередь FIFO на данном тике.
+
+### Увеличение / уменьшение открытого ордера
+
+```ts
+await raydium.clmm.increaseLimitOrder({
+  poolInfo,
+  poolKeys,
+  limitOrderId: <LIMIT_ORDER_PUBKEY>,
+  addAmount: new BN(20_000_000),
+  txVersion: TxVersion.V0,
+}).then((b) => b.execute({ sendAndConfirm: true }));
+
+await raydium.clmm.decreaseLimitOrder({
+  poolInfo,
+  poolKeys,
+  limitOrderId: <LIMIT_ORDER_PUBKEY>,
+  removeAmount: new BN(10_000_000),
+  txVersion: TxVersion.V0,
+}).then((b) => b.execute({ sendAndConfirm: true }));
+```
+
+`decreaseLimitOrder` может уменьшать только **неисполненную** часть ордера; исполненная часть заморожена до расчёта. Обе инструкции завершаются с ошибкой `InvalidOrderPhase`, если ордер уже полностью исполнен.
+
+### Расчёт по исполненному ордеру
+
+```ts
+await raydium.clmm.settleLimitOrder({
+  poolInfo,
+  poolKeys,
+  limitOrderId: <LIMIT_ORDER_PUBKEY>,
+  txVersion: TxVersion.V0,
+}).then((b) => b.execute({ sendAndConfirm: true }));
+```
+
+`settleLimitOrder` считывает `unfilled_ratio_x64` ордера относительно трекера когорты, вычисляет исполненный выход и переводит его на ATA владельца. Владелец может вызвать это самостоятельно; `limit_order_admin` (офф-чейн-кипер) также может вызвать это от имени владельца — выходные токены в любом случае отправляются владельцу.
+
+Для закрытия полностью рассчитанных ордеров с возвратом ренты используйте `closeLimitOrder` (единичный) или `closeAllLimitOrder` (пакетный). Для пакетного расчёта нескольких ордеров `settleAllLimitOrder` упаковывает максимальное количество вызовов `SettleLimitOrder`, умещающееся в одну v0-транзакцию.
+
+### Просмотр активных ордеров кошелька (офф-чейн)
+
+```ts
+// API helper. See api-reference/temp-api-v1.
+const active = await fetch(
+  `https://temp-api-v1.raydium.io/limit-order/order/list?wallet=<your-wallet-pubkey>`,
+).then((r) => r.json());
+```
+
+Эндпоинт активных ордеров возвращает как неисполненные, так и частично исполненные ордера в одном ответе (поля `totalAmount` / `filledAmount` / `pendingSettle` различают фазы). Для истории закрытых ордеров используйте `/limit-order/history/order/list-by-user?wallet=…` (по кошельку, с пагинацией через `nextPageId`); для полного журнала событий конкретного ордера — `/limit-order/history/event/list-by-pda?pda=…`.
+
+## Скелет Rust CPI
+
+```rust
+use anchor_lang::prelude::*;
+use raydium_amm_v3::cpi;
+use raydium_amm_v3::program::AmmV3;
+use raydium_amm_v3::cpi::accounts::SwapV2;
+
+#[derive(Accounts)]
+pub struct ProxyClmmSwap<'info> {
+    #[account(mut)]
+    pub payer: Signer<'info>,
+    /// CHECK:
+    pub amm_config: UncheckedAccount<'info>,
+    #[account(mut)]
+    /// CHECK:
+    pub pool_state: UncheckedAccount<'info>,
+    #[account(mut)]
+    /// CHECK:
+    pub input_token_account: UncheckedAccount<'info>,
+    #[account(mut)]
+    /// CHECK:
+    pub output_token_account: UncheckedAccount<'info>,
+    #[account(mut)]
+    /// CHECK:
+    pub input_vault: UncheckedAccount<'info>,
+    #[account(mut)]
+    /// CHECK:
+    pub output_vault: UncheckedAccount<'info>,
+    #[account(mut)]
+    /// CHECK:
+    pub observation_state: UncheckedAccount<'info>,
+    /// CHECK:
+    pub token_program: UncheckedAccount<'info>,
+    /// CHECK:
+    pub token_program_2022: UncheckedAccount<'info>,
+    /// CHECK:
+    pub memo_program: UncheckedAccount<'info>,
+    /// CHECK:
+    pub input_vault_mint: UncheckedAccount<'info>,
+    /// CHECK:
+    pub output_vault_mint: UncheckedAccount<'info>,
+    pub clmm_program: Program<'info, AmmV3>,
+    // `remaining_accounts` carries the tick_array and bitmap_extension accounts.
+}
+
+pub fn proxy_swap(
+    ctx: Context<ProxyClmmSwap>,
+    amount: u64,
+    other_amount_threshold: u64,
+    sqrt_price_limit_x64: u128,
+    is_base_input: bool,
+) -> Result<()> {
+    let cpi_accounts = SwapV2 {
+        payer:                 ctx.accounts.payer.to_account_info(),
+        amm_config:            ctx.accounts.amm_config.to_account_info(),
+        pool_state:            ctx.accounts.pool_state.to_account_info(),
+        input_token_account:   ctx.accounts.input_token_account.to_account_info(),
+        output_token_account:  ctx.accounts.output_token_account.to_account_info(),
+        input_vault:           ctx.accounts.input_vault.to_account_info(),
+        output_vault:          ctx.accounts.output_vault.to_account_info(),
+        observation_state:     ctx.accounts.observation_state.to_account_info(),
+        token_program:         ctx.accounts.token_program.to_account_info(),
+        token_program_2022:    ctx.accounts.token_program_2022.to_account_info(),
+        memo_program:          ctx.accounts.memo_program.to_account_info(),
+        input_vault_mint:      ctx.accounts.input_vault_mint.to_account_info(),
+        output_vault_mint:     ctx.accounts.output_vault_mint.to_account_info(),
+    };
+    let cpi_ctx = CpiContext::new(ctx.accounts.clmm_program.to_account_info(), cpi_accounts)
+        .with_remaining_accounts(ctx.remaining_accounts.to_vec());
+    cpi::swap_v2(cpi_ctx, amount, other_amount_threshold, sqrt_price_limit_x64, is_base_input)
+}
+```
+
+Порядок remaining-аккаунтов для `SwapV2`:
+
+```
+[tick_array_bitmap_extension?, tick_array_0, tick_array_1, …]
+```
+
+Если swap не требует расширения, его можно опустить; в противном случае оно идёт первым среди remaining-аккаунтов.
+
+## Типичные ошибки
+
+- **Несоответствие тиков шагу** → `InvalidTickIndex`. Всегда выравнивайте через `TickUtils.getPriceAndTick`.
+- **Недостаточно tick-массивов в `SwapV2`** → `TickArrayNotFound`. Используйте `computeAmountOutFormat` для получения полного списка.
+- **Полнодиапазонная позиция без bitmap-расширения** → PDA расширения должен быть записываемым; SDK обрабатывает это автоматически.
+- **Путаница между `sqrt_price_x64` и `price`** → ошибка в 2 раза здесь особенно болезненна. При сомнениях доверьте вычисление SDK, передав ему человекочитаемую цену.
+- **Слишком частый сбор наград** → каждый сбор стоит одну транзакцию. Используйте `harvestAllRewards` для пакетного сбора по многим позициям.
+- **Сожжение NFT при наличии непогашенного долга по ренте** → `ClosePosition` также закрывает mint NFT и ATA; не закрывайте их отдельно, иначе программа вернёт ошибку.
+- **Открытие лимитного ордера на тике, не кратном шагу** → `InvalidTickIndex`. Всегда квантизируйте через `TickUtils.getPriceAndTick`.
+- **Вызов `decreaseLimitOrder` на полностью исполненном ордере** → `InvalidOrderPhase`. Используйте `settleLimitOrder`, а затем `closeLimitOrder`.
+- **Отсутствие `dynamicFeeConfigId` при `enableDynamicFee: true`** → `CreateCustomizablePool` вернёт ошибку `InvalidDynamicFeeConfigParams`. Либо отключите динамическую комиссию, либо выберите конфигурацию из `/main/clmm-dynamic-config`.
+
+## Что делать дальше
+
+- [`sdk-api/typescript-sdk`](/ru/sdk-api/typescript-sdk) — полная документация SDK.
+- [`sdk-api/rest-api`](/ru/sdk-api/rest-api) — эндпоинты котировок и метаданных пулов.
+- [`user-flows/create-clmm-pool`](/ru/user-flows/create-clmm-pool) — пошаговое руководство без кода.
+- [`integration-guides/aggregator`](/ru/integration-guides/aggregator) — маршрутизация CLMM в составе пути.
+
+Источники:
+
+- [Raydium SDK v2](https://github.com/raydium-io/raydium-sdk-V2)
+- [Raydium SDK v2 demos](https://github.com/raydium-io/raydium-sdk-V2-demo)
+- [`raydium-io/raydium-clmm`](https://github.com/raydium-io/raydium-clmm)

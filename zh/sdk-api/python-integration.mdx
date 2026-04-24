@@ -1,0 +1,268 @@
+---
+title: "Python 集成"
+description: "通过 solders、solana-py 和 anchorpy 构建面向 Raydium 的机器人和后端——环境设置、读取池状态、发送交换和典型的机器人架构。"
+---
+
+<Info>
+  **本页内容由 AI 自动翻译，所有内容以英文版本为准。**
+
+  [查看英文版 →](/sdk-api/python-integration)
+</Info>
+
+<Info>
+  Raydium 不发布官方 Python SDK。这里的模式由三个维护良好的社区库组成：**`solders`**（Rust 绑定的 Solana 基元）、**`solana-py`**（RPC 客户端）和 **`anchorpy`**（从 IDL 生成的 Anchor 风格指令构建器）。这种组合涵盖了 TS SDK 的所有功能，只是不那么精细。
+</Info>
+
+## 环境
+
+```bash
+python -m venv .venv
+source .venv/bin/activate
+
+pip install solders solana anchorpy construct base58
+```
+
+截至本文撰写时可协同工作的版本：
+
+```
+solders == 0.21.*
+solana  == 0.34.*
+anchorpy == 0.20.*
+```
+
+`anchorpy` 会定期落后于 `anchor-lang` 的版本；对于最近部署的 Raydium 程序，在提交前应验证 IDL 在你固定的 `anchorpy` 版本下能够编译。
+
+## 连接和密钥对
+
+```python
+from solana.rpc.async_api import AsyncClient
+from solders.keypair import Keypair
+
+client = AsyncClient("https://api.mainnet-beta.solana.com", commitment="confirmed")
+owner  = Keypair.from_bytes(bytes(open("keypair.json", "rb").read()))
+```
+
+`AsyncClient` 是异步变体；同步的 `Client` 可用于快速脚本，但异步更适合发送多个请求的场景。
+
+## 读取池状态
+
+大多数生产用途从 Raydium 的 REST API 读取已解码的池状态（参见 [`sdk-api/rest-api`](/zh/sdk-api/rest-api)），而不是手动解码链上数据——这样做更简单，延迟对大多数用例都是可接受的。
+
+```python
+import httpx
+
+async def get_pool(pool_id: str) -> dict:
+    async with httpx.AsyncClient() as http:
+        r = await http.get(
+            "https://api-v3.raydium.io/pools/info/ids",
+            params={"ids": pool_id},
+        )
+        r.raise_for_status()
+        data = r.json()
+        if not data["success"]:
+            raise RuntimeError(data["error"]["message"])
+        return data["data"][0]
+
+pool = await get_pool("58oQChx4yWmvKdwLLZzBi4ChoCc2fqCUWBkwMihLYQo2")
+print(pool["price"], pool["day"]["volume"])
+```
+
+对于需要最低可能延迟的机器人，直接解码链上字节：
+
+```python
+from construct import Struct, Int64ul, Int128ul, Bytes, this
+
+# 部分 CPMM PoolState 布局（前几个字段）
+POOL_STATE_LAYOUT = Struct(
+    "discriminator"     / Bytes(8),
+    "amm_config"        / Bytes(32),
+    "pool_creator"      / Bytes(32),
+    "token_0_vault"     / Bytes(32),
+    "token_1_vault"     / Bytes(32),
+    "lp_mint"           / Bytes(32),
+    "token_0_mint"      / Bytes(32),
+    "token_1_mint"      / Bytes(32),
+    # ...
+)
+
+from solders.pubkey import Pubkey
+
+async def decode_pool(pool_id: Pubkey) -> dict:
+    resp = await client.get_account_info(pool_id)
+    data = resp.value.data
+    return POOL_STATE_LAYOUT.parse(data)
+```
+
+完整布局在 `src/raydium/cpmm/layout.ts`（TS 源码）中；根据需要将其移植到 `construct`。`anchorpy` 可以在给定 IDL 的情况下自动完成此操作——见下文。
+
+## 构建和发送交换
+
+为简起见，使用 Raydium 的**服务器构建交易**端点。服务器返回签名就绪的交易；你只需添加自己的签名：
+
+```python
+import httpx
+import base64
+from solders.transaction import VersionedTransaction
+from solana.rpc.types import TxOpts
+
+async def swap(pool_id: str, amount_in: int, slippage_bps: int):
+    async with httpx.AsyncClient() as http:
+        r = await http.get(
+            "https://api-v3.raydium.io/transaction/swap-base-in",
+            params={
+                "poolId":       pool_id,
+                "amount":       amount_in,
+                "inputMint":    "So11111111111111111111111111111111111111112",  # WSOL
+                "outputMint":   "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",  # USDC
+                "slippageBps":  slippage_bps,
+                "wallet":       str(owner.pubkey()),
+                "txVersion":    "V0",
+                "computeUnitPriceMicroLamports": 50_000,
+            },
+        )
+        r.raise_for_status()
+        data = r.json()["data"]
+
+    # 解码预构建的交易，用我们的密钥对签名，然后发送。
+    raw  = base64.b64decode(data["tx"]["transaction"])
+    tx   = VersionedTransaction.from_bytes(raw)
+    tx.sign([owner])
+
+    sig = await client.send_transaction(tx, opts=TxOpts(skip_preflight=False))
+    await client.confirm_transaction(sig.value, commitment="confirmed")
+    return sig.value, data["swapResponse"]
+```
+
+这是构建可工作机器人的最快方式。服务器报价很快过期（约 30 秒）；不要缓存。
+
+## 通过 `anchorpy` 在客户端构建交换
+
+当你需要更低的延迟或无法访问 Raydium API 时（受制裁地区、离线设置）：
+
+```python
+from anchorpy import Program, Provider, Wallet, Context
+from solana.rpc.async_api import AsyncClient
+from solders.pubkey import Pubkey
+import json
+
+idl = json.load(open("cpmm.json"))  # 来自 raydium-sdk-v2
+provider = Provider(client, Wallet(owner))
+program  = Program(idl, Pubkey.from_string(CPMM_PROGRAM_ID), provider)
+
+# 调用 swap_base_input：
+tx_sig = await program.rpc["swap_base_input"](
+    amount_in,
+    minimum_amount_out,
+    ctx=Context(
+        accounts={
+            "payer":                owner.pubkey(),
+            "authority":            owner.pubkey(),
+            "amm_config":           amm_config_pk,
+            "pool_state":           pool_state_pk,
+            "input_token_account":  user_input_ata,
+            "output_token_account": user_output_ata,
+            "input_vault":          input_vault_pk,
+            "output_vault":         output_vault_pk,
+            "input_token_program":  TOKEN_PROGRAM_ID,
+            "output_token_program": TOKEN_PROGRAM_ID,
+            "input_token_mint":     input_mint,
+            "output_token_mint":    output_mint,
+            "observation_state":    observation_state_pk,
+        },
+    ),
+)
+```
+
+PDA 推导（观察状态、池权限）遵循与 CPMM 章节相同的公式。`anchorpy` 不会自动推导它们。
+
+## 典型机器人架构
+
+常见的 Python Raydium 机器人结构：
+
+```
+┌──────────────────┐
+│ 调度器           │  cron / asyncio / redis 队列
+└──────────┬───────┘
+           │
+           ▼
+┌──────────────────┐
+│ 价格轮询器       │  httpx + Raydium REST API
+│  （每个池）      │  或 WebSocket RPC 订阅
+└──────────┬───────┘
+           │ 事件
+           ▼
+┌──────────────────┐
+│ 策略引擎         │  计算信号，决定交易参数
+└──────────┬───────┘
+           │ 交易参数
+           ▼
+┌──────────────────┐
+│ 交易构建器       │  Raydium REST 服务器构建交易或 anchorpy
+│ + 签名器         │  solders.Keypair
+└──────────┬───────┘
+           │ VersionedTransaction
+           ▼
+┌──────────────────┐
+│ RPC 发送器       │  solana-py AsyncClient + Jito RPC
+│ （重试+监控）    │  优先费逻辑
+└──────────┬───────┘
+           │ 签名
+           ▼
+┌──────────────────┐
+│ 账本存储         │  Postgres 存储持仓、待处理交易、PnL
+└──────────────────┘
+```
+
+生产环境关键决策：
+
+- **RPC 提供商。** 公开主网 RPC 会积极限流。使用专用提供商（Helius、QuickNode、Triton）以应对持续流量。
+- **WebSocket 用于池状态。** `client.account_subscribe(pool_id)` 在每个状态变化时推送更新。比轮询紧凑得多。
+- **优先费提供商。** Helius 有 `getPriorityFeeEstimate` 端点；Triton 有自己的。根据目标程序上最近费用的第 75 个百分位数来调整你的费用。
+- **用于 MEV 敏感交易的捆绑。** 如果你无法容忍三明治风险，通过 Jito 的区块引擎路由。Python 库：`jito-sdk-python`（第三方，质量参差不齐）。
+
+## 读取农场状态
+
+```python
+FARM_V6_ID = Pubkey.from_string("...")
+
+async def get_farm_v6(farm_id: Pubkey):
+    resp = await client.get_account_info(farm_id)
+    return farm_v6_idl_program.account["FarmState"].decode(resp.value.data)
+
+farm = await get_farm_v6(farm_id)
+print(farm.total_staked, farm.reward_info_count)
+for r in farm.reward_infos[:farm.reward_info_count]:
+    print(r.reward_mint, r.emission_per_second_x64)
+```
+
+`anchorpy` 的 `.account["X"].decode(bytes)` 给出与 IDL 结构匹配的原生 Python 对象。
+
+## 陷阱
+
+### 1. 小数处理
+
+Python 的原生 `float` 是 IEEE-754 双精度浮点；9 位小数代币中的金额（1 SOL = 1e9 单位）保持准确，但比率和乘积会丧失精度。使用 `int`（`solders` 为所有金额字段返回 `int`），并对任何价格算术通过 `decimal.Decimal` 路由。
+
+### 2. 基于插槽与基于时间戳的推理
+
+某些农场版本使用插槽计数器；LaunchLab 使用时间戳。`solana-py` 在 RPC 响应中返回 `slot`，但将插槽转换为时间戳会有损失（因领导者日程而异）。如果你需要挂钟时间，显式调用 `get_block_time(slot)`。
+
+### 3. 连接池耗尽
+
+`AsyncClient` 默认为每个请求打开一个 HTTP 连接。在高负载下，重用 `httpx.AsyncClient` 会话并设置适当的 `limits=httpx.Limits(max_connections=100)`。
+
+### 4. 交易大小限制
+
+Python 构建的交易不会比 TS 构建的交易更小——1232 字节限制同样适用。对于通过超过 2 个池的任何路由，使用 V0 交易（地址查找表）。
+
+## 指针
+
+- [`sdk-api/rest-api`](/zh/sdk-api/rest-api) —— 上述使用的 HTTP 端点。
+- [`sdk-api/anchor-idl`](/zh/sdk-api/anchor-idl) —— 获取 `anchorpy` IDL 的位置。
+- [`integration-guides/routing-and-mev`](/zh/integration-guides/routing-and-mev) —— Jito 捆绑模式。
+
+来源：
+
+- [solders](https://github.com/kevinheavey/solders)
+- [solana-py](https://github.com/michaelhly/solana-py)
+- [anchorpy](https://github.com/kevinheavey/anchorpy)

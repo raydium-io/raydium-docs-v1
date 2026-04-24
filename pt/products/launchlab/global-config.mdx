@@ -1,0 +1,211 @@
+---
+title: "LaunchLab GlobalConfig"
+description: "Contas de configuração em nível de protocolo que vinculam todo lançamento do LaunchLab — taxas de fee, mínimos de supply, limites de lock-rate, as wallets de migração que controlam a graduação e o esquema de indexação por curva."
+---
+
+<Info>
+  **Esta página foi traduzida automaticamente por IA. A versão em inglês é a fonte oficial.**
+
+  [Ver versão em inglês →](/products/launchlab/global-config)
+</Info>
+
+<Info>
+  `GlobalConfig` é a conta de configuração em **nível de protocolo**. Pode haver muitas delas — indexadas por `(curve_type, index)` — e todo lançamento escolhe exatamente uma no tempo de `Initialize`. Os valores no `GlobalConfig` escolhido então se tornam limites rígidos para os parâmetros daquele lançamento. Para customização em nível de plataforma (taxa de fee por plataforma, formas de curva permitidas, splits de NFT na graduação), veja [`products/launchlab/platform-config`](/pt/products/launchlab/platform-config).
+</Info>
+
+## O que é
+
+Um `GlobalConfig` é um PDA singleton-por-`(curve_type, index)` que fixa as regras em nível de protocolo que todo lançamento deve obedecer:
+
+- O tipo de bonding curve permitido (`curve_type`).
+- A taxa de fee de trade que a curva cobra em cada compra e venda.
+- A taxa de migração cobrada na graduação.
+- Pisos em supply, lock rate, sell rate e migrate rate.
+- O quote mint (tipicamente wrapped SOL ou USDC) — o ativo que os usuários compram.
+- Três wallets em nível de protocolo: o proprietário de fee de protocolo, o proprietário de fee de migração e as duas wallets de controle de migração que autorizam a graduação para AMM v4 / CPMM.
+- Um flag opcional (`requires_platform_auth`) que controla quais plataformas podem usar essa configuração.
+
+Contas `GlobalConfig` são criadas e atualizadas pelo admin do programa LaunchLab (a pubkey de admin hardcoded compartilhada entre programas Raydium baseados em Anchor — veja [`reference/program-addresses`](/pt/reference/program-addresses)).
+
+## Layout
+
+```rust
+// states/config.rs
+pub const GLOBAL_CONFIG_SEED: &str = "global_config";
+
+#[account]
+pub struct GlobalConfig {
+    pub epoch:                   u64,         // recent_epoch tracker
+    pub curve_type:              u8,          // 0 = ConstantProduct, 1 = FixedPrice, 2 = LinearPrice
+    pub index:                   u16,         // discriminator within a curve_type
+    pub migrate_fee:             u64,         // SOL paid on graduation
+    pub trade_fee_rate:          u64,         // 1/1_000_000 of volume
+    pub max_share_fee_rate:      u64,         // 100 bps cap on platform share fee
+    pub min_base_supply:         u64,         // floor on Initialize supply (no decimals)
+    pub max_lock_rate:           u64,         // ceiling on vesting locked / supply
+    pub min_base_sell_rate:      u64,         // floor on base_supply_graduation / supply
+    pub min_base_migrate_rate:   u64,         // floor on tokens that seed the post-graduation pool
+    pub min_quote_fund_raising:  u64,         // floor on quote_reserve_target (with decimals)
+    pub quote_mint:              Pubkey,
+    pub protocol_fee_owner:      Pubkey,      // claims protocol fees via CollectFee
+    pub migrate_fee_owner:       Pubkey,      // claims migration fees via CollectMigrateFee
+    pub migrate_to_amm_wallet:   Pubkey,      // can sign MigrateToAmm
+    pub migrate_to_cpswap_wallet:Pubkey,      // can sign MigrateToCpswap
+    pub requires_platform_auth:  u8,          // 0/1 flag
+    pub padding_alignment:       [u8; 7],
+    pub padding:                 [u64; 15],
+}
+```
+
+Derivação de PDA:
+
+```ts
+const [globalConfig] = PublicKey.findProgramAddressSync(
+  [
+    Buffer.from("global_config"),
+    Buffer.from(quoteMint.toBytes()),
+    Buffer.from([curveType]),
+    u16ToBytes(index),
+  ],
+  LAUNCHLAB_PROGRAM_ID,
+);
+```
+
+(Verifique a ordem exata de seeds da conta on-chain antes de assinar — a instrução `create_config` do programa é a fonte de verdade.)
+
+## Semântica dos campos
+
+### `curve_type` e `index`
+
+Juntos, esses campos indexam um `GlobalConfig` de forma única. Existe um `GlobalConfig` por par `(curve_type, index)`:
+
+- `curve_type = 0` — Curva de virtual-reserve de produto constante. Padrão e mais usado.
+- `curve_type = 1` — Curva de preço fixo.
+- `curve_type = 2` — Curva de preço linear.
+
+`index` é um `u16` que permite ao admin publicar múltiplas configurações por tipo de curva (p.ex., uma com uma taxa mais apertada, uma com um mínimo de quote raise mais alto). No `Initialize` o lançamento fornece um par `(curve_type, index)` e o programa carrega o `GlobalConfig` correspondente.
+
+### Taxas
+
+- `trade_fee_rate` — denominado em `1/1_000_000` do volume de trade. Aplicado a cada compra e venda na curva. O `protocol_fee_owner` reivindica sua parte via `CollectFee`.
+- `migrate_fee` — uma taxa fixa em lamports (ou unidades de quote, dependendo da configuração) cobrada uma vez na graduação. Reivindicada por `migrate_fee_owner` via `CollectMigrateFee`.
+- `max_share_fee_rate` — inicializado em `10_000` (100 bps). Limita a taxa de fee de share da **plataforma** do `PlatformConfig` vinculante (veja [`platform-config`](/pt/products/launchlab/platform-config)). O programa reforça `trade_fee_rate + max_share_fee_rate < RATE_DENOMINATOR_VALUE`.
+
+### Pisos de supply e taxa
+
+Esses pisos limitam quais parâmetros de forma de curva um lançamento pode escolher no `Initialize`. Se o `CurveParams` do criador violar qualquer um deles, `Initialize` reverte com `InvalidInput`.
+
+- `min_base_supply` — o mínimo `supply` (sem decimais) que a curva pode declarar. Padrão é `10_000_000`.
+- `max_lock_rate` — denominado em `1/1_000_000`; padrão `300_000` (30%). Limita vesting via `total_locked_amount <= supply * max_lock_rate / 1_000_000`.
+- `min_base_sell_rate` — denominado em `1/1_000_000`; padrão `200_000` (20%). Limita `base_supply_graduation / supply` por baixo.
+- `min_base_migrate_rate` — denominado em `1/1_000_000`; padrão `200_000` (20%). Limita o número de tokens restantes para semear o pool pós-graduação.
+- `min_quote_fund_raising` — mínimo `quote_reserve_target` que um lançamento pode declarar (com decimais). Padrão é `30_000_000_000` unidades do quote mint.
+
+### Quote mint e wallets de protocolo
+
+- `quote_mint` — o ativo que os usuários compram. A maioria dos lançamentos usa wrapped SOL (`So111…112`) ou USDC (`EPjF…Dt1v`). Um `GlobalConfig` está vinculado a um quote mint; lançamentos que precisam de um target de quote diferente visam um `(curve_type, index)` diferente.
+- `protocol_fee_owner` — pubkey que assina `CollectFee` e reivindica as taxas de protocolo acumuladas em cada lançamento vinculado a essa configuração. Armazenado on-chain; o admin pode rotacioná-lo via `UpdateConfig`.
+- `migrate_fee_owner` — pubkey que assina `CollectMigrateFee`.
+
+### Wallets de migração
+
+Os dois caminhos de graduação requerem signers diferentes:
+
+- `migrate_to_amm_wallet` — deve assinar `MigrateToAmm`. Usada para lançamentos cujo `migrate_type = 0` (formar para AMM v4 + OpenBook).
+- `migrate_to_cpswap_wallet` — deve assinar `MigrateToCpswap`. Usada para `migrate_type = 1` (formar para CPMM). Lançamentos Token-2022 sempre seguem esse caminho.
+
+Essas são tipicamente mantidas pelo crank de graduação operado pelo Raydium, então a graduação ocorre logo após a curva atingir o threshold em vez de esperar pelo criador chamá-la.
+
+### `requires_platform_auth`
+
+Um flag `u8` (`0` = qualquer um pode usar essa configuração; não-zero = apenas plataformas com um PDA `PlatformGlobalAccess` válido podem formar contra ele). Quando definido, cada `Initialize` contra esse `GlobalConfig` deve incluir uma conta `PlatformGlobalAccess` correspondente provando que a plataforma foi pré-autorizada via `CreatePlatformGlobalAccess` (uma instrução apenas de admin). Veja [`platform-config`](/pt/products/launchlab/platform-config) para a mecânica do lado da plataforma.
+
+## Padrões na inicialização
+
+Quando `CreateConfig` é chamado, o programa semeia muitos campos com padrões hardcoded:
+
+```rust
+self.max_share_fee_rate     = 10_000;                  // 100 bps
+self.min_base_supply        = 10_000_000;              // no decimals
+self.max_lock_rate          = 300_000;                 // 30%
+self.min_base_migrate_rate  = 200_000;                 // 20%
+self.min_base_sell_rate     = 200_000;                 // 20%
+self.min_quote_fund_raising = 30_000_000_000;
+self.requires_platform_auth = 0;
+```
+
+O admin define `curve_type`, `index`, `migrate_fee`, `trade_fee_rate`, `quote_mint` e as quatro pubkeys de wallet explicitamente no tempo de criação; valores posteriores podem ser ajustados via `UpdateConfig`.
+
+## Como um lançamento escolhe um `GlobalConfig`
+
+No `Initialize`, o criador passa:
+
+- `(curve_type, index)` para selecionar qual PDA `GlobalConfig` carregar.
+- `CurveParams` descrevendo a forma da curva (`supply`, `total_base_sell`, `total_quote_fund_raising`, `migrate_type`).
+- `VestingParams` descrevendo supply bloqueado.
+- `MintParams` para o base mint.
+
+O programa reforça:
+
+- `curve_type` corresponde a `global_config.curve_type`.
+- `supply >= global_config.min_base_supply`.
+- `total_locked_amount <= supply * max_lock_rate / 1_000_000`.
+- `total_base_sell >= supply * min_base_sell_rate / 1_000_000`.
+- `(supply − total_base_sell − total_locked_amount) >= supply * min_base_migrate_rate / 1_000_000` — ou seja, tokens suficientes restantes para semear o pool pós-graduação.
+- `total_quote_fund_raising >= min_quote_fund_raising`.
+- Se `requires_platform_auth != 0`, um PDA `PlatformGlobalAccess` válido é incluído.
+
+Após `Initialize`, o `PoolState` do lançamento armazena a pubkey `global_config` diretamente, então o vínculo é permanente.
+
+## Caminho de atualização
+
+`UpdateConfig` é apenas de admin e recebe um par `(param: u8, value: u64)`. Cada valor `param` seleciona qual campo mutar:
+
+| `param` | Campo alterado |
+|---------|---------------|
+| 0 | `migrate_fee` |
+| 1 | `trade_fee_rate` |
+| 2 | `max_share_fee_rate` |
+| 3 | `min_base_supply` |
+| 4 | `max_lock_rate` |
+| 5 | `min_base_sell_rate` |
+| 6 | `min_base_migrate_rate` |
+| 7 | `min_quote_fund_raising` |
+
+Rotações de wallet (`protocol_fee_owner`, `migrate_fee_owner`, `migrate_to_amm_wallet`, `migrate_to_cpswap_wallet`) recebem uma forma de argumento `Pubkey` separada; verifique a fonte de `update_config` para a tabela de dispatch exata antes de compor uma transação de admin.
+
+`requires_platform_auth` é acionado via `set_requires_platform_auth(bool)`.
+
+## Lendo um `GlobalConfig` de um cliente
+
+```ts
+import { Raydium } from "@raydium-io/raydium-sdk-v2";
+
+// Fetch by PDA derivation:
+const [configPda] = PublicKey.findProgramAddressSync(
+  [
+    Buffer.from("global_config"),
+    quoteMint.toBytes(),
+    Buffer.from([curveType]),
+    u16ToBytes(index),
+  ],
+  LAUNCHLAB_PROGRAM_ID,
+);
+
+const config = await raydium.launchpad.getGlobalConfig(configPda);
+console.log(config.tradeFeeRate, config.minQuoteFundRaising);
+```
+
+Para uma UI listando todas as configurações disponíveis, percorra o helper `getAllGlobalConfigs` do SDK ou consulte o endpoint da API LaunchLab que as espelha; a contagem de contas on-chain é pequena (single digits na prática).
+
+## Referências
+
+- [`products/launchlab/platform-config`](/pt/products/launchlab/platform-config) — overlay por plataforma que restringe ainda mais a forma da curva.
+- [`products/launchlab/accounts`](/pt/products/launchlab/accounts) — grafo completo de contas para um lançamento.
+- [`products/launchlab/instructions`](/pt/products/launchlab/instructions) — instruções `Initialize` e update.
+- [`reference/program-addresses`](/pt/reference/program-addresses) — pubkey de admin, ID do programa, autoridades compartilhadas.
+
+Fontes:
+
+- `raydium-launch/programs/launchpad/src/states/config.rs` — struct `GlobalConfig` e `initialize`.
+- `raydium-launch/programs/launchpad/src/lib.rs` — `create_config`, `update_config`.

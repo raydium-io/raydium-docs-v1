@@ -1,0 +1,150 @@
+---
+title: "LaunchLab – Übersicht"
+description: "Wie Raydiums Bonding-Curve-Launchplattform funktioniert: Trading gegen eine deterministische Kurve vor Graduierung, die Finanzierungsschwelle, die die Graduierung auslöst, und die automatische Migration in einen Standard-CPMM-Pool."
+---
+
+<Info>
+  **Diese Seite wurde mit KI automatisch übersetzt. Maßgeblich ist stets die englische Version.**
+
+  [Englische Version ansehen →](/products/launchlab/overview)
+</Info>
+
+## Das Problem, das LaunchLab löst
+
+Vor LaunchLab erforderte der Start eines neuen Tokens auf Raydium, dass der Ersteller einen AMM-Pool mit beiden Seiten des Paares von vornherein mit Liquidität ausstattete – das Team musste die Quote-seitige Liquidität (SOL oder USDC) aus eigenen Mitteln bereitstellen. Dies begünstigte gut finanzierte Projekte und beschränkte den Zugang zum Launchpad-Mechanismus auf Anfangskapital.
+
+LaunchLab ersetzt diesen Schritt durch eine **Bonding Curve**: Der Token wird gegen eine Kurve bereitgestellt, die in einem Quote-Mint notiert ist (üblicherweise SOL oder USDC). Käufer erwerben den Token, indem sie Quote an die Kurve senden, die daraufhin atomar Base-Token-Einheiten zu einem Preis prägt oder freigeben, der durch die Kurvenformel und das aktuelle Angebot bestimmt wird. Keine vorab bereitgestellte Liquidität erforderlich.
+
+Sobald die Kurve genug Quote gesammelt hat, um der Liquiditätsformel eines echten AMM-Pools zu entsprechen, **graduiert** sie: Das Programm erstellt einen CPMM-Pool im Mainnet mit der Basis- und Quote-Reserve der Kurve, und von da an findet der Handel auf dem AMM statt.
+
+## Lebenszyklus
+
+```
+             ┌───────────────────────┐
+creator  ──▶ │  Initialize (Launch)  │   ▸ mints the base token, funds the curve vaults,
+             │                        │     sets curve params and graduation threshold
+             └───────────┬────────────┘
+                         │
+                         ▼
+             ┌───────────────────────┐       repeated N times
+             │   Buy  /  Sell        │ ◀─── traders interact with the curve
+             └───────────┬────────────┘
+                         │ curve quote_reserve
+                         │ crosses threshold
+                         ▼
+             ┌───────────────────────┐   ▸ snapshots curve state
+             │      Graduate         │   ▸ deploys CPMM pool seeded with curve reserves
+             │                        │   ▸ locks / burns remaining base supply per policy
+             └───────────┬────────────┘
+                         │
+                         ▼
+             ┌───────────────────────┐
+             │   CPMM pool live      │   ▸ standard CPMM behavior going forward
+             └───────────────────────┘
+```
+
+Jeder Launch durchläuft diese Abfolge genau einmal. `Buy` und `Sell` sind die einzigen von Nutzern aufzurufenden Instruktionen in der mittleren Phase; `Graduate` ist erlaubnisfrei (jeder kann sie aufrufen, sobald die Schwelle überschritten ist), aber in der Praxis ruft das SDK sie automatisch in der Transaktion auf, die die Schwelle überschreitet.
+
+## Zwei feste Parteien
+
+Ein LaunchLab-State hat zwei ausgezeichnete Konten:
+
+- **Der Base-Mint** – der zu startende Token. Seine Mint-Authority wird vom LaunchLab-Programm bis zur Graduierung gehalten; nach der Graduierung wird sie widerrufen.
+- **Der Quote-Mint** – die Sicherheit. Immer ein etablierter Mint (SOL / USDC / RAY). Die Launch-Konfiguration wählt einen bei `Initialize`; er kann nicht geändert werden.
+
+Plus zwei Vaults:
+
+- **`base_vault`** – enthält den Teil des Base-Angebots, der vorab für die Kurve geprägt, aber noch nicht verkauft wurde. Sinkt, wenn Nutzer kaufen.
+- **`quote_vault`** – sammelt die Quote, die von Käufern eingezahlt wird. Steigt, wenn Nutzer kaufen. Dieser Saldo wird gegen die Graduierungsschwelle geprüft.
+
+## Preismodell
+
+LaunchLab unterstützt mehrere Kurvenformeln (siehe [`bonding-curve`](/de/products/launchlab/bonding-curve)). Das gebräuchlichste ist eine **quadratische** Bonding Curve, die der Pump.fun / Curve.fi / Bancor-Abstammung ähnelt:
+
+```
+price(s) = k × (s / S_max)²     (or similar — exact formula is curve-config dependent)
+```
+
+wobei `s` die Menge des bereits an Nutzer verkauften Base ist und `S_max` das maximale Angebot der Kurve ist. Der Preis steigt monoton mit jedem Kauf und sinkt mit jedem Verkauf. Da das Programm die AMM-integrierte Kostgenau berechnet, liefert ein Kauf beliebiger Größe den korrekten integrierten Betrag; es gibt keine Slippage pro Trade über die natürliche Konvexität der Kurve hinaus.
+
+## Graduierung
+
+Ein Launch graduiert, wenn `quote_vault.balance ≥ graduation_threshold`. Die Schwelle wird bei `Initialize` gesetzt und wird üblicherweise so gewählt, dass bei Graduierung der implizierte Kurvenkurs dem Preis entspricht, bei dem der AMM-Pool mit den gesammelten Reserven öffnet. Konkret:
+
+```
+threshold ≈ S_graduate × price(S_graduate) × f
+```
+
+wobei `S_graduate` die bereits verkaufte Base-Menge ist, `price(S_graduate)` der marginale Kurvenkurs an diesem Punkt und `f` ein kleiner Faktor zur Berücksichtigung der Gebührenspanne (1–2%).
+
+Bei Graduierung:
+
+1. Das Programm erstellt eine Momentaufnahme von `(base_vault_remaining, quote_vault)`.
+2. Es ruft CPMM `CreatePool` CPI mit diesen zwei Reserven auf und prägt die initiale LP auf eine vom Programm gehaltene Authority (üblicherweise pro Policy gebrannt / gesperrt).
+3. Es widerruft die Mint-Authority des Base-Mints (damit keine weiteren Base-Tokens je geprägt werden können).
+4. `LaunchState.status` wechselt zu `Graduated`.
+
+Nach der Graduierung lehnen `Buy` und `Sell` ab. Der Handel wird auf dem resultierenden CPMM-Pool fortgesetzt, der von jedem anderen Raydium-CPMM-Pool nicht zu unterscheiden ist.
+
+## Gebühren
+
+Während der Kurvephase verursacht jeder `Buy` und `Sell` eine Gebühr, aufgeteilt in:
+
+- **Curve LP-Seite** – erhöht das implizierte `k` der Kurve, was späteren Käufern zugute kommt (engerer Preis).
+- **Protokoll** – wird der LaunchLab-Administration angerechnet, eingezogen via `CollectFees`.
+- **Ersteller** – optional, konfigurierbar bei `Initialize`. Einige Launches lenken einen Anteil an den Ersteller als laufende Einnahmequelle.
+
+Standardsätze sind dokumentiert auf [`bonding-curve`](/de/products/launchlab/bonding-curve). Die genaue Aufteilung wird auf `LaunchState.fees` gespeichert und kann pro Launch unterschiedlich sein.
+
+Nach der Graduierung folgen Gebühren der CPMM-Konfiguration, mit der der Pool erstellt wurde (üblicherweise `AmmConfig[0]`, die 0,25%-Stufe).
+
+## Wer hält die LP nach der Graduierung?
+
+LaunchLab unterstützt mehrere LP-Richtlinien nach der Graduierung:
+
+- **Burn** – LP wird auf eine tote Adresse geprägt. Der Pool wird permanent; niemand kann Liquidität entfernen.
+- **Lock** – LP wird auf ein zeitgesperrtes Escrow geprägt, das nach einer Vesting-Periode an den Ersteller freigegeben wird.
+- **Ersteller erhält sofort** – wird nur für berechtigte Launches verwendet.
+
+Die Richtlinie wird bei `Initialize` gesetzt und kann nicht geändert werden. Die meisten offenen Launches verwenden **burn** – sobald der Pool existiert, ist seine Liquidität für immer da.
+
+## Wichtige Invarianten
+
+- **Der Base-Mint ist nach der Graduierung inflationsfrei.** Seine `mint_authority` wird widerrufen; `freeze_authority` wurde nie gesetzt.
+- **Token-2022 wird via `initialize_with_token_2022` unterstützt.** Standard `Initialize` / `InitializeV2` erstellen SPL Token Launches; die dedizierte `InitializeWithToken2022` Instruktion erstellt einen Launch, dessen Base-Mint Token-2022 ist (mit optionalem `TransferFeeConfig`). Token-2022 Launches müssen zu einem CPMM-Pool graduieren – sie können nicht zu AMM v4 graduieren, das nur SPL Token ist.
+- **Kurvenzustand ist in eine Richtung monoton.** `base_sold` steigt nur bei Buy, `quote_vault` steigt nur bei Buy (sinkt bei Sell – was symmetrisch `base_sold` reduziert). Das Programm lässt die Kurve nie negativ werden.
+- **Graduierung ist ein Einweigtor.** Selbst wenn Post-Graduierungs-Trading den AMM-Pool-Preis zurück unter den Graduierungspreis drückt, geht der Launch nicht zurück zur Kurve.
+
+## Wann LaunchLab verwenden
+
+<Note>
+  Diese Seite beschreibt nur Protokoll-Mechaniken. Nichts hier stellt finanzielle, rechtliche oder Anlageberatung dar. Token-Starts sind mit erheblichen Finanzrisiken verbunden. Konsultieren Sie geeignete Fachleute, bevor Sie einen Token starten, bei dem öffentliche Fundraising erfolgt.
+</Note>
+
+- Sie starten einen neuen Token ohne etablierten Markt.
+- Sie möchten, dass der Markt den eröffnenden CPMM-Preis bestimmt, anstatt ihn vorab zu erklären.
+- Sie möchten es jedem – einschließlich des Teams selbst – ermöglichen, zu denselben kurvenbedingten Preisen zu kaufen, anstatt Insidern mit Rabatt vorab zuzuweisen.
+
+Verwenden Sie **nicht** LaunchLab für:
+
+- Bestehende Tokens mit etablierten Märkten (verwenden Sie `CreatePool` auf CPMM direkt).
+- Launches, bei denen Sie präzise Kontrolle über den eröffnenden AMM-Preis benötigen (Sie können ihn mit sorgfältiger Kurvenkonfiguration approximieren, aber der Mechanismus ist immer noch kurvengetrieben).
+- Tokens, die Token-2022-Erweiterungen erfordern, die LaunchLab nicht in die Whitelist aufnimmt (das Launch-Programm lehnt Erweiterungen wie `TransferHook` und `PermanentDelegate` selbst auf dem Token-2022-Pfad ab).
+
+## Kapitelinhalt
+
+- [`bonding-curve`](/de/products/launchlab/bonding-curve) – die Kurvenformel, Kosten- und Ertragsmathematik, Graduierungsschwellen-Ableitung.
+- [`accounts`](/de/products/launchlab/accounts) – `LaunchConfig`, `LaunchState`, Vaults, Authority PDAs.
+- [`instructions`](/de/products/launchlab/instructions) – `Initialize`, `Buy`, `Sell`, `Graduate`, `CollectFees`, `SetParams`.
+- [`code-demos`](/de/products/launchlab/code-demos) – end-to-end TypeScript-Beispiele.
+
+## Nächste Schritte
+
+- [`products/cpmm/overview`](/de/products/cpmm/overview) – was nach der Graduierung eines Launches geschieht.
+- [`user-flows/create-cpmm-pool`](/de/user-flows/create-cpmm-pool) – alternativer Pfad für Tokens, die keine Kurve benötigen.
+- [`reference/program-addresses`](/de/reference/program-addresses) – LaunchLab-Programm-ID.
+
+Quellen:
+
+- [Raydium SDK v2 `LaunchLab` Modul](https://github.com/raydium-io/raydium-sdk-V2) (IDL unter `src/raydium/launchpad/`).
+- LaunchLab-Programm-Quellcode ist derzeit nicht als eigenständiges Repo veröffentlicht. Die mit dem obigen SDK gebündelte IDL ist die kanonische Schnittstelle.

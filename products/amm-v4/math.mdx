@@ -1,0 +1,177 @@
+---
+title: "AMM v4 math"
+description: "Constant-product invariant with AMM v4's fee convention, reserve-to-orderbook price conversion, target-order grid construction, and the PnL settlement step."
+---
+
+## The invariant
+
+The pool maintains `coin_reserve × pc_reserve = k`, where:
+
+```
+coin_reserve = coin_vault_balance
+             + orders_posted_on_openbook.base
+             + pending_coin_fill_not_yet_settled
+pc_reserve   = pc_vault_balance
+             + orders_posted_on_openbook.quote
+             + pending_pc_fill_not_yet_settled
+             - accrued_pnl_pc
+```
+
+Two things to notice:
+
+1. Reserves include **committed-on-OpenBook** amounts. The AMM's limit orders remain part of its liquidity — they are not "lost" to the order book, just escrowed there. Computing `k` off only the on-chain vault balances underestimates reserves.
+2. The PnL accrual (`need_take_pnl_*`) is subtracted so the curve is conserved when the admin sweeps fees. Same principle as CPMM's `protocol_fees_*` exclusion.
+
+Every `Swap*` operation enforces `k' ≥ k` after adding the LP's fee share back into the reserves.
+
+## Fee convention
+
+AMM v4 uses **ratio fees** (numerator/denominator pairs) rather than the `1/1_000_000` convention of CPMM / CLMM. The on-chain `Fees` struct (see [`Fees::initialize`](https://github.com/raydium-io/raydium-amm/blob/master/program/src/state.rs) in the program source) defaults to:
+
+```
+Fees {
+  min_separate_numerator:    5,
+  min_separate_denominator:  10_000,   //  5/10_000 = 0.05%
+
+  trade_fee_numerator:      25,
+  trade_fee_denominator:    10_000,    // 25/10_000 = 0.25% — used for OpenBook limit-order pricing
+
+  pnl_numerator:            12,
+  pnl_denominator:          100,       // 12/100   = 12%   — protocol's share OF the swap fee
+
+  swap_fee_numerator:       25,
+  swap_fee_denominator:     10_000,    // 25/10_000 = 0.25% — gross fee on AMM-path swaps
+}
+```
+
+Interpretation (published mainnet defaults):
+
+- **Total swap fee:** `swap_fee = amount_in × 25 / 10_000 = 0.25%` of the gross input.
+- **Protocol share:** `pnl_numerator / pnl_denominator = 12 / 100 = 12%` **of the swap fee**, which works out to `0.25% × 12% = 0.03%` of volume. This share accrues to the PnL counters and is swept by `WithdrawPnl`.
+- **LP share:** the remaining `88%` of the swap fee, which works out to `0.25% × 88% = 0.22%` of volume. Stays in the pool and inflates `k`.
+- **No fund share.** AMM v4 does not have the CPMM/CLMM fund-fee split.
+
+Note that `pnl_numerator / pnl_denominator` is a fraction **of the fee**, not of trade volume — a common misreading of these field names.
+
+`trade_fee_numerator / trade_fee_denominator` (also `25 / 10_000`) is a separate field used by the OpenBook integration when computing fee-inclusive prices for the AMM's grid of limit orders; it equals `swap_fee` by default but is read from a different code path.
+
+Deviations from these defaults are rare but do exist on a handful of legacy pools; always read the fees from `AmmInfo.fees` before quoting.
+
+## Direct swap math (AMM path)
+
+The simplest case: user swaps against the pool's vaults without interacting with OpenBook. The pool's internal reserves (including on-book allocations) are the denominator.
+
+**SwapBaseIn (exact input):**
+
+```
+amount_after_fee = amount_in − ceil(amount_in × swap_fee_numerator / swap_fee_denominator)
+amount_out = amount_after_fee × out_reserve
+           / (in_reserve + amount_after_fee)
+require(amount_out >= minimum_amount_out)
+```
+
+The reserves used here are the **effective** reserves. Historically this was `coin_vault_balance + coin_posted_on_openbook + ...` (the AMM's vault plus the tokens it had locked into OpenBook orders). **As of the OpenBook deactivation, the on-book balance is zero**, so the effective reserves equal the raw vault balances. The `MonitorStep` / implicit-settle path that used to refresh the OpenBook side is no longer needed in practice.
+
+**SwapBaseOut (exact output):**
+
+```
+amount_in_after_fee = ceil(in_reserve × amount_out / (out_reserve − amount_out))
+amount_in_gross     = ceil(amount_in_after_fee × swap_fee_denominator
+                            / (swap_fee_denominator − swap_fee_numerator))
+require(amount_in_gross <= maximum_amount_in)
+```
+
+## Order-book interaction (historical)
+
+<Note>
+  **No longer active.** The grid construction described in this section reflects how AMM v4 *originally* mirrored the curve onto an OpenBook market. The OpenBook integration has been deactivated; pools no longer post or maintain orders on OpenBook. The math below is preserved for context — it explains what the on-chain `target_orders` / `amm_open_orders` accounts were sized for and why the program still validates `MonitorStep`-related parameters even though the keeper no longer cranks them.
+</Note>
+
+Separately from user swaps, AMM v4 historically placed a **grid** of limit orders on the OpenBook market. The grid was computed from `AmmInfo` parameters:
+
+- **`depth`** — number of price levels per side.
+- **`amount_wave`** — base unit of size per level.
+- **`min_size`**, **`coin_lot_size`**, **`pc_lot_size`** — OpenBook market constraints.
+- **`state_data.swap_acc_coin_fee`**, **`swap_acc_pc_fee`** — cumulative fee counters since last `TakePnl`.
+
+The program derives per-level prices by walking out from the current curve price in constant-ratio steps:
+
+```
+price_level(k) = curve_price × (1.0001 ^ k)       # conceptually
+size_level(k)  = amount_wave × f(depth, k)        # tapered by depth
+```
+
+The exact prices and sizes are determined by `target_orders` computed in `build_orders` and compared with `amm_open_orders` each `MonitorStep`. Any divergence results in cancellations + new posts. Freshly filled orders on OpenBook settle into the pool vaults on the next operation that refreshes the OpenBook side.
+
+Integrators rarely need to compute the grid — the Raydium keeper maintains it — but it is useful to know that:
+
+- A pool with significant **on-book** liquidity has that liquidity contributing to `k`, not sitting idle.
+- A stale OpenBook market (event queue full, cranks blocked) prevents grid updates; the AMM can then quote prices that diverge from the visible order book until the next crank.
+
+## Settlement step (PnL)
+
+The 0.03% protocol share accrues into `state_data.need_take_pnl_coin` and `state_data.need_take_pnl_pc`. `TakePnl` moves these amounts out of the vaults to the admin-specified destination, then zeroes the counters.
+
+Crucial property: reserves in the invariant are always computed **minus** accrued PnL, so `TakePnl` does not move the curve. This matches the CPMM convention.
+
+## Worked example
+
+Pool state:
+
+- `coin_reserve = 1_000_000_000_000` (1,000,000 coin-side; 6 decimals)
+- `pc_reserve   = 2_000_000_000_000` (2,000,000 pc-side; 6 decimals)
+- Fees: default `swap = 25/10_000`, `pnl = 3/10_000`.
+
+User: `SwapBaseIn` exact-input `1_000_000_000` coin (1,000 coin).
+
+```
+swap_fee        = ceil(1_000_000_000 * 25 / 10_000)    = 2_500_000
+amount_after_fee =                                      997_500_000
+
+amount_out = amount_after_fee * pc_reserve
+           / (coin_reserve + amount_after_fee)
+           = 997_500_000 * 2_000_000_000_000
+           / (1_000_000_000_000 + 997_500_000)
+           ≈ 1_995_015_009  (1,995.015 pc)
+
+// Of the 2_500_000 swap fee:
+pnl_share = 2_500_000 * 3 / 25  = 300_000    (goes to protocol via need_take_pnl_coin)
+lp_share  = 2_500_000 * 22 / 25 = 2_200_000  (stays in coin_reserve)
+
+new coin_reserve = 1_000_000_000_000 + 1_000_000_000                 = 1_001_000_000_000
+                   (of which 300_000 is accrued PnL)
+  curve coin_reserve = 1_001_000_000_000 − 300_000 = 1_000_999_700_000
+new pc_reserve   = 2_000_000_000_000 − 1_995_015_009                 ≈ 1_998_004_984_991
+
+k' = curve_coin_reserve * new_pc_reserve
+   ≈ 2.000_002_701E24
+k  = 1_000_000_000_000 * 2_000_000_000_000
+   = 2.0E24
+k' > k   ✓
+```
+
+The LP share (`2_200_000`) is not broken out anywhere — it is simply the residual that raises `k'`.
+
+## Precision rules
+
+- Reserve multiplications use `u128`; final divisions round toward zero.
+- `swap_fee` rounds up (so the pool does not undercharge).
+- `amount_in` for `SwapBaseOut` rounds up (so the user does not underpay).
+- Pools with extreme reserve ratios can hit `ZeroTradingTokens` on very small inputs; same convention as CPMM.
+
+## Limitations vs CPMM
+
+- AMM v4's reserves include the OpenBook-escrowed portion, so an integrator cannot quote correctly from `getTokenAccountBalance` alone. Always fetch the full state (vaults + `open_orders.free` + `open_orders.locked`), or use the SDK / API quote.
+- AMM v4 does not expose a structured on-chain TWAP. External consumers that want an AMM-v4-backed price must compute it themselves from trade logs.
+- Token-2022 is not supported.
+
+## Where to go next
+
+- [`products/amm-v4/instructions`](/products/amm-v4/instructions) — where `SwapBaseIn`, `Deposit`, etc. plug in.
+- [`products/amm-v4/fees`](/products/amm-v4/fees) — full fee mechanics, `TakePnl` details.
+- [`algorithms/constant-product`](/algorithms/constant-product) — the shared derivation.
+
+Sources:
+
+- [Raydium AMM program source — `raydium-io/raydium-amm`](https://github.com/raydium-io/raydium-amm)
+- Raydium SDK v2 `Liquidity` module

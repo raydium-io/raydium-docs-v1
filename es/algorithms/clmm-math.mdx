@@ -1,0 +1,252 @@
+---
+title: "Matemática de liquidez concentrada"
+description: "Representación de precio-raíz, fórmulas de liquidez-a-cantidad, pasos de swap de un tick y multi-tick, contabilidad del crecimiento de comisiones — la matemática detrás de Raydium CLMM."
+---
+
+<Info>
+  **Esta página fue traducida automáticamente por IA. La versión en inglés es la fuente autorizada.**
+
+  [Ver versión en inglés →](/algorithms/clmm-math)
+</Info>
+
+## Por qué precio-raíz, no precio
+
+Los CLMMs de la familia Uniswap-v3 representan el precio como su raíz cuadrada, almacenada en punto fijo `Q64.64`:
+
+```
+sqrt_price_x64 = floor(sqrt(price) · 2^64)
+```
+
+Tres razones:
+
+1. **Matemática de liquidez lineal.** La cantidad de token0 o token1 en un rango de precio resulta ser una función lineal de `sqrt_price`, no de `price`. Almacenar `sqrt_price` permite que el paso de swap evalúe esas fórmulas lineales sin calcular una raíz cuadrada.
+2. **Control de desbordamiento.** `sqrt_price · L` cabe en `u256` para todos los parámetros razonables; `price · L` puede desbordar mucho antes.
+3. **Matemática de ticks uniforme.** Como los ticks se definen como `1.0001^i`, `sqrt(price) = 1.00005^i` también es una potencia exacta de la escala 1.00005. Cada cruce de tick se traduce en una pequeña multiplicación en el espacio `sqrt_price_x64`.
+
+El precio y el precio-raíz tienen una relación uno a uno; la conversión es `price = (sqrt_price_x64 / 2^64)^2`.
+
+## Malla de ticks
+
+Los precios se discretizan en una cuadrícula:
+
+```
+price(tick_i) = 1.0001^i
+```
+
+`tick_i` es un `i32`. El rango activo es `[MIN_TICK, MAX_TICK] = [−443636, 443636]`, lo que proporciona un rango de precio aproximadamente `[2^−128, 2^128]`. El `tick_spacing` de cada pool se establece según su nivel de comisión: espaciados más pequeños para pares ajustados (por ejemplo, el nivel de stablecoin 0.01% usa espaciado 1), espaciados más grandes para pares volátiles (el nivel 0.25% usa 60, el nivel 1% usa 120).
+
+Las posiciones deben tener `tick_lower` y `tick_upper` alineados a `tick_spacing`. Los ticks activos de un pool (aquellos con liquidez que comienzan o terminan allí) son los únicos ticks que el paso de swap considera.
+
+## Liquidez-a-cantidad
+
+Para una posición con liquidez `L` y rango de precio `[sqrt_lo, sqrt_hi]` (todos valores `sqrt_price`):
+
+| Estado del pool | Cantidad de token0 | Cantidad de token1 |
+|------------|-------------------|-------------------|
+| Precio por encima del rango (`sqrt_p ≥ sqrt_hi`) | 0 | `L · (sqrt_hi − sqrt_lo)` |
+| Precio dentro del rango | `L · (sqrt_hi − sqrt_p) / (sqrt_p · sqrt_hi)` | `L · (sqrt_p − sqrt_lo)` |
+| Precio por debajo del rango (`sqrt_p ≤ sqrt_lo`) | `L · (sqrt_hi − sqrt_lo) / (sqrt_lo · sqrt_hi)` | 0 |
+
+Derivación: diferencia el invariante CPMM localmente. Dentro de cualquier rango de tick único, la posición se comporta como un CPMM con reservas virtuales `(x_v, y_v)` elegidas de modo que el `(sqrt_p, L)` actual del pool sea consistente con `L = sqrt(x_v · y_v)`. Integrando desde `sqrt_p` hasta el límite del rango se obtienen las cantidades anteriores.
+
+**Fórmulas inversas** (usadas al crear una posición para una `amount0` o `amount1` dada):
+
+```
+L_from_amount0(amount0, sqrt_lo, sqrt_hi, sqrt_p) =
+    amount0 · sqrt_p · sqrt_hi / (sqrt_hi − sqrt_p)
+
+L_from_amount1(amount1, sqrt_lo, sqrt_hi, sqrt_p) =
+    amount1 / (sqrt_p − sqrt_lo)
+
+// Para un depósito simétrico en una posición dentro del rango, tomar el mínimo.
+L = min(L_from_amount0, L_from_amount1)
+```
+
+## Paso de swap de un solo tick
+
+Dentro de un rango de tick único el pool se comporta como un CPMM. Dado el `sqrt_p` actual y el `sqrt_target`:
+
+```
+Δamount0_step = L · (sqrt_target − sqrt_p) / (sqrt_p · sqrt_target)     // si se intercambia por token0
+Δamount1_step = L · (sqrt_target − sqrt_p)                              // si se intercambia por token1
+```
+
+### Paso de entrada exacta
+
+Dado `Δin_remaining`:
+
+```
+// Candidato a nuevo sqrt_p si llenáramos hasta el límite del tick:
+sqrt_after_full = sqrt_target
+amount_to_full  = Δamount_in_to_reach(sqrt_p → sqrt_target)
+
+if Δin_remaining ≥ amount_to_full:
+    // consumir el resto del cubo
+    sqrt_p'         = sqrt_target
+    Δin_consumed    = amount_to_full
+    Δout            = amount_out_at_boundary
+else:
+    // no cruzamos; resolver para el sqrt_p terminal
+    sqrt_p'         = L · sqrt_p / (L + Δin_remaining · sqrt_p)      // para swaps 0→1
+    Δin_consumed    = Δin_remaining
+    Δout            = L · (sqrt_p − sqrt_p')                          // proporcional a Δsqrt
+```
+
+El swap `0→1` reduce `sqrt_p` (el precio baja a medida que vendemos token0). Un swap `1→0` lo aumenta. Las fórmulas son simétricas con `sqrt_p` y `sqrt_target` intercambiados.
+
+### Paso de salida exacta
+
+Misma estructura, resolviendo para `Δin` en su lugar.
+
+## Bucle de swap multi-tick
+
+Un swap itera sobre ticks hasta que la entrada se agota o se alcanza el límite de precio:
+
+```
+while Δin_remaining > 0 and sqrt_p != sqrt_price_limit:
+    next_tick = find_next_initialized_tick(pool.tick_current, direction)
+    sqrt_target = min(next_tick.sqrt_price, sqrt_price_limit)       // direccionalmente
+
+    (Δin, Δout, sqrt_p') = single_step(sqrt_p, sqrt_target, L, Δin_remaining)
+
+    Δin_remaining -= Δin
+    accumulated_out += Δout
+
+    if sqrt_p' == next_tick.sqrt_price:
+        // cruzar el tick
+        L += next_tick.liquidity_net * direction_sign
+        flip_fee_growth_outside(next_tick)
+        match_limit_orders_at_tick(next_tick, ...)        // ver products/clmm/math
+        pool.tick_current = next_tick.tick_index
+    sqrt_p = sqrt_p'
+```
+
+Cada `single_step` utiliza la `L` actual del pool. `L` cambia **solo** al cruzar un tick inicializado. La liquidez entre ticks es constante, que es lo que hace que la matemática del paso sea de forma cerrada.
+
+`liquidity_net` en un tick es la suma con signo de las liquideces de posición que comienzan en ese tick menos las que terminan allí. Cruzar hacia arriba suma `liquidity_net`; cruzar hacia abajo lo resta.
+
+Cuando el pool tiene órdenes de límite abiertas en un tick, el paso de cruce de tick también consume oportunamente parte de la entrada del swap para llenar esas órdenes (FIFO entre cohortes). El algoritmo de coincidencia y el recargo de comisión dinámica que puede aplicarse además del paso base se documentan en [`products/clmm/math`](/es/products/clmm/math); no cambian las fórmulas de forma cerrada de un solo paso anteriores.
+
+## Acumuladores de crecimiento de comisiones
+
+CLMM rastrea comisiones por unidad de liquidez activa, por lado, globalmente y por tick:
+
+```
+fee_growth_global_0_x64     // Q64.64, monótono
+fee_growth_global_1_x64
+tick.fee_growth_outside_0_x64   // "comisiones acumuladas mientras este tick estaba fuera del rango activo"
+tick.fee_growth_outside_1_x64
+```
+
+En cada `single_step`:
+
+```
+step_lp_fee = (Δin · fee_rate) · (1 − protocol_fraction − fund_fraction)
+fee_growth_global += step_lp_fee · 2^64 / L     // solo para el lado de entrada
+```
+
+(El `fee_growth_global` del otro lado no se mueve en este paso, ya que ningún token en ese lado se pagó como entrada.)
+
+Al cruzar un tick, el programa **invierte** `fee_growth_outside`:
+
+```
+tick.fee_growth_outside_0_x64 = fee_growth_global_0_x64 − tick.fee_growth_outside_0_x64
+tick.fee_growth_outside_1_x64 = fee_growth_global_1_x64 − tick.fee_growth_outside_1_x64
+```
+
+"Fuera" es relativo a `tick_current`. Cuando `tick_current` está por encima del tick, fuera significa "debajo". Cuando `tick_current` está por debajo, fuera significa "arriba". La inversión cambia la interpretación.
+
+### `fee_growth_inside` para una posición
+
+Dada una posición `[tick_lower, tick_upper]` y el `tick_current` actual:
+
+```
+if tick_current >= tick_upper:
+    inside = tick_lower.fee_growth_outside − tick_upper.fee_growth_outside
+else if tick_current < tick_lower:
+    inside = tick_upper.fee_growth_outside − tick_lower.fee_growth_outside
+else:     // la posición está dentro del rango
+    inside = fee_growth_global
+           − tick_lower.fee_growth_outside
+           − tick_upper.fee_growth_outside
+```
+
+Las comisiones no cobradas de una posición para el lado de token `s` son:
+
+```
+tokens_owed_s += L · (fee_growth_inside_s − fee_growth_inside_last_s) / 2^64
+fee_growth_inside_last_s = fee_growth_inside_s
+```
+
+Esta actualización se ejecuta en cada interacción con la posición (`IncreaseLiquidity`, `DecreaseLiquidity`, `CollectFees`).
+
+## Ejemplo trabajado — cruzar un tick
+
+Pool (simplificado):
+
+- `sqrt_p_x64 = 2^64 · 1.0 = 2^64` (precio = 1.0)
+- `L = 1_000_000`
+- `tick_current = 0`
+- Siguiente tick inicializado abajo: `tick = −60`, `sqrt_price = 1.0001^(−30) ≈ 0.99700`, `liquidity_net = −400_000` (este tick termina una posición, por lo que un cruce hacia abajo elimina 400k)
+- Tasa de comisión: 0.25%
+
+Swap: `Δin = 10_000` token0, dirección = 0→1.
+
+**Paso 1 — hasta `sqrt_target = 0.99700 · 2^64`**:
+
+```
+amount_in_to_target = L · (1/sqrt_target − 1/sqrt_p)
+                    = 1_000_000 · (1/0.99700 − 1/1.0)
+                    ≈ 1_000_000 · 0.003009
+                    ≈ 3_009
+```
+
+3,009 &lt; 10,000, así que llenamos este paso completamente:
+
+```
+Δin_step  = 3_009 / (1 − 0.0025)  = 3_017    // bruto de comisión
+Δout_step = L · (sqrt_p − sqrt_target) ≈ 1_000_000 · 0.00299 ≈ 2_990
+sqrt_p    = 0.99700 · 2^64
+tick_current = −60
+L         = 1_000_000 + (−400_000)  = 600_000         // cruzó el tick
+fee_growth_outside en tick −60 se invierte
+Δin_remaining = 10_000 − 3_017 = 6_983
+```
+
+**Paso 2 — con nuevo `L = 600_000`**:
+
+El siguiente tick inicializado (digamos `tick = −120`) está en `sqrt = 0.99402`. Recomputa `amount_in_to_target`:
+
+```
+amount_in_to_target = 600_000 · (1/0.99402 − 1/0.99700)
+                    ≈ 600_000 · 0.003010
+                    ≈ 1_806
+```
+
+Todavía menos que `Δin_remaining`. Cruza de nuevo. Continúa hasta que `Δin_remaining` llegue a cero.
+
+La secuencia completa de `Δout` se acumula en la salida de swap final.
+
+## Inicialización y guardas contra desbordamiento
+
+- `MIN_SQRT_PRICE_X64` y `MAX_SQRT_PRICE_X64` corresponden a `tick = ±443636`. Cualquier swap que empuje `sqrt_p` fuera de este rango revierte.
+- El parámetro `sqrt_price_limit` del usuario debe estar en el mismo intervalo; el programa lo verifica.
+- Los productos de `L · Δsqrt` se calculan en `u256` y luego se desplazan de nuevo a `u128` para evitar desbordamiento.
+
+## Diferencias vs Uniswap v3
+
+- **Oráculo.** El `ObservationState` de Raydium almacena un búfer de anillo `(block_timestamp, tick_cumulative, seconds_per_liquidity_cumulative)`; formato de transferencia ligeramente diferente de Uniswap pero la misma matemática TWAP.
+- **Token-2022.** Raydium CLMM soporta acuñaciones de Token-2022; la variante de comisión de transferencia requiere ajustes adicionales de cantidad pre/post-swap. Ver [`algorithms/token-2022-transfer-fees`](/es/algorithms/token-2022-transfer-fees).
+- **Mapa de bits de tick.** Raydium empaqueta el mapa de bits de tick inicializado en `[u64; 16]` por pool para `find_next_initialized_tick` rápido; Uniswap usa una asignación por palabra en cadena. La compensación es alquiler vs costo de búsqueda.
+- **Espacios de recompensas.** Raydium soporta 3 flujos de recompensas por pool con contadores `reward_growth_global_x64` separados; la misma estructura que el acumulador de crecimiento de comisiones.
+
+## Enlaces
+
+- [`products/clmm/math`](/es/products/clmm/math) — la implementación en cadena y ejemplo trabajado con campos de struct CLMM reales.
+- [`products/clmm/ticks-and-positions`](/es/products/clmm/ticks-and-positions) — malla de ticks, semántica `liquidity_net`/`gross` y rango activo.
+- [`products/clmm/fees`](/es/products/clmm/fees) — el acumulador de crecimiento de comisiones en acción.
+
+Fuentes:
+
+- Documento técnico de Uniswap v3 (derivación canónica de matemática de precio-raíz).
+- Código fuente del programa Raydium CLMM.

@@ -1,0 +1,241 @@
+---
+title: "Déblocage progressif dans LaunchLab"
+description: "Jetons bloqués, période d'indisponibilité (cliff) et calendrier de déblocage linéaire, compte VestingRecord par bénéficiaire, et les instructions create / claim que les créateurs et les plateformes utilisent pour distribuer la réserve après la graduation."
+---
+
+<Info>
+  **Cette page est traduite automatiquement par IA. La version anglaise fait foi.**
+
+  [Voir la version anglaise →](/products/launchlab/vesting)
+</Info>
+
+<Info>
+  Le déblocage progressif est **optionnel** dans un lancement LaunchLab. Définissez `vesting_param.total_locked_amount = 0` lors de l'`Initialize` et la section ci-dessous ne s'applique pas. Une fois activé, le calendrier est figé pour la durée de vie du lancement ; la période d'indisponibilité et le calendrier de déblocage ne peuvent pas être modifiés rétroactivement.
+</Info>
+
+## Pourquoi le déblocage progressif
+
+La courbe de liaison vend `base_supply_graduation` jetons pendant la levée de fonds et amorce le pool post-graduation avec le reste. Le déblocage progressif prélève une tranche supplémentaire de la réserve, la bloque pour une période d'indisponibilité configurable, puis la libère linéairement à un ou plusieurs bénéficiaires — généralement l'équipe du créateur, les conseillers ou les partenaires de la plateforme.
+
+Cas d'usage courants :
+
+- **Allocation d'équipe.** Un créateur réserve, par exemple, 5 % de la réserve pour l'équipe fondatrice, bloquée pendant 6 mois et débloquée linéairement sur les 12 mois suivants.
+- **Allocation de plateforme.** Une plateforme de lancement reçoit une tranche de chaque jeton qu'elle liste, selon le même calendrier, via `CreatePlatformVestingAccount`.
+- **Allocations aux conseillers / contributeurs.** Plusieurs bénéficiaires avec leurs propres comptes `VestingRecord`, chacun suivant indépendamment son montant réclamé.
+
+Les jetons bloqués n'entrent jamais dans la courbe et ne font pas partie du pool LP de graduation. Ils restent dormants dans le `base_vault` du pool jusqu'à ce que chaque bénéficiaire appelle `ClaimVestedToken`.
+
+## Forme du calendrier
+
+Le déblocage progressif d'un lancement est décrit par trois nombres, enregistrés une seule fois au moment de l'`Initialize` :
+
+| Champ | Type | Signification |
+|-------|------|---------------|
+| `total_locked_amount` | `u64` | Somme de tous les jetons de base bloqués pour tous les bénéficiaires (créateur + plateforme). Doit satisfaire `total_locked_amount <= supply * max_lock_rate / 1_000_000` de la `GlobalConfig` contraignante. |
+| `cliff_period` | `u64` (secondes) | Temps d'attente après la fin de la levée de fonds avant que les jetons ne se débloquent. |
+| `unlock_period` | `u64` (secondes) | Durée de la fenêtre de déblocage linéaire après la période d'indisponibilité. `0` signifie que tout se débloque instantanément à la fin de la période d'indisponibilité. |
+
+Ces trois valeurs vivent sur `PoolState.vesting_schedule` (une structure `VestingSchedule`) plus le `start_time` en chaîne, que le programme enregistre comme `block_time + cliff_period` au moment où la levée de fonds se termine avec succès (lorsque les conditions de graduation sont d'abord respectées).
+
+```rust
+// states/pool.rs
+pub struct VestingSchedule {
+    pub total_locked_amount:     u64,
+    pub cliff_period:            u64,
+    pub unlock_period:           u64,
+    pub start_time:              u64,   // set by the program at fundraising end
+    pub allocated_share_amount:  u64,   // running sum of allocations to vesting records
+}
+```
+
+`allocated_share_amount` est le montant total déjà attribué aux comptes `VestingRecord` via `CreateVestingAccount` / `CreatePlatformVestingAccount`. Il ne doit jamais dépasser `total_locked_amount`. Si un créateur suralloue, l'appel `CreateVestingAccount` suivant revient avec `InvalidTotalLockedAmount`.
+
+## Formule de déblocage linéaire
+
+Après la fin de la levée de fonds, le programme calcule le montant cumulatif débloqué pour chaque `VestingRecord` comme suit :
+
+```
+elapsed         = min(now, start_time + unlock_period) − start_time
+unlocked_amount = token_share_amount × elapsed / unlock_period
+```
+
+Si `unlock_period == 0`, l'intégralité de `token_share_amount` devient réclamable en une seule étape à `start_time`. Sinon, la courbe est une ligne droite allant de 0 à `start_time` à `token_share_amount` à `start_time + unlock_period`, plafonnée à `token_share_amount` par la suite.
+
+Le montant transféré à chaque appel `ClaimVestedToken` est le delta entre le montant cumulatif débloqué fraîchement recalculé et le champ `claimed_amount` en cours sur le dossier.
+
+```
+delta_amount    = unlocked_amount − vesting_record.claimed_amount
+vesting_record.claimed_amount = unlocked_amount
+```
+
+Une réclamation avant `start_time` revient avec `VestingNotStarted`. Une réclamation après `start_time + unlock_period` règle le reste complet.
+
+## Dispositions des comptes
+
+### `VestingSchedule`
+
+Vit en ligne sur `PoolState`. Voir [`accounts`](/fr/products/launchlab/accounts).
+
+### `VestingRecord`
+
+Dossier par bénéficiaire. PDA dérivé comme :
+
+```
+seeds = [
+  b"pool_vesting",
+  pool_state.key(),
+  beneficiary.key(),
+]
+program = LaunchLab program
+```
+
+```rust
+// states/vesting.rs
+#[account]
+pub struct VestingRecord {
+    pub epoch:               u64,         // recent_epoch tracker
+    pub pool:                Pubkey,      // back-pointer to PoolState
+    pub beneficiary:         Pubkey,      // who can call ClaimVestedToken
+    pub claimed_amount:      u64,         // cumulative claimed
+    pub token_share_amount:  u64,         // total allocated to this beneficiary
+    pub padding:             [u64; 8],
+}
+```
+
+Un bénéficiaire ne peut avoir **qu'un seul** `VestingRecord` par lancement. Réaffecter au même bénéficiaire sur le même lancement revient parce que le PDA existe déjà.
+
+## Instructions
+
+### `CreateVestingAccount`
+
+Réservé au créateur. Alloue une tranche du `total_locked_amount` du pool à un nouveau bénéficiaire en initialisant un nouveau PDA `VestingRecord`.
+
+**Arguments**
+
+```
+share_amount: u64    // tokens to assign to this beneficiary
+```
+
+**Comptes**
+
+| # | Nom | W | S | Notes |
+|---|-----|---|---|-------|
+| 1 | `creator` | W | S | Doit égaler `pool_state.creator` ; paie le loyer pour le nouveau compte. |
+| 2 | `beneficiary` | W |   | Reçoit les jetons débloqués plus tard. La clé publique est verrouillée ici — elle ne peut pas être modifiée. |
+| 3 | `pool_state` | W |   | Muté pour incrémenter `vesting_schedule.allocated_share_amount`. |
+| 4 | `vesting_record` | W |   | `init` ; PDA `[b"pool_vesting", pool_state, beneficiary]`. |
+| 5 | `system_program` |   |   | Nécessaire pour la création de compte. |
+
+**Conditions préalables**
+
+- `share_amount > 0`.
+- `pool_state.vesting_schedule.allocated_share_amount + share_amount <= total_locked_amount`.
+- La clé publique du `beneficiary` n'a pas de `VestingRecord` existant pour ce pool.
+
+**Conditions ultérieures**
+
+- `vesting_record` initialisé avec `token_share_amount = share_amount`, `claimed_amount = 0`.
+- `pool_state.vesting_schedule.allocated_share_amount += share_amount`.
+
+**Erreurs courantes** — `InvalidTotalLockedAmount`, `InvalidInput`.
+
+### `CreatePlatformVestingAccount`
+
+Variante de plateforme-administrateur de `CreateVestingAccount`. Le portefeuille de déblocage progressif de la plateforme (stocké sur `PlatformConfig.platform_vesting_wallet`) est le bénéficiaire, et la part est limitée par `PlatformConfig.platform_vesting_scale`.
+
+Le signataire doit égaler `platform_config.platform_vesting_wallet`. Les autres comptes reflètent `CreateVestingAccount`. Utilisez ceci quand une plateforme s'engage à recevoir une part de déblocage progressif fixe à chaque lancement qu'elle liste.
+
+### `ClaimVestedToken`
+
+Réservé au bénéficiaire. Transfère les jetons fraîchement débloqués du `base_vault` du pool vers le compte ATA du bénéficiaire.
+
+**Arguments**
+
+Aucun (le programme calcule le montant de la réclamation à partir du calendrier).
+
+**Comptes**
+
+| # | Nom | W | S | Notes |
+|---|-----|---|---|-------|
+| 1 | `beneficiary` | W | S | Doit égaler `vesting_record.beneficiary`. |
+| 2 | `authority` |   |   | PDA `[b"vault_auth_seed"]` ; signe le transfert du coffre-fort. |
+| 3 | `pool_state` | W |   | Muté uniquement si le calendrier doit être revalidé. |
+| 4 | `vesting_record` | W |   | `claimed_amount` est mis à jour. |
+| 5 | `base_vault` | W |   | Coffre-fort de jetons de base du pool ; débité. |
+| 6 | `beneficiary_ata` | W |   | Reçoit les jetons débloqués ; `init_if_needed`. |
+| 7 | `base_mint` |   |   | Mint de jeton de base du pool. |
+| 8 | `token_program` |   |   | Programme SPL Token ou Token-2022. |
+| 9 | `associated_token_program` |   |   | Pour la création d'ATA si nécessaire. |
+| 10 | `system_program` |   |   | Nécessaire pour la création de compte. |
+
+**Conditions préalables**
+
+- `block_time >= pool_state.vesting_schedule.start_time` (sinon `VestingNotStarted`).
+- `pool_state.status == PoolStatus::Migrated` — la graduation doit avoir déjà eu lieu. L'appel avant la graduation revient.
+- Le delta du montant débloqué est supérieur à zéro. Un appel sans opération (delta calculé est 0) revient.
+
+**Conditions ultérieures**
+
+- `vesting_record.claimed_amount` avance vers le nouveau montant cumulatif débloqué.
+- `delta_amount` de jeton de base est transféré vers `beneficiary_ata`.
+
+**Erreurs courantes** — `VestingNotStarted`, `NoAssetsToCollect`, `MathOverflow`.
+
+## Exemple détaillé
+
+Un lancement définit :
+
+- `supply = 1_000_000_000`
+- `total_locked_amount = 100_000_000` (10 % de la réserve)
+- `cliff_period = 180 * 86400` (180 jours)
+- `unlock_period = 365 * 86400` (1 an linéaire après la période d'indisponibilité)
+
+Le créateur alloue deux comptes `VestingRecord` immédiatement après `Initialize` :
+
+- Bénéficiaire A (équipe) : `share_amount = 70_000_000`
+- Bénéficiaire B (conseiller) : `share_amount = 30_000_000`
+
+`allocated_share_amount = 100_000_000`, égal à `total_locked_amount` — aucune allocation supplémentaire possible.
+
+La levée de fonds se termine le `2027-01-01T00:00Z`. Le programme définit `start_time = 2027-01-01 + 180 jours = 2027-06-30`.
+
+Le `2027-09-30` (90 jours après `start_time`), le bénéficiaire A appelle `ClaimVestedToken` :
+
+```
+elapsed         = min(now, start_time + 365·86400) − start_time
+                = 90 · 86400
+unlocked_amount = 70_000_000 × (90 / 365) ≈ 17_260_274
+delta_amount    = 17_260_274 − 0 = 17_260_274
+```
+
+Le portefeuille d'A reçoit 17,26M jetons de base. `vesting_record.claimed_amount` avance à 17_260_274.
+
+Six mois plus tard (`2028-03-31`, 270 jours après `start_time`), A réclame à nouveau :
+
+```
+unlocked_amount = 70_000_000 × (270 / 365) ≈ 51_780_822
+delta_amount    = 51_780_822 − 17_260_274 = 34_520_548
+```
+
+A reçoit 34,52M jetons supplémentaires. Après `2028-06-30` (la fin de `unlock_period`), la prochaine réclamation transfère les ~18,22M restants et laisse `claimed_amount == token_share_amount`.
+
+## Cas limites
+
+- **Bénéficiaire perd sa clé.** La clé publique sur `VestingRecord.beneficiary` est le seul signataire pouvant appeler `ClaimVestedToken`. Il n'y a pas de chemin de récupération. Définissez le bénéficiaire sur un multisig si la récupération est importante.
+- **Frais de transfert Token-2022.** Si le mint de base est un mint Token-2022 avec une extension de frais de transfert, le bénéficiaire reçoit `delta_amount − transfer_fee`, pas le delta complet. Le coffre-fort du pool enregistre toujours le montant brut comme transféré — la différence s'accumule sur le compte de frais retenus du mint.
+- **Pool non gradué.** L'appel de `ClaimVestedToken` avant la graduation revient. L'horloge de déblocage progressif commence uniquement lorsque la levée de fonds se termine réellement ; un lancement avorté (qui ne définit jamais `start_time`) laisse les jetons bloqués inaccessibles dans le coffre-fort.
+- **Tentatives de surallocation.** Le programme applique `allocated_share_amount <= total_locked_amount` à chaque `CreateVestingAccount`. Le reste (s'il y en a) de `total_locked_amount` laissé non alloué est **perdu** — ces jetons restent dans le coffre-fort pour toujours une fois que le lancement se termine. Allouez le montant complet sauf si c'est l'intention.
+
+## Références
+
+- [`products/launchlab/accounts`](/fr/products/launchlab/accounts) — disposition complète de `PoolState` incluant `VestingSchedule`.
+- [`products/launchlab/instructions`](/fr/products/launchlab/instructions) — cycle de vie de la graduation.
+- [`products/launchlab/platform-config`](/fr/products/launchlab/platform-config) — sémantique de `platform_vesting_scale` pour les allocations de plateforme.
+- [`products/launchlab/global-config`](/fr/products/launchlab/global-config) — plafond de `max_lock_rate` qui limite `total_locked_amount`.
+
+Sources :
+
+- `raydium-launch/programs/launchpad/src/states/vesting.rs` — `VestingRecord`.
+- `raydium-launch/programs/launchpad/src/states/pool.rs` — `VestingSchedule`, `VestingParams`, `is_vesting_started`, `vesting_end_time`.
+- `raydium-launch/programs/launchpad/src/instructions/create_vesting_account.rs`.
+- `raydium-launch/programs/launchpad/src/instructions/claim_vested_token.rs`.

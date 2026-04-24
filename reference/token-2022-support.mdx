@@ -1,0 +1,251 @@
+---
+title: "Token-2022 support matrix"
+description: "Which Raydium programs support Token-2022, the explicit extension allow-list each program enforces at pool creation, and the bypass paths (static mint whitelist, per-mint registry, Superstate detection) that admit otherwise-rejected mints."
+---
+
+<Info>
+  Raydium does **not** accept arbitrary Token-2022 mints. CPMM and CLMM both run a strict **allow-list mode**: only a small set of extensions pass by default; everything else is rejected at pool creation. A handful of trusted mints are admitted by hardcoded address; CLMM additionally supports an admin-managed per-mint registry and a runtime Superstate-token detection. This page is the single-page reference for what's enforced and where, with file-and-line citations into the program source.
+</Info>
+
+## Program-level support
+
+| Program | Token-2022 base/quote mints? | Mode |
+|---|---|---|
+| **CPMM** | Yes — gated | Strict extension allow-list + 4-mint static whitelist. |
+| **CLMM** | Yes — gated | Strict extension allow-list + 6-mint static whitelist + admin per-mint registry + Superstate detection. |
+| **AMM v4** | No | Program predates Token-2022; both mints must be classic SPL Token. |
+| **Stable AMM** | No | Same constraints as AMM v4. |
+| **Farm v6** | Yes, partial | Reward mint can be Token-2022 (subject to the same allow-list when a farm wraps a CPMM/CLMM LP); user-stake LP mints inherit from the wrapped pool. |
+| **LaunchLab** | Yes, program-managed | Base mint can be Token-2022, but only via the dedicated `initialize_with_token_2022` instruction; the program itself creates the mint with `MetadataPointer` (always) and optionally `TransferFeeConfig` (rate ≤ 5%). Pre-existing Token-2022 mints with arbitrary extensions cannot be used as the base. |
+| **Burn & Earn** | Mirrors pool program | Inherits CPMM / CLMM gating. |
+
+The allow-list checks live in:
+
+- **CPMM**: `is_supported_mint` in [`raydium-cp-swap/programs/cp-swap/src/utils/token.rs:178`](https://github.com/raydium-io/raydium-cp-swap), called from `Initialize`.
+- **CLMM**: `is_supported_mint` in [`raydium-clmm/programs/amm/src/util/token.rs:280`](https://github.com/raydium-io/raydium-clmm), called from `CreatePool`.
+- **LaunchLab**: `initialize_with_token_2022` in `raydium-launchpad/programs/launchpad/src/instructions/initialize_with_token_2022.rs` (source not publicly available).
+
+There is **no** swap-time mint check on CPMM or CLMM — the gate fires only at pool creation. Once a pool exists, swaps just trust that the mints didn't change, which is correct for the immutable parts of Token-2022 mint state.
+
+## CPMM and CLMM extension allow-list
+
+After the static-whitelist short-circuits (covered below), the program iterates the mint's extensions and rejects the mint if it carries **any** extension other than these five:
+
+| Extension | Reason it's allowed |
+|---|---|
+| `TransferFeeConfig` | Pool math subtracts the inbound fee; the Token-2022 program handles the outbound fee. See [`algorithms/token-2022-transfer-fees`](/algorithms/token-2022-transfer-fees). |
+| `MetadataPointer` | Decorative — points at on-chain metadata. |
+| `TokenMetadata` | Decorative — inline metadata. |
+| `InterestBearingConfig` | Pool sees the principal amount; UI multiplier is decorator-only and the underlying balance is preserved. |
+| `ScaledUiAmount` | Same shape as interest-bearing — scale factor applies to UI display only. |
+
+Anything not in this list — `TransferHook`, `NonTransferable`, `ConfidentialTransferMint`, `PermanentDelegate`, `MintCloseAuthority`, `DefaultAccountState`, `GroupPointer`, `GroupMemberPointer`, `MemberPointer`, `Pausable`, etc. — causes `is_supported_mint` to return `false` and pool creation to revert.
+
+The relevant lines (CPMM, identical shape in CLMM):
+
+```rust
+for e in extensions {
+    if e != ExtensionType::TransferFeeConfig
+        && e != ExtensionType::MetadataPointer
+        && e != ExtensionType::TokenMetadata
+        && e != ExtensionType::InterestBearingConfig
+        && e != ExtensionType::ScaledUiAmount
+    {
+        return Ok(false);
+    }
+}
+Ok(true)
+```
+
+— [`cp-swap/src/utils/token.rs:190–200`](https://github.com/raydium-io/raydium-cp-swap)
+
+## Bypass paths
+
+A Token-2022 mint that doesn't fit the allow-list can still be admitted through one of three explicit bypasses. They're attempted in order, before the extension iteration runs.
+
+### 1. Static mint whitelist
+
+A constant `MINT_WHITELIST` array of base58 strings is hardcoded in each program. If the mint's address matches, the function returns `true` immediately and no extension check is performed.
+
+| Program | Whitelisted mints |
+|---|---|
+| CPMM | `HVbpJAQGNpkgBaYBZQBR1t7yFdvaYVp2vCQQfKKEN4tM`, `Crn4x1Y2HUKko7ox2EZMT6N2t2ZyH7eKtwkBGVnhEq1g`, `FrBfWJ4qE5sCzKm3k3JaAtqZcXUh4LvJygDeketsrsH4`, `2b1kV6DkPAnxd5ixfnxCpjxmKwqjjaYmCZfHsFu24GXo` |
+| CLMM | The same four, plus `DAUcJBg4jSpVoEzASxYzdqHMUN8vuTpQyG2TvDcCHfZg`, `AUSD1jCcCyPLybk1YnvPWsHQSrZ46dxwoMniN4N2UEB9` |
+
+These addresses are baked into the program; updating the list requires a program upgrade through the 3/4 upgrade multisig.
+
+### 2. Per-mint registry — CLMM only
+
+CLMM additionally consults a `SupportMintAssociated` PDA at seed `[b"support_mint", mint]`. If that PDA exists for the mint, it's admitted regardless of its extension set.
+
+The PDA is created by `CreateSupportMintAssociated` ([`admin/create_support_mint_associated.rs`](https://github.com/raydium-io/raydium-clmm)). The instruction is gated to two signers:
+
+- `crate::admin::ID` — the standard Raydium admin authority.
+- `crate::create_support_mint_associated_owner::ID` — a dedicated authority for this purpose: `RayVyjyJQz9vAi126A4sGexKnSU1XeZaHTRcM1mZMPY` (mainnet), `rayf3nEbb3bnfN6RDGFpqPbjc5uUa3tRUzu6UVYrRx5` (devnet).
+
+Effect: the CLMM team can opt a specific Token-2022 mint into pool creation without a program upgrade. CPMM has no equivalent — its allow-list is strictly source-coded.
+
+### 3. Superstate detection — CLMM only
+
+CLMM has a third path specifically for Superstate's tokenized assets, which use the `ScaledUiConfig` extension that the version of `spl-token-2022` linked into the CLMM program cannot unpack. Rather than upgrade the dependency, CLMM detects Superstate tokens by their authority shape:
+
+```rust
+superstate_allowlist::ID == freeze_authority
+    && *mint_account_info.owner == spl_token_2022::ID
+    && default_account_state_freeze
+    && maybe_permanent_delegate
+```
+
+— [`raydium-clmm/programs/amm/src/util/token.rs:485`](https://github.com/raydium-io/raydium-clmm)
+
+A mint passes this branch if **all four** hold:
+
+- Its owning program is the Token-2022 program.
+- Its freeze authority equals `superstate_allowlist::ID`. Mainnet: `2Yq4T3mPNfjtEyTxSbRjRKqLf1pwbTasuCQrWe6QpM7x`. Devnet: `3TRuL3MFvzHaUfQAb6EsSAbQhWdhmYrKxEiViVkdQfXu`.
+- Its `DefaultAccountState` extension is set to `Frozen`.
+- Its permanent delegate is also `superstate_allowlist::ID`.
+
+This is a heuristic, not a registry — any future mint Superstate issues with the same authority shape will be admitted automatically.
+
+## What the bypasses do not waive
+
+The bypasses skip the extension allow-list, but the program still enforces:
+
+- The mint is owned by either `Token` or `Token-2022`. A custom token program is rejected upstream.
+- The pool vaults are created with the right ATA extensions for Token-2022 pools (`ImmutableOwner`, etc.).
+- All transfers go through `transfer_checked` — fee-bearing mints land the right amount in vault.
+
+A whitelisted or PDA-registered mint that, e.g., adds a `TransferHook` later does not gain a swap-time check; the hook would simply run on every transfer and could brick swaps. Whitelisting is therefore a high-trust action.
+
+## "Blocked" semantics
+
+When `is_supported_mint` returns `false`, pool creation reverts with `ErrorCode::NotSupportMint` (CPMM) / `ErrorCode::NotSupportMint` (CLMM). See [`reference/error-codes`](/reference/error-codes) for the numeric codes.
+
+Existing pools cannot retroactively fail this check — the gate runs only at creation. Mint extensions are immutable for the categories Raydium rejects (transfer hook, non-transferable, confidential transfer can't be added post-creation), so the static check is sufficient.
+
+## Why each excluded extension is excluded
+
+- **TransferHook** — invokes a custom program on every transfer, with arbitrary CU consumption, arbitrary failure conditions, and the ability to reenter the calling program. No safe sandbox exists. Some DEXes maintain hook allow-lists; Raydium does not.
+- **NonTransferable** — `Transfer` always fails. A pool cannot take custody.
+- **ConfidentialTransfer** — transfer amounts are encrypted; the curve cannot price the swap.
+- **PermanentDelegate** — a holder of the delegate can sweep any token account, including the pool vault. Permitted only via the static whitelist for trusted issuers (e.g., regulated stablecoins).
+- **MintCloseAuthority** — the mint can be closed; existing pools become unusable. Disallowed by default.
+- **DefaultAccountState (Frozen)** — pool ATAs would land in `Frozen` state and require thawing per account. Allowed only via Superstate detection, which assumes the issuer thaws institutional accounts on enrollment.
+- **Group/Member pointers** — not actively harmful, but unreviewed. Disallowed by default to keep the surface narrow.
+
+## Transfer-fee accounting
+
+For mints carrying `TransferFeeConfig`, every swap, deposit, and withdraw moves less than the nominal amount. The SDK surfaces both halves of the calculation:
+
+```ts
+const { amountIn, amountOut, feeAmount, token2022FeeIn, token2022FeeOut } =
+  await raydium.cpmm.computeSwapAmount({ ... });
+```
+
+A correct UI shows:
+
+- `amountIn + token2022FeeIn` as "you send"
+- `amountOut - token2022FeeOut` as "you receive"
+- `feeAmount` as the pool fee (LP + protocol), which is separate from the Token-2022 transfer fee
+
+A naive UI that shows only `amountIn → amountOut` understates costs.
+
+### `maximumFee` cap
+
+Token-2022 transfer fees are capped per transfer. For a 1 % mint with a 10,000-token cap, a 100,000,000-token transfer pays only 10,000 in fee. The SDK's `computeSwapAmount` applies the cap; direct program callers must replicate it.
+
+### Epoch transition
+
+A mint authority can schedule a fee-rate change that activates at the next epoch. During the transition window, two configs (`older`, `newer`) live on the mint at once and `TransferChecked` selects by current epoch. CPMM `SwapV2` and CLMM `SwapV2` both pass the full mint account in `accounts`, so the program reads the right config without an extra lookup.
+
+If you quote more than one epoch in advance via the Trade API or SDK, executed fee can differ from quoted fee — bounded by the older config's `maximum_fee_basis_points`.
+
+## Interest-bearing and ScaledUiAmount
+
+The pool holds the principal amount; the "UI amount" is the principal multiplied by a time-dependent or admin-set scale factor. Swap math operates on principal:
+
+```
+principal_in = ui_amount_in / ui_multiplier(now)
+```
+
+The SDK converts automatically. Direct RPC readers should treat `pool.token0Vault.amount` as principal.
+
+## "Token-2022 pool" definition
+
+A pool is a Token-2022 pool if **either** mint has `programId == TokenzQdB...`. The API surfaces this:
+
+```
+GET /pools/info/ids?ids=<POOL_ID>
+```
+
+```json
+{
+  "data": [{
+    "mintA": { "programId": "TokenzQdB...", "hasTransferFee": true, ... },
+    "mintB": { "programId": "Tokenkeg...", ... }
+  }]
+}
+```
+
+Use `programId` to dispatch, and `hasTransferFee` to surface a UI warning.
+
+## SDK helpers
+
+```ts
+import { Raydium, TOKEN_2022_PROGRAM_ID } from "@raydium-io/raydium-sdk-v2";
+import { ExtensionType, getExtensionTypes, unpackMint } from "@solana/spl-token";
+
+const raydium = await Raydium.load({ owner, connection });
+
+const acct = await connection.getAccountInfo(mintPubkey);
+if (!acct) throw new Error("mint not found");
+const mint = unpackMint(mintPubkey, acct, acct.owner);
+
+if (acct.owner.equals(TOKEN_2022_PROGRAM_ID)) {
+  const extensions = getExtensionTypes(mint.tlvData);
+  const accepted = new Set([
+    ExtensionType.TransferFeeConfig,
+    ExtensionType.MetadataPointer,
+    ExtensionType.TokenMetadata,
+    ExtensionType.InterestBearingConfig,
+    ExtensionType.ScaledUiAmount,
+  ]);
+  const rejecting = extensions.filter(e => !accepted.has(e));
+  if (rejecting.length) {
+    console.warn("Pool creation will revert unless this mint is whitelisted:", rejecting);
+  }
+}
+```
+
+## Common integration mistakes
+
+- **Pre-flighting only the program ID.** A mint can be Token-2022 *and* unsupported. Walk the extension list against the allow-list (and the static whitelist) before allowing pool creation.
+- **Trusting the SDK's quote when the mint isn't accepted at all.** The quote API doesn't refuse to quote — pool creation is what reverts. Confirm `is_supported_mint` semantics off-chain before exposing pool creation in your UI.
+- **Quoting without the transfer-fee haircut.** A 1% transfer-fee mint on both sides of a 0.25% CPMM pool has an effective fee around 2.25%, not 0.25%. Use the SDK quote or Trade API quote — never compute fee manually from the pool's fee tier alone.
+- **Calling the legacy `Swap` instruction on a Token-2022 pool.** `Swap` predates Token-2022. Use `SwapV2` whenever either mint is Token-2022.
+- **Auto-listing new Token-2022 mints.** Wallets and aggregators should check for `TransferHook` and `NonTransferable` before surfacing a mint to users; both are Raydium-hostile.
+
+## Future work
+
+Solana ecosystem and protocol roadmap items that would change this matrix:
+
+- Allow-listed transfer-hook programs at the Solana level (ecosystem convention evolving).
+- Confidential-transfer-compatible AMMs (research stage).
+- Broader CPMM per-mint registry (parity with CLMM).
+- Dependency upgrade so CLMM's `ScaledUiConfig` decoding works without the Superstate heuristic.
+
+This page will be updated when any land.
+
+## Pointers
+
+- [`algorithms/token-2022-transfer-fees`](/algorithms/token-2022-transfer-fees) — fee math in swaps.
+- [`products/cpmm/instructions`](/products/cpmm/instructions) — `SwapV2`, `Initialize`.
+- [`products/clmm/instructions`](/products/clmm/instructions) — `SwapV2`, `CreatePool`, `CreateSupportMintAssociated`.
+- [`reference/error-codes`](/reference/error-codes) — `NotSupportMint` numeric codes per program.
+
+Sources:
+
+- `raydium-cp-swap/programs/cp-swap/src/utils/token.rs` — `MINT_WHITELIST`, `is_supported_mint`.
+- `raydium-clmm/programs/amm/src/util/token.rs` — `MINT_WHITELIST`, `superstate_allowlist`, `is_superstate_token`, `is_supported_mint`.
+- `raydium-clmm/programs/amm/src/instructions/admin/create_support_mint_associated.rs` — per-mint registry instruction.
+- `raydium-launchpad/programs/launchpad/src/instructions/initialize_with_token_2022.rs` — LaunchLab Token-2022 base-mint creation.

@@ -1,0 +1,249 @@
+---
+title: "穩定 AMM 程式碼示例"
+description: "如何從 API 識別穩定 AMM 資金池，透過流動性模組進行交換（原生支援 version=5 資金池），以及使用鏈下穩定曲線協助程式。"
+---
+
+<Info>
+  **本頁內容由 AI 自動翻譯，所有內容以英文版本為準。**
+
+  [查看英文版 →](/products/stable/code-demos)
+</Info>
+
+<Info>
+  **版本資訊。**
+
+  - SDK: `@raydium-io/raydium-sdk-v2@0.2.42-alpha`
+  - 叢集: Solana `mainnet-beta`
+  - 穩定 AMM 程式 ID: `5quBtoiQqxF9Jv6KYKctB59NT3gtJD2Y65kdnB1Uev3h` (參見 [`reference/program-addresses`](/zh-Hant/reference/program-addresses))
+  - 最後驗證: 2026-04
+
+  SDK 的 `liquidity` 模組原生支援穩定 AMM 資金池。穩定資金池在 `ApiV3PoolInfoStandardItem` 上顯示為 **`version: 5`**（或 `pooltype: "StablePool"`）；與 AMM v4（`version: 4`）常數乘積資金池相同的 `addLiquidity` / `removeLiquidity` / 交換協助程式也適用於它們——SDK 會自動偵測變體並發出正確的指令。鏈下穩定曲線數學位於 `src/raydium/liquidity/stable.ts`。
+</Info>
+
+## 設定
+
+```bash
+npm install @raydium-io/raydium-sdk-v2 @solana/web3.js @solana/spl-token
+```
+
+```ts
+import { Raydium, TxVersion } from "@raydium-io/raydium-sdk-v2";
+import { Connection, Keypair, clusterApiUrl } from "@solana/web3.js";
+import BN from "bn.js";
+import bs58 from "bs58";
+
+const connection = new Connection(clusterApiUrl("mainnet-beta"));
+const owner = Keypair.fromSecretKey(bs58.decode(process.env.PRIVATE_KEY!));
+
+const raydium = await Raydium.load({
+  connection,
+  owner,
+  cluster: "mainnet",
+  // 選用：如果你打算直接呼叫 `liquidity/stable.ts` 中的報價協助程式，
+  // 請載入穩定曲線模型版面配置。資金池層級的交換 / 新增 / 移除
+  // 會為你延遲執行此操作，因此大多數呼叫者可以跳過此步驟。
+});
+
+// 一次性：預取鏈上模型資料版面配置，供鏈下穩定曲線協助程式使用。
+// 僅在直接呼叫 getStablePrice / getDxByDyBaseIn / getDyByDxBaseIn 時需要。
+// addLiquidity / removeLiquidity / swap 不需要此步驟。
+await raydium.liquidity.initLayout();
+```
+
+## 識別穩定資金池
+
+`ApiV3PoolInfoStandardItem` 上的兩個等價信號：
+
+```ts
+const isStable =
+  pool.version === 5 ||
+  pool.pooltype.includes("StablePool"); // SDK 內部使用此字串檢查
+
+// 或者，透過程式 ID：
+const STABLE_AMM_PROGRAM_ID = "5quBtoiQqxF9Jv6KYKctB59NT3gtJD2Y65kdnB1Uev3h";
+const isStableByProgram = pool.programId === STABLE_AMM_PROGRAM_ID;
+```
+
+AMM v4（`version: 4`、常數乘積）和穩定 AMM（`version: 5`）都透過 SDK 上相同的 `LiquidityModule` API 進行流程。在內部，該模組會分派至：
+
+- `InstructionType.AmmV4AddLiquidity` / `AmmV4RemoveLiquidity` 適用於 v4 資金池
+- `InstructionType.AmmV5AddLiquidity` / `AmmV5RemoveLiquidity` 適用於 v5（穩定）資金池
+
+資金池的 `programId`（與資金池金鑰一起返回）會告知 SDK 要將其 CPI 到哪個程式；你不需要硬編碼它。
+
+## 根據代幣對查找資金池
+
+```ts
+import { PublicKey } from "@solana/web3.js";
+
+// 兩個常見的代幣示例
+const mintA = new PublicKey("Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB"); // USDT
+const mintB = new PublicKey("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"); // USDC
+
+const pools = await raydium.api.fetchPoolByMintPair({
+  mint1: mintA.toBase58(),
+  mint2: mintB.toBase58(),
+});
+
+const stablePool = pools.find(
+  (p) => p.version === 5 || p.pooltype.includes("StablePool"),
+);
+
+if (!stablePool) {
+  throw new Error("此代幣對不存在穩定資金池");
+}
+
+console.log("穩定資金池 id：", stablePool.id);
+console.log("穩定資金池 programId：", stablePool.programId);
+console.log("TVL：", stablePool.tvl);
+```
+
+如果代幣對同時有 v4（常數乘積）資金池和 v5（穩定）資金池，響應會包含兩者——選擇你的流程所需的，或將它們交給 [AMM 路由](/zh-Hant/products/routing)程式，讓它選擇最佳路由。
+
+## 透過穩定資金池交換
+
+`LiquidityModule.swap` 流程的形狀與 v4 資金池相同——只需將 v5 資金池物件傳遞給它：
+
+```ts
+import { Percent, TokenAmount, toToken } from "@raydium-io/raydium-sdk-v2";
+
+const inputAmount = new TokenAmount(toToken(stablePool.mintA), 1_000_000); // 1 USDT
+const slippage = new Percent(50, 10_000); // 0.5%
+
+// 使用 SDK 的穩定曲線協助程式內部計算預期輸出。
+const { amountOut, minAmountOut } = raydium.liquidity.computeAmountOut({
+  poolInfo: stablePool,
+  amountIn: inputAmount,
+  mintIn:  stablePool.mintA.address,
+  mintOut: stablePool.mintB.address,
+  slippage,
+});
+
+console.log("預期輸出：", amountOut.toSignificant());
+console.log("最小輸出：", minAmountOut.toSignificant());
+
+// 建立並簽署交換交易。
+const { transaction, execute } = await raydium.liquidity.swap({
+  poolInfo: stablePool,
+  amountIn:    inputAmount.raw,
+  amountOut:   minAmountOut.raw,
+  fixedSide:   "in",
+  txVersion:   TxVersion.V0,
+});
+
+const { txId } = await execute({ sendAndConfirm: true });
+console.log("穩定交換交易：", txId);
+```
+
+SDK 從資金池金鑰讀取資金池的 `programId`，並分派到穩定 AMM 程式。不需要特殊的 `programId` 引數。
+
+## 新增和移除流動性
+
+`addLiquidity` 和 `removeLiquidity` 在 v4 和 v5 資金池上的運作方式完全相同：
+
+```ts
+import { Percent, TokenAmount, toToken } from "@raydium-io/raydium-sdk-v2";
+
+const amountInA = new TokenAmount(toToken(stablePool.mintA), 100_000_000); // 100 USDT
+const slippage  = new Percent(50, 10_000); // 0.5%
+
+// 計算曲線對此 A 規模所需的匹配 B 金額。
+const { anotherAmount, minAnotherAmount } = raydium.liquidity.computePairAmount({
+  poolInfo: stablePool,
+  amount:   amountInA.toSignificant(),
+  baseIn:   true,
+  slippage,
+});
+
+const { execute } = await raydium.liquidity.addLiquidity({
+  poolInfo: stablePool,
+  amountInA,
+  amountInB:      anotherAmount,
+  otherAmountMin: minAnotherAmount,
+  fixedSide:      "a",
+  txVersion:      TxVersion.V0,
+});
+
+const { txId } = await execute({ sendAndConfirm: true });
+console.log("新增流動性交易：", txId);
+```
+
+在內部，SDK 會發出 `InstructionType.AmmV5AddLiquidity`，因為 `pooltype.includes("StablePool")` 為真。對應的 `removeLiquidity` 流程是對稱的——輸入 `lpAmount` 和你願意在每一側接受的最小金額。
+
+## 鏈下報價協助程式（stable.ts）
+
+對於伺服器端報價或回溯測試，SDK 會公開底層穩定曲線數學：
+
+```ts
+import {
+  getStablePrice,
+  getDxByDyBaseIn,
+  getDyByDxBaseIn,
+} from "@raydium-io/raydium-sdk-v2";
+
+// 在使用這些函式之前，你必須呼叫一次 initLayout()（將鏈上
+// `ModelDataInfo` PDA 載入到 SDK 的 StableLayout 快取中）。
+await raydium.liquidity.initLayout();
+
+const modelData = raydium.liquidity.stableLayout;
+
+// 資金池目前儲備量時的現貨價格。
+const price = getStablePrice(modelData, /* x */, /* y */, /* withFee */);
+console.log("現貨價格：", price);
+
+// 報價：給定 dx 輸入，多少 dy 輸出（此處不適用手續費）？
+const dyOut = getDyByDxBaseIn(modelData, /* x */, /* y */, /* dx */);
+
+// 報價：給定 dy 輸出目標，需要多少 dx 輸入？
+const dxIn  = getDxByDyBaseIn(modelData, /* x */, /* y */, /* dy */);
+```
+
+這些是純函式——無 RPC、無簽署。鏈上 `ModelDataInfo` 由 `initLayout()` 一次性取得並快取在 `raydium.liquidity.stableLayout`。傳遞目前儲備量（`x`、`y`），協助程式會透過二進制搜尋查詢表並在兩個周圍 `DataElement` 列之間進行線性插值來計算。參見 [`products/stable/math`](/zh-Hant/products/stable/math) 以了解底層演算法。
+
+## 透過 AMM 路由進行路由（多跳 / 最佳價格）
+
+如果你不想自己選擇場所，[AMM 路由](/zh-Hant/products/routing)程式會考慮每個 Raydium AMM（v4 / CPMM / CLMM / 穩定），並透過最佳組合進行路由：
+
+```ts
+const route = await raydium.tradeV2.fetchRoutes({
+  inputMint:  mintA,
+  outputMint: mintB,
+  amount:     new BN(1_000_000),
+  slippage,
+});
+
+// route.routes[0].poolType 告知你最佳路由使用的程式；
+// 每當穩定資金池是最優路徑的一部分時，「Stable」就會在此出現。
+console.log(route.routes[0]);
+
+const { execute } = await raydium.tradeV2.swap({
+  inputMint:    mintA,
+  outputMint:   mintB,
+  inputAmount:  new BN(1_000_000),
+  swapResult:   route.routes[0],
+  slippage,
+  txVersion:    TxVersion.V0,
+});
+
+const { txId } = await execute({ sendAndConfirm: true });
+```
+
+這是生產環境中交換者和聚合器的推薦路徑——你永遠不需要手動決定穩定資金池是否存在或它是否是今天更好的場所。
+
+## 建議
+
+1. **對於終端使用者交換**，優先使用 [`tradeV2`](/zh-Hant/products/routing) 路由流程。它處理包括穩定資金池在內的每個 Raydium 資金池型別。
+2. **對於資金池特定操作**（已知穩定資金池上的 LP 新增 / 移除），直接使用 `LiquidityModule`——它會自動偵測 v5 資金池。
+3. **對於鏈下報價 / 分析**，在 `initLayout()` 後呼叫 `getStablePrice` / `getDyByDxBaseIn` / `getDxByDyBaseIn`。模型資料快取後，每次報價無 RPC 流量。
+4. **不要手動編碼原始 `SwapBaseIn` 指令。** 穩定 AMM 程式（從 AMM v4 分叉）在 V1 交換進入點期望 17–19 個 OpenBook 帳戶，`model_data_account` 插入其中。SDK 的預先構建協助程式正確處理每個帳戶和排序；自行開發容易出錯。
+
+## 後續步驟
+
+- [數學](/zh-Hant/products/stable/math)——查詢表插值的運作方式。
+- [指令](/zh-Hant/products/stable/instructions)——完整指令參考。
+- [AMM 路由](/zh-Hant/products/routing)——跨 AMM v4、CPMM、CLMM、穩定的多資金池路由。
+
+來源：
+
+- [`raydium-sdk-V2/src/raydium/liquidity/liquidity.ts`](https://github.com/raydium-io/raydium-sdk-V2/blob/master/src/raydium/liquidity/liquidity.ts) — 模組進入點；v4 / v5 分派。
+- [`raydium-sdk-V2/src/raydium/liquidity/stable.ts`](https://github.com/raydium-io/raydium-sdk-V2/blob/master/src/raydium/liquidity/stable.ts) — `StableLayout`、`getStablePrice`、`getDxByDyBaseIn`、`getDyByDxBaseIn`。

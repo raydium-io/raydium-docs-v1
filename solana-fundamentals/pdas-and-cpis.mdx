@@ -1,0 +1,273 @@
+---
+title: "PDAs and CPIs"
+description: "Program-derived addresses and cross-program invocation — the two primitives Raydium uses to manage state deterministically and compose with other programs. Seeds, bumps, invoke vs invoke_signed, and the patterns Raydium's code follows."
+---
+
+<Info>
+  **PDAs** (program-derived addresses) and **CPIs** (cross-program invocation) are the two primitives that make Raydium possible. PDAs let a program "own" deterministic addresses without private keys — that's how pool authorities and vaults work. CPIs let one program call another — that's how Raydium swaps tokens via the SPL Token program and how integrators compose Raydium into their own flows. Both are worth understanding before reading Raydium's source.
+</Info>
+
+## PDAs: addresses without keys
+
+A **Program-Derived Address** is a public key that:
+
+- Is not on the ed25519 curve (no private key exists for it).
+- Is derived deterministically from a program ID and a set of seeds.
+- Can be signed for by *only* the derivation program, via `invoke_signed`.
+
+Every Raydium pool authority, every pool state account, every vault, every farm state — they're all PDAs.
+
+### Derivation
+
+A PDA is computed by hashing the program ID with the seeds, then finding a "bump" byte that forces the result off-curve. The first bump (typically starting from 255 and decrementing) that produces an off-curve address wins; this is the **canonical bump**.
+
+```ts
+import { PublicKey } from "@solana/web3.js";
+
+const [poolAuthority, bump] = PublicKey.findProgramAddressSync(
+  [Buffer.from("authority"), poolId.toBuffer()],
+  CPMM_PROGRAM_ID,
+);
+```
+
+The seeds can be anything — strings, other pubkeys, `u64` values as little-endian bytes. Raydium's convention is a human-readable prefix followed by unique identifiers.
+
+### Raydium PDA patterns
+
+Common PDAs in Raydium's programs:
+
+| PDA | Seeds | Program |
+|-----|-------|---------|
+| AMM authority (AMM v4) | `[b"amm authority"]` + bump | AMM v4 |
+| Pool state (CPMM) | `[b"pool", amm_config, mint_a, mint_b]` | CPMM |
+| Pool vault (CPMM) | `[b"pool_vault", pool, mint]` | CPMM |
+| Authority (CPMM) | `[b"vault_and_lp_mint_auth_seed"]` | CPMM |
+| Pool state (CLMM) | `[b"pool", amm_config, mint_0, mint_1]` | CLMM |
+| Tick array (CLMM) | `[b"tick_array", pool, start_tick_index]` | CLMM |
+| Observation (CLMM) | `[b"observation", pool]` | CLMM |
+| Personal position (CLMM) | `[b"position", position_nft_mint]` | CLMM |
+| Farm state (Farm v6) | `[b"pool_farm_state", farm_id]` | Farm v6 |
+| User ledger (Farm v6) | `[b"user_ledger", farm, user]` | Farm v6 |
+
+Users and integrators can compute these without fetching anything — given the public inputs (pool ID, farm ID, user key), the PDA is deterministic.
+
+### Canonical bump
+
+Although there can in principle be multiple bumps producing off-curve addresses, Raydium's programs always use the **canonical bump** (found by decrementing from 255). This is stored in the PDA's account data so subsequent transactions can pass it in and skip the (expensive) derivation loop:
+
+```rust
+#[account]
+pub struct PoolState {
+    pub bump: [u8; 1],
+    // ... rest of pool state
+}
+```
+
+On subsequent transactions, the bump is read from the pool state rather than recomputed.
+
+## CPIs: calling other programs
+
+**Cross-Program Invocation** lets a program invoke another program's instructions inline within a single transaction. Raydium uses CPIs extensively:
+
+- Swap instructions call SPL Token program to move tokens.
+- CLMM calls Metaplex to mint the position NFT.
+- Pool creation calls System Program to allocate accounts.
+- Farm v6 calls SPL Token to transfer rewards.
+
+Integrators also use CPIs to call *into* Raydium — that's how vault strategies, leveraged-LP protocols, and auto-compounders work. See [`integration-guides/cpi-integration`](/integration-guides/cpi-integration).
+
+### invoke vs invoke_signed
+
+The Solana runtime offers two CPI primitives:
+
+- **`invoke`**: call another program; the called program inherits the outer transaction's signers.
+- **`invoke_signed`**: call another program *on behalf of a PDA*; the runtime verifies the PDA's seeds and authorizes the signature.
+
+`invoke_signed` is the magic that lets programs hold authority over accounts without managing private keys.
+
+### Example: Raydium transferring from a pool vault
+
+A pool vault is a Token Account whose authority is a PDA of the pool program. To transfer tokens out during a swap, the pool program must sign as that PDA:
+
+```rust
+// Seeds for the pool authority
+let authority_seeds: &[&[u8]] = &[
+    b"vault_and_lp_mint_auth_seed",
+    &[authority_bump],
+];
+let signer_seeds: &[&[&[u8]]] = &[authority_seeds];
+
+// Build CPI context
+let cpi_accounts = Transfer {
+    from:      input_vault.to_account_info(),
+    to:        user_ata.to_account_info(),
+    authority: pool_authority.to_account_info(),
+};
+let cpi_program = token_program.to_account_info();
+let cpi_ctx     = CpiContext::new_with_signer(cpi_program, cpi_accounts, signer_seeds);
+
+// Execute
+token::transfer(cpi_ctx, amount)?;
+```
+
+The runtime sees `invoke_signed` is called by the CPMM program, verifies that `vault_and_lp_mint_auth_seed + bump` derives to `pool_authority`'s address when hashed with the CPMM program ID, and permits the authority signature on the token transfer. No private key involved.
+
+### Example: integrator calling Raydium CPMM
+
+An integrator program (e.g., an escrow) can invoke Raydium's `swap_base_input` via CPI:
+
+```rust
+use raydium_cpmm::cpi::{self, accounts::Swap};
+
+let cpi_accounts = Swap {
+    payer:                order.to_account_info(),      // PDA, will sign
+    authority:            pool_authority_info,
+    amm_config:           amm_config_info,
+    pool_state:           pool_info,
+    input_token_account:  order_input_ata,
+    output_token_account: order_output_ata,
+    input_vault:          input_vault_info,
+    output_vault:         output_vault_info,
+    input_token_program:  input_token_program_info,
+    output_token_program: output_token_program_info,
+    input_token_mint:     input_mint_info,
+    output_token_mint:    output_mint_info,
+    observation_state:    observation_info,
+};
+
+let seeds = &[b"order", user.key.as_ref(), &[order.bump]];
+let cpi_ctx = CpiContext::new_with_signer(
+    cpmm_program.to_account_info(),
+    cpi_accounts,
+    &[seeds],
+);
+
+cpi::swap_base_input(cpi_ctx, amount_in, min_out)?;
+```
+
+This is the canonical integration pattern — see [`integration-guides/cpi-integration`](/integration-guides/cpi-integration) for the full escrow example.
+
+## CPI depth limit
+
+Solana caps CPI depth at **4 levels**. A transaction's top-level instruction counts as depth 0; each CPI invocation increments depth.
+
+Practical implication: Raydium's own swap already uses 1-2 levels of CPI (Raydium → SPL Token). An integrator calling Raydium uses 2. If that integrator is called by another integrator, it's 3. The 4th level is the limit.
+
+Most compositions stay under this easily, but deep nesting (aggregator → router → Raydium → hook) can hit it. Design flat rather than deep.
+
+## Remaining accounts
+
+When a Raydium instruction needs a variable number of accounts (e.g., CLMM swap crossing an unknown number of tick arrays), the extra accounts are passed as **remaining accounts** — appended to the fixed-account list, interpreted by position.
+
+CPMM's `SwapV2` uses remaining accounts for transfer-hook programs' extra required accounts. Clients fetch the needed accounts and append them:
+
+```ts
+const swapIx = await raydium.cpmm.swap({
+  /* ... */
+  // SDK handles remaining accounts automatically
+});
+```
+
+At the CPI level, integrators must forward remaining accounts through their own instruction:
+
+```rust
+pub struct Swap<'info> {
+    // ... fixed accounts
+    // Plus Remaining accounts forwarded via ctx.remaining_accounts
+}
+
+// Forward remaining_accounts into the CPI
+cpi::swap_base_input(
+    cpi_ctx.with_remaining_accounts(ctx.remaining_accounts.to_vec()),
+    amount_in,
+    min_out,
+)?;
+```
+
+## PDA pitfalls
+
+### Wrong seeds → wrong address
+
+A bug where seeds are in the wrong order, wrong encoding, or include/exclude an extra byte silently produces a different PDA. The transaction fails ambiguously (the program tries to read an account that doesn't exist). Always unit-test seed derivation against known golden values.
+
+### Not storing bump
+
+If you re-derive the bump on every transaction, you pay compute for the derivation loop. Store the canonical bump in the PDA's data and read it from there.
+
+### Confusing canonical vs non-canonical bump
+
+Non-canonical bumps (if anyone finds one that yields off-curve) are allowed by `invoke_signed` but rejected by Raydium's programs via `assert_eq!(bump, canonical_bump)`. If someone tries to claim a PDA with a non-canonical bump, the tx fails.
+
+### Passing a PDA as signer when you're not the owning program
+
+Only the program whose ID is in the PDA's derivation can `invoke_signed` with its seeds. If you try, the runtime rejects.
+
+## CPI pitfalls
+
+### Forgetting to forward `remaining_accounts`
+
+If your outer instruction passes transfer-hook accounts in `remaining_accounts` but the CPI into Raydium doesn't forward them, Raydium fails because it can't find the hook accounts. Always include `with_remaining_accounts` in CPIs that need them.
+
+### Writable flags mismatch
+
+An account that the outer instruction marks writable must also be writable in the CPI call if the called program intends to write it. Mismatch → runtime rejection.
+
+### Not accounting for rent
+
+CPI to a program that creates an account (e.g., ATA creation) requires the payer to have enough SOL for rent. Failed rent checks appear as obscure errors.
+
+## Worked example: computing Raydium CPMM PDAs
+
+```ts
+import { PublicKey } from "@solana/web3.js";
+
+const CPMM_PROGRAM_ID = new PublicKey("CPMMoo8L3F4NbTegBCKVNunggL7H1Zpdmwpwh8KMoZ0F");
+
+function computeCpmmPdas(ammConfig, mintA, mintB) {
+  const [poolState, poolBump] = PublicKey.findProgramAddressSync(
+    [
+      Buffer.from("pool"),
+      ammConfig.toBuffer(),
+      mintA.toBuffer(),
+      mintB.toBuffer(),
+    ],
+    CPMM_PROGRAM_ID,
+  );
+
+  const [authority] = PublicKey.findProgramAddressSync(
+    [Buffer.from("vault_and_lp_mint_auth_seed")],
+    CPMM_PROGRAM_ID,
+  );
+
+  const [vaultA] = PublicKey.findProgramAddressSync(
+    [Buffer.from("pool_vault"), poolState.toBuffer(), mintA.toBuffer()],
+    CPMM_PROGRAM_ID,
+  );
+
+  const [vaultB] = PublicKey.findProgramAddressSync(
+    [Buffer.from("pool_vault"), poolState.toBuffer(), mintB.toBuffer()],
+    CPMM_PROGRAM_ID,
+  );
+
+  const [observation] = PublicKey.findProgramAddressSync(
+    [Buffer.from("observation"), poolState.toBuffer()],
+    CPMM_PROGRAM_ID,
+  );
+
+  return { poolState, authority, vaultA, vaultB, observation, poolBump };
+}
+```
+
+This is exactly what Raydium SDK does under the hood when you call `getPoolInfoFromRpc({ poolId })` — it derives the associated PDAs without a round-trip.
+
+## Pointers
+
+- [`solana-fundamentals/account-model`](/solana-fundamentals/account-model) — how PDAs fit in the account model.
+- [`solana-fundamentals/programs-and-anchor`](/solana-fundamentals/programs-and-anchor) — Anchor's helpers for declaring PDAs.
+- [`integration-guides/cpi-integration`](/integration-guides/cpi-integration) — building integrations that CPI into Raydium.
+- [`sdk-api/rust-cpi`](/sdk-api/rust-cpi) — Raydium's Rust CPI types.
+
+Sources:
+
+- [Solana PDA docs](https://docs.solana.com/developing/programming-model/calling-between-programs).
+- [Anchor PDA & CPI docs](https://www.anchor-lang.com/docs/pdas-and-cpis).

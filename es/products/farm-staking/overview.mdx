@@ -1,0 +1,109 @@
+---
+title: "Descripción general de Farm / Staking"
+description: "Cómo el programa de granja de Raydium distribuye tokens de recompensa a los que apuestan — la contabilidad por acción compartida, las generaciones de versión de granja (v3, v5, v6), y cómo las granjas se relacionan pero son distintas de los pools AMM / CLMM que las acompañan."
+---
+
+<Info>
+  **Esta página fue traducida automáticamente por IA. La versión en inglés es la fuente autorizada.**
+
+  [Ver versión en inglés →](/products/farm-staking/overview)
+</Info>
+
+## Qué es una granja
+
+Una **granja** (*farm*) es un programa independiente en la cadena que distribuye uno o más **mints de recompensa** a las cuentas que apuestan un **mint de apuesta**. El mint de apuesta casi siempre es un token LP emitido por CPMM, AMM v4 o un pool de par heredado, pero se admiten y se utilizan granjas de activo único (apostar SOL, RAY o un token de proyecto directamente) para un pequeño número de programas de larga duración.
+
+Propiedades clave:
+
+- **Basada en emisiones, no en comisiones.** A diferencia de los flujos de recompensas integrados de CLMM, las recompensas de granja no están vinculadas al volumen de swap o a la actividad del pool. El presupuesto de una granja se deposita por adelantado por el creador y emite a una tasa constante por segundo hasta que se agota.
+- **Independiente del pool.** El pool no sabe que la granja existe. Mover LP entre billeteras no notifica a la granja; un usuario debe retirar activamente (`Withdraw`) de la granja primero. Del mismo modo, `Withdraw` del pool no retira de la granja.
+- **Libro mayor por usuario y por recompensa.** Cada apostador tiene una cuenta `UserStake` (o "Ledger") por granja que registra su cantidad apostada y su instantánea del contador recompensa por acción para cada uno de los flujos de recompensa de la granja.
+- **Multi-recompensa.** Farm v5 admite hasta 2 recompensas; v6 admite hasta 5. Cada recompensa tiene su propio vault, tasa por segundo, hora de inicio y hora de finalización.
+
+## Las tres versiones activas
+
+Raydium ha lanzado tres versiones del programa de granja. Todas están activas y cada una lleva su propio esquema PDA y conjunto de instrucciones. Los integradores deben tratarlas como tres programas distintos que comparten un modelo conceptual.
+
+| Versión | Ubicación del ID del programa | Máx. recompensas | Diferencias notables |
+|---------|---------------------|-------------|----------------------|
+| **v3** | ver [`reference/program-addresses`](/es/reference/program-addresses) | 1 | Esquema más antiguo. Las granjas más antiguas (RAY-USDC, SOL-USDC) todavía se enrutan aquí. |
+| **v5** | ver [`reference/program-addresses`](/es/reference/program-addresses) | 2 | Se añadió la segunda ranura de recompensa y `AddReward`-style top-ups. |
+| **v6** | ver [`reference/program-addresses`](/es/reference/program-addresses) | 5 | Versión actual. Ranuras expandidas, administración más limpia, admite agricultura de posición CLMM mediante un adaptador específico de v6 (raro en la práctica). |
+
+El SDK expone `raydium.farm` como una única fachada — la versión se deduce del propietario de la cuenta de granja. Cuando se crean integraciones en la cadena, debe despachar manualmente.
+
+## Contabilidad recompensa por acción compartida
+
+El programa de granja utiliza el patrón estándar de "maestro-chef" visto en los contratos de rendimiento de DeFi:
+
+```
+reward_per_share := total_rewards_distributed_by_stream / total_staked
+pending(user)    := user.staked × (reward_per_share − user.reward_debt)
+```
+
+- **`reward_per_share`** se almacena en la cuenta de granja como un contador de punto fijo (Q64.64 en v5+, Q56.8 en v3). Solo crece.
+- **`user.reward_debt`** es la instantánea de `reward_per_share` en la última interacción del usuario. No es una deuda que el usuario debe; es un desplazamiento utilizado para calcular acumulaciones futuras.
+- En `Deposit` y `Withdraw`, la granja primero liquida las recompensas pendientes (acreditando `user.pending_reward` o enviando directamente al ATA del usuario, dependiendo de la versión), luego actualiza `user.reward_debt` al contador actual.
+- En `Harvest`, la granja paga `pending_reward` y registra `reward_debt` nuevamente.
+
+La tasa de emisión por segundo entra en la contabilidad a través de una actualización perezosa:
+
+```
+elapsed        := min(now, reward.end_time) − reward.last_update_time
+new_emissions  := reward.per_second × elapsed
+if total_staked > 0:
+    reward_per_share += new_emissions / total_staked
+reward.last_update_time := now
+```
+
+Perezosa: ninguna instrucción se emite "cada segundo". El contador se actualiza cada vez que alguien toca la granja (`Deposit`, `Withdraw`, `Harvest`, actualización de administrador). Las granjas sin actividad acumulan una brecha creciente que se cierra en la siguiente interacción.
+
+## Mint de apuesta vs mint de recompensa
+
+**El mint de apuesta se mantiene en depósito, no se quema.** Cuando un usuario apuesta 100 LP, la granja mueve 100 LP del ATA del usuario al vault de apuesta de la granja. En `Withdraw`, la granja devuelve 100 LP. La granja nunca llama al pool.
+
+**Los mints de recompensa se pagan desde vaults pre-financiados por el creador.** Cuando un creador configura una granja, deposita el presupuesto de recompensa completo (digamos, 1.000.000 RAY + 500.000 USDC) en los dos vaults de recompensa. El programa de granja no acuña nuevos tokens; simplemente distribuye lo que hay en el vault durante la duración del flujo. Si el vault se drena antes de `end_time`, las emisiones se detienen.
+
+## Programas de emisión
+
+Cada flujo de recompensa tiene tres parámetros de tiempo:
+
+- **`start_time`** — la marca de tiempo UNIX en la que comienzan las emisiones. Antes de esto, sin acumulación.
+- **`end_time`** — la marca de tiempo en la que se detienen las emisiones. Después de esto, `reward_per_share` ya no crece a partir de este flujo.
+- **`per_second`** — la tasa de emisión mientras `start_time ≤ now < end_time`.
+
+Una recompensa se puede extender (empujar `end_time` hacia adelante, rellenar el vault) a través de `AddReward` / `SetRewards` en v5 / v6. Se puede reiniciar después de `end_time` a través de `RestartRewards`. No se puede acortar sin cooperación del administrador.
+
+## Lo que las granjas NO son
+
+- **No es un distribuidor de comisiones.** CPMM y CLMM cobran comisiones comerciales directamente en el estado del pool. Las granjas no tocan las comisiones del pool. El único camino desde las comisiones del pool a un tenedor de tokens es el canje de LP o el `CollectFee` de CLMM.
+- **No es automático.** El LP debe ser apostado explícitamente para ganar recompensas de granja. Los tenedores de LP que dejan sus tokens en su billetera no ganan nada de la granja.
+- **No es fungible.** Cada cuenta `UserStake` está vinculada a un par `(farm, user)`. No puede transferir su apuesta a otra billetera sin desapostar primero.
+- **No es compatible con posiciones CLMM directamente.** Farm v6 introdujo un adaptador CLMM, pero en la práctica los pools CLMM utilizan sus propios flujos de recompensas integrados (ver [`products/clmm/fees`](/es/products/clmm/fees)) en lugar de emisiones de granja.
+
+## Cuándo las granjas son la herramienta adecuada
+
+Utilice una granja cuando quiera:
+
+- Incentivar LP para uno de los pools CPMM o AMM v4 de su proyecto con un token externo (el token de su proyecto, un token de un socio, etc.).
+- Ejecutar un programa de apuesta en un mint de activo único (clásico "apuesta RAY, gana RAY") sin desplegar su propio contrato.
+- Superponer recompensas adicionales en un pool existente sin necesidad de acceso de administrador a ese pool.
+
+Utilice en su lugar los flujos de recompensas integrados de CLMM cuando su pool sea CLMM. Tienen una economía idéntica pero participan en la contabilidad de crecimiento de comisiones dentro de la posición (las posiciones dentro del rango ganan pro rata, las posiciones fuera del rango no) y no requieren que los usuarios muevan su NFT de posición.
+
+## Contenidos del capítulo
+
+- [`accounts`](/es/products/farm-staking/accounts) — diseño completo del estado en cadena por versión.
+- [`instructions`](/es/products/farm-staking/instructions) — cada instrucción de granja con su lista de cuentas y pre/poscondiciones.
+- [`code-demos`](/es/products/farm-staking/code-demos) — ejemplos de TypeScript para apostar, cosechar y crear una nueva granja.
+
+## A dónde ir a continuación
+
+- [`products/clmm/fees`](/es/products/clmm/fees) — comparar emisiones de granja con el modelo de recompensas integrado de CLMM.
+- [`reference/program-addresses`](/es/reference/program-addresses) — los tres IDs del programa de granja.
+- [`protocol-overview/versions-and-migration`](/es/protocol-overview/versions-and-migration) — cuándo usar cada versión de granja.
+
+Fuentes:
+
+- Farm v6 IDL incluido en el SDK: [`raydium-io/raydium-sdk-V2`](https://github.com/raydium-io/raydium-sdk-V2) en `src/raydium/farm/`.
+- [Módulo `Farm` de Raydium SDK v2](https://github.com/raydium-io/raydium-sdk-V2)

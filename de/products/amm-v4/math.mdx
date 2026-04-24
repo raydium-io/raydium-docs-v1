@@ -1,0 +1,183 @@
+---
+title: "AMM-v4-Mathematik"
+description: "Constant-Product-Invariante mit der Gebührenkonvention von AMM v4, Reserve-zu-Orderbook-Preiskonvertierung, Zielorder-Gitterkonstruktion und der PnL-Abrechnung."
+---
+
+<Info>
+  **Diese Seite wurde mit KI automatisch übersetzt. Maßgeblich ist stets die englische Version.**
+
+  [Englische Version ansehen →](/products/amm-v4/math)
+</Info>
+
+## Die Invariante
+
+Der Pool erhält `coin_reserve × pc_reserve = k`, wobei:
+
+```
+coin_reserve = coin_vault_balance
+             + orders_posted_on_openbook.base
+             + pending_coin_fill_not_yet_settled
+pc_reserve   = pc_vault_balance
+             + orders_posted_on_openbook.quote
+             + pending_pc_fill_not_yet_settled
+             - accrued_pnl_pc
+```
+
+Zwei wichtige Punkte:
+
+1. Die Reserven enthalten **auf OpenBook eingegangene** Beträge. Die Limitorder des AMM bleiben Teil seiner Liquidität – sie gehen nicht an das Orderbuch „verloren", sondern sind dort nur hinterlegt. Die Berechnung von `k` nur aus den On-Chain-Vault-Saldos unterschätzt die tatsächlichen Reserven.
+2. Der PnL-Rückgang (`need_take_pnl_*`) wird subtrahiert, damit die Kurve erhalten bleibt, wenn der Admin Gebühren einzieht. Das gleiche Prinzip wie die `protocol_fees_*`-Ausnahme bei CPMM.
+
+Jeder `Swap*`-Vorgang sichert `k' ≥ k` ab, nachdem der Gebührenanteil des LP wieder zu den Reserven hinzugefügt wurde.
+
+## Gebührenkonvention
+
+AMM v4 verwendet **Verhältnisgebühren** (Zähler/Nenner-Paare) statt der `1/1_000_000`-Konvention von CPMM/CLMM. Die On-Chain-`Fees`-Struktur (siehe [`Fees::initialize`](https://github.com/raydium-io/raydium-amm/blob/master/program/src/state.rs) im Programmquellcode) hat folgende Standardwerte:
+
+```
+Fees {
+  min_separate_numerator:    5,
+  min_separate_denominator:  10_000,   //  5/10_000 = 0.05%
+
+  trade_fee_numerator:      25,
+  trade_fee_denominator:    10_000,    // 25/10_000 = 0.25% — wird für Limitorder-Preisbildung bei OpenBook verwendet
+
+  pnl_numerator:            12,
+  pnl_denominator:          100,       // 12/100   = 12%   — Anteil des Protokolls VON der Swap-Gebühr
+
+  swap_fee_numerator:       25,
+  swap_fee_denominator:     10_000,    // 25/10_000 = 0.25% — Bruttogebühr für AMM-Pfad-Swaps
+}
+```
+
+Interpretation (veröffentlichte Mainnet-Standardwerte):
+
+- **Gesamte Swap-Gebühr:** `swap_fee = amount_in × 25 / 10_000 = 0,25%` des Brutto-Eingabebetrags.
+- **Protokollanteil:** `pnl_numerator / pnl_denominator = 12 / 100 = 12%` **der Swap-Gebühr**, was `0,25% × 12% = 0,03%` des Volumens entspricht. Dieser Anteil sammelt sich in den PnL-Zählern an und wird durch `WithdrawPnl` entnommen.
+- **LP-Anteil:** Die verbleibenden `88%` der Swap-Gebühr, was `0,25% × 88% = 0,22%` des Volumens entspricht. Bleiben im Pool und erhöhen `k`.
+- **Kein Fondsanteil.** AMM v4 hat keine Fondsgebühren-Aufteilung wie CPMM/CLMM.
+
+Beachten Sie, dass `pnl_numerator / pnl_denominator` ein Bruchteil **der Gebühr** ist, nicht des Handelsvolumens – eine häufige Fehlinterpretation dieser Feldnamen.
+
+`trade_fee_numerator / trade_fee_denominator` (auch `25 / 10_000`) ist ein separates Feld, das von der OpenBook-Integration beim Berechnen von gebühreninklusiven Preisen für das Gitter von Limitorder des AMM verwendet wird. Es entspricht standardmäßig `swap_fee`, wird aber über einen anderen Code-Pfad ausgelesen.
+
+Abweichungen von diesen Standardwerten sind selten, es gibt aber einige auf älteren Pools. Lesen Sie die Gebühren immer aus `AmmInfo.fees` aus, bevor Sie Preise angeben.
+
+## Direkter Swap (AMM-Pfad)
+
+Der einfachste Fall: Der Benutzer tauscht gegen die Vault des Pools aus, ohne mit OpenBook zu interagieren. Die internen Reserven des Pools (einschließlich On-Book-Zuordnungen) sind der Nenner.
+
+**SwapBaseIn (genaue Eingabe):**
+
+```
+amount_after_fee = amount_in − ceil(amount_in × swap_fee_numerator / swap_fee_denominator)
+amount_out = amount_after_fee × out_reserve
+           / (in_reserve + amount_after_fee)
+require(amount_out >= minimum_amount_out)
+```
+
+Die hier verwendeten Reserven sind die **effektiven** Reserven. Historisch war dies `coin_vault_balance + coin_posted_on_openbook + ...` (der Vault des AMM plus die Token, die in OpenBook-Orders gesperrt waren). **Seit der OpenBook-Deaktivierung ist der On-Book-Saldo null**, daher entsprechen die effektiven Reserven den reinen Vault-Bilanzen. Der `MonitorStep`/Implicit-Settle-Pfad, der früher die OpenBook-Seite aktualisierte, wird in der Praxis nicht mehr benötigt.
+
+**SwapBaseOut (genaue Ausgabe):**
+
+```
+amount_in_after_fee = ceil(in_reserve × amount_out / (out_reserve − amount_out))
+amount_in_gross     = ceil(amount_in_after_fee × swap_fee_denominator
+                            / (swap_fee_denominator − swap_fee_numerator))
+require(amount_in_gross <= maximum_amount_in)
+```
+
+## Orderbook-Interaktion (historisch)
+
+<Note>
+  **Nicht mehr aktiv.** Die in diesem Abschnitt beschriebene Gitterkonstruktion zeigt, wie AMM v4 **ursprünglich** die Kurve auf einem OpenBook-Markt abbildete. Die OpenBook-Integration wurde deaktiviert; Pools veröffentlichen oder verwalten keine Order mehr auf OpenBook. Die Mathematik unten wird zu Dokumentationszwecken beibehalten – sie erklärt, wofür die On-Chain-Konten `target_orders`/`amm_open_orders` dimensioniert wurden und warum das Programm weiterhin `MonitorStep`-bezogene Parameter validiert, obwohl der Keeper sie nicht mehr ausführt.
+</Note>
+
+Getrennt von Benutzer-Swaps platzierte AMM v4 historisch ein **Gitter** von Limitorder auf dem OpenBook-Markt. Das Gitter wurde aus `AmmInfo`-Parametern berechnet:
+
+- **`depth`** – Anzahl der Preisstufen pro Seite.
+- **`amount_wave`** – Basiseinheit der Größe pro Stufe.
+- **`min_size`**, **`coin_lot_size`**, **`pc_lot_size`** – OpenBook-Marktbeschränkungen.
+- **`state_data.swap_acc_coin_fee`**, **`swap_acc_pc_fee`** – kumulative Gebührenzähler seit letztem `TakePnl`.
+
+Das Programm leitet Preise pro Stufe ab, indem es vom aktuellen Kurspreis in konstanten Verhältnisschritten ausgeht:
+
+```
+price_level(k) = curve_price × (1.0001 ^ k)       # konzeptionell
+size_level(k)  = amount_wave × f(depth, k)        # reduziert durch depth
+```
+
+Die genauen Preise und Größen werden durch `target_orders` bestimmt, die in `build_orders` berechnet und bei jedem `MonitorStep` mit `amm_open_orders` verglichen werden. Jede Abweichung führt zu Annullierungen und neuen Orders. Neu gefüllte Order auf OpenBook werden bei der nächsten Operation, die die OpenBook-Seite aktualisiert, in die Pool-Vault abgerechnet.
+
+Integratoren müssen das Gitter selten selbst berechnen – der Raydium-Keeper verwaltet es – aber es ist nützlich zu wissen, dass:
+
+- Ein Pool mit erheblicher **On-Book**-Liquidität diese Liquidität zu `k` beiträgt, nicht untätig ruht.
+- Ein veralteter OpenBook-Markt (Event-Queue voll, Cranks blockiert) verhindert Gitter-Updates; der AMM kann dann Preise angeboten, die vom sichtbaren Orderbook abweichen, bis zum nächsten Crank.
+
+## Abrechnung (PnL)
+
+Der 0,03%-Protokollanteil sammelt sich in `state_data.need_take_pnl_coin` und `state_data.need_take_pnl_pc` an. `TakePnl` verschiebt diese Beträge aus den Vault zum Admin-angegebenen Ziel und setzt die Zähler zurück.
+
+Entscheidende Eigenschaft: Reserven in der Invariante werden immer **minus** aufgelaufenem PnL berechnet, daher beweget `TakePnl` die Kurve nicht. Dies entspricht der CPMM-Konvention.
+
+## Praktisches Beispiel
+
+Pool-Zustand:
+
+- `coin_reserve = 1_000_000_000_000` (1.000.000 Coin-Seite; 6 Dezimalstellen)
+- `pc_reserve   = 2_000_000_000_000` (2.000.000 PC-Seite; 6 Dezimalstellen)
+- Gebühren: Standard `swap = 25/10_000`, `pnl = 3/10_000`.
+
+Benutzer: `SwapBaseIn` mit genaue Eingabe `1_000_000_000` Coin (1.000 Coin).
+
+```
+swap_fee        = ceil(1_000_000_000 * 25 / 10_000)    = 2_500_000
+amount_after_fee =                                      997_500_000
+
+amount_out = amount_after_fee * pc_reserve
+           / (coin_reserve + amount_after_fee)
+           = 997_500_000 * 2_000_000_000_000
+           / (1_000_000_000_000 + 997_500_000)
+           ≈ 1_995_015_009  (1.995,015 PC)
+
+// Von der 2_500_000 Swap-Gebühr:
+pnl_share = 2_500_000 * 3 / 25  = 300_000    (geht an Protokoll via need_take_pnl_coin)
+lp_share  = 2_500_000 * 22 / 25 = 2_200_000  (bleibt in coin_reserve)
+
+new coin_reserve = 1_000_000_000_000 + 1_000_000_000                 = 1_001_000_000_000
+                   (von dem 300_000 aufgelaufener PnL ist)
+  curve coin_reserve = 1_001_000_000_000 − 300_000 = 1_000_999_700_000
+new pc_reserve   = 2_000_000_000_000 − 1_995_015_009                 ≈ 1_998_004_984_991
+
+k' = curve_coin_reserve * new_pc_reserve
+   ≈ 2.000_002_701E24
+k  = 1_000_000_000_000 * 2_000_000_000_000
+   = 2.0E24
+k' > k   ✓
+```
+
+Der LP-Anteil (`2_200_000`) wird nirgendwo separat ausgebrochen – er ist einfach der Rest, der `k'` erhöht.
+
+## Präzisionsregeln
+
+- Reserve-Multiplikationen verwenden `u128`; endgültige Divisionen runden gegen null.
+- `swap_fee` rundet auf (damit der Pool nicht untergebührt).
+- `amount_in` für `SwapBaseOut` rundet auf (damit der Benutzer nicht unterbezahlt).
+- Pools mit extremen Reserveverhältnissen können `ZeroTradingTokens` bei sehr kleinen Eingaben treffen; gleiches Verfahren wie CPMM.
+
+## Einschränkungen im Vergleich zu CPMM
+
+- Die Reserven von AMM v4 enthalten den OpenBook-hinterlegten Anteil, daher kann ein Integrator nicht korrekt nur aus `getTokenAccountBalance` zitieren. Holen Sie sich immer den vollständigen Zustand (Vault + `open_orders.free` + `open_orders.locked`), oder verwenden Sie das SDK/API-Angebot.
+- AMM v4 stellt keine strukturierte On-Chain-TWAP zur Verfügung. Externe Verbraucher, die einen AMM-v4-gestützten Preis benötigen, müssen ihn selbst aus Handelsprotokollen berechnen.
+- Token-2022 wird nicht unterstützt.
+
+## Nächste Schritte
+
+- [`products/amm-v4/instructions`](/de/products/amm-v4/instructions) – wo `SwapBaseIn`, `Deposit` usw. einbinden.
+- [`products/amm-v4/fees`](/de/products/amm-v4/fees) – vollständige Gebührenmechanik, `TakePnl`-Details.
+- [`algorithms/constant-product`](/de/algorithms/constant-product) – die gemeinsame Ableitung.
+
+Quellen:
+
+- [Raydium-AMM-Programmquelle – `raydium-io/raydium-amm`](https://github.com/raydium-io/raydium-amm)
+- Raydium SDK v2 `Liquidity`-Modul

@@ -1,0 +1,280 @@
+---
+title: "交易和费用"
+description: "Solana 交易的结构方式、其运行的限制，以及典型交易中的两个不同费用类别——Solana 网络费用和 Raydium 协议费用——的堆叠方式。"
+---
+
+<Info>
+  **本页内容由 AI 自动翻译，所有内容以英文版本为准。**
+
+  [查看英文版 →](/solana-fundamentals/transactions-and-fees)
+</Info>
+
+<Info>
+  Solana 交易是一个原子性执行的指令列表。理解交易结构——指令、账户、签名者、计算预算——是使用 Raydium 构建、调试或优化任何内容的前提。本页介绍了这个结构、约束它的限制，以及两个费用类别（Solana 网络费用、Raydium 协议费用）在真实交换中的堆叠方式。
+</Info>
+
+## 交易结构
+
+Solana 交易有三个核心组件：
+
+- **消息（Message）**：有序的指令列表、它们引用的账户及最近的区块哈希。
+- **签名（Signatures）**：每个签名者一个，证明交易已被授权。
+- **最近的区块哈希（Recent blockhash）**：证明交易是最近的；具有陈旧区块哈希（>150 个插槽）的交易将被拒绝。
+
+### 指令
+
+指令指定：
+
+- `program_id` — 要调用的程序。
+- `accounts` — 该程序可能访问的账户（及其可写/签名者标志）。
+- `data` — 程序解释的不透明字节。
+
+单个交易可以包含多个指令。它们按顺序执行；如果任何一个失败，所有之前的指令都会回滚（原子性）。
+
+典型的 Raydium 交换交易包括：
+
+1. `ComputeBudget::SetComputeUnitLimit` — 提高默认 CU 限制。
+2. `ComputeBudget::SetComputeUnitPrice` — 设置优先级费用。
+3. 可选的 `CreateAssociatedTokenAccount` — 如果用户没有输出 ATA，则创建一个。
+4. `Raydium::SwapBaseInput` — 执行交换。
+5. 可选的 `CloseAccount` — 关闭一个 wrapped-SOL ATA。
+
+SDK 通过 `raydium.trade.swap()` 自动打包这些。
+
+## 交易中的账户
+
+交易中任何指令接触的每个账户都必须在交易的账户密钥列表中。每个账户都有标记：
+
+- **签名者/非签名者**：账户所有者是否必须签署交易？
+- **可写/只读**：交易能否修改账户？
+
+运行时强制执行这些标记：尝试写入非可写账户的程序失败，运行时拒绝缺少必需签名者的交易。
+
+对于 CPMM 交换，账户列表有约 13 个条目（参见 [`solana-fundamentals/account-model`](/zh/solana-fundamentals/account-model)）。有多个 tick 数组交叉的 CLMM 交换可能有 20 个以上。
+
+## 交易大小限制
+
+Solana 将交易限制在 **1232 字节**，包括签名、消息和头部。这是复杂交易最常见的障碍——Raydium 的 CLMM 多跳路由定期接近这个限制。
+
+典型的约 1000 字节 Raydium 交换的分解：
+
+| 组件 | 大小 |
+|-----------|------|
+| 签名 | 64 B |
+| 签名计数 | 1 B |
+| 消息头 | 3 B |
+| 区块哈希 | 32 B |
+| 账户密钥（13 × 32 B） | 416 B |
+| 指令（4 × ~100-150 B） | 400–600 B |
+| **总计** | ~900–1100 B |
+
+### 地址查询表（ALTs）
+
+ALT 允许交易通过 1 字节索引引用已发布表中的账户，而不是完整的 32 字节公钥。这大幅压缩交易：
+
+- 直接引用 20 个账户的交易：~640 B 的公钥。
+- 使用 ALT 的同一交易：~20 B 的索引 + ALT 引用。
+
+Raydium 在主网上为 CPMM/CLMM 交换路径维护 ALT。SDK 自动使用它们。构建多跳路由的聚合器大量依赖它们。
+
+```ts
+import { VersionedTransaction } from "@solana/web3.js";
+
+// SDK 构建一个带有 ALT 引用的 v0（版本化）交易
+const { transaction } = await raydium.trade.swap({ /* ... */ });
+// transaction 是一个 VersionedTransaction，不是 legacy Transaction。
+```
+
+## 计算预算
+
+每个交易都有一个**计算单位（CU）预算**。超过它会终止执行并失败交易。
+
+- **默认值**：每个交易 200,000 CU。
+- **最大值**：每个交易 1,400,000 CU（通过 `ComputeBudget::SetComputeUnitLimit` 提高）。
+- **每块天花板**：每块 48M CU（协议级别）。
+
+典型的 Raydium CU 消耗（参见 [`integration-guides/priority-fee-tuning`](/zh/integration-guides/priority-fee-tuning) 了解完整表格）：
+
+| 指令 | CU |
+|-------------|-----|
+| CPMM 交换 | ~140,000 |
+| CLMM 交换（无 tick 交叉） | ~170,000 |
+| CLMM 交换（4 个 tick 交叉） | ~320,000 |
+| Farm v6 质押 | ~130,000 |
+| CPMM 池创建 | ~250,000 |
+
+始终通过 `ComputeBudget` 设置显式 CU 限制；否则你会得到 200k 的默认值，这对大多数 Raydium 指令来说太低了。
+
+```ts
+import { ComputeBudgetProgram } from "@solana/web3.js";
+
+tx.add(
+  ComputeBudgetProgram.setComputeUnitLimit({ units: 300_000 }),
+);
+```
+
+如果你设置的 CU 限制太低，交易在达到上限时失败；设置太高则在拥塞时存在被降级优先级的风险（根据定价模型，你可能为未使用的计算付费）。
+
+## 优先级费用
+
+除了基本交易费（每个签名 5000 lamports）外，验证者越来越多地优先级化支付**优先级费用**的交易：每 CU 的 microlamports 小费。
+
+```
+priority_fee = compute_unit_price (micro-lamports) × compute_unit_limit
+```
+
+示例：10,000 µL/CU × 300,000 CU = 3,000,000 µL = 0.003 SOL。
+
+优先级费用是本地的——它们仅影响块内的排序；它们不会提高你的包含概率相对于不包含。在拥塞期间设置合理的优先级费用至关重要。
+
+```ts
+tx.add(
+  ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 10_000 }),
+);
+```
+
+参见 [`integration-guides/priority-fee-tuning`](/zh/integration-guides/priority-fee-tuning) 了解如何动态调整。
+
+## 指令计数和账户计数限制
+
+超过 1232 字节总限制：
+
+- **每个交易的最大账户数**：128。
+- **每个指令的最大账户数（CPI）**：64。
+- **每个交易的最大指令数**：无硬限制，仅受大小限制。
+- **最大 CPI 深度**：4（一个程序可以调用另一个，后者可以调用另一个，4 级深）。
+
+跨越多个 tick 数组的 Raydium CLMM 交换可能会对账户限制造成很大压力——单个交换接触池、输入/输出金库、输入/输出 ATA、多个 tick 数组、可能还有 transfer-hook 程序的额外账户，加上强制的计算预算/系统/令牌程序引用。通过 CPI 组合 Raydium 的设计（例如自动复利机制）需要考虑这一点。
+
+## Raydium 交换中的费用类别
+
+用户交换交易支付两个类别的费用：
+
+### Solana 网络费用
+
+以 SOL 支付给验证者。
+
+- **基础签名费**：每个签名 5000 lamports。几乎总是 1 个签名 = 0.000005 SOL。
+- **优先级费用**：CU 价格 × CU 限制（microlamports）。随拥塞变化；参见 [`integration-guides/priority-fee-tuning`](/zh/integration-guides/priority-fee-tuning)。
+
+这些费用去往验证者，与 Raydium 无关，即使对于失败的交易也被收取（除了某些优先级费用边界情况）。
+
+### Raydium 协议费用
+
+从交换金额中扣除。
+
+- **交换费**：输入的百分比（CPMM 典型 0.25%，CLMM 按级别 0.01%–1%）。在 LP 和协议目的地之间分割。参见 [`ray/protocol-fees`](/zh/ray/protocol-fees)。
+
+这些费用是 Raydium 账务的内部部分——用户看到的输出金额比零费用池产生的要少。
+
+### 示例：\$1000 USDC → SOL 通过 CPMM 0.25% 级别
+
+| 费用类别 | 金额 | 去往 |
+|--------------|--------|---------|
+| 基础签名费 | 0.000005 SOL (~\$0.0007) | 验证者 |
+| 优先级费（10k µL × 300k CU） | 0.003 SOL (~\$0.45) | 验证者 |
+| CPMM 交换费（0.25%） | \$2.50 | LP + 协议 |
+| **用户总成本** | ~\$2.95 | |
+
+滑点（价格影响 + 市场波动）不是费用，但会影响相同的底线。
+
+## 版本化交易
+
+Solana 有两种交易格式：
+
+- **Legacy**：原始格式，不支持 ALT。
+- **v0（版本化）**：支持 ALT，可扩展到未来版本。
+
+所有现代 Solana 工具都使用 v0。Raydium SDK 默认发出 v0 交易。
+
+```ts
+// 直接构建 v0 交易
+import { VersionedTransaction, TransactionMessage } from "@solana/web3.js";
+
+const msg = new TransactionMessage({
+  payerKey:        owner.publicKey,
+  recentBlockhash: blockhash,
+  instructions:    [ /* ... */ ],
+}).compileToV0Message([lookupTableAccount]);
+
+const tx = new VersionedTransaction(msg);
+tx.sign([owner]);
+```
+
+## 区块哈希新鲜度
+
+交易必须包含来自最后约 150 个插槽（约 60 秒）内的区块哈希。超过该窗口，验证者会拒绝它。
+
+对于重试循环，在每次重试时获取新的区块哈希：
+
+```ts
+async function sendWithRetry(tx, maxRetries = 3) {
+  for (let i = 0; i < maxRetries; i++) {
+    const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash();
+    tx.message.recentBlockhash = blockhash;
+    tx.sign([owner]);
+    try {
+      return await connection.sendRawTransaction(tx.serialize());
+    } catch (e) {
+      if (i === maxRetries - 1) throw e;
+    }
+  }
+}
+```
+
+参见 [`integration-guides/priority-fee-tuning`](/zh/integration-guides/priority-fee-tuning) 了解完整的递增费用重试模式。
+
+## 并行执行
+
+Solana 在多核验证者上并行执行非冲突的交易。两个交易冲突如果它们都写同一账户。
+
+对 Raydium 的影响：
+
+- 同一池上的两次交换无法并行执行——两者都写池状态。
+- 池 A 上的交换和池 B 上的交换如果账户列表不重叠则并行执行。
+- 只读交易永远不会阻止同一账户上的写入器（只读与自己并发，但不与写入并发）。
+
+这就是为什么 Solana 尽管单池序列化仍能维持高 DEX 吞吐量的原因。
+
+## 交易确认级别
+
+提交交易时，你选择一个确认级别：
+
+| 级别 | 等待 | 最终性 |
+|------|------|----------|
+| `processed` | ~400 ms | 未最终化；可能回滚 |
+| `confirmed` | ~1 s | 多数投票 |
+| `finalized` | ~13 s | 多数已确立 |
+
+对于交换 UX，`confirmed` 是标准的。对于处理大额价值的操作（池创建、奖励补充），`finalized` 更安全。
+
+```ts
+await connection.sendAndConfirmTransaction(tx, [owner], {
+  commitment: "confirmed",
+});
+```
+
+## 模拟
+
+Solana 支持在提交前模拟交易：
+
+```ts
+const sim = await connection.simulateTransaction(tx);
+console.log(sim.value.logs);
+console.log(sim.value.unitsConsumed);
+```
+
+Raydium SDK 在计算 `getBestSwapInfo` 时在内部使用模拟来验证选定路由确实成功。模拟不是免费的——它消耗 RPC 容量——但它在付费前捕获错误。
+
+## 指针
+
+- [`solana-fundamentals/account-model`](/zh/solana-fundamentals/account-model) — 交易中的账户。
+- [`solana-fundamentals/pdas-and-cpis`](/zh/solana-fundamentals/pdas-and-cpis) — 程序如何相互调用。
+- [`integration-guides/priority-fee-tuning`](/zh/integration-guides/priority-fee-tuning) — 调整 CU 限制和优先级费用。
+- [`ray/protocol-fees`](/zh/ray/protocol-fees) — Raydium 协议费用结构。
+
+来源：
+
+- [Solana Transaction 文档](https://docs.solana.com/developing/programming-model/transactions)。
+- [Address Lookup Tables 提案](https://docs.solana.com/developing/lookup-tables)。
+- [计算预算文档](https://docs.solana.com/developing/programming-model/runtime)。

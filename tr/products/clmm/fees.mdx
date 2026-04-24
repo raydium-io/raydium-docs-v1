@@ -1,0 +1,266 @@
+---
+title: "CLMM ücretleri ve ödülleri"
+description: "CLMM'nin işlem ücretini LP'ler, protokol ve fon arasında nasıl böldüğü; üç slotlu ödül sisteminin kapsam içi pozisyonlara nasıl yayıldığı ve her ikisinin pozisyon bazında bakiyelere nasıl yansıdığı."
+---
+
+<Info>
+  **Bu sayfa yapay zekâ tarafından otomatik olarak çevrilmiştir. İngilizce sürüm esas alınır.**
+
+  [İngilizce sürümü görüntüle →](/products/clmm/fees)
+</Info>
+
+## Ücret kademeleri
+
+CLMM pool'ları oluşturulurken bir `AmmConfig`'e bağlanır; bu yapılandırma işlem ücreti oranını, protokol ve fon paylarını ve **tick aralığını** belirler (bkz. [`products/clmm/ticks-and-positions`](/tr/products/clmm/ticks-and-positions)). Yaygın kullanılan kademelerin güncel halini `GET https://api-v3.raydium.io/main/clmm-config` üzerinden doğrulayabilirsiniz:
+
+| `AmmConfig` indeksi | `trade_fee_rate` | Tick aralığı | Tipik kullanım |
+|---|---|---|---|
+| 0 | `100` (%0,01) | 1 | Stabil çiftler |
+| 1 | `500` (%0,05) | 10 | Birbiriyle ilişkili blue-chip'ler |
+| 2 | `2_500` (%0,25) | 60 | Standart çiftler |
+| 3 | `10_000` (%1,00) | 120 | Oynak veya uzun kuyruklu varlıklar |
+
+İşlem ücreti oranı `1/FEE_RATE_DENOMINATOR = 1/1_000_000` birimindedir ve işlem hacmine uygulanır. Protokol ve fon oranları aynı paydayı kullanır; ancak hacme değil, **işlem ücretine** uygulanır — bu kural CPMM ile aynıdır.
+
+## Swap başına ücret dağılımı
+
+Bir swap'ın her adımında (bkz. [`products/clmm/math`](/tr/products/clmm/math)):
+
+```
+step_trade_fee   = ceil(step_input * trade_fee_rate / 1_000_000)
+step_protocol    = floor(step_trade_fee * protocol_fee_rate / 1_000_000)
+step_fund        = floor(step_trade_fee * fund_fee_rate     / 1_000_000)
+step_lp          = step_trade_fee - step_protocol - step_fund
+```
+
+- `step_lp`, mevcut aktif likiditeyle orantılı biçimde `fee_growth_global_{input_side}_x64`'e yansır: `fee_growth_global += step_lp × 2^64 / pool.liquidity`.
+- `step_protocol`, `PoolState.protocol_fees_token_{input_side}`'de birikir ve `CollectProtocolFee` ile toplanır.
+- `step_fund`, `PoolState.fund_fees_token_{input_side}`'de birikir ve `CollectFundFee` ile toplanır.
+
+CPMM'de olduğu gibi protokol ve fon payları vault'larda tutulur, ancak **eğrinin likidite görünümünün dışında kalır**: swap matematiği bekleyen ancak henüz toplanmamış ücretlerle şişirilmemiş olan `pool.liquidity`'yi okur.
+
+## Ücretlerin neden her token için ayrı tutulduğu
+
+CPMM'de bir swap'ın ücreti her zaman girdi token'ından kesilir ve pool'un diğer tarafı bu swap'ın protokol/fon tahakkukunu görmez. CLMM'de aynı kural her adımda geçerlidir: **ücretler o adımda girdi olan token'da birikir**. Çok tickli bir swap tutarlı bir yönde ilerlediğinden tüm adımlar ücreti aynı token'da keser; dolayısıyla herhangi bir swap'taki ücretler pratikte *tek* tarafa akar.
+
+Kullanıcı token0 → token1 takas ederse `fee_growth_global_0_x64` yükselir; `fee_growth_global_1_x64` değişmez. Pozisyonlar bu swap için token0 cinsinden ücret kazanır. Bir sonraki swap ters yönde gidip `fee_growth_global_1_x64`'ü artırabilir. Zamanla dengeli bir pool her iki tarafta da birikim yapar.
+
+## Tek taraflı ücret (`CollectFeeOn`)
+
+[`CreateCustomizablePool`](/tr/products/clmm/instructions) aracılığıyla oluşturulan pool'lar varsayılan dışı bir ücret toplama modunu seçebilir. Bu mod pool oluşturulurken sabitlenir ve `PoolState.fee_on` alanında saklanır.
+
+| `CollectFeeOn` değeri | `fee_on` baytı | Davranış |
+|---|---|---|
+| `FromInput` (varsayılan) | `0` | Klasik Uniswap-V3 — ücret her zaman swap adımının girdi token'ından kesilir. Girdi token'ı swap yönüne göre değişir. |
+| `Token0Only` | `1` | Ücret her zaman token0 cinsinden hesaplanır. 0→1 swap'larında ücret girdi token'ından kesilir (`FromInput` ile aynı). 1→0 swap'larında ücret swap'ın çıktısından (token0) alınır. |
+| `Token1Only` | `2` | `Token0Only`'nin simetrisi — ücret her zaman token1 cinsindendir. |
+
+**Bir pool'un neden `Token0Only` veya `Token1Only` seçeceği** — LP'lere tek ve öngörülebilir bir birikim para birimi sunmak için. `MEMECOIN / USDC` gibi LP'lerin dolar cinsinden hesap tuttuğu çiftlerde `Token1Only` (ücretler her zaman USDC'de kapanır) avantajlıdır; LP kâr-zararı hangi tarafın daha fazla işlem yaptığından etkilenmez. Bunun bedeli şudur: ücretin swap çıktısından alındığı yönlerde kullanıcı `out − ε` yerine `out − fee` alır, bu nedenle fiyatlama mantığı ücreti çıkış tarafından düşmelidir. SDK'nın `computeAmountOut` fonksiyonu bu dallanmayı `fee_on`'a göre yönetir; `pool.fee_on`'u doğrudan okuyan istemci kodu, `PoolState` üzerindeki yardımcı fonksiyonları taklit etmelidir:
+
+```rust
+pool.is_fee_on_input(zero_for_one: bool) -> bool   // true → fee is deducted from input
+pool.is_fee_on_token0(zero_for_one: bool) -> bool  // for telemetry / accounting
+```
+
+**LP düzeyindeki etkisi** — ücret, standart `fee_growth_global_{0,1}_x64` akümülatörleri üzerinden yönlendirilmeye devam eder; pozisyonlar yine aynı `fee_growth_inside` formülüyle ücret tahakkuk ettirir. Asimetri yalnızca taraf tahakkuk *yönündedir*, matematiksel hesaplamada değil.
+
+`fee_on`, oluşturma sonrasında **değiştirilemez**. Eski `CreatePool` talimatıyla oluşturulan pool'lar kalıcı olarak `FromInput` modundadır.
+
+## Dinamik ücret
+
+`enable_dynamic_fee = true` ile oluşturulan pool'lar, `AmmConfig.trade_fee_rate`'in üzerine oynaklık güdümlü bir ek ücret uygular. Mekanizma, Trader Joe / Meteora dinamik ücret tasarımının basitleştirilmiş bir uyarlamasıdır.
+
+### Durum
+
+`PoolState.dynamic_fee_info`, pool oluşturulurken alınan `DynamicFeeConfig` anlık görüntüsünden beş kalibrasyon parametresi ve her swap tarafından güncellenen dört durum alanı taşır. Bayt düzeni için bkz. [`products/clmm/accounts`](/tr/products/clmm/accounts#dynamicfeeconfig-and-dynamicfeeinfo).
+
+### Swap başına güncelleme
+
+Her swap adımında program üç alt adım çalıştırır:
+
+1. **Referansı azalt.** `now - last_update_timestamp > filter_period` koşulu sağlanıyorsa oynaklık referansı azalır:
+
+    ```
+    if elapsed > decay_period:
+        volatility_reference = 0
+    elif elapsed > filter_period:
+        volatility_reference = volatility_accumulator * reduction_factor / 10_000
+    # else: hold the previous reference
+    ```
+
+2. **Akümülatörü güncelle.** Yeni akümülatör, referans değeri artı kat edilen mutlak mesafenin (`tick_spacing` birimi cinsinden) bir ayrıntı ölçeğiyle çarpılıp yapılandırılan üst sınıra kısıtlanmasıyla oluşur:
+
+    ```
+    delta_idx     = abs(tick_spacing_index_reference - current_tick_spacing_index)
+    accumulator   = volatility_reference + delta_idx * 10_000   // VOLATILITY_ACCUMULATOR_SCALE
+    accumulator   = min(accumulator, max_volatility_accumulator)
+    ```
+
+3. **Ek ücreti hesapla.** Ek ücret akümülatörde paraboliktir (kanonik formülde swap "tick mesafesi" karesine alındığından), `dynamic_fee_control` tarafından kazanç ölçeklenerek uygulanır:
+
+    ```
+    fee_increment_rate = dynamic_fee_control * (accumulator * tick_spacing)^2
+                       / (100_000 * 10_000^2)
+    fee_rate           = AmmConfig.trade_fee_rate + fee_increment_rate
+    fee_rate           = min(fee_rate, 100_000)              // 10% cap
+    ```
+
+%10 üst sınırı (`MAX_FEE_RATE_NUMERATOR = 100_000`, `1e6` biriminde) bir güvenlik rayı olarak sabit kodlanmıştır; iyi ayarlanmış yapılandırmalarda pratikte bu sınırın çok altında kalınır.
+
+### Parametreleri seçme
+
+Pilot pool'larda işe yarayan tipik aralıklar:
+
+| Parametre | Tipik aralık | Notlar |
+|---|---|---|
+| `filter_period` | 30 – 60 s | Referansı mikro-oynaklık boyunca korur; düşük değer = daha reaktif |
+| `decay_period` | 300 – 1800 s | Bu sessizlik penceresinin ardından ücret tabana döner |
+| `reduction_factor` | 4_000 – 8_000 | `10_000` üzerinden. Yüksek = yüksek ücret daha uzun süre devam eder |
+| `dynamic_fee_control` | 1_000 – 50_000 | `100_000` üzerinden. Eğri üzerindeki kazanç |
+| `max_volatility_accumulator` | 100_000 – 10_000_000 | Ek ücretin ulaşabileceği üst sınırı belirler |
+
+Kalibre etmek için geçmiş swap'ları formüle karşı çevrimdışı olarak yeniden oynatın, ardından `dynamic_fee_control`'ü ortalama ücretin bir hedefle örtüşeceği şekilde ayarlayın (örneğin 1σ günlerde tabana göre 1,5×, 3σ günlerde 5×).
+
+### LP'lerin gördüğü
+
+Dinamik ücret geliri, temel ücretle aynı akümülatörler üzerinden akar: `fee_growth_global_{0,1}_x64`. Ayrı bir "dinamik ücret büyüme" alanı yoktur. Oynak pool'lardaki LP'ler, oynaklık dönemlerinde ek bir talep veya uzlaşma talimatı gerekmeksizin daha yüksek ücret kazanır.
+
+### Entegratörlerin bilmesi gerekenler
+
+- Bir fiyat teklifinin döndürdüğü ücret, pool rezervleri hareket etmemiş olsa bile N bloğu ile N+1 bloğu arasında değişebilir — her swap oynaklık akümülatörünü kaydırır. Trade API teklifleri teklif anındaki blok için geçerlidir; reaktif bir pool teklif ile uygulama arasında tetiklenirse birkaç bps sapma olabilir.
+- `volatility_accumulator` ve `last_update_timestamp` zincir üzerinde herkese açıktır — istemciler çevrimdışı simülasyonlar için formülü istemci tarafında yeniden üretebilir.
+
+## Pozisyon bazında ücret muhasebesi
+
+Her pozisyon, son dokunulduğu anda şu bilgileri saklar:
+
+- `fee_growth_inside_0_last_x64` ve `fee_growth_inside_1_last_x64` — o anlık görüntüdeki aralığa özgü ücret büyümesi.
+
+Sonraki her dokunuşta (`IncreaseLiquidity`, `DecreaseLiquidity` ve tick sınırı ücret büyümesini örtülü olarak güncelleyen tüm durum geçişlerinde):
+
+1. Program, **global** ücret büyümesinden ve iki uç tickin `fee_growth_outside_*` değerlerinden `fee_growth_inside_{0,1}_x64`'ü yeniden hesaplar.
+2. Δ, pozisyonun likiditesiyle ağırlıklandırılarak `tokens_fees_owed_{0,1}`'e eklenir:
+
+   ```
+   Δ_fee_growth_inside_0 = fee_growth_inside_now_0 - fee_growth_inside_last_0
+   tokens_fees_owed_0  += Δ_fee_growth_inside_0 * position.liquidity / 2^64
+   ```
+
+3. `fee_growth_inside_{0,1}_last_x64` güncellenir.
+
+Token'lar fiziksel olarak yalnızca `DecreaseLiquidity` veya özel `CollectFees` yolu üzerinde taşınır (Raydium'un mevcut talimat setinde ücretler `DecreaseLiquidity`'nin bir parçası olarak toplanır). `DecreaseLiquidity` çağrısında `liquidity = 0` ayarlamak, standart "yalnızca topla" deyimidir.
+
+### Kapsam dışı pozisyonlar hiçbir şey kazanmaz
+
+Bir pozisyonun aralığı `tick_current`'ı içermiyorsa, bu pozisyon için hesaplanan `fee_growth_inside` **üstten sınırlıdır** ve fiyat kapsamın dışındayken hareket etmez. Fiyat tekrar aralığa dönene kadar pozisyon ücret tahakkuk ettirmeyi bırakır. Bu bir hata değil, bir özelliktir — yoğunlaştırılmış likiditenin hem sermayeyi hem de *ücret verimini* yoğunlaştırma biçimidir.
+
+## Ödül akışları
+
+Bir CLMM pool'u aynı anda en fazla **üç** ödül akışı barındırabilir. Her akış, `PoolState.reward_infos[i]` içinde saklanan (ödül mint'i, yayın hızı, başlangıç zamanı, bitiş zamanı) dörtlüsüdür.
+
+```rust
+pub struct RewardInfo {
+    pub reward_state: u8,               // Uninitialized | Initialized | Open | Ended
+    pub open_time: u64,
+    pub end_time: u64,
+    pub last_update_time: u64,
+    pub emissions_per_second_x64: u128, // Q64.64 reward tokens per second
+    pub reward_total_emissioned: u64,
+    pub reward_claimed: u64,
+    pub token_mint:    Pubkey,
+    pub token_vault:   Pubkey,
+    pub authority:     Pubkey,           // who can SetRewardParams / fund
+    pub reward_growth_global_x64: u128,  // accumulator, Q64.64
+}
+```
+
+### Uzlaşma döngüsü
+
+Her likidite dokunuşlu talimat (ve bağımsız bir talimat olarak `UpdateRewardInfos`) tüm aktif akışları `now`'a taşır:
+
+```
+for each reward_info with state in {Open, Ended within grace}:
+    elapsed         = min(now, end_time) − last_update_time
+    if elapsed > 0 && pool.liquidity > 0:
+        reward_growth_global_x64 += emissions_per_second_x64 × elapsed × 2^64 / pool.liquidity
+        reward_total_emissioned  += emissions_per_second × elapsed
+    last_update_time = min(now, end_time)
+```
+
+`pool.liquidity == 0` olan bir aralıkta yayın gerçekleştirilemiyor; ödenmesi gereken kapsam içi likidite yoktur. Kalan bütçe ödül vault'unda kalır. Akışı başlatıp unutan protokoller `SetRewardParams` aracılığıyla bütçeyi artırabilir veya akışı sonlandırabilir.
+
+### Pozisyon bazında ödül tahakkuku
+
+Tıpkı ücretler gibi, ancak her akış için ek bir boyut eklenmiştir:
+
+```
+for each stream i:
+    reward_growth_inside_now_i   = compute_inside_i(pool, tick_lower, tick_upper)
+    Δ_i = reward_growth_inside_now_i - personal_position.reward_infos[i].growth_inside_last_x64
+    personal_position.reward_infos[i].reward_amount_owed += Δ_i * personal_position.liquidity / 2^64
+    personal_position.reward_infos[i].growth_inside_last_x64 = reward_growth_inside_now_i
+```
+
+Kullanıcılar `CollectReward` aracılığıyla talep eder; bu işlem `reward_amount_owed` miktarını akışın vault'undan kullanıcıya aktarır ve sayacı sıfırlar.
+
+### Yalnızca kapsam içi pozisyonlar ödül kazanır
+
+`reward_growth_inside`, `fee_growth_inside` ile aynı formülü kullanır — tick dışı akümülatörler aracılığıyla — bu nedenle mevcut fiyat aralığının dışındaki pozisyonlar ödül biriktiremez. Bu durum, Uniswap v3'ün "teşvikler aktif likiditeye gider" tasarım tercihini yansıtır ve LP çıkarlarını spot fiyat kapsamıyla örtüştürür.
+
+### Akışları fonlama ve sonlandırma
+
+Bir akış `InitializeReward` aracılığıyla oluşturulur; bu işlem toplam bütçeyi (`emissions_per_second × (end_time − open_time)`) peşinen akışın ödül vault'una yatırır. Program, fon sağlayıcının bakiyesi yetersizse `InitializeReward`'ı reddeder. `SetRewardParams`, `end_time`'ı uzatabilir veya yayın hızını artırabilir; LP'lere zaten vaadedilmiş yayınları ortadan kaldırmamak için her ikisinin azaltılması engellenir.
+
+`now > end_time` olduğunda akış `Ended` durumuna geçer, ancak `reward_growth_global_x64`'ü okunmaya devam eder — yayın dursa da LP'ler tarihsel olarak kazandıkları miktarlar için uzun süre `CollectReward` çağırabilir.
+
+## Yönetici koleksiyonu
+
+| İmzacı | Talimat | Etki |
+|--------|-------------|--------|
+| `amm_config.owner` | `CollectProtocolFee` | `protocol_fees_token_{0,1}` değerini bir alıcıya aktar. |
+| `amm_config.fund_owner` | `CollectFundFee` | `fund_fees_token_{0,1}` değerini bir alıcıya aktar. |
+
+Her iki işlem de eğriyi hareket ettirmez — birikmiş miktarlar zaten `pool.liquidity`'nin dışındadır. Mainnet'te bu imzacıları kimlerin tuttuğu için bkz. [`security/admin-and-multisig`](/tr/security/admin-and-multisig).
+
+## Token-2022 etkileşimleri
+
+Ücretler ve ödüller, pool'un veya akışın token'larından biri cinsinden hesaplanır. Token-2022 uzantıları, CPMM'deki gibi aynı şekilde davranır:
+
+- **Swap'ın girdi mint'inde transfer ücreti.** Pool `amount_in − mint_transfer_fee` alır. CLMM programının adım girdisi net tutar üzerinden hesaplanır; dolayısıyla pool'un ücret akümülatörleri vault'ta gerçekten bulunan token'ları yansıtır.
+- **Çıktı mint'inde transfer ücreti.** Pool `amount_out` gönderir; kullanıcı `amount_out − mint_transfer_fee` alır. Slippage kontrolleri kullanıcının aldığı tutara göre yapılmalıdır.
+- **Ödül mint'inde transfer ücreti.** Yayınlar, `InitializeReward` anında "vault'a giren" birimler cinsinden hesaplanır (fon sağlayıcı mint transfer ücretini vault'a öder). `CollectReward` sırasında yapılan çekimler ise başka bir mint transfer ücreti doğurur; LP'ler transfer ücretli ödül token'larında küçük bir kesinti bekler.
+- **Transfersiz / gizli / grup üyesi mint'ler.** `CreatePool` / `InitializeReward` aşamasında reddedilir.
+
+Çok adımlı transfer ücretli bir swap'ta birleşik etki önemli olabilir. Bunu göz ardı eden fiyatlayıcılar fazla iyimser sonuçlar verir; referans hesaplama için bkz. [`algorithms/token-2022-transfer-fees`](/tr/algorithms/token-2022-transfer-fees).
+
+## Ücret ve ödülleri zincir dışında okuma
+
+```ts
+const pool = await raydium.clmm.getPoolInfoFromRpc(poolId);
+const position = await raydium.clmm.getOwnerPositionInfo({
+  wallet: owner.publicKey,
+});
+
+for (const p of position) {
+  console.log("Position", p.nftMint.toBase58(),
+              "range", p.tickLower, "→", p.tickUpper,
+              "L", p.liquidity.toString(),
+              "fees owed:", p.tokenFeesOwed0.toString(),
+              p.tokenFeesOwed1.toString(),
+              "rewards owed:", p.rewardInfos.map(r => r.rewardAmountOwed.toString()));
+}
+```
+
+`tokenFeesOwed*` ve `rewardAmountOwed`, pozisyonun en son dokunulduğu andaki anlık görüntülerdir. **Güncel** değerleri (o andan bu yana gerçekleşen büyümeyi de yansıtan) görmek için sıfır likidite ile simülasyonda `IncreaseLiquidity` çağırın ya da global `fee_growth_*` ve iki tick dışı anlık görüntüyü kullanarak yeniden hesaplayın.
+
+## Sıradaki adımlar
+
+- [`products/clmm/math`](/tr/products/clmm/math) — `fee_growth_inside`'ın tam türetimi.
+- [`products/clmm/instructions`](/tr/products/clmm/instructions) — `CollectReward`, `InitializeReward`, `SetRewardParams` hesap listeleri.
+- [`algorithms/token-2022-transfer-fees`](/tr/algorithms/token-2022-transfer-fees) — transfer ücretli mint'lerle fiyatlama.
+- [`reference/fee-comparison`](/tr/reference/fee-comparison) — CLMM/CPMM/AMM-v4 ücret matrisi karşılaştırması.
+
+Kaynaklar:
+
+- [`raydium-io/raydium-clmm` — `states/pool.rs`, `libraries/fixed_point_64.rs`](https://github.com/raydium-io/raydium-clmm)
+- "Uniswap v3 Core" teknik belgesi, §7 (ücret büyümesi)

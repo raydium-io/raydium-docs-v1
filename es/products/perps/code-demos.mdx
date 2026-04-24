@@ -1,0 +1,312 @@
+---
+title: "Demostraciones de código para Perps"
+description: "Acceso programático a Raydium Perps mediante la API de Orderly Network: depositar USDC, registrar la cuenta de trading, colocar/cancelar/modificar órdenes, obtener posiciones, suscribirse a un WebSocket de mercado y retirar fondos."
+---
+
+<Info>
+  **Esta página fue traducida automáticamente por IA. La versión en inglés es la fuente autorizada.**
+
+  [Ver versión en inglés →](/products/perps/code-demos)
+</Info>
+
+<Info>
+  **Raydium Perps es un despliegue de etiqueta blanca en Orderly Network.** El libro de órdenes, el motor de emparejamiento y el estado de la cuenta residen en Orderly. El SDK de Raydium v2 (`@raydium-io/raydium-sdk-v2`) **no** cubre perps — para acceso programático, usa directamente la API REST + WebSocket de Orderly. Los fragmentos a continuación muestran los flujos más comunes; la referencia canónica está en [orderly.network/docs](https://orderly.network/docs/build-on-omnichain/evm-api/introduction).
+</Info>
+
+<Info>
+  **Banner de versión.**
+
+  - Backend: API REST + WebSocket de Orderly Network
+  - Esquema de fragmento verificado contra la API de Orderly a partir de 2026-04
+  - Cluster de Solana para depósitos en cadena: `mainnet-beta`
+  - Firma: Ed25519 de Solana sobre la carga útil de estilo EIP-712 de Orderly (Orderly utiliza un esquema EIP-712 incluso para cadenas que no son EVM; consulta la documentación de Orderly para la lista de campos más reciente)
+
+  La superficie de la API de Orderly evoluciona; verifica [orderly.network/docs](https://orderly.network/docs/build-on-omnichain/evm-api/introduction) antes de copiar estos fragmentos en producción.
+</Info>
+
+## Qué hay en esta página
+
+Los flujos a continuación cubren el ciclo de vida relevante para el integrador:
+
+1. Configuración de cuenta — depositar USDC y registrar la cuenta con Orderly.
+2. Llamadas REST autenticadas — solicitar firma para colocación de órdenes, cancelación y consultas de cuenta.
+3. Trading — colocar órdenes de mercado / límite, cancelar, obtener posiciones y ejecuciones.
+4. Datos de mercado — suscribirse al libro de órdenes y WebSocket de transacciones.
+5. Retiro — iniciar un retiro de vuelta a la billetera.
+
+Estos fragmentos están dirigidos a Node.js + TypeScript con `@solana/web3.js` y `tweetnacl` para firma Ed25519. Son **puntos de partida** — la superficie de la API de Orderly es amplia y cambia más rápido que esta página; siempre verifica la documentación en vivo de Orderly antes de enviar código de producción.
+
+## Configuración
+
+```ts
+import { Connection, Keypair, PublicKey, clusterApiUrl } from "@solana/web3.js";
+import nacl from "tweetnacl";
+import bs58 from "bs58";
+import fs from "node:fs";
+
+// 1. Cartera de Solana — posee USDC, firma transacciones de depósito/retiro.
+const connection = new Connection(process.env.RPC_URL ?? clusterApiUrl("mainnet-beta"));
+const owner = Keypair.fromSecretKey(
+  new Uint8Array(JSON.parse(fs.readFileSync(process.env.KEYPAIR!, "utf8"))),
+);
+
+// 2. Clave de trading de Orderly — par de claves Ed25519 separado usado para firmar solicitudes de API.
+//    NO es la cartera de Solana. Genéralo una vez, mantenlo en secreto, reutilízalo entre sesiones.
+const orderlyKey = nacl.sign.keyPair();   // ed25519
+const orderlyPubB58 = "ed25519:" + bs58.encode(orderlyKey.publicKey);
+
+// 3. URL base de Orderly. Raydium utiliza el host mainnet de Orderly.
+const ORDERLY_BASE = "https://api.orderly.org";
+const BROKER_ID    = "raydium";   // Espacio de nombres de broker de Raydium en Orderly
+const CHAIN_ID     = "solana";    // para registro de cuenta entre cadenas
+```
+
+La clave de trading de Orderly **no** es tu clave de billetera. Es una clave para firmar solicitudes que registras contra tu billetera en el primer uso; puedes rotarla sin tocar fondos. Trata como una credencial de sesión.
+
+## Registro de cuenta
+
+Antes de colocar cualquier orden, registra la billetera con Orderly:
+
+```ts
+import { encodeUserSettlement } from "./eip712-helpers"; // consulta la documentación de Orderly para la carga útil exacta
+
+// 1. Solicita un nonce de registro a Orderly.
+const nonceResp = await fetch(`${ORDERLY_BASE}/v1/registration_nonce`).then(r => r.json());
+const registrationNonce = nonceResp.data.registration_nonce;
+
+// 2. Firma una carga útil de registro con la billetera de Solana (EIP-712-style en Solana
+//    se implementa como un mensaje estructurado; el SDK de Orderly proporciona el codificador).
+const payload = encodeUserSettlement({
+  brokerId: BROKER_ID,
+  chainId: CHAIN_ID,
+  registrationNonce,
+  timestamp: Date.now(),
+});
+const walletSig = nacl.sign.detached(Buffer.from(payload), owner.secretKey);
+
+// 3. Registra, incluyendo la clave de trading Ed25519 de Orderly.
+const reg = await fetch(`${ORDERLY_BASE}/v1/register_account`, {
+  method: "POST",
+  headers: { "Content-Type": "application/json" },
+  body: JSON.stringify({
+    message: payload,
+    signature: bs58.encode(walletSig),
+    userAddress: owner.publicKey.toBase58(),
+    orderlyKey: orderlyPubB58,
+  }),
+}).then(r => r.json());
+
+console.log("ID de cuenta:", reg.data.account_id);
+```
+
+Los IDs de cuenta son deterministas por par `(broker_id, wallet_address)` — el registro es idempotente. Si una billetera ya se ha registrado con el broker de Raydium, la llamada devuelve el mismo ID de cuenta sin crear uno nuevo.
+
+## Depositar USDC
+
+Los depósitos mueven USDC desde el ATA de la billetera al almacén de liquidación de Orderly. Son transacciones de Solana en cadena:
+
+```ts
+// Construye la ix de depósito usando el programa de Solana de Orderly (el ID del programa de almacén se
+// publica en sus documentos; extrae dinámicamente en lugar de codificar de forma rígida).
+const vaultProgramId = new PublicKey("<orderly_solana_vault_program_id>");
+
+const depositIx = await buildOrderlyDepositIx({
+  vaultProgramId,
+  user: owner.publicKey,
+  brokerId: BROKER_ID,
+  amountUsdc: BigInt(100_000_000),    // 100 USDC (6 decimales)
+});
+
+const tx = new Transaction().add(depositIx);
+const sig = await connection.sendTransaction(tx, [owner]);
+await connection.confirmTransaction(sig, "confirmed");
+console.log("Tx de depósito:", sig);
+```
+
+Después de ~30 segundos, el relayer de Orderly indexa el depósito y el saldo aparece bajo el margen libre de la cuenta. Consulta `/v1/client/holding` para confirmar:
+
+```ts
+const holdingResp = await orderlyAuthGet("/v1/client/holding");
+console.log("Saldos:", holdingResp.data.holding);
+```
+
+(`orderlyAuthGet` se define a continuación — cada llamada autenticada la atraviesa.)
+
+## Ayudante de firma de solicitud
+
+Cada llamada REST autenticada a Orderly lleva una firma Ed25519 sobre `(timestamp + method + path + body)`:
+
+```ts
+async function orderlyAuthRequest(
+  method: "GET" | "POST" | "PUT" | "DELETE",
+  path: string,
+  body?: unknown,
+): Promise<any> {
+  const ts   = Date.now().toString();
+  const json = body ? JSON.stringify(body) : "";
+  const msg  = `${ts}${method}${path}${json}`;
+  const sig  = nacl.sign.detached(Buffer.from(msg), orderlyKey.secretKey);
+
+  const resp = await fetch(ORDERLY_BASE + path, {
+    method,
+    headers: {
+      "Content-Type": "application/json",
+      "orderly-account-id":  /* el account_id registrado */ "",
+      "orderly-key":         orderlyPubB58,
+      "orderly-signature":   bs58.encode(sig),
+      "orderly-timestamp":   ts,
+    },
+    body: json || undefined,
+  });
+  return resp.json();
+}
+
+const orderlyAuthGet  = (p: string)            => orderlyAuthRequest("GET",  p);
+const orderlyAuthPost = (p: string, b: object) => orderlyAuthRequest("POST", p, b);
+const orderlyAuthDel  = (p: string)            => orderlyAuthRequest("DELETE", p);
+```
+
+Protección contra reproducción: las solicitudes con un `timestamp` más de 5 segundos desincronizado del reloj del servidor se rechazan. Sincroniza tu reloj (NTP) y evita firmar solicitudes por adelantado.
+
+## Colocar una orden de mercado
+
+```ts
+const marketResp = await orderlyAuthPost("/v1/order", {
+  symbol:        "PERP_SOL_USDC",
+  order_type:    "MARKET",
+  side:          "BUY",
+  order_quantity: 1.0,        // 1 SOL de posición
+  reduce_only:    false,
+});
+
+if (marketResp.success) {
+  console.log("ID de orden:", marketResp.data.order_id);
+} else {
+  console.error("Rechazado:", marketResp.message);
+}
+```
+
+Las órdenes de mercado se ejecutan inmediatamente. La respuesta devuelve el `order_id` resultante más un estado. Las ejecuciones vienen a través del WebSocket (ver abajo); la respuesta de REST en sí no se bloquea hasta que esté completamente ejecutada.
+
+## Colocar una orden de límite con Post-Only
+
+```ts
+const limitResp = await orderlyAuthPost("/v1/order", {
+  symbol:         "PERP_SOL_USDC",
+  order_type:     "LIMIT",
+  side:           "SELL",
+  order_quantity: 0.5,
+  order_price:    140.50,
+  // combinaciones de banderas:
+  // post_only: true hace que esto sea una orden solo creador — se cancela si cruzara.
+  // reduce_only / time_in_force se pueden establecer independientemente.
+  post_only:      true,
+});
+console.log(limitResp);
+```
+
+Para `IOC` / `FOK`, establece `time_in_force: "IOC"` o `"FOK"`. Consulta [`products/perps/order-types`](/es/products/perps/order-types) para la semántica de cada bandera.
+
+## Cancelar una orden
+
+```ts
+// Por ID de orden
+await orderlyAuthDel(`/v1/order?order_id=${orderId}&symbol=PERP_SOL_USDC`);
+
+// Cancelar TODAS las órdenes en un símbolo
+await orderlyAuthDel(`/v1/orders?symbol=PERP_SOL_USDC`);
+```
+
+Una cancelación se reconoce de forma síncrona pero la cancelación real puede correr una carrera con una ejecución. Siempre reconcilia sondando `/v1/orders` o observando el WebSocket — asumir que una cancelación tuvo éxito sin confirmación puede llevar a posiciones duplicadas o no intencionadas.
+
+## Obtener posiciones abiertas
+
+```ts
+const posResp = await orderlyAuthGet("/v1/positions");
+for (const p of posResp.data.rows) {
+  console.log(
+    p.symbol,
+    "tamaño:",  p.position_qty,
+    "entrada:", p.average_open_price,
+    "no realizado:", p.unsettled_pnl,
+  );
+}
+```
+
+Un `position_qty` negativo es una venta en corto, positivo es una compra larga. `position_qty == 0` significa que la posición está cerrada pero la fila puede permanecer hasta la siguiente limpieza.
+
+## Obtener historial de ejecuciones
+
+```ts
+const fills = await orderlyAuthGet(
+  "/v1/trades?symbol=PERP_SOL_USDC&start_t=" + (Date.now() - 86_400_000)
+);
+for (const t of fills.data.rows) {
+  console.log(t.executed_timestamp, t.side, t.executed_quantity, "@", t.executed_price);
+}
+```
+
+Los argumentos de tiempo son marcas de tiempo Unix en milisegundos. El tamaño de página predeterminado es 25 filas; usa los parámetros de consulta `page` y `size` para paginar.
+
+## WebSocket: datos de mercado
+
+```ts
+import WebSocket from "ws";
+
+const ws = new WebSocket(`wss://ws.orderly.org/ws/stream/${accountId}`);
+
+ws.on("open", () => {
+  // Datos de mercado públicos: deltas de libro de órdenes + transacciones para un símbolo
+  ws.send(JSON.stringify({ id: "ob1", topic: "orderbook@PERP_SOL_USDC" }));
+  ws.send(JSON.stringify({ id: "tr1", topic: "trade@PERP_SOL_USDC" }));
+});
+
+ws.on("message", (raw) => {
+  const msg = JSON.parse(raw.toString());
+  if (msg.topic?.startsWith("orderbook@")) {
+    // delta de profundidad: { bids: [[precio, qty], ...], asks: [[precio, qty], ...] }
+    applyOrderbookDelta(msg.data);
+  } else if (msg.topic?.startsWith("trade@")) {
+    console.log("transacción:", msg.data);
+  }
+});
+```
+
+Para el flujo **privado** (tus ejecuciones, actualizaciones de posición, cambios de saldo), el WebSocket tiene que estar autenticado. Envía una carga útil de `subscribe` firmada de la misma manera que las solicitudes REST, limitada a tu ID de cuenta. La documentación de Orderly tiene la forma exacta de la carga útil; cambia ocasionalmente, así que no codifiques un esquema particular aquí.
+
+## Retirar USDC
+
+```ts
+// 1. Solicita un retiro.
+const wRes = await orderlyAuthPost("/v1/withdraw_request", {
+  token:  "USDC",
+  chain_id: CHAIN_ID,
+  amount: 50.0,                          // unidades humanas
+  receiver: owner.publicKey.toBase58(),
+});
+
+console.log("ID de solicitud de retiro:", wRes.data.withdraw_id);
+```
+
+Orderly retransmite el retiro en cadena al domicilio del receptor. Hay una tarifa de retiro plana de **1 USDC** (consulta [`products/perps/fees`](/es/products/perps/fees)). La transferencia en cadena ocurre dentro de 1–2 minutos en condiciones normales; espera más tiempo durante la congestión.
+
+## Trampas
+
+- **No reutilices la clave de trading entre entornos.** Una única clave de trading de Orderly registrada contra tu billetera está asociada con una cuenta mainnet de Solana. Si también necesitas devnet o staging, genera una clave separada para cada uno.
+- **Sincronización de tiempo.** La tolerancia de sesgo de reloj de Orderly es ajustada (±5s). En servicios de larga duración, la desviación de NTP eventualmente romperá la firma. Resincroniza periódicamente.
+- **Reconexiones de WebSocket.** El WS público ocasionalmente cae conexiones durante actualizaciones de Orderly. Implementa retroceso exponencial y resuscribirse al reabrirse.
+- **Límites de velocidad.** Las llamadas de REST tienen límites de velocidad por nivel por cuenta. Cancela en masa a través de `cancel_all` en lugar de hacer un bucle con `cancel`-by-id cuando tienes >5 órdenes para cancelar.
+- **La dirección de la posición es implícita.** Una orden de `BUY` en `PERP_SOL_USDC` abre o extiende una compra larga; una `SELL` abre o extiende una venta en corto — pero si ya tienes una compra larga, una `SELL` *reduce* (y puede cambiar) la posición porque Raydium Perps está en modo unidireccional. Siempre verifica la posición actual antes de colocar una orden si la dirección importa.
+- **Los fondos y las liquidaciones son separados del flujo de órdenes.** Los pagos de fondos y las liquidaciones aparecen como flujos de eventos separados; no son "órdenes". Suscribete a los temas relevantes de WS privado si necesitas observarlos.
+
+## Por dónde continuar
+
+- [`products/perps/trading-basics`](/es/products/perps/trading-basics) — la cartilla conceptual sobre mecánica de perpetuos.
+- [`products/perps/order-types`](/es/products/perps/order-types) — la semántica de cada tipo de orden y bandera.
+- [`products/perps/collateral`](/es/products/perps/collateral) — activos de colateral soportados y límites por cadena.
+- [`products/perps/fees`](/es/products/perps/fees) — cronogramas creador/aceptador y la tarifa de retiro.
+
+Fuentes:
+
+- [Documentación de desarrollador de Orderly Network](https://orderly.network/docs/build-on-omnichain/evm-api/introduction) — referencia canónica para la superficie de la API utilizada anteriormente. Raydium Perps lo consume directamente.
+- [SDK de TypeScript de Orderly](https://github.com/OrderlyNetwork/orderly-sdk-js) — envuelve la misma capa REST/WebSocket con ayudantes tipados; útil si quieres saltar escribir la capa de firma tú mismo.

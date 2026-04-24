@@ -1,0 +1,258 @@
+---
+title: "CPMM 数学"
+description: "定価公式の不変量、SwapBaseInput 対 SwapBaseOutput、Token-2022 の転送手数料処理、およびオブザベーション アカウントの更新方法。"
+---
+
+<Info>
+  **このページは AI による自動翻訳です。すべての内容は英語版を正とします。**
+
+  [英語版を表示 →](/products/cpmm/math)
+</Info>
+
+## 不変量
+
+CPMM は、2 つのボールトに対して古典的な定価公式の不変量を維持しています：
+
+$$
+x \cdot y = k
+$$
+
+ここで `x` はボール0の残高**後**の Token-2022 転送手数料、`y` も同様です。すべてのスワップは、LP に付与されたトレード手数料を考慮した後、`k' ≥ k` を保つ必要があります。プロトコル、ファンド、およびクリエイター バケットはカウント**されません**（ボール内に存在しますが、曲線ビューから除外されます。下記の [曲線上の手数料](#曲線上の手数料) を参照）。したがって、`k` は LP が手数料を蓄積するにつれて、時間とともに単調に増加します。
+
+LP シェアは `k` ではなく、プールの準備金によって価格設定されます：
+
+$$
+\text{LP price in token0} = \frac{x}{\text{lpSupply}}, \qquad \text{LP price in token1} = \frac{y}{\text{lpSupply}}
+$$
+
+`ΔLP` の LP トークンを焼却すると、正確に `ΔLP × x / lpSupply` の token0 および `ΔLP × y / lpSupply` の token1 が返されます。デポジットまたはウィズドローアルではいずれも曲線も `k` も動きません。価格を変更するのはスワップのみです。
+
+## スワップパスのフィー モデル
+
+CPMM は、すべてのスワップに対して**2 つの独立した手数料レート**を適用します：
+
+- **トレード手数料**はインプット側で取られ、`AmmConfig.trade_fee_rate` で請求されます。その後、LP、プロトコル、およびファンド シェアに分割されます。LP シェアはボール内に留まり、`k` が増加します。プロトコル シェアとファンド シェアはボール アカウンティングから抽出されます）。
+- **クリエイター手数料**（`enable_creator_fee == true` の場合のみアクティブ）は `AmmConfig.creator_fee_rate` で請求されます。スワップの方向に応じて、**インプット**側または**アウトプット**側で取られます（[`products/cpmm/fees`](/ja/products/cpmm/fees#which-side-of-the-trade-the-fees-are-taken-from) を参照）。これはトレード手数料のスライスではなく、独自のバケットです。
+
+以下を定義します：
+
+- `FEE_RATE_DENOMINATOR = 1_000_000`
+- `trade_fee_rate` — `AmmConfig` から、例えば `2500` = 関連するボリューム側の 0.25%
+- `creator_fee_rate` — `AmmConfig` から、例えば `1000` = 関連するボリューム側の 0.10%
+- `protocol_fee_rate`、`fund_fee_rate` — ボリュームではなく、トレード手数料の `1/FEE_RATE_DENOMINATOR` の単位で表示
+
+クリエイター手数料がインプット側の場合：
+
+```
+total_input_fee = ceil(amount_in * (trade_fee_rate + creator_fee_rate) / FEE_RATE_DENOMINATOR)
+creator_fee     = floor(total_input_fee * creator_fee_rate / (trade_fee_rate + creator_fee_rate))
+trade_fee       = total_input_fee - creator_fee
+amount_in_after_fees = amount_in - total_input_fee
+```
+
+クリエイター手数料がアウトプット側の場合：
+
+```
+trade_fee            = ceil(amount_in * trade_fee_rate / FEE_RATE_DENOMINATOR)
+amount_in_after_fees = amount_in - trade_fee
+amount_out_curve     = curve_output(amount_in_after_fees, ...)
+creator_fee          = ceil(amount_out_curve * creator_fee_rate / FEE_RATE_DENOMINATOR)
+amount_out           = amount_out_curve - creator_fee
+```
+
+どちらの場合でも、トレード手数料は同じ方法で分割されます：
+
+```
+protocol_fee   = floor(trade_fee * protocol_fee_rate / FEE_RATE_DENOMINATOR)
+fund_fee       = floor(trade_fee * fund_fee_rate     / FEE_RATE_DENOMINATOR)
+lp_fee         = trade_fee - protocol_fee - fund_fee     // creator_fee はここでは引かれません
+```
+
+`protocol_fee + fund_fee + creator_fee` の金額はボール内に保持されていますが、プール状態（`protocol_fees_token*`、`fund_fees_token*`、`creator_fees_token*`）で個別に追跡されます。定価公式の不変量が `k' ≥ k` をチェックするとき、ボール残高**マイナス**すべての 3 つの蓄積されたが未回収の手数料を使用します。したがって、LP は `lp_fee` のみを取得します。
+
+徴収指示および計算例については、[`products/cpmm/fees`](/ja/products/cpmm/fees) を参照してください。
+
+## SwapBaseInput (入力確定)
+
+「ユーザーが入力ミントの正確に `amount_in` をくれて、アウトプット ミントの少なくとも `minimum_amount_out` を受け取ります。」
+
+当分の間 Token-2022 を無視すると：
+
+```
+amount_in_after_trade_fee = amount_in - trade_fee
+amount_out                = y − (x * y) / (x + amount_in_after_trade_fee)
+```
+
+代数的には：
+
+$$
+\text{amount\_out} = \frac{y \cdot \Delta x_{\text{net}}}{x + \Delta x_{\text{net}}}
+$$
+
+ここで `Δx_net = amount_in_after_trade_fee` です。
+
+プログラムは次にボール アカウンティングを更新して、プロトコル/ファンド/クリエイターが負う `trade_fee` の部分は「蓄積」バケットに存在します（次の `x` の曲線に含まれない）。一方、LP シェアは次のスワップに向けて `x` に参加します。
+
+### インプット側の Token-2022
+
+入力ミントに転送手数料の拡張機能がある場合、**ミント**はユーザー → ボール への転送時に手数料を控除します。したがって、ボールは実際に `amount_in − transfer_fee_in(amount_in)` を受け取ります。CPMM プログラムは以下を計算します：
+
+```
+amount_actually_received = amount_in − transfer_fee_in(amount_in)
+trade_fee                = ceil(amount_actually_received * trade_fee_rate / FEE_RATE_DENOMINATOR)
+amount_in_after_trade_fee = amount_actually_received − trade_fee
+```
+
+そして、`amount_in_after_trade_fee` に対して曲線を実行します。これは重要です。**曲線の価格はボール内に到着したネット金額から計算されるため**、ユーザーの見出し金額ではありません。
+
+### アウトプット側の Token-2022
+
+アウトプット ミントに転送手数料がある場合、プールはボール内の `amount_out` をユーザーに送信します。その後、**ミント**は出時に手数料をスキムするため、ユーザーは `amount_out − transfer_fee_out(amount_out)` を受け取ります。プログラムは通常通り曲線から `amount_out` を計算しますが、見積もりを表示するときにボールの「ボール送信」数をユーザーの「ユーザー受取」数に変換するのは、インテグレーターの責任です。
+
+### スリッページ チェック
+
+`amount_out` を計算した後：
+
+```
+require(amount_out >= minimum_amount_out, "AmountSpecifiedLessThanMinimum")
+```
+
+アウトプット ミントが転送手数料を請求する場合、SDK はスリッページ定数がボールが送信するものではなく、ユーザーが実際に受け取るもので表示されるように、`minimum_amount_out` を設定する前に転送手数料を適用します。
+
+## SwapBaseOutput (出力確定)
+
+「ユーザーはアウトプット ミントの正確に `amount_out` を受け取り、入力ミントの最大 `maximum_amount_in` まで支払う意思があります。」
+
+`Δx_net` の曲線を反転します：
+
+$$
+\Delta x_{\text{net}} = \left\lceil \frac{x \cdot \text{amount\_out}}{y - \text{amount\_out}} \right\rceil
+$$
+
+上限は重要です。整数の切り詰めの後、`k' ≥ k` が保証されます。その後：
+
+```
+// ネット インから グロス インに逆算します。
+// 手数料はグロスに適用されるため：
+//   net = gross − ceil(gross * rate / D)
+//       ≈ gross * (D − rate) / D
+// 適切な場所で上限を反転します：
+gross_needed = ceil(Δx_net * D / (D − trade_fee_rate))
+```
+
+Token-2022 インプットで、以下でラップします：
+
+```
+gross_needed_before_mint_fee
+  = inflate_for_transfer_fee(gross_needed, input_mint)
+```
+
+ユーザーが十分に支払うため、ミントの転送手数料控除後、プールは依然として `gross_needed` を受け取ります。
+
+### スリッページ チェック
+
+```
+require(gross_needed_before_mint_fee <= maximum_amount_in, "AmountSpecifiedExceedsMaximum")
+```
+
+## 計算例
+
+プール状態、Token-2022 を無視：
+
+- `x = 1_000_000_000_000` (token0 の 1,000,000.000000、6 小数点)
+- `y = 2_000_000_000_000` (token1 の 2,000,000.000000、6 小数点)
+- `AmmConfig`: `trade_fee_rate = 2500`、`protocol_fee_rate = 120_000`、`fund_fee_rate = 40_000`、`creator_fee_rate = 0`
+
+ユーザー：`SwapBaseInput` と `amount_in = 1_000_000_000` (token0 の 1,000.000000)。クリエイター手数料は無効です（`enable_creator_fee = false`）。
+
+```
+trade_fee                = ceil(1_000_000_000 * 2500 / 1_000_000)       = 2_500_000
+  protocol_fee           = floor(2_500_000 * 120_000 / 1_000_000)       = 300_000
+  fund_fee               = floor(2_500_000 *  40_000 / 1_000_000)       = 100_000
+  lp_fee                 = 2_500_000 − 300_000 − 100_000                 = 2_100_000
+creator_fee              = 0                                              // 無効
+
+amount_in_after_trade_fee = 1_000_000_000 − 2_500_000                    = 997_500_000
+
+amount_out = y − (x * y) / (x + Δx_net)
+           = 2_000_000_000_000
+             − (1_000_000_000_000 * 2_000_000_000_000)
+               / (1_000_000_000_000 + 997_500_000)
+           ≈ 1_995_015_009
+
+new_vault0_raw   = x + amount_in                                        = 1_001_000_000_000
+new_vault1       = y − amount_out                                       ≈ 1_998_004_984_991
+
+// ボール0で受け取った 1_000_000_000 のうち、400_000 は「蓄積手数料」
+// （プロトコル+ファンド）、曲線が除外する必要があります：
+curve_x          = new_vault0_raw − (protocol_fees_token0 + fund_fees_token0)
+                 = 1_001_000_000_000 − 400_000
+                 = 1_000_999_600_000
+
+k' = curve_x * new_vault1 ≈ 2.000_002_501_E24  ≥  k = 2.0E24   ✓
+```
+
+同じプールが `enable_creator_fee = true` で `creator_fee_rate = 1000` (0.10%) をインプット側に持っていた場合、プログラムは `total_input_fee = ceil(1_000_000_000 * 3500 / 1_000_000) = 3_500_000` を請求し、次に `creator_fee = 1_000_000` および `trade_fee = 2_500_000` に分割します。上記の例から `trade_fee` のプロトコル/ファンド/LP 算術は変わりません。クリエイター手数料は独自のバケットで、`creator_fees_token0` に蓄積され、プロトコルおよびファンド バケットとともに `curve_x` から除外されます。
+
+入力ミントに 1% の Token-2022 転送手数料がある場合、ボールは `1_000_000_000` トークンではなく `990_000_000` トークンを受け取り、以降のすべての計算はそのネット金額を使用します。
+
+## オブザベーション更新ルール
+
+すべてのスワップで、プログラムは新しいオブザベーションをリング バッファにプッシュするかどうかを評価します：
+
+```
+let since_last = now − observations[head].block_timestamp;
+if since_last >= MIN_OBSERVATION_INTERVAL {
+    let price0 = (vault1 << 32) / vault0;            // Q32.32-ish
+    let price1 = (vault0 << 32) / vault1;
+    let head' = (head + 1) % OBSERVATION_NUM;
+    observations[head'] = Observation {
+        block_timestamp: now,
+        cumulative_token0_price_x32:
+            observations[head].cumulative_token0_price_x32 + price0 * since_last,
+        cumulative_token1_price_x32:
+            observations[head].cumulative_token1_price_x32 + price1 * since_last,
+    };
+    head = head';
+}
+```
+
+2 つのプロパティ：
+
+- **累積価格、スポット価格ではない。** 単一のオブザベーションは価格ではありません。時刻 `t0` から `t1` まで TWAP を取得するには、各端に最も近いオブザベーションを読み、`(cumulative(t1) − cumulative(t0)) / (t1 − t0)` を計算します。
+- **サンプルはレート制限されます。** 同じスロット内のバック・ツー・バック スワップは 1 つのオブザベーションを共有できます。スワップの直後にオブザベーションを読むと、1 スロット古い可能性があります。これは正常です。
+
+詳細は [`products/clmm/accounts`](/ja/products/clmm/accounts) を参照してください。
+
+## 曲線上の手数料
+
+これは微妙な部分で、呼び出す価値があります。曲線の算術は**ネット**ボール残高に対して機能します。つまり、生の SPL 残高からプロトコル、ファンド、およびクリエイター手数料を蓄積したもの（3 つすべて独立したバケットです。[`products/cpmm/fees`](/ja/products/cpmm/fees) を参照）を差し引いたもの。具体的なイメージ：
+
+```
+raw_vault_balance   = RPC getTokenAccountBalance が返すもの
+accrued_fees        = protocol_fees_token{0,1} + fund_fees_token{0,1} + creator_fees_token{0,1}
+curve_balance       = raw_vault_balance − accrued_fees
+invariant           = curve_balance0 * curve_balance1
+```
+
+インテグレーターの結果：
+
+- **生の残高から見積もらないでください。** 最初に蓄積手数料フィールドを差し引くか、`SwapBaseInput` をシミュレーションとして呼び出してその戻り値を取得してください。
+- **`CollectProtocolFee` がトークンをボール外に移動します。** 徴収後、`raw_vault_balance` が低下しますが、`curve_balance` は変わりません。プールの価格は移動しません。これは意図的です。
+
+## 精度およびオーバーフロー
+
+- すべての曲線算術は `x * y` でオーバーフローを防ぐために `u128` 中間値を使用します。
+- 除算はゼロに向かって丸められます。ただし、`SwapBaseOutput` の `Δx_net` は切り上げ、手数料計算では `trade_fee` で切り上げ、部分分割で切り下げされます。これらの丸め方向は、不変量が整数の切り詰めのため減少しないよう選択されています。
+- 極端なボール比率（数十億：1）を持つプール は、小さなトレードで精度の床にヒットしてください。その場合、プログラムは `ZeroTradingTokens` を返します。[`reference/error-codes`](/ja/reference/error-codes) を参照してください。
+
+## 次に進むこと
+
+- [`products/cpmm/fees`](/ja/products/cpmm/fees) — 完全なフィー ティアと徴収セマンティクス。
+- [`products/cpmm/instructions`](/ja/products/cpmm/instructions) — この数学を呼び出す指示。
+- [`algorithms/constant-product`](/ja/algorithms/constant-product) — AMM v4 および CPMM 間で共有される `x · y = k` の導出およびエッジ ケース。
+
+出典：
+
+- [`raydium-io/raydium-cp-swap` — `states/curve.rs` のスワップ数学](https://github.com/raydium-io/raydium-cp-swap)
+- [監査セキュリティ](/ja/security/audits) にリンクされた Raydium 監査レポート

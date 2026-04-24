@@ -1,0 +1,279 @@
+---
+title: "PDA dan CPI"
+description: "Program-derived address dan cross-program invocation — dua primitif yang digunakan Raydium untuk mengelola state secara deterministik dan berkomposisi dengan program lain. Seeds, bumps, invoke vs invoke_signed, dan pola yang diikuti kode Raydium."
+---
+
+<Info>
+  **Halaman ini diterjemahkan secara otomatis oleh AI. Versi bahasa Inggris adalah acuan resmi.**
+
+  [Lihat versi bahasa Inggris →](/solana-fundamentals/pdas-and-cpis)
+</Info>
+
+<Info>
+  **PDA** (program-derived address) dan **CPI** (cross-program invocation) adalah dua primitif yang membuat Raydium mungkin. PDA memungkinkan program "memiliki" alamat deterministik tanpa kunci privat — itulah cara kerja otoritas pool dan vault. CPI memungkinkan satu program memanggil program lain — itulah cara Raydium menukar token melalui program SPL Token dan cara integrator mekomposisi Raydium ke dalam alur mereka sendiri. Keduanya patut dipahami sebelum membaca kode sumber Raydium.
+</Info>
+
+## PDA: alamat tanpa kunci
+
+**Program-Derived Address** adalah kunci publik yang:
+
+- Tidak berada pada kurva ed25519 (tidak ada kunci privat untuknya).
+- Diturunkan secara deterministik dari ID program dan serangkaian seed.
+- Hanya dapat ditandatangani oleh program penurunan melalui `invoke_signed`.
+
+Setiap otoritas pool Raydium, setiap akun state pool, setiap vault, setiap state farm — semuanya adalah PDA.
+
+### Penurunan
+
+PDA dihitung dengan melakukan hash ID program dengan seed, kemudian menemukan byte "bump" yang memaksa hasilnya keluar dari kurva. Bump pertama (biasanya dimulai dari 255 dan menurun) yang menghasilkan alamat off-curve menang; ini adalah **canonical bump**.
+
+```ts
+import { PublicKey } from "@solana/web3.js";
+
+const [poolAuthority, bump] = PublicKey.findProgramAddressSync(
+  [Buffer.from("authority"), poolId.toBuffer()],
+  CPMM_PROGRAM_ID,
+);
+```
+
+Seed dapat berupa apa saja — string, kunci publik lainnya, nilai `u64` sebagai byte little-endian. Konvensi Raydium adalah awalan yang dapat dibaca manusia diikuti oleh pengenal unik.
+
+### Pola PDA Raydium
+
+PDA umum dalam program Raydium:
+
+| PDA | Seeds | Program |
+|-----|-------|---------|
+| AMM authority (AMM v4) | `[b"amm authority"]` + bump | AMM v4 |
+| Pool state (CPMM) | `[b"pool", amm_config, mint_a, mint_b]` | CPMM |
+| Pool vault (CPMM) | `[b"pool_vault", pool, mint]` | CPMM |
+| Authority (CPMM) | `[b"vault_and_lp_mint_auth_seed"]` | CPMM |
+| Pool state (CLMM) | `[b"pool", amm_config, mint_0, mint_1]` | CLMM |
+| Tick array (CLMM) | `[b"tick_array", pool, start_tick_index]` | CLMM |
+| Observation (CLMM) | `[b"observation", pool]` | CLMM |
+| Personal position (CLMM) | `[b"position", position_nft_mint]` | CLMM |
+| Farm state (Farm v6) | `[b"pool_farm_state", farm_id]` | Farm v6 |
+| User ledger (Farm v6) | `[b"user_ledger", farm, user]` | Farm v6 |
+
+Pengguna dan integrator dapat menghitung ini tanpa mengambil apa pun — mengingat input publik (ID pool, ID farm, kunci pengguna), PDA bersifat deterministik.
+
+### Canonical bump
+
+Meskipun pada prinsipnya dapat ada beberapa bump yang menghasilkan alamat off-curve, program Raydium selalu menggunakan **canonical bump** (ditemukan dengan menurun dari 255). Ini disimpan dalam data akun PDA sehingga transaksi selanjutnya dapat meneruskannya dan melewati loop derivasi yang (mahal):
+
+```rust
+#[account]
+pub struct PoolState {
+    pub bump: [u8; 1],
+    // ... sisa dari pool state
+}
+```
+
+Pada transaksi berikutnya, bump dibaca dari state pool daripada dihitung ulang.
+
+## CPI: memanggil program lain
+
+**Cross-Program Invocation** memungkinkan program memanggil instruksi program lain secara inline dalam transaksi tunggal. Raydium menggunakan CPI secara ekstensif:
+
+- Instruksi swap memanggil program SPL Token untuk memindahkan token.
+- CLMM memanggil Metaplex untuk mencetak NFT posisi.
+- Pembuatan pool memanggil System Program untuk mengalokasikan akun.
+- Farm v6 memanggil SPL Token untuk mentransfer reward.
+
+Integrator juga menggunakan CPI untuk memanggil *ke dalam* Raydium — itulah cara strategi vault, protokol LP tertinggi, dan auto-compounder bekerja. Lihat [`integration-guides/cpi-integration`](/id/integration-guides/cpi-integration).
+
+### invoke vs invoke_signed
+
+Runtime Solana menawarkan dua primitif CPI:
+
+- **`invoke`**: panggil program lain; program yang dipanggil mewarisi penanda tangan transaksi luar.
+- **`invoke_signed`**: panggil program lain *atas nama PDA*; runtime memverifikasi seed PDA dan mengotorisasi signature.
+
+`invoke_signed` adalah magic yang memungkinkan program menahan otoritas atas akun tanpa mengelola kunci privat.
+
+### Contoh: Raydium mentransfer dari pool vault
+
+Pool vault adalah Token Account yang otoritasnya adalah PDA dari program pool. Untuk mentransfer token keluar selama swap, program pool harus menandatangani sebagai PDA itu:
+
+```rust
+// Seeds untuk pool authority
+let authority_seeds: &[&[u8]] = &[
+    b"vault_and_lp_mint_auth_seed",
+    &[authority_bump],
+];
+let signer_seeds: &[&[&[u8]]] = &[authority_seeds];
+
+// Bangun konteks CPI
+let cpi_accounts = Transfer {
+    from:      input_vault.to_account_info(),
+    to:        user_ata.to_account_info(),
+    authority: pool_authority.to_account_info(),
+};
+let cpi_program = token_program.to_account_info();
+let cpi_ctx     = CpiContext::new_with_signer(cpi_program, cpi_accounts, signer_seeds);
+
+// Eksekusi
+token::transfer(cpi_ctx, amount)?;
+```
+
+Runtime melihat `invoke_signed` dipanggil oleh program CPMM, memverifikasi bahwa `vault_and_lp_mint_auth_seed + bump` diturunkan ke alamat `pool_authority` ketika di-hash dengan ID program CPMM, dan mengizinkan signature otoritas pada transfer token. Tidak ada kunci privat yang terlibat.
+
+### Contoh: integrator memanggil Raydium CPMM
+
+Program integrator (misalnya, escrow) dapat memanggil `swap_base_input` Raydium melalui CPI:
+
+```rust
+use raydium_cpmm::cpi::{self, accounts::Swap};
+
+let cpi_accounts = Swap {
+    payer:                order.to_account_info(),      // PDA, akan menandatangani
+    authority:            pool_authority_info,
+    amm_config:           amm_config_info,
+    pool_state:           pool_info,
+    input_token_account:  order_input_ata,
+    output_token_account: order_output_ata,
+    input_vault:          input_vault_info,
+    output_vault:         output_vault_info,
+    input_token_program:  input_token_program_info,
+    output_token_program: output_token_program_info,
+    input_token_mint:     input_mint_info,
+    output_token_mint:    output_mint_info,
+    observation_state:    observation_info,
+};
+
+let seeds = &[b"order", user.key.as_ref(), &[order.bump]];
+let cpi_ctx = CpiContext::new_with_signer(
+    cpmm_program.to_account_info(),
+    cpi_accounts,
+    &[seeds],
+);
+
+cpi::swap_base_input(cpi_ctx, amount_in, min_out)?;
+```
+
+Ini adalah pola integrasi kanonik — lihat [`integration-guides/cpi-integration`](/id/integration-guides/cpi-integration) untuk contoh escrow lengkap.
+
+## Batas kedalaman CPI
+
+Solana membatasi kedalaman CPI pada **4 level**. Instruksi tingkat atas transaksi dihitung sebagai kedalaman 0; setiap invokasi CPI menambah kedalaman.
+
+Implikasi praktis: swap Raydium sendiri sudah menggunakan 1-2 level CPI (Raydium → SPL Token). Integrator yang memanggil Raydium menggunakan 2. Jika integrator itu dipanggil oleh integrator lain, itu 3. Level ke-4 adalah batasnya.
+
+Sebagian besar komposisi tetap berada di bawah ini dengan mudah, tetapi nesting dalam (aggregator → router → Raydium → hook) dapat mencapainya. Desain rata daripada dalam.
+
+## Akun sisa
+
+Ketika instruksi Raydium membutuhkan jumlah akun variabel (misalnya, swap CLMM melintasi jumlah tick array yang tidak diketahui), akun ekstra diteruskan sebagai **remaining accounts** — ditambahkan ke daftar akun tetap, diinterpretasikan berdasarkan posisi.
+
+`SwapV2` CPMM menggunakan remaining accounts untuk akun wajib ekstra program transfer-hook. Klien mengambil akun yang dibutuhkan dan menambahkannya:
+
+```ts
+const swapIx = await raydium.cpmm.swap({
+  /* ... */
+  // SDK menangani remaining accounts secara otomatis
+});
+```
+
+Pada level CPI, integrator harus meneruskan remaining accounts melalui instruksi mereka sendiri:
+
+```rust
+pub struct Swap<'info> {
+    // ... akun tetap
+    // Plus Remaining accounts yang diteruskan melalui ctx.remaining_accounts
+}
+
+// Teruskan remaining_accounts ke dalam CPI
+cpi::swap_base_input(
+    cpi_ctx.with_remaining_accounts(ctx.remaining_accounts.to_vec()),
+    amount_in,
+    min_out,
+)?;
+```
+
+## Perangkap PDA
+
+### Seed salah → alamat salah
+
+Bug di mana seed berada dalam urutan yang salah, encoding yang salah, atau menyertakan/mengecualikan byte ekstra secara senyap menghasilkan PDA yang berbeda. Transaksi gagal secara ambigu (program mencoba membaca akun yang tidak ada). Selalu unit-test derivasi seed terhadap nilai golden yang diketahui.
+
+### Tidak menyimpan bump
+
+Jika Anda menurunkan bump pada setiap transaksi, Anda membayar compute untuk loop derivasi. Simpan canonical bump dalam data PDA dan bacanya dari sana.
+
+### Membingungkan canonical vs non-canonical bump
+
+Non-canonical bump (jika ada yang menemukan bump yang menghasilkan off-curve) diizinkan oleh `invoke_signed` tetapi ditolak oleh program Raydium melalui `assert_eq!(bump, canonical_bump)`. Jika seseorang mencoba mengklaim PDA dengan bump non-canonical, tx gagal.
+
+### Melewatkan PDA sebagai signer padahal Anda bukan program pemilik
+
+Hanya program yang ID-nya ada dalam derivasi PDA yang dapat `invoke_signed` dengan seed-nya. Jika Anda mencoba, runtime menolak.
+
+## Perangkap CPI
+
+### Lupa meneruskan `remaining_accounts`
+
+Jika instruksi luar Anda melewatkan akun transfer-hook dalam `remaining_accounts` tetapi CPI ke Raydium tidak meneruskannya, Raydium gagal karena tidak dapat menemukan akun hook. Selalu sertakan `with_remaining_accounts` dalam CPI yang membutuhkannya.
+
+### Ketidakcocokan bendera writable
+
+Akun yang ditandai writable oleh instruksi luar juga harus writable dalam panggilan CPI jika program yang dipanggil berniat menulisnya. Ketidakcocokan → penolakan runtime.
+
+### Tidak mempertimbangkan rent
+
+CPI ke program yang membuat akun (misalnya, pembuatan ATA) memerlukan payer memiliki cukup SOL untuk rent. Pemeriksaan rent yang gagal muncul sebagai error yang tidak jelas.
+
+## Contoh kerja: menghitung PDA CPMM Raydium
+
+```ts
+import { PublicKey } from "@solana/web3.js";
+
+const CPMM_PROGRAM_ID = new PublicKey("CPMMoo8L3F4NbTegBCKVNunggL7H1Zpdmwpwh8KMoZ0F");
+
+function computeCpmmPdas(ammConfig, mintA, mintB) {
+  const [poolState, poolBump] = PublicKey.findProgramAddressSync(
+    [
+      Buffer.from("pool"),
+      ammConfig.toBuffer(),
+      mintA.toBuffer(),
+      mintB.toBuffer(),
+    ],
+    CPMM_PROGRAM_ID,
+  );
+
+  const [authority] = PublicKey.findProgramAddressSync(
+    [Buffer.from("vault_and_lp_mint_auth_seed")],
+    CPMM_PROGRAM_ID,
+  );
+
+  const [vaultA] = PublicKey.findProgramAddressSync(
+    [Buffer.from("pool_vault"), poolState.toBuffer(), mintA.toBuffer()],
+    CPMM_PROGRAM_ID,
+  );
+
+  const [vaultB] = PublicKey.findProgramAddressSync(
+    [Buffer.from("pool_vault"), poolState.toBuffer(), mintB.toBuffer()],
+    CPMM_PROGRAM_ID,
+  );
+
+  const [observation] = PublicKey.findProgramAddressSync(
+    [Buffer.from("observation"), poolState.toBuffer()],
+    CPMM_PROGRAM_ID,
+  );
+
+  return { poolState, authority, vaultA, vaultB, observation, poolBump };
+}
+```
+
+Ini persis apa yang SDK Raydium lakukan di balik layar ketika Anda memanggil `getPoolInfoFromRpc({ poolId })` — ia menurunkan PDA yang terkait tanpa round-trip.
+
+## Referensi
+
+- [`solana-fundamentals/account-model`](/id/solana-fundamentals/account-model) — bagaimana PDA cocok dalam account model.
+- [`solana-fundamentals/programs-and-anchor`](/id/solana-fundamentals/programs-and-anchor) — helper Anchor untuk mendeklarasikan PDA.
+- [`integration-guides/cpi-integration`](/id/integration-guides/cpi-integration) — membangun integrasi yang CPI ke Raydium.
+- [`sdk-api/rust-cpi`](/id/sdk-api/rust-cpi) — tipe Rust CPI Raydium.
+
+Sumber:
+
+- [Solana PDA docs](https://docs.solana.com/developing/programming-model/calling-between-programs).
+- [Anchor PDA & CPI docs](https://www.anchor-lang.com/docs/pdas-and-cpis).

@@ -1,0 +1,411 @@
+---
+title: "Özel bir programdan CPI"
+description: "Raydium'u çağıran zincir üstü programlar için bileşim desenleri — emanetler, toplayıcı proxy'ler, otomatik bileşik vault'lar — hesap inşası, PDA imzalayanları, kalan hesaplar ve işlem bütçesi ayırımını içeren tam çalışan örneklerle."
+---
+
+<Info>
+  **Bu sayfa yapay zekâ tarafından otomatik olarak çevrilmiştir. İngilizce sürüm esas alınır.**
+
+  [İngilizce sürümü görüntüle →](/integration-guides/cpi-integration)
+</Info>
+
+## CPI'nin doğru araç olduğu durumlar
+
+Özel bir program, işlemin yalnızca sizin programınızın gerçekleştirebileceği diğer zincir üstü durum değişiklikleriyle atomik olarak gerçekleşmesi gerektiğinde anlamlıdır. Yaygın durumlar:
+
+- **Emanet / limit order programları** — kullanıcı bir mint'i emanetinize yatırır, programınız bir fiyat koşulunu izler ve tetiklenmesi halinde programınız atomik olarak Raydium'dan swap yapar ve kullanıcının hesabını krediye alır.
+- **Toplayıcı proxy'ler** — bir swap'ı Raydium + bir veya daha fazla başka DEX'ten geçiren ve tüm atlamaları programınızın sahip olduğu tek bir slippage kontrolü altında tutan tek bir talimat.
+- **Otomatik bileşik vault'lar** — LP veya farm stake'i vault'unuza yatırın, vault ödülleri belirli bir programa göre hasat eder, likiditeyi yeniden sağlar, hisse token'ları yayınlar.
+- **Strateji vault'ları** — CLMM üzerinden swap yaparak yeniden dengelenen kaldıraçlı LP pozisyonları; pozisyonları kapatıp teminatı bir işlemde swap eden likidatörler.
+- **Özel vesting'li token-lansman platformları** — programınız vesting token'larını tutar ve Raydium havuzuna belirli bir programa göre serbest bırakır.
+
+Yalnızca çevrimdışı koddan swap göndermek istiyorsanız CPI aşırı yüktür — SDK'yı kullanın. CPI'nin karmaşıklığı, kendi durum ile atomiklik gereksinimiyken kazanır.
+
+## Bileşim desenleri
+
+### Desen 1: İnce proxy
+
+Programınız bir politikayu doğrulayan (örn. beyaz listedeki mint çiftleri, doğrulanmış kullanıcılar için ücret indirimi) tek bir talimat ortaya koyan ve ardından Raydium'a iletir.
+
+```
+┌──────────────┐   user tx    ┌────────────────┐  CPI  ┌──────────┐
+│ user         │─────────────▶│ your program   │──────▶│ Raydium  │
+└──────────────┘              │  (validate)    │       │  (CPMM)  │
+                              └────────────────┘       └──────────┘
+```
+
+Durum kullanıcının ATA'larında yaşar. Programınız hiçbir token'a sahip değildir. Minimal güven ayak izi.
+
+### Desen 2: Emanet
+
+Programınız kullanıcının input mint'ini tutan bir PDA'ya sahiptir. Tetiklenmesi halinde, PDA kendi bakiyesini swap yapmak için Raydium'a bir CPI imzalar.
+
+```
+           deposit                   trigger
+   user ───────────▶  PDA vault  ───────────────▶  Raydium swap
+                     (your prog)                    (signed by PDA)
+                                                            │
+                                                            ▼
+                                                    PDA vault (output mint)
+                                                            │
+                                                     withdraw ▼
+                                                         user
+```
+
+Kritik detay: PDA, `CpiContext::new_with_signer` aracılığıyla imzalar. [Signer seeds](#pda-imzalayan-seed-ler) bölümüne bakın.
+
+### Desen 3: Bileşik çok-atlama
+
+Programınız bir talimatta birden fazla CPI yayınlar, tümü arasında tek bir slippage sınırı uygular. Raydium swap talimatlardır her birinin kendi `minimum_amount_out` vardır, ancak bunları 0'a (veya çok gevşek bir tabana) ayarlar ve son atlama sonrasında kesin bir minimum uygularsınız.
+
+```
+instruction:
+  CPI swap: tokenA → tokenB   (raydium, loose min)
+  CPI swap: tokenB → tokenC   (raydium / third-party, loose min)
+  CPI swap: tokenC → tokenD   (raydium, loose min)
+  require(user.tokenD_ata.amount - pre_balance >= user_min_out)
+```
+
+Bu size tüm rota için tek bir geri çevirme kapısı verir. Yalnızca her atlama slippage-güvenli olduğuna güvendiğinizde bu deseni kullanın; aksi takdirde, her atlama kendi minimum'unu uygulamaya izin verin.
+
+### Desen 4: Vault / strateji
+
+Programınız bir PDA'da LP token'larını veya farm stake'ini tutar. Bir keeper (veya kullanıcı) `compound()` çağırır, bu:
+
+1. Farm'dan ödülleri hasat eder.
+2. Ödülleri pool token'ları için swap yapar (CPMM veya CLMM'ye CPI).
+3. Gelirleri LP'ye geri yatırır (başka bir CPI).
+4. Yeni LP'yi stake eder (başka bir CPI).
+
+Tümü tek bir işlemde gerçekleşir, böylece vault'un NAV'ı atomik olarak hareket eder. İşlem bütçesi tipik olarak 600k–1M CU'dur; adres arama tabloları zorunludur.
+
+## Hesap listesi inşası
+
+Çağıran programın `Accounts` yapısı Raydium programının hesap sırasını yansıtır, ancak çoğu Raydium tarafındaki hesap `UncheckedAccount`'tır çünkü Raydium onları kendisi doğrular. Yalnızca *sizin* sahip olduğunuz hesaplara kısıtlamalar eklersiniz:
+
+```rust
+use anchor_lang::prelude::*;
+use anchor_spl::token::{Token, TokenAccount};
+
+#[derive(Accounts)]
+pub struct EscrowSwap<'info> {
+    /// Emanet PDA'sı; input mint'i tutar ve CPI'ye imza atar.
+    #[account(
+        mut,
+        seeds = [b"escrow", user.key().as_ref()],
+        bump = escrow.bump,
+    )]
+    pub escrow: Account<'info, Escrow>,
+
+    #[account(mut)]
+    pub user: Signer<'info>,
+
+    // ----- Raydium tarafındaki hesaplar, çoğunlukla kontrol edilmemiş -----
+
+    /// CHECK: CPMM tarafından doğrulanır
+    #[account(mut)] pub pool_state: UncheckedAccount<'info>,
+    /// CHECK: CPMM tarafından doğrulanır
+    pub amm_config: UncheckedAccount<'info>,
+    /// CHECK: CPMM tarafından doğrulanır
+    pub pool_authority: UncheckedAccount<'info>,
+    #[account(mut)] pub input_vault:  Account<'info, TokenAccount>,
+    #[account(mut)] pub output_vault: Account<'info, TokenAccount>,
+    /// CHECK: CPMM tarafından doğrulanır
+    #[account(mut)] pub observation_state: UncheckedAccount<'info>,
+
+    /// Emanet'in input ATA'sı — emanet PDA'sı tarafından sahip olunan.
+    #[account(
+        mut,
+        associated_token::mint = input_mint,
+        associated_token::authority = escrow,
+    )]
+    pub escrow_input_ata: Account<'info, TokenAccount>,
+
+    /// Emanet'in output ATA'sı.
+    #[account(
+        mut,
+        associated_token::mint = output_mint,
+        associated_token::authority = escrow,
+    )]
+    pub escrow_output_ata: Account<'info, TokenAccount>,
+
+    pub input_mint:  Account<'info, anchor_spl::token::Mint>,
+    pub output_mint: Account<'info, anchor_spl::token::Mint>,
+
+    pub cpmm_program:       Program<'info, raydium_cp_swap::program::RaydiumCpSwap>,
+    pub token_program:      Program<'info, Token>,
+    pub token_program_2022: Program<'info, anchor_spl::token_2022::Token2022>,
+}
+```
+
+Asimetri — sizin hesaplarınız üzerinde kesin doğrulama, Raydium'unkilerde `UncheckedAccount` — tembelliktir değil. Alıcı kendi dosyasını doğrular; çağıran üzerinde çift doğrulama sadece CU yakar ve Raydium yeni bir yapı düzeni alanı gönderdiğinde senkronizasyon çıkması riskidir.
+
+## CPI çağrısının kendisi
+
+```rust
+use raydium_cp_swap::cpi::{self, accounts::Swap as CpmmSwap};
+
+pub fn escrow_swap(
+    ctx: Context<EscrowSwap>,
+    amount_in: u64,
+    minimum_amount_out: u64,
+) -> Result<()> {
+    let user_key = ctx.accounts.user.key();
+    let bump     = ctx.accounts.escrow.bump;
+    let seeds: &[&[u8]] = &[b"escrow", user_key.as_ref(), &[bump]];
+    let signer: &[&[&[u8]]] = &[seeds];
+
+    let cpi_accounts = CpmmSwap {
+        payer:                ctx.accounts.user.to_account_info(),
+        authority:            ctx.accounts.escrow.to_account_info(),
+        amm_config:           ctx.accounts.amm_config.to_account_info(),
+        pool_state:           ctx.accounts.pool_state.to_account_info(),
+        input_token_account:  ctx.accounts.escrow_input_ata.to_account_info(),
+        output_token_account: ctx.accounts.escrow_output_ata.to_account_info(),
+        input_vault:          ctx.accounts.input_vault.to_account_info(),
+        output_vault:         ctx.accounts.output_vault.to_account_info(),
+        input_token_program:  ctx.accounts.token_program.to_account_info(),
+        output_token_program: ctx.accounts.token_program.to_account_info(),
+        input_token_mint:     ctx.accounts.input_mint.to_account_info(),
+        output_token_mint:    ctx.accounts.output_mint.to_account_info(),
+        observation_state:    ctx.accounts.observation_state.to_account_info(),
+    };
+
+    let cpi_ctx = CpiContext::new_with_signer(
+        ctx.accounts.cpmm_program.to_account_info(),
+        cpi_accounts,
+        signer,
+    );
+
+    cpi::swap_base_input(cpi_ctx, amount_in, minimum_amount_out)?;
+    Ok(())
+}
+```
+
+### PDA imzalayan seed'ler
+
+CPI yalnızca `authority` olarak iletilen PDA, çağıranın söylediği türetmeyle eşleşirse başarılı olur. İkisinin şu konularda anlaşması gerekir:
+
+1. Seed bayt sırası (burada `[b"escrow", user.key().as_ref()]`).
+2. Bump.
+3. Çağıran program kimliği (Raydium'unkisi değil, sizin programınız).
+
+Raydium kimin authority olduğunu umursamaz — yalnızca `authority` imzasının işlemi kapsamasını ve input ATA'nın bu authority'ye ait olmasını umursar. Doğrulama `anchor_spl::token::transfer`'de gerçekleşir: ATA'nın `authority` alanı imzalayan ile eşleşmelidir.
+
+Yaygın hata: `user`'ı authority olarak iletmek (ve `escrow` PDA'sına ait olan `escrow_input_ata`'dan transfer etmek). SPL Token programı `owner mismatch` ile reddeder. Her zaman `authority` alanını ATA sahibi ile eşleştirin.
+
+## Kalan hesaplar
+
+Birçok Raydium talimatı, sabit olanlardan sonra eklenen değişken uzunluklu bir hesap listesi alır — **kalan hesaplar**.
+
+- **CLMM `SwapV2`**: swap yönünde swap'ın geçebileceği tick arrayları için 1–8 `TickArrayState` hesabı.
+- **Farm v6 `Deposit` / `Harvest` / `Withdraw`**: `(reward_vault, user_reward_ata)` çiftleri, canlı her ödül slotu başına bir çift.
+- **Token-2022 transfer-hook mint'leri**: transfer-hook programı artı hook'un ihtiyaç duyduğu hesaplar.
+
+Anchor CPI yardımcıları kalan hesapları tür kontrol etmez. Onları geçirin:
+
+```rust
+let cpi_ctx = CpiContext::new_with_signer(program, accounts, signer)
+    .with_remaining_accounts(ctx.remaining_accounts.to_vec());
+```
+
+**Sıralama önemlidir.** CLMM için:
+
+```
+remaining = [
+    tick_array_in_direction_0,    // ilk geçilen
+    tick_array_in_direction_1,
+    ...,
+]
+```
+
+Farm v6 hasat için:
+
+```
+remaining = [
+    reward_vault_0, user_reward_ata_0,
+    reward_vault_1, user_reward_ata_1,
+    // reward_state'i Uninitialized olan tüm slot'ları atla
+]
+```
+
+Çağıran programınız istemciden aldığı kalan hesapları değiştirilmemiş olarak iletmelidir. Onları filtrelemeye veya yeniden sıralamaya çalışmayın.
+
+## Bileşik çağrılar için işlem bütçesi
+
+Bir CPI kendisi ~1.500 CU'ya mal olur; çağrılan tarafın kendi CU kullanımı üstüne yığılır. Raydium CPI başına kabaca bütçe:
+
+| Çağrı | CU (SPL Token) | CU (Token-2022) |
+|------|----------------|-----------------|
+| CPMM swap_base_input | ~150,000 | ~200,000 |
+| CLMM swap_v2 (tek tick array) | ~180,000 | ~230,000 |
+| CLMM swap_v2 (2 tick'i geçer) | ~220,000 | ~270,000 |
+| Farm v6 deposit | ~120,000 | ~150,000 |
+| Farm v6 harvest (ödül slotu başına) | +30,000 | +40,000 |
+| AMM v4 swap_base_in | ~140,000 | n/a |
+
+Her CPI frame için ~1.500 ve programınızın kendi yükü için ~20.000 ekleyin. `harvest → swap A → swap B → deposit LP → stake LP` yapan bir otomatik bileşik kolay 700k CU'ya ulaşır.
+
+Her zaman açık bir `ComputeBudgetProgram::set_compute_unit_limit` ayarlayın:
+
+```ts
+import { ComputeBudgetProgram } from "@solana/web3.js";
+
+const tx = new Transaction().add(
+  ComputeBudgetProgram.setComputeUnitLimit({ units: 900_000 }),
+  ComputeBudgetProgram.setComputeUnitPrice({ microLamports: priorityFeeMicroLamports }),
+  yourInstruction,
+);
+```
+
+Varsayılan 200k CU tavanı bileşik bir çağrı tamamlanmadan çok önce sessizce bitecektir.
+
+## Hata yayılması
+
+Raydium programları istikrarlı hata kodlarıyla Anchor hataları döndürür. Çağıran programınız bunları `Err(ProgramError::Custom(code))` olarak görür. Varsayılan olarak geçirin:
+
+```rust
+cpi::swap_base_input(cpi_ctx, amount_in, minimum_amount_out)?;
+```
+
+Veya belirli kodlar için kesintiye uğratın:
+
+```rust
+use raydium_cp_swap::error::ErrorCode as CpmmErr;
+
+match cpi::swap_base_input(cpi_ctx, amount_in, minimum_amount_out) {
+    Ok(_) => {},
+    Err(err) if is_err(err, CpmmErr::ExceededSlippage) => {
+        // Programınız daha büyük slippage'da yeniden denemeyi isteyebilir veya durumu geri açabilir.
+        return err!(YourErr::PoolTooVolatile);
+    }
+    Err(err) => return Err(err),
+}
+```
+
+Hata kodu-anlam eşlemesi IDL politikasına göre program başına istikrarlıdır ([`sdk-api/anchor-idl`](/tr/sdk-api/anchor-idl)); yeni kodlar sonda ekleyerek, mevcut kodlar asla anlam değişikliği yapmaz.
+
+## Tam çalışan örnek: limit-order emaneti
+
+Akış:
+
+1. **`open_order`** — kullanıcı `amount_in` kadarını `input_mint`'den emanet PDA'ya yatırır; hedef `min_amount_out` ve son kullanma tarihini kaydeder.
+2. **`execute_order`** — herkes (keeper) mevcut pool hesaplarıyla çağırır. Program mevcut teklifi ≥ `min_amount_out` olup olmadığını kontrol eder, ardından Raydium swap'ı CPI'ye verir ve çıktıyı emanette tutar.
+3. **`claim`** — kullanıcı output mint'i emanetten çeker.
+
+```rust
+#[account]
+pub struct LimitOrder {
+    pub user:          Pubkey,
+    pub input_mint:    Pubkey,
+    pub output_mint:   Pubkey,
+    pub amount_in:     u64,
+    pub min_out:       u64,
+    pub expiry_unix:   i64,
+    pub state:         u8,    // 0 open, 1 filled, 2 cancelled, 3 expired
+    pub bump:          u8,
+}
+
+#[program]
+pub mod limit_orders {
+    use super::*;
+
+    pub fn execute_order(
+        ctx: Context<ExecuteOrder>,
+    ) -> Result<()> {
+        let order = &ctx.accounts.order;
+        require!(order.state == 0, OrderErr::NotOpen);
+        require!(Clock::get()?.unix_timestamp < order.expiry_unix, OrderErr::Expired);
+
+        let user_key = order.user;
+        let seeds: &[&[u8]] = &[b"order", user_key.as_ref(), &[order.bump]];
+        let signer: &[&[&[u8]]] = &[seeds];
+
+        let pre_out_balance = ctx.accounts.escrow_output_ata.amount;
+
+        let cpi_accounts = CpmmSwap {
+            payer:                ctx.accounts.keeper.to_account_info(),
+            authority:            ctx.accounts.order.to_account_info(),
+            amm_config:           ctx.accounts.amm_config.to_account_info(),
+            pool_state:           ctx.accounts.pool_state.to_account_info(),
+            input_token_account:  ctx.accounts.escrow_input_ata.to_account_info(),
+            output_token_account: ctx.accounts.escrow_output_ata.to_account_info(),
+            input_vault:          ctx.accounts.input_vault.to_account_info(),
+            output_vault:         ctx.accounts.output_vault.to_account_info(),
+            input_token_program:  ctx.accounts.token_program.to_account_info(),
+            output_token_program: ctx.accounts.token_program.to_account_info(),
+            input_token_mint:     ctx.accounts.input_mint.to_account_info(),
+            output_token_mint:    ctx.accounts.output_mint.to_account_info(),
+            observation_state:    ctx.accounts.observation_state.to_account_info(),
+        };
+
+        let cpi_ctx = CpiContext::new_with_signer(
+            ctx.accounts.cpmm_program.to_account_info(),
+            cpi_accounts,
+            signer,
+        );
+
+        // Emanet minimum'u uygula — Raydium'un slippage'ına güveniyoruz, ama
+        // gelecekteki bir değişiklik bir kez gevşetirse de kontrol etmek için sonrası swap deltaısını yeniden kontrol ederiz.
+        cpi::swap_base_input(cpi_ctx, order.amount_in, order.min_out)?;
+
+        ctx.accounts.escrow_output_ata.reload()?;
+        let delta = ctx.accounts.escrow_output_ata.amount
+            .checked_sub(pre_out_balance)
+            .ok_or(error!(OrderErr::AccountingError))?;
+        require!(delta >= order.min_out, OrderErr::InsufficientOutput);
+
+        let order = &mut ctx.accounts.order;
+        order.state = 1;
+        Ok(())
+    }
+}
+```
+
+Keeper işlem ücretini öder (başka bir yerde bir keeper ücreti alırlar — gösterilmemiştir). Emanet PDA'sı CPI'ye imza atar. Raydium tarafındaki slippage kontrolü *ve* emanet'in kendi delta kontrolü zemin sınırını uygular — çiftçi kasnak.
+
+## Test
+
+Raydium programlarını yerel bir doğrulayıcıya entegrasyon testleri için çekmek (`Anchor.toml`'den):
+
+```toml
+[test.validator]
+clone = [
+  { address = "CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK" }, # CPMM
+  { address = "CLMM...." },                                     # CLMM
+  { address = "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8" }, # AMM v4
+  { address = "FarmqiPv5eAj3j1GMdMCMUGXqPUvmquZtMy86QH6rzhG" }, # Farm v6
+]
+```
+
+Testleriniz gerçekten swap yürütebilmesi için pool state hesaplarını da klonlayın; `anchor test` bunları başlangıçta mainnet'ten alır. [`sdk-api/rust-cpi`](/tr/sdk-api/rust-cpi#bir-cpi-akışı-test-etme) adresine bakın.
+
+## Bileşime özgü tuzaklar
+
+### Yeniden-girişkenlik
+
+Solana'da gerçek yeniden-girişkenlik yok — bir CPI aynı çağrıda kaynak programına geri çağrı yapamaz. Ancak yine de kendinizi mantıksal yeniden-girişkenliğe inşa edebilirsiniz: durumunuzu okuyan bir CPI, ardından kodunuz tekrar okur ve CPI'nin onu değiştirmediğini varsayarak. Raydium için CPI'ler durumunuza dokunmaz, bu nedenle örn. flash-loan bağlamlarından daha az bir endişe konusudur. Ancak Raydium'u bir borç verme protokolüyle bileştirirseniz, farkında olun.
+
+### Hesap değişebilirlik sapması
+
+Programınız bir hesabı `mut` olarak iletirse ancak Raydium onu salt okunur olarak beklerse (veya tersi), çalışma zamanı çağrıyı `InvalidAccountData` ile reddeder. Raydium'un talimattının beklenen değişebilirliğini her zaman IDL'de kontrol edin; `anchor_cp_swap::cpi::accounts::Swap` bunu alan türleriyle zorunlu kılar.
+
+### Token-2022 program alanı
+
+Input ve output mint'ler farklı token programları altında olabilir — biri SPL Token, biri Token-2022. CPI bu nedenle ayrı `input_token_program` ve `output_token_program` alanlarına sahiptir. Her mint'in `owner` alanını her zaman kontrol edin ve doğru programı her slota yönlendirin.
+
+### Sürümlü işlemler
+
+2+ Raydium CPI'sı artı bir ATA oluşturması yapan bileşik bir tx nadiren eski (v0-olmadan-LUT) işlemde uyar. V0'ı adres arama tabloları ile kullanın; `raydium.getRaydiumLutAddresses()` aracılığıyla Raydium'un genel LUT'larını çekin.
+
+## İşaretçiler
+
+- [`sdk-api/rust-cpi`](/tr/sdk-api/rust-cpi) — düşük seviye CPI mekaniği.
+- [`integration-guides/priority-fee-tuning`](/tr/integration-guides/priority-fee-tuning) — işlem bütçesini boyutlandırma.
+- [`products/cpmm/code-demos`](/tr/products/cpmm/code-demos), [`products/clmm/code-demos`](/tr/products/clmm/code-demos), [`products/farm-staking/code-demos`](/tr/products/farm-staking/code-demos) — ürün başına CPI snippet'leri.
+
+Kaynaklar:
+
+- [raydium-cp-swap CPI crate](https://github.com/raydium-io/raydium-cp-swap)
+- [raydium-clmm CPI crate](https://github.com/raydium-io/raydium-clmm)
+- [Anchor CPI docs](https://www.anchor-lang.com/docs/cross-program-invocations)

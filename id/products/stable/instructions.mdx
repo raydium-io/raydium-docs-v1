@@ -1,0 +1,349 @@
+---
+title: "Instruksi Stable AMM"
+description: "Set instruksi lengkap: Initialize, InitModelData, UpdateModelData, Deposit, Withdraw, SwapBaseIn, SwapBaseOut, MonitorStep, SetParams, WithdrawPnl, WithdrawSrm, PreInitialize, SimulateInfo."
+---
+
+<Info>
+  **Halaman ini diterjemahkan secara otomatis oleh AI. Versi bahasa Inggris adalah acuan resmi.**
+
+  [Lihat versi bahasa Inggris →](/products/stable/instructions)
+</Info>
+
+<Info>
+  Stable AMM berbagi sebagian besar permukaan instruksi dengan AMM v4. Instruksi unik adalah `InitModelData` dan `UpdateModelData`, yang mengisi dan memperbarui tabel lookup. Semua operasi lainnya (swap, deposit, withdraw, crank) mengikuti pola yang sama seperti AMM v4.
+</Info>
+
+## Inventaris instruksi
+
+| Instruksi | Kategori | Catatan |
+|-------------|----------|-------|
+| `Initialize` | Lifecycle | Buat pool (memerlukan akun model-data yang sudah dialokasikan sebelumnya). |
+| `PreInitialize` | Lifecycle | Pembantu pre-allocation warisan. |
+| `InitModelData` | Model setup | Buat dan inisialisasi tabel lookup. |
+| `UpdateModelData` | Model setup | Isi hingga 5 elemen tabel per pemanggilan. |
+| `Deposit` | Liquidity | Tambah likuiditas, terima LP. |
+| `Withdraw` | Liquidity | Bakar LP, terima kedua sisi. |
+| `SwapBaseIn` | Swap | Swap exact-input. |
+| `SwapBaseOut` | Swap | Swap exact-output. |
+| `MonitorStep` | Crank | Selesaikan OpenBook, perbarui order. |
+| `SetParams` | Admin | Ubah parameter pool. |
+| `WithdrawPnl` | Admin | Ambil biaya protokol yang terkumpul. |
+| `WithdrawSrm` | Legacy | Ambil rebate SRM (**warisan**). |
+| `SimulateInfo` | Diagnostic | Pembantu quote read-only. |
+
+## `Initialize`
+
+Bootstrap pool Stable AMM baru yang terikat pada pasar OpenBook yang ada dan akun `ModelDataInfo` yang sudah dibuat sebelumnya.
+
+**Arguments**
+
+```
+nonce: u8
+open_time: u64
+```
+
+**Accounts** (writable `W`, signer `S`)
+
+| # | Name | W | S | Catatan |
+|---|------|---|---|-------|
+| 1 | `token_program` |   |   | SPL Token. |
+| 2 | `system_program` |   |   | |
+| 3 | `rent` |   |   | |
+| 4 | `amm` | W |   | Akun `AmmInfo` pool. |
+| 5 | `amm_authority` |   |   | PDA seluruh program. |
+| 6 | `amm_open_orders` | W |   | OpenBook `OpenOrders`. |
+| 7 | `lp_mint` | W |   | Mint token LP yang dapat dipertukarkan. |
+| 8 | `coin_mint` |   |   | |
+| 9 | `pc_mint` |   |   | |
+| 10 | `pool_coin_token_account` | W |   | Vault coin pool. |
+| 11 | `pool_pc_token_account` | W |   | Vault pc pool. |
+| 12 | `amm_target_orders` | W |   | Grid untuk order OpenBook. |
+| 13 | `model_data_account` |   |   | **Akun tabel lookup.** |
+| 14 | `serum_program` |   |   | Program OpenBook. |
+| 15 | `serum_market` |   |   | Pasar OpenBook. |
+| 16 | `user_dest_lp_token` | W |   | ATA LP kreator (menerima LP awal). |
+| 17 | `user_wallet` | W | S | Kreator; membayar rent, mendanai deposit awal. |
+| (opt) | `srm_token` | W |   | Akun token SRM untuk diskon biaya (warisan). |
+
+**Preconditions**
+
+- `model_data_account` harus sudah dibuat dan diinisialisasi oleh `InitModelData` sebelumnya.
+- `lp_mint` harus kosong (pasokan nol).
+- Vault harus ada dan dimiliki oleh `amm_authority`.
+
+**Postconditions**
+
+- `AmmInfo` diinisialisasi dengan semua referensi.
+- `TargetOrders` dinolkan dan siap untuk `MonitorStep` pertama.
+- Token LP awal dimint dan dikirim ke `user_dest_lp_token`.
+- Order OpenBook **belum** diposting; `MonitorStep` pertama mempostingnya.
+
+## `InitModelData`
+
+Buat dan inisialisasi akun `ModelDataInfo`. Harus dipanggil sekali sebelum `Initialize`.
+
+**Arguments**
+
+```
+multiplier: u64       // scale factor (misalnya, 10^6)
+```
+
+**Accounts** (writable `W`, signer `S`)
+
+| # | Name | W | S | Catatan |
+|---|------|---|---|-------|
+| 1 | `model_data_account` | W |   | Akun tabel 50k-elemen. |
+| 2 | `amm_admin` |   | S | Admin pool (harus menandatangani untuk membuktikan otoritas). |
+
+**Preconditions**
+
+- `model_data_account` harus cukup besar (~1,2 MB untuk 50k × 24 bytes).
+- `model_data_account` harus dimiliki oleh program Stable.
+
+**Postconditions**
+
+- `status = Initialized`.
+- `multiplier` diatur.
+- `valid_data_count = 0` (tidak ada elemen yang diisi; panggil `UpdateModelData` untuk menambahkannya).
+- Array `elements` dinolkan.
+
+## `UpdateModelData`
+
+Isi hingga 5 elemen tabel dalam satu pemanggilan. Harus dipanggil setelah `InitModelData` tetapi sebelum swap mulai menggunakan tabel.
+
+**Arguments**
+
+```
+array_data: [UpdateModelData; 5]
+
+pub struct UpdateModelData {
+  pub index: u64,
+  pub data: DataElement,
+}
+```
+
+**Accounts** (writable `W`, signer `S`)
+
+| # | Name | W | S | Catatan |
+|---|------|---|---|-------|
+| 1 | `amm_admin` |   | S | Penandatangan (harus menjadi admin pool). |
+| 2 | `model_data_account` | W |   | Akun tabel. |
+
+**Preconditions**
+
+- `amm_admin` harus cocok dengan `AmmInfo.amm_admin`.
+- Setiap index dalam `array_data` harus valid (dalam 50.000).
+- **Entries harus diurutkan** (tidak divalidasi on-chain untuk kecepatan): x ascending, y descending, price ascending.
+
+**Postconditions**
+
+- Elemen ditulis ke `model_data_account.elements[index]` untuk setiap input.
+- `valid_data_count` diperbarui ke indeks maksimal yang ditulis + 1.
+
+**Catatan governance:** Tidak ada penegakan on-chain untuk urutan sortir atau konsistensi harga. Admin yang berbahaya atau ceroboh dapat merusak tabel dan menyebabkan quote yang salah. Dalam praktiknya, multisig Raydium mengontrol alamat ini.
+
+## `Deposit`
+
+Tambah likuiditas, terima token LP.
+
+**Arguments**
+
+```
+max_coin_amount: u64
+max_pc_amount: u64
+base_side: u64          // 0 = base on coin, 1 = base on pc
+```
+
+**Accounts** — seperti AMM v4, ~13 akun. Harus menyertakan `model_data_account` sebagai read-only.
+
+**Math** — pro-rata standar menggunakan tabel lookup untuk menghitung rasio. SDK menghitung pasangan coin/pc untuk jumlah LP yang diinginkan dan memeriksa terhadap batas maksimal.
+
+## `Withdraw`
+
+Bakar LP, terima kedua sisi pro-rata.
+
+**Arguments**
+
+```
+amount: u64            // Token LP yang akan dibakar
+```
+
+**Accounts** — seperti AMM v4, dengan `model_data_account` sebagai read-only.
+
+**Preconditions**
+
+- `user_lp_token_account` menyimpan setidaknya `amount`.
+
+**Postconditions**
+
+- `amount` token LP dibakar.
+- Pengguna menerima jumlah coin dan pc sesuai pro-rata saat ini, disesuaikan dengan biaya yang terkumpul.
+
+## `SwapBaseIn`
+
+Swap exact-input menggunakan tabel lookup untuk pricing.
+
+**Arguments**
+
+```
+amount_in: u64
+minimum_amount_out: u64
+```
+
+**Accounts** (~17 total)
+
+| # | Name | W | S | Catatan |
+|---|------|---|---|-------|
+| 1 | `token_program` |   |   | |
+| 2 | `amm` | W |   | |
+| 3 | `amm_authority` |   |   | |
+| 4 | `amm_open_orders` | W |   | |
+| 5 | `amm_target_orders` | W |   | |
+| 6 | `pool_coin_token_account` | W |   | |
+| 7 | `pool_pc_token_account` | W |   | |
+| 8 | `model_data_account` |   |   | **Tabel lookup read-only.** |
+| 9 | `serum_program` |   |   | |
+| 10 | `serum_market` | W |   | |
+| 11 | `serum_bids` | W |   | |
+| 12 | `serum_asks` | W |   | |
+| 13 | `serum_event_queue` | W |   | |
+| 14 | `serum_coin_vault` | W |   | |
+| 15 | `serum_pc_vault` | W |   | |
+| 16 | `serum_vault_signer` |   |   | |
+| 17 | `user_source_token` | W |   | Akun token input pengguna. |
+| 18 | `user_dest_token` | W |   | Akun token output pengguna. |
+| 19 | `user_owner` |   | S | Pengguna (penandatangan transaksi). |
+
+**Preconditions**
+
+- `amm.status` mengizinkan swap.
+- `user_source_token` menyimpan ≥ `amount_in`.
+
+**Postconditions**
+
+- Pengguna kehilangan `amount_in`, mendapat `amount_out ≥ minimum_amount_out`.
+- Biaya pool menambah counter `need_take_pnl_*`.
+- Order OpenBook mungkin selesai jika diisi.
+
+**Math** — Interpolasi tabel lookup seperti yang dijelaskan dalam [`products/stable/math`](/id/products/stable/math).
+
+## `SwapBaseOut`
+
+Swap exact-output (kebalikan dari `SwapBaseIn`). Akun yang sama, arah math berbeda.
+
+**Arguments**
+
+```
+max_amount_in: u64
+amount_out: u64
+```
+
+## `MonitorStep`
+
+Crank tanpa izin: selesaikan isi OpenBook, perbarui grid limit-order.
+
+**Arguments**
+
+```
+plan_order_limit: u16
+place_order_limit: u16
+cancel_order_limit: u16
+```
+
+**Accounts** (~18 total) — sama seperti AMM v4 `MonitorStep` ditambah `model_data_account` sebagai read-only.
+
+**Preconditions**
+
+- Referensi akun OpenBook harus cocok dengan pasar terikat pool.
+
+**Postconditions**
+
+- Isi OpenBook yang tertunda diselesaikan ke dalam vault pool.
+- Order limit baru diposting ke OpenBook berdasarkan kurva tabel lookup.
+- `TargetOrders` diperbarui.
+
+## `SetParams`
+
+Hanya admin. Ubah parameter pool (status, state, fees, owner, model-data key, dll).
+
+**Arguments**
+
+```
+param: u8              // parameter mana yang diubah (Status, State, Fees, dll)
+value: Option<u64>    // nilai baru (jika param numerik)
+new_pubkey: Option<Pubkey>  // alamat baru (jika param adalah kunci akun)
+fees: Option<Fees>    // biaya baru (jika param adalah Fees)
+```
+
+**Accounts** — bervariasi menurut param. Selalu memerlukan `amm_admin` sebagai penandatangan.
+
+**Param umum:**
+
+- `param = 0` (Status) — ubah bitmask operasi.
+- `param = 9` (Fees) — ubah trade_fee, pembagian pnl, dll.
+- `param = 11` (ModelDataKey) — rebind tabel lookup (jarang, memerlukan tindakan admin).
+
+## `WithdrawPnl`
+
+Hanya admin. Ambil biaya protokol yang terkumpul dari `need_take_pnl_*` ke dalam akun PnL yang ditunjuk.
+
+**Arguments** — tidak ada (driven state).
+
+**Accounts** (~14 total)
+
+| # | Name | W | S | Catatan |
+|---|------|---|---|-------|
+| 1 | `token_program` |   |   | |
+| 2 | `amm` | W |   | |
+| 3 | `amm_authority` |   |   | |
+| 4 | `amm_open_orders` | W |   | |
+| 5 | `pool_coin_token_account` | W |   | |
+| 6 | `pool_pc_token_account` | W |   | |
+| 7 | `coin_pnl_dest` | W |   | Akun coin admin (menerima biaya). |
+| 8 | `pc_pnl_dest` | W |   | Akun pc admin (menerima biaya). |
+| 9 | `pnl_admin` |   | S | Penandatangan (harus cocok dengan kepemilikan pool). |
+| 10+ | Akun OpenBook (~4) |   |   | Selesaikan isi yang tertunda terlebih dahulu. |
+
+**Preconditions**
+
+- `pnl_admin` harus berwenang.
+
+**Postconditions**
+
+- `need_take_pnl_coin` dan `need_take_pnl_pc` ditransfer ke akun admin.
+- Counter dinolkan.
+
+## `WithdrawSrm`
+
+**Warisan** (**jangan gunakan di pool baru**). Mengambil rebate token diskon biaya SRM dari pool era Serum awal.
+
+**Arguments**
+
+```
+amount: u64
+```
+
+## `SimulateInfo`
+
+Pembantu quote read-only untuk klien dan SDK.
+
+**Arguments**
+
+```
+param: u8              // PoolInfo, SwapBaseInInfo, SwapBaseOutInfo, RunCrankInfo
+swap_base_in_value: Option<SwapInstructionBaseIn>
+swap_base_out_value: Option<SwapInstructionBaseOut>
+```
+
+**Usage** — dipanggil via `simulateTransaction` untuk mendapatkan quote tanpa menjalankan swap.
+
+## Langkah berikutnya
+
+- [Accounts](/id/products/stable/accounts) — untuk tata letak dan ukuran field akun.
+- [Math](/id/products/stable/math) — untuk logika interpolasi tabel lookup.
+- [Code demos](/id/products/stable/code-demos) — untuk melihat cara memanggil ini dari SDK.
+
+Sources:
+
+- `raydium-stable/program/src/instruction.rs` (enum dan pack/unpack)
+- `raydium-stable/program/src/processor.rs` (logika eksekusi)

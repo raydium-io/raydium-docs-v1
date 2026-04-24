@@ -1,0 +1,241 @@
+---
+title: "Vesting LaunchLab"
+description: "Token terkunci, jadwal cliff dan linear-unlock, akun VestingRecord per-penerima, serta instruksi create / claim yang digunakan kreator dan platform untuk mendistribusikan cadangan pasokan setelah graduation."
+---
+
+<Info>
+  **Halaman ini diterjemahkan secara otomatis oleh AI. Versi bahasa Inggris adalah acuan resmi.**
+
+  [Lihat versi bahasa Inggris →](/products/launchlab/vesting)
+</Info>
+
+<Info>
+  Vesting adalah **opsional** pada peluncuran LaunchLab. Tetapkan `vesting_param.total_locked_amount = 0` saat `Initialize` dan bagian di bawah tidak berlaku. Setelah diaktifkan, jadwal bersifat tetap selama masa hidup launch; cliff dan periode unlock tidak dapat diubah secara retroaktif.
+</Info>
+
+## Mengapa vesting
+
+Kurva bonding menjual `base_supply_graduation` token selama penggalangan dana dan menabur sisa ke pool pasca-graduation. Vesting mengambil irisan tambahan dari pasokan, menguncinya untuk cliff yang dapat dikonfigurasi, kemudian mereleasenya secara linier kepada satu atau lebih penerima — biasanya tim kreator, penasihat, atau mitra platform.
+
+Kasus penggunaan praktis:
+
+- **Alokasi tim.** Kreator mereservasi, katakanlah, 5% dari pasokan untuk tim pendiri, dikunci selama 6 bulan dan dibuka secara linier selama 12 bulan berikutnya.
+- **Alokasi platform.** Platform peluncuran menerima irisan dari setiap token yang ditempatkannya, pada jadwal yang sama, melalui `CreatePlatformVestingAccount`.
+- **Hibah penasihat / kontributor.** Penerima ganda dengan akun `VestingRecord` mereka sendiri, masing-masing melacak jumlah yang diklaim mereka secara independen.
+
+Token terkunci tidak pernah memasuki kurva dan bukan bagian dari LP graduation. Mereka tetap dorman di `base_vault` pool hingga setiap penerima memanggil `ClaimVestedToken`.
+
+## Bentuk jadwal
+
+Vesting untuk peluncuran dijelaskan dengan tiga angka, dicatat sekali pada waktu `Initialize`:
+
+| Field | Type | Arti |
+|-------|------|------|
+| `total_locked_amount` | `u64` | Jumlah semua token base terkunci di semua penerima (kreator + platform). Harus memenuhi `total_locked_amount <= supply * max_lock_rate / 1_000_000` dari `GlobalConfig` yang mengikat. |
+| `cliff_period` | `u64` (detik) | Waktu tunggu setelah penggalangan dana berakhir sebelum token unlock apa pun. |
+| `unlock_period` | `u64` (detik) | Durasi jendela unlock linier setelah cliff. `0` berarti semuanya dibuka secara instan pada akhir cliff. |
+
+Ketiga nilai ini berada di `PoolState.vesting_schedule` (struct `VestingSchedule`) ditambah `start_time` on-chain, yang program catat sebagai `block_time + cliff_period` pada saat penggalangan dana berhasil berakhir (ketika kondisi graduation pertama kali terpenuhi).
+
+```rust
+// states/pool.rs
+pub struct VestingSchedule {
+    pub total_locked_amount:     u64,
+    pub cliff_period:            u64,
+    pub unlock_period:           u64,
+    pub start_time:              u64,   // diatur program saat akhir penggalangan dana
+    pub allocated_share_amount:  u64,   // jumlah berjalan alokasi ke vesting records
+}
+```
+
+`allocated_share_amount` adalah jumlah total yang sudah ditetapkan ke akun `VestingRecord` melalui `CreateVestingAccount` / `CreatePlatformVestingAccount`. Ini tidak boleh pernah melebihi `total_locked_amount`. Jika kreator over-allocate, panggilan `CreateVestingAccount` berikutnya dibatalkan dengan `InvalidTotalLockedAmount`.
+
+## Formula unlock linier
+
+Setelah penggalangan dana berakhir, program menghitung jumlah unlock kumulatif untuk setiap `VestingRecord` sebagai:
+
+```
+elapsed         = min(now, start_time + unlock_period) − start_time
+unlocked_amount = token_share_amount × elapsed / unlock_period
+```
+
+Jika `unlock_period == 0`, seluruh `token_share_amount` menjadi klaim dalam satu langkah di `start_time`. Sebaliknya kurva adalah garis lurus dari 0 di `start_time` ke `token_share_amount` di `start_time + unlock_period`, dibatasi pada `token_share_amount` sesudahnya.
+
+Jumlah yang ditransfer pada setiap panggilan `ClaimVestedToken` adalah delta antara jumlah unlock kumulatif yang baru dihitung ulang dan bidang `claimed_amount` yang berjalan di rekam.
+
+```
+delta_amount    = unlocked_amount − vesting_record.claimed_amount
+vesting_record.claimed_amount = unlocked_amount
+```
+
+Klaim sebelum `start_time` dibatalkan dengan `VestingNotStarted`. Klaim setelah `start_time + unlock_period` menyelesaikan sisa penuh.
+
+## Tata letak akun
+
+### `VestingSchedule`
+
+Berada inline di `PoolState`. Lihat [`accounts`](/id/products/launchlab/accounts).
+
+### `VestingRecord`
+
+Rekam per-penerima. PDA diturunkan sebagai:
+
+```
+seeds = [
+  b"pool_vesting",
+  pool_state.key(),
+  beneficiary.key(),
+]
+program = program LaunchLab
+```
+
+```rust
+// states/vesting.rs
+#[account]
+pub struct VestingRecord {
+    pub epoch:               u64,         // pelacak recent_epoch
+    pub pool:                Pubkey,      // back-pointer ke PoolState
+    pub beneficiary:         Pubkey,      // siapa yang dapat memanggil ClaimVestedToken
+    pub claimed_amount:      u64,         // klaim kumulatif
+    pub token_share_amount:  u64,         // total alokasi ke penerima ini
+    pub padding:             [u64; 8],
+}
+```
+
+Penerima hanya dapat memiliki **satu** `VestingRecord` per peluncuran. Mengalokasikan kembali ke penerima yang sama pada peluncuran yang sama dibatalkan karena PDA sudah ada.
+
+## Instruksi
+
+### `CreateVestingAccount`
+
+Hanya kreator. Mengalokasikan irisan dari `total_locked_amount` pool ke penerima baru dengan menginisialisasi PDA `VestingRecord` segar.
+
+**Argumen**
+
+```
+share_amount: u64    // token untuk ditetapkan ke penerima ini
+```
+
+**Akun**
+
+| # | Nama | W | S | Catatan |
+|---|------|---|---|---------|
+| 1 | `creator` | W | S | Harus sama dengan `pool_state.creator`; membayar sewa untuk akun baru. |
+| 2 | `beneficiary` | W |   | Menerima token unlock nanti. Pubkey dikunci di sini — tidak dapat diubah. |
+| 3 | `pool_state` | W |   | Dimutasi untuk menaikkan `vesting_schedule.allocated_share_amount`. |
+| 4 | `vesting_record` | W |   | `init`; PDA `[b"pool_vesting", pool_state, beneficiary]`. |
+| 5 | `system_program` |   |   | Diperlukan untuk pembuatan akun. |
+
+**Prekondisi**
+
+- `share_amount > 0`.
+- `pool_state.vesting_schedule.allocated_share_amount + share_amount <= total_locked_amount`.
+- Pubkey `beneficiary` tidak memiliki `VestingRecord` yang ada untuk pool ini.
+
+**Potkondisi**
+
+- `vesting_record` diinisialisasi dengan `token_share_amount = share_amount`, `claimed_amount = 0`.
+- `pool_state.vesting_schedule.allocated_share_amount += share_amount`.
+
+**Kesalahan umum** — `InvalidTotalLockedAmount`, `InvalidInput`.
+
+### `CreatePlatformVestingAccount`
+
+Varian platform-admin dari `CreateVestingAccount`. Dompet vesting platform (disimpan di `PlatformConfig.platform_vesting_wallet`) adalah penerima, dan bagian dibatasi oleh `PlatformConfig.platform_vesting_scale`.
+
+Penandatangan harus sama dengan `platform_config.platform_vesting_wallet`. Akun lainnya mencerminkan `CreateVestingAccount`. Gunakan ini ketika platform berkomitmen untuk menerima bagian vesting tetap pada setiap peluncuran yang ditempatkannya.
+
+### `ClaimVestedToken`
+
+Hanya penerima. Mentransfer token yang baru dibuka dari `base_vault` pool ke ATA penerima.
+
+**Argumen**
+
+Tidak ada (program menghitung jumlah klaim dari jadwal).
+
+**Akun**
+
+| # | Nama | W | S | Catatan |
+|---|------|---|---|---------|
+| 1 | `beneficiary` | W | S | Harus sama dengan `vesting_record.beneficiary`. |
+| 2 | `authority` |   |   | PDA `[b"vault_auth_seed"]`; menandatangani transfer vault. |
+| 3 | `pool_state` | W |   | Dimutasi hanya jika jadwal perlu divalidasi ulang. |
+| 4 | `vesting_record` | W |   | `claimed_amount` diperbarui. |
+| 5 | `base_vault` | W |   | Vault token base pool; didebit. |
+| 6 | `beneficiary_ata` | W |   | Menerima token unlock; `init_if_needed`. |
+| 7 | `base_mint` |   |   | Mint base pool. |
+| 8 | `token_program` |   |   | Program SPL Token atau Token-2022. |
+| 9 | `associated_token_program` |   |   | Untuk pembuatan ATA jika diperlukan. |
+| 10 | `system_program` |   |   | Diperlukan untuk pembuatan akun. |
+
+**Prekondisi**
+
+- `block_time >= pool_state.vesting_schedule.start_time` (sebaliknya `VestingNotStarted`).
+- `pool_state.status == PoolStatus::Migrated` — graduation harus sudah terjadi. Memanggil sebelum graduation membatalkan.
+- Delta unlock-amount lebih besar dari nol. Panggilan no-op (delta yang dihitung adalah 0) dibatalkan.
+
+**Potkondisi**
+
+- `vesting_record.claimed_amount` maju ke jumlah unlock kumulatif yang baru.
+- `delta_amount` token base ditransfer ke `beneficiary_ata`.
+
+**Kesalahan umum** — `VestingNotStarted`, `NoAssetsToCollect`, `MathOverflow`.
+
+## Contoh kerja
+
+Peluncuran menetapkan:
+
+- `supply = 1_000_000_000`
+- `total_locked_amount = 100_000_000` (10% dari pasokan)
+- `cliff_period = 180 * 86400` (180 hari)
+- `unlock_period = 365 * 86400` (1 tahun linier setelah cliff)
+
+Kreator mengalokasikan dua akun `VestingRecord` segera setelah `Initialize`:
+
+- Penerima A (tim): `share_amount = 70_000_000`
+- Penerima B (penasihat): `share_amount = 30_000_000`
+
+`allocated_share_amount = 100_000_000`, sama dengan `total_locked_amount` — tidak ada alokasi lebih lanjut yang mungkin.
+
+Penggalangan dana selesai pada `2027-01-01T00:00Z`. Program menetapkan `start_time = 2027-01-01 + 180 hari = 2027-06-30`.
+
+Pada `2027-09-30` (90 hari setelah `start_time`), Penerima A memanggil `ClaimVestedToken`:
+
+```
+elapsed         = min(now, start_time + 365·86400) − start_time
+                = 90 · 86400
+unlocked_amount = 70_000_000 × (90 / 365) ≈ 17_260_274
+delta_amount    = 17_260_274 − 0 = 17_260_274
+```
+
+Dompet A menerima 17.26M token base. `vesting_record.claimed_amount` maju ke 17_260_274.
+
+Enam bulan kemudian (`2028-03-31`, 270 hari setelah `start_time`), A mengklaim lagi:
+
+```
+unlocked_amount = 70_000_000 × (270 / 365) ≈ 51_780_822
+delta_amount    = 51_780_822 − 17_260_274 = 34_520_548
+```
+
+A menerima 34.52M token lagi. Setelah `2028-06-30` (akhir `unlock_period`), klaim berikutnya mentransfer ~18.22M yang tersisa dan meninggalkan `claimed_amount == token_share_amount`.
+
+## Kasus tepi
+
+- **Penerima kehilangan kunci mereka.** Pubkey di `VestingRecord.beneficiary` adalah satu-satunya penandatangan yang dapat memanggil `ClaimVestedToken`. Tidak ada jalan pemulihan. Tetapkan penerima ke multisig jika pemulihan penting.
+- **Biaya transfer Token-2022.** Jika mint base adalah mint Token-2022 dengan ekstensi transfer-fee, penerima menerima `delta_amount − transfer_fee`, bukan delta penuh. Vault pool masih mencatat jumlah bruto sebagai ditransfer — perbedaan mengakrual ke akun withheld-fee mint.
+- **Pool tidak graduated.** Memanggil `ClaimVestedToken` sebelum graduation membatalkan. Jam vesting mulai hanya ketika penggalangan dana benar-benar selesai; peluncuran yang dibatalkan (yang tidak pernah mengatur `start_time`) meninggalkan token terkunci tidak dapat dijangkau di vault.
+- **Upaya over-allocation.** Program memberlakukan `allocated_share_amount <= total_locked_amount` pada setiap `CreateVestingAccount`. Sisa (jika ada) dari `total_locked_amount` yang tidak dialokasikan adalah **hilang** — token tersebut tetap di vault selamanya setelah peluncuran graduation. Alokasikan jumlah penuh kecuali itu adalah tujuannya.
+
+## Penunjuk
+
+- [`products/launchlab/accounts`](/id/products/launchlab/accounts) — tata letak `PoolState` lengkap termasuk `VestingSchedule`.
+- [`products/launchlab/instructions`](/id/products/launchlab/instructions) — siklus hidup graduation.
+- [`products/launchlab/platform-config`](/id/products/launchlab/platform-config) — semantik `platform_vesting_scale` untuk alokasi platform.
+- [`products/launchlab/global-config`](/id/products/launchlab/global-config) — batas `max_lock_rate` yang membatasi `total_locked_amount`.
+
+Sumber:
+
+- `raydium-launch/programs/launchpad/src/states/vesting.rs` — `VestingRecord`.
+- `raydium-launch/programs/launchpad/src/states/pool.rs` — `VestingSchedule`, `VestingParams`, `is_vesting_started`, `vesting_end_time`.
+- `raydium-launch/programs/launchpad/src/instructions/create_vesting_account.rs`.
+- `raydium-launch/programs/launchpad/src/instructions/claim_vested_token.rs`.

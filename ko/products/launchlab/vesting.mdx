@@ -1,0 +1,241 @@
+---
+title: "LaunchLab 베스팅"
+description: "락된 토큰, 클리프와 선형 언락 스케줄, 수혜자별 VestingRecord 계정, 그리고 졸업 후 예비 공급량 배포를 위해 크리에이터와 플랫폼이 사용하는 create/claim 명령어."
+---
+
+<Info>
+  **이 페이지는 AI 자동 번역입니다. 모든 내용은 영문판을 기준으로 합니다.**
+
+  [영문판 보기 →](/products/launchlab/vesting)
+</Info>
+
+<Info>
+  LaunchLab 런칭에서 베스팅은 **선택 사항**입니다. `Initialize`에서 `vesting_param.total_locked_amount = 0`으로 설정하면 아래 섹션이 적용되지 않습니다. 한번 활성화되면 스케줄은 런칭 전체 기간 동안 고정되며, 클리프와 언락 기간은 소급해서 변경할 수 없습니다.
+</Info>
+
+## 베스팅이 필요한 이유
+
+본딩 커브는 펀드레이징 중에 `base_supply_graduation` 토큰을 판매하고 졸업 후 풀에 나머지를 시드합니다. 베스팅은 공급량에서 추가 부분을 떼어내고, 설정 가능한 클리프 동안 락하거나, 하나 이상의 수혜자에게 선형으로 릴리스합니다. 수혜자는 보통 크리에이터의 팀, 자문가, 또는 플랫폼 파트너입니다.
+
+실제 사용 사례:
+
+- **팀 할당.** 크리에이터가 공급량의 예를 들어 5%를 창립팀을 위해 예약하고, 6개월 동안 락한 후 다음 12개월 동안 선형으로 언락합니다.
+- **플랫폼 할당.** 런칭 플랫폼이 자신이 나열하는 모든 토큰의 일부를 `CreatePlatformVestingAccount`를 통해 동일한 스케줄로 수신합니다.
+- **자문가/기여자 보조금.** 여러 수혜자가 자신의 `VestingRecord` 계정을 각각 가지고 있으며, 각각 독립적으로 청구된 금액을 추적합니다.
+
+락된 토큰은 절대 곡선에 들어가지 않으며 졸업 LP의 일부가 아닙니다. 각 수혜자가 `ClaimVestedToken`을 호출할 때까지 풀의 `base_vault`에 휴면 상태로 남아 있습니다.
+
+## 스케줄 모양
+
+런칭을 위한 베스팅은 세 개의 숫자로 설명되며, `Initialize` 시간에 한 번 기록됩니다:
+
+| 필드 | 타입 | 의미 |
+|------|------|------|
+| `total_locked_amount` | `u64` | 모든 수혜자(크리에이터 + 플랫폼)에 걸쳐 락된 모든 기본 토큰의 합계입니다. 바인딩 `GlobalConfig`의 `total_locked_amount <= supply * max_lock_rate / 1_000_000`을 만족해야 합니다. |
+| `cliff_period` | `u64` (초) | 펀드레이징이 끝난 후 토큰이 언락되기 전의 대기 시간입니다. |
+| `unlock_period` | `u64` (초) | 클리프 후 선형 언락 윈도우의 기간입니다. `0`은 클리프 끝에 모든 것이 즉시 언락됨을 의미합니다. |
+
+이 세 값은 `PoolState.vesting_schedule` (`VestingSchedule` 구조체)과 온체인 `start_time`에 있으며, 이는 프로그램이 펀드레이징이 성공적으로 끝날 때 기록합니다 (졸업 조건이 처음 충족될 때).
+
+```rust
+// states/pool.rs
+pub struct VestingSchedule {
+    pub total_locked_amount:     u64,
+    pub cliff_period:            u64,
+    pub unlock_period:           u64,
+    pub start_time:              u64,   // 프로그램이 펀드레이징 종료 시 설정
+    pub allocated_share_amount:  u64,   // 베스팅 레코드에 할당된 총 금액의 누계
+}
+```
+
+`allocated_share_amount`는 `CreateVestingAccount` / `CreatePlatformVestingAccount`를 통해 `VestingRecord` 계정에 이미 할당된 총 금액입니다. 이는 절대 `total_locked_amount`를 초과하지 않아야 합니다. 크리에이터가 과다 할당하면, 다음 `CreateVestingAccount` 호출은 `InvalidTotalLockedAmount`로 되돌립니다.
+
+## 선형 언락 공식
+
+펀드레이징이 끝난 후, 프로그램은 각 `VestingRecord`에 대한 누적 언락 금액을 다음과 같이 계산합니다:
+
+```
+elapsed         = min(now, start_time + unlock_period) − start_time
+unlocked_amount = token_share_amount × elapsed / unlock_period
+```
+
+`unlock_period == 0`이면, 전체 `token_share_amount`는 `start_time`에 한 번에 청구 가능해집니다. 그렇지 않으면 곡선은 `start_time`에서 0부터 `start_time + unlock_period`에서 `token_share_amount`까지의 직선이며, 그 이후로는 `token_share_amount`로 캡됩니다.
+
+각 `ClaimVestedToken` 호출 시 전송되는 금액은 새로 다시 계산된 누적 언락 금액과 레코드의 실행 중인 `claimed_amount` 필드 사이의 차이입니다.
+
+```
+delta_amount    = unlocked_amount − vesting_record.claimed_amount
+vesting_record.claimed_amount = unlocked_amount
+```
+
+`start_time` 전의 청구는 `VestingNotStarted`로 되돌립니다. `start_time + unlock_period` 후의 청구는 남은 전체 금액을 정산합니다.
+
+## 계정 레이아웃
+
+### `VestingSchedule`
+
+`PoolState`에 인라인으로 존재합니다. [`accounts`](/ko/products/launchlab/accounts)를 참조하세요.
+
+### `VestingRecord`
+
+수혜자별 레코드입니다. PDA는 다음과 같이 파생됩니다:
+
+```
+seeds = [
+  b"pool_vesting",
+  pool_state.key(),
+  beneficiary.key(),
+]
+program = LaunchLab program
+```
+
+```rust
+// states/vesting.rs
+#[account]
+pub struct VestingRecord {
+    pub epoch:               u64,         // recent_epoch tracker
+    pub pool:                Pubkey,      // PoolState로의 역포인터
+    pub beneficiary:         Pubkey,      // ClaimVestedToken을 호출할 수 있는 사람
+    pub claimed_amount:      u64,         // 누적 청구 금액
+    pub token_share_amount:  u64,         // 이 수혜자에게 할당된 총액
+    pub padding:             [u64; 8],
+}
+```
+
+수혜자는 런칭당 **하나의** `VestingRecord`만 가질 수 있습니다. 동일한 런칭에서 동일한 수혜자에게 다시 할당하려고 하면 PDA가 이미 존재하기 때문에 되돌립니다.
+
+## 명령어
+
+### `CreateVestingAccount`
+
+크리에이터 전용입니다. 풀의 `total_locked_amount` 일부를 새로운 수혜자에게 할당하여 신규 `VestingRecord` PDA를 초기화합니다.
+
+**인수**
+
+```
+share_amount: u64    // 이 수혜자에게 할당할 토큰
+```
+
+**계정**
+
+| # | 이름 | W | S | 노트 |
+|---|------|---|---|------|
+| 1 | `creator` | W | S | `pool_state.creator`와 동일해야 합니다. 새 계정의 렌트를 지불합니다. |
+| 2 | `beneficiary` | W |   | 나중에 언락된 토큰을 수신합니다. 공개키는 여기에 락됩니다 — 변경할 수 없습니다. |
+| 3 | `pool_state` | W |   | `vesting_schedule.allocated_share_amount` 범프로 변경됩니다. |
+| 4 | `vesting_record` | W |   | `init`; PDA `[b"pool_vesting", pool_state, beneficiary]`. |
+| 5 | `system_program` |   |   | 계정 생성에 필수입니다. |
+
+**전제 조건**
+
+- `share_amount > 0`.
+- `pool_state.vesting_schedule.allocated_share_amount + share_amount <= total_locked_amount`.
+- `beneficiary` 공개키는 이 풀에 대한 기존 `VestingRecord`가 없습니다.
+
+**후제 조건**
+
+- `vesting_record`는 `token_share_amount = share_amount`, `claimed_amount = 0`으로 초기화됩니다.
+- `pool_state.vesting_schedule.allocated_share_amount += share_amount`.
+
+**일반적인 오류** — `InvalidTotalLockedAmount`, `InvalidInput`.
+
+### `CreatePlatformVestingAccount`
+
+`CreateVestingAccount`의 플랫폼 관리자 변형입니다. 플랫폼의 베스팅 지갑 (`PlatformConfig.platform_vesting_wallet`에 저장됨)이 수혜자이며, 공유는 `PlatformConfig.platform_vesting_scale`로 제한됩니다.
+
+서명자는 `platform_config.platform_vesting_wallet`과 동일해야 합니다. 다른 계정은 `CreateVestingAccount`를 반영합니다. 플랫폼이 자신이 나열하는 모든 런칭에서 고정 베스팅 공유를 수신하도록 계약할 때 이를 사용하세요.
+
+### `ClaimVestedToken`
+
+수혜자 전용입니다. 풀의 `base_vault`에서 수혜자의 ATA로 새로 언락된 토큰을 전송합니다.
+
+**인수**
+
+없음 (프로그램이 스케줄에서 청구 금액을 계산함).
+
+**계정**
+
+| # | 이름 | W | S | 노트 |
+|---|------|---|---|------|
+| 1 | `beneficiary` | W | S | `vesting_record.beneficiary`와 동일해야 합니다. |
+| 2 | `authority` |   |   | PDA `[b"vault_auth_seed"]`; 볼트 전송에 서명합니다. |
+| 3 | `pool_state` | W |   | 스케줄을 다시 검증해야 하는 경우에만 변경됩니다. |
+| 4 | `vesting_record` | W |   | `claimed_amount` 업데이트됩니다. |
+| 5 | `base_vault` | W |   | 풀의 기본 토큰 볼트; 차감됩니다. |
+| 6 | `beneficiary_ata` | W |   | 언락된 토큰을 수신합니다; `init_if_needed`. |
+| 7 | `base_mint` |   |   | 풀의 기본 민트입니다. |
+| 8 | `token_program` |   |   | SPL Token 또는 Token-2022 프로그램. |
+| 9 | `associated_token_program` |   |   | 필요한 경우 ATA 생성을 위해. |
+| 10 | `system_program` |   |   | 계정 생성에 필수입니다. |
+
+**전제 조건**
+
+- `block_time >= pool_state.vesting_schedule.start_time` (그렇지 않으면 `VestingNotStarted`).
+- `pool_state.status == PoolStatus::Migrated` — 졸업이 이미 발생했어야 합니다. 졸업 전에 호출하면 되돌립니다.
+- 언락 금액 델타가 0보다 큽니다. 무작동 호출 (계산된 델타가 0)은 되돌립니다.
+
+**후제 조건**
+
+- `vesting_record.claimed_amount`는 새로운 누적 언락 금액으로 진행됩니다.
+- `delta_amount` 기본 토큰이 `beneficiary_ata`로 전송됩니다.
+
+**일반적인 오류** — `VestingNotStarted`, `NoAssetsToCollect`, `MathOverflow`.
+
+## 실제 예제
+
+런칭이 다음을 설정합니다:
+
+- `supply = 1_000_000_000`
+- `total_locked_amount = 100_000_000` (공급량의 10%)
+- `cliff_period = 180 * 86400` (180일)
+- `unlock_period = 365 * 86400` (클리프 후 1년 선형)
+
+크리에이터는 `Initialize` 직후 두 개의 `VestingRecord` 계정을 할당합니다:
+
+- 수혜자 A (팀): `share_amount = 70_000_000`
+- 수혜자 B (자문가): `share_amount = 30_000_000`
+
+`allocated_share_amount = 100_000_000`, `total_locked_amount`와 동일합니다 — 추가 할당은 불가능합니다.
+
+펀드레이징이 `2027-01-01T00:00Z`에 완료됩니다. 프로그램은 `start_time = 2027-01-01 + 180 days = 2027-06-30`을 설정합니다.
+
+`2027-09-30` (`start_time` 이후 90일)에 수혜자 A가 `ClaimVestedToken`을 호출합니다:
+
+```
+elapsed         = min(now, start_time + 365·86400) − start_time
+                = 90 · 86400
+unlocked_amount = 70_000_000 × (90 / 365) ≈ 17_260_274
+delta_amount    = 17_260_274 − 0 = 17_260_274
+```
+
+A의 지갑이 1,726만 기본 토큰을 수신합니다. `vesting_record.claimed_amount`는 17_260_274로 진행됩니다.
+
+6개월 후 (`2028-03-31`, `start_time` 이후 270일), A가 다시 청구합니다:
+
+```
+unlocked_amount = 70_000_000 × (270 / 365) ≈ 51_780_822
+delta_amount    = 51_780_822 − 17_260_274 = 34_520_548
+```
+
+A는 추가 3,452만 토큰을 수신합니다. `2028-06-30` (unlock_period 끝) 이후, 다음 청구는 남은 약 1,822만을 전송하고 `claimed_amount == token_share_amount`로 남깁니다.
+
+## 엣지 케이스
+
+- **수혜자가 키를 잃음.** `VestingRecord.beneficiary`의 공개키는 `ClaimVestedToken`을 호출할 수 있는 유일한 서명자입니다. 복구 경로가 없습니다. 복구가 중요하면 수혜자를 멀티시그로 설정하세요.
+- **Token-2022 전송 수수료.** 기본 민트가 전송 수수료 확장을 가진 Token-2022 민트인 경우, 수혜자는 전체 델타가 아니라 `delta_amount − transfer_fee`를 수신합니다. 풀의 볼트는 여전히 전송된 총액으로 기록합니다 — 차이는 민트의 보류 수수료 계정에 누적됩니다.
+- **풀이 졸업하지 않음.** 졸업 전에 `ClaimVestedToken`을 호출하면 되돌립니다. 베스팅 시계는 펀드레이징이 실제로 완료될 때만 시작됩니다. 중단된 런칭 (절대 `start_time`을 설정하지 않음)은 볼트에서 락된 토큰에 도달할 수 없게 남깁니다.
+- **과다 할당 시도.** 프로그램은 모든 `CreateVestingAccount`에서 `allocated_share_amount <= total_locked_amount`를 강제합니다. `total_locked_amount`의 남은 부분 (있는 경우) 할당되지 않은 것은 **손실**됩니다 — 런칭이 졸업하면 그 토큰은 영구적으로 볼트에 남아 있습니다. 의도가 아닌 한 전체 금액을 할당하세요.
+
+## 포인터
+
+- [`products/launchlab/accounts`](/ko/products/launchlab/accounts) — `VestingSchedule`을 포함한 전체 `PoolState` 레이아웃.
+- [`products/launchlab/instructions`](/ko/products/launchlab/instructions) — 졸업 라이프사이클.
+- [`products/launchlab/platform-config`](/ko/products/launchlab/platform-config) — 플랫폼 할당을 위한 `platform_vesting_scale` 의미론.
+- [`products/launchlab/global-config`](/ko/products/launchlab/global-config) — `total_locked_amount`를 제한하는 `max_lock_rate` 상한.
+
+출처:
+
+- `raydium-launch/programs/launchpad/src/states/vesting.rs` — `VestingRecord`.
+- `raydium-launch/programs/launchpad/src/states/pool.rs` — `VestingSchedule`, `VestingParams`, `is_vesting_started`, `vesting_end_time`.
+- `raydium-launch/programs/launchpad/src/instructions/create_vesting_account.rs`.
+- `raydium-launch/programs/launchpad/src/instructions/claim_vested_token.rs`.

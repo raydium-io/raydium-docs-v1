@@ -1,0 +1,369 @@
+---
+title: "Математика CLMM"
+description: "Представление sqrt-цены, преобразование ликвидности ↔ объемы токенов, шаг swap в одном тике, итерация по нескольким тикам и учет роста комиссий."
+---
+
+<Info>
+  **Эта страница переведена с помощью ИИ. За эталон принимается английская версия.**
+
+  [Открыть английскую версию →](/products/clmm/math)
+</Info>
+
+## Представление sqrt-цены
+
+CLMM хранит цену как `sqrt_price_x64` — квадратный корень из цены token1 за token0, представленный в виде числа с фиксированной точкой Q64.64:
+
+$$
+\text{sqrt\_price\_x64} = \lfloor \sqrt{p} \cdot 2^{64} \rfloor
+$$
+
+где `p = token1_amount / token0_amount`. Работа с `sqrt` вместо `p` линеаризует математику swap (дельты объемов токенов становятся линейны по отношению к `Δsqrt_price`), а фиксированная точка `x64` обеспечивает точность при многотиковых swaps.
+
+Преобразование между тиком и sqrt-ценой предвычисляется через логарифмическую аппроксимацию `bit-by-bit`:
+
+$$
+\text{sqrt\_price\_x64}(t) \approx 2^{64} \cdot (1.0001)^{t/2}
+$$
+
+реализованное как экспоненциация с таблицей поиска в `tick_math::get_sqrt_price_at_tick`.
+
+## Ликвидность как канонический блок
+
+Внутри диапазона `[sqrt_a, sqrt_b]` (где `sqrt_a < sqrt_b`) позиция с **ликвидностью `L`** соответствует объемам токенов следующим образом. Пусть `sqrt_c = sqrt_price_x64` — текущая цена пула.
+
+| Случай | `amount0` | `amount1` |
+|--------|-----------|-----------|
+| `sqrt_c <= sqrt_a` (цена пула ниже диапазона) | `L · (sqrt_b - sqrt_a) / (sqrt_a · sqrt_b)` | `0` |
+| `sqrt_a < sqrt_c < sqrt_b` (в диапазоне) | `L · (sqrt_b - sqrt_c) / (sqrt_c · sqrt_b)` | `L · (sqrt_c - sqrt_a)` |
+| `sqrt_c >= sqrt_b` (цена пула выше диапазона) | `0` | `L · (sqrt_b - sqrt_a)` |
+
+Все три тождества вытекают из инварианта `x = L / sqrt_p`, `y = L · sqrt_p`, который сосредоточенная ликвидность удовлетворяет внутри диапазона.
+
+Интеграторам обычно нужно обратное преобразование: по депозиту `amount0` / `amount1` вычислить максимальное `L`, которое вмещается в диапазон. SDK-функция `LiquidityMath.getLiquidityFromTokenAmounts` делает это. Формула для случая с диапазоном:
+
+$$
+L_0 = \text{amount0} \cdot \frac{\text{sqrt\_c} \cdot \text{sqrt\_b}}{\text{sqrt\_b} - \text{sqrt\_c}},
+\qquad
+L_1 = \frac{\text{amount1}}{\text{sqrt\_c} - \text{sqrt\_a}},
+\qquad
+L = \min(L_0, L_1)
+$$
+
+Какая сторона ограничена, определяет реально потребленное соотношение; другая сторона может иметь остаток.
+
+## Шаг swap в одном тике
+
+Swap состоит из **шагов**. Каждый шаг либо (a) потребляет всю доступную входную ликвидность внутри текущего диапазона тика без пересечения тика, либо (b) перемещает цену ровно до следующего инициализированного тика.
+
+Имея текущее состояние `(sqrt_c, L)` и **восходящий** swap (token0 входит, token1 выходит, `sqrt_price` возрастает), расстояние до следующего инициализированного тика — `sqrt_t`. Внутри этого микроинтервала взаимосвязь между входом и ценой:
+
+$$
+\Delta\text{amount0} = L \cdot \left( \frac{1}{\text{sqrt\_c}} - \frac{1}{\text{sqrt\_t}} \right)
+= \frac{L \cdot (\text{sqrt\_t} - \text{sqrt\_c})}{\text{sqrt\_c} \cdot \text{sqrt\_t}}
+$$
+
+и
+
+$$
+\Delta\text{amount1} = L \cdot (\text{sqrt\_t} - \text{sqrt\_c})
+$$
+
+Программа делает одно из двух:
+
+- **Весь ввод вмещается?** Если оставшийся вводимый объем (после комиссии) меньше `Δamount0` для достижения `sqrt_t`, решить уравнение для новой `sqrt_c'` точно:
+
+  $$
+  \text{sqrt\_c}' = \frac{L \cdot \text{sqrt\_c}}{L + \Delta\text{input} \cdot \text{sqrt\_c}}
+  $$
+
+  (для swap с точным входом `token0 → token1`). Swap завершается на этом шаге без пересечения тика.
+
+- **Ввод превышает `Δamount0`?** Установить `sqrt_c' = sqrt_t`, пересечь тик (применить `liquidity_net`), уменьшить оставшийся ввод на `Δamount0`, увеличить выход на `Δamount1` и повторить.
+
+Для противоположного направления (`token1 → token0`, цена идет вниз), формулы имеют `sqrt_c` и `sqrt_t` переставленные и обращение в другом месте.
+
+Полная реализация на Rust находится в `raydium-clmm/programs/amm/src/libraries/swap_math.rs`. Логика там совпадает один-в-один с `SwapMath.computeSwapStep` Uniswap v3.
+
+## Комиссии на каждом шаге
+
+Торговые комиссии берутся с **входного** объема на каждом шаге, по тому же соглашению, что и CPMM:
+
+```
+step_fee_amount  = ceil(step_input * trade_fee_rate / 1_000_000)
+step_net_input   = step_input - step_fee_amount
+protocol_portion = floor(step_fee_amount * protocol_fee_rate / 1_000_000)
+fund_portion     = floor(step_fee_amount * fund_fee_rate     / 1_000_000)
+lp_portion       = step_fee_amount - protocol_portion - fund_portion
+```
+
+Доля LP распределяется между текущей активной ликвидностью путем обновления глобального аккумулятора роста комиссий:
+
+$$
+\text{fee\_growth\_global}_{\text{in}} \mathrel{+}= \text{lp\_portion} \cdot \frac{2^{64}}{L}
+$$
+
+— то есть она выражена в *комиссиях на единицу ликвидности*, Q64.64, так что позиция объемом `L_i`, которая оставалась в диапазоне на протяжении этого swap, позже сможет прочитать `L_i · Δfee_growth_global / 2^{64}` причитающихся токенов.
+
+Доли protocol и fund аккумулируются в `PoolState.protocol_fees_token_{0,1}` и `PoolState.fund_fees_token_{0,1}` соответственно, идентично CPMM. Они выводятся через `CollectProtocolFee` / `CollectFundFee`.
+
+## Рост комиссий снаружи и внутри
+
+Сложная часть учета комиссий в CLMM: позиция зарабатывает комиссии только пока цена пула **внутри** ее диапазона. Пул отслеживает кумулятивные комиссии глобально; позиции нужно знать кумулятивные комиссии *только пока она находится внутри своего диапазона*.
+
+Решение — это **основанный на тиках** аккумулятор. Каждый тик хранит:
+
+```
+fee_growth_outside_0_x64
+fee_growth_outside_1_x64
+```
+
+В момент инициализации тика:
+
+- Если цена пула **выше** этого тика (`tick_current >= this_tick`), `fee_growth_outside = fee_growth_global`. (Все заработанное до сих пор "снаружи" — то есть ниже — этого тика относительно текущей цены.)
+- Иначе `fee_growth_outside = 0`.
+
+Когда цена пересекает тик, программа **переворачивает** `fee_growth_outside` этого тика:
+
+$$
+\text{fee\_growth\_outside} \gets \text{fee\_growth\_global} - \text{fee\_growth\_outside}
+$$
+
+Инвариант, который это сохраняет: для любого тика `t`, `fee_growth_outside(t)` равен комиссиям, которые накопились пока `tick_current` был на противоположной стороне `t`.
+
+**Рост комиссий внутри диапазона `[tick_lower, tick_upper]`** тогда выводится как:
+
+```
+if tick_current >= tick_upper:
+    fee_growth_below = fee_growth_outside(tick_lower)
+    fee_growth_above = fee_growth_global - fee_growth_outside(tick_upper)
+elif tick_current >= tick_lower:
+    fee_growth_below = fee_growth_outside(tick_lower)
+    fee_growth_above = fee_growth_outside(tick_upper)
+else:
+    fee_growth_below = fee_growth_global - fee_growth_outside(tick_lower)
+    fee_growth_above = fee_growth_outside(tick_upper)
+
+fee_growth_inside = fee_growth_global - fee_growth_below - fee_growth_above
+```
+
+Это формула роста комиссий Uniswap-v3, без изменений.
+
+## Что хранит позиция и что она читает
+
+`PersonalPositionState` хранит `fee_growth_inside_0_last_x64` и `fee_growth_inside_1_last_x64`: значения `fee_growth_inside` на момент последнего обращения к позиции.
+
+При любом последующем обращении (увеличение, уменьшение, сбор), программа:
+
+1. Вычисляет текущий `fee_growth_inside_{0,1}_x64` используя формулу выше.
+2. Вычисляет `Δ = fee_growth_inside_now − fee_growth_inside_last` (модульное вычитание на u128).
+3. Добавляет `Δ × position.liquidity / 2^{64}` к `tokens_fees_owed_{0,1}`.
+4. Обновляет `fee_growth_inside_last` новым значением.
+
+Токены действительно движут из хранилищ только при `CollectFees` / `DecreaseLiquidity`, против `tokens_fees_owed`.
+
+## Вознаграждения
+
+Каждый из до 3 потоков вознаграждений пула использует ту же machinery на основе growth-inside, в собственном аккумуляторе `reward_growth_global_x64`. В момент эмиссии:
+
+$$
+\text{reward\_growth\_global} \mathrel{+}= \text{emission\_per\_second} \cdot \Delta t \cdot \frac{2^{64}}{L}
+$$
+
+— эмиссии масштабируются обратно пропорционально активной ликвидности, так что более плотный пул платит каждой позиции пропорционально меньше в секунду, но в сумме по большему количеству позиций. Причитающееся вознаграждение на одну позицию равно
+
+$$
+\text{reward\_owed} = (\text{reward\_growth\_inside}_{\text{now}} - \text{reward\_growth\_inside}_{\text{last}}) \cdot L / 2^{64}
+$$
+
+и запрашивается через `CollectReward`. См. [`/ru/products/clmm/fees`](/ru/products/clmm/fees).
+
+## Разобранный пример: swap с точным входом
+
+Предположим:
+
+- `tick_spacing = 60`
+- `sqrt_price_x64 = 1 × 2^{64}` — цена = 1.0, так что `tick_current = 0`.
+- Активная ликвидность `L = 1_000_000 × 2^{64}`.
+- Следующий инициализированный тик выше: `t = 60` (sqrt_price_b ≈ `1.003004 × 2^{64}`).
+- Ставка торговой комиссии: 500 (0.05%).
+
+Пользователь: `SwapBaseInput` с точным входом 1,000 token0.
+
+Шаг 1 — комиссии:
+
+```
+trade_fee       = ceil(1000 * 500 / 1_000_000)  = 1
+step_net_input  = 999
+```
+
+Шаг 2 — вмещается ли 999 в текущий диапазон тика?
+
+```
+Δ до следующего тика (amount0):
+  L · (sqrt_t - sqrt_c) / (sqrt_c * sqrt_t)
+  ≈ 1_000_000 · (1.003004 − 1) / (1 · 1.003004)
+  ≈ 2995.5 token0
+```
+
+`999 < 2995.5`, так что весь ввод вмещается без пересечения тика.
+
+Шаг 3 — новая цена:
+
+```
+sqrt_c' = L · sqrt_c / (L + Δin · sqrt_c)
+        = 1_000_000 · 1 / (1_000_000 + 999 · 1)
+        ≈ 0.999001
+```
+
+то есть `sqrt_c'` немного ниже `sqrt_c`. Заметим, что формула выше предназначена для swap `token1 → token0`. Пример здесь — `token0 → token1`, что толкает цену **вверх**, а не вниз — так что мы используем соответствующую форму для `token0 in`:
+
+```
+sqrt_c' = sqrt_c + Δin / L
+        = 1 + 999 / 1_000_000
+        = 1.000999
+```
+
+(это соответствует ожидаемому направлению swap для `token0 → token1`: `sqrt_c` растет вместе с ценой.)
+
+Шаг 4 — объем выхода:
+
+```
+Δout token1 = L · (sqrt_c' − sqrt_c)
+            = 1_000_000 · 0.000999
+            = 999.00
+```
+
+После округления пользователь получает ≈ 999 token1. Комиссия (1 token0) разделяется между LP, protocol и fund по `trade_fee_rate × protocol_fee_rate / 1e6` (и аналогично для fund); доля LP поступает в `fee_growth_global_0_x64`.
+
+## Matching лимитных ордеров во время swap
+
+Когда шаг swap пересекает тик, содержащий открытые лимитные ордера, эти ордера потребляют ввод swap **перед** LP-кривой, по точной цене тика. Matching — FIFO внутри тика по когортам `order_phase`.
+
+### Состояние на когорту в `TickState`
+
+```
+order_phase                  : u64    монотонный id когорты
+orders_amount                : u64    общий входной токен в текущей (новейшей) когорте
+part_filled_orders_remaining : u64    оставшийся вводимый объем когорты, которую swap заполняет
+unfilled_ratio_x64           : u128   Q64.64 коэффициент заполнения частично заполненной когорты
+```
+
+Двухкогортный layout существует потому, что новые ордера могут быть открыты на тике *пока* старая когорта еще заполняется. Новооткрытые ордера присоединяются к `orders_amount` и наследуют следующий `order_phase`; они не могут заполняться пока предыдущая когорта полностью не потреблена.
+
+### Шаг matching
+
+Псевдокод для matching, происходящего при каждом пересечении тика во время swap:
+
+```
+fn match_limit_orders_at_tick(tick, swap_input_remaining, sqrt_p):
+    # 1. Сначала пытаемся заполнить частично заполненную когорту.
+    if tick.part_filled_orders_remaining > 0:
+        consume = min(tick.part_filled_orders_remaining, swap_input_remaining)
+        # Обновляем unfilled-ratio для этой когорты.
+        tick.unfilled_ratio_x64 *= (1 - consume / tick.part_filled_orders_remaining)
+        tick.part_filled_orders_remaining -= consume
+        swap_input_remaining -= consume
+        if tick.part_filled_orders_remaining == 0:
+            tick.unfilled_ratio_x64 = 0
+        if swap_input_remaining == 0: return
+
+    # 2. Повышаем активную когорту.
+    if tick.orders_amount > 0:
+        tick.part_filled_orders_remaining = tick.orders_amount
+        tick.orders_amount = 0
+        tick.order_phase += 1
+        tick.unfilled_ratio_x64 = ONE_X64
+        # Рекурсия с вновь повышенной когортой.
+        return match_limit_orders_at_tick(tick, swap_input_remaining, sqrt_p)
+
+    return  # тик больше не имеет лимитных ордеров
+```
+
+Выходные токены, идущие владельцам лимитных ордеров, **не** переводятся за каждый swap. Они находятся виртуально в выходном хранилище пула до тех пор, пока владелец ордера не вызовет `SettleLimitOrder` (или `DecreaseLimitOrder`). Пул просто отслеживает, сколько когорты теперь заполнено через `unfilled_ratio_x64`. Каждый `LimitOrderState` хранит собственный снимок `(order_phase, unfilled_ratio_x64)` на момент открытия, поэтому settlement сводится к:
+
+```
+filled_amount  = total_amount × (1 − tick_now.unfilled_ratio_x64 / order.unfilled_ratio_x64)
+                if tick_now.order_phase > order.order_phase
+                else 0
+output_amount  = price_at(tick_index) × filled_amount   # adjusted for direction
+```
+
+Это O(1) settlement — весь смысл дизайна когорт — тик может заполнить произвольно много ордеров без per-order газа.
+
+### Взаимодействие с LP-кривой
+
+На шаге swap, matching лимитных ордеров происходит **на** тике (нулевое `Δsqrt_price`); потребление LP-кривой происходит **между** тиками. Порядок, следовательно:
+
+1. Пересечь тик `t_cross` (применить изменение LP `liquidity_net` первым, так как это то, как делает Uniswap-V3).
+2. Заполнить любые лимитные ордера, сидящие на `t_cross`.
+3. Продолжить вдоль LP-кривой к следующему инициализированному тику или до исчерпания `swap_input`.
+
+Лимитные ордера тем самым дают трейдерам *более* эффективную ликвидность ровно по цене ордера (эффект улучшения цены), ценой того, что LP не зарабатывают комиссии на этой части объема swap — лимитная часть торговли свободна от комиссии для swapper, так как размещающий лимитный ордер действует как maker. Динамическая надбавка к комиссии (если включена) все еще применяется к LP-части того же swap.
+
+## Вывод динамической комиссии
+
+`PoolState.dynamic_fee_info` несет состояние волатильности. Каждый шаг swap вычисляет ставку комиссии за шаг как:
+
+$$
+\text{fee\_rate}_{\text{total}} = \text{trade\_fee\_rate}_{\text{config}} +
+\underbrace{\frac{\text{dynamic\_fee\_control} \cdot (\text{vol\_acc} \cdot \text{tick\_spacing})^2}
+{D_{\text{ctrl}} \cdot S_{\text{vol}}^2}}_{\text{динамическая надбавка}}
+$$
+
+где:
+
+- $D_{\text{ctrl}} = 100{,}000$ — `DYNAMIC_FEE_CONTROL_DENOMINATOR`
+- $S_{\text{vol}} = 10{,}000$ — `VOLATILITY_ACCUMULATOR_SCALE`
+- `vol_acc` — это per-swap аккумулятор после правила обновления ниже
+- `tick_spacing` из `PoolState.tick_spacing`
+
+Результат зажимается на $100{,}000 / 10^6 = 10\%$.
+
+### Обновление аккумулятора
+
+Два правила применяются каждый swap по порядку:
+
+**Decay.** Референтный уровень снижается на основе времени с момента последнего обновления:
+
+$$
+\text{vol\_ref} = \begin{cases}
+0 & \text{если } \Delta t > \text{decay\_period} \\
+\text{vol\_acc}_{\text{prev}} \cdot \dfrac{\text{reduction\_factor}}{10{,}000} & \text{если } \text{filter\_period} < \Delta t \le \text{decay\_period} \\
+\text{vol\_ref}_{\text{prev}} & \text{если } \Delta t \le \text{filter\_period}
+\end{cases}
+$$
+
+**Accumulate.** Новый аккумулятор — это референс плюс расстояние в тиках, пройденное с предыдущего референсного индекса:
+
+$$
+\text{vol\_acc} = \min\left(
+    \text{vol\_ref} + \left| t_{\text{ref}} - t_{\text{now}} \right| \cdot S_{\text{vol}},
+    \text{max\_vol\_acc}
+\right)
+$$
+
+`tick_spacing_index_reference` ($t_{\text{ref}}$) в единицах tick-spacing, не в сырых тиках: $t_{\text{ref}} = \lfloor \text{tick\_current} / \text{tick\_spacing} \rfloor$.
+
+### Почему парабола от расстояния в тиках
+
+Возведение аккумулятора в квадрат означает, что комиссия растет как *квадрат* расстояния, на которое цена отошла от своей референтной точки. Эмпирически это соответствует масштабированию дисперсии цены при случайном блуждании: прогулка на 2× расстояния в тиках подразумевает в 4 раза больше подразумеваемую волатильность, так что взимает в 4 раза больше надбавку. Параметр `dynamic_fee_control` калибрует абсолютный уровень.
+
+Окно `filter_period` предотвращает крошечные субсекундные колебания (например, MEV-боты, выполняющие sandwich-атаки) от раздувания аккумулятора. Окно `decay_period` предотвращает один прошлый скачок от взимания комиссий неопределенно долго после того, как рынок успокоился.
+
+## Численная устойчивость
+
+- Все промежуточные произведения проходят через арифметику `u128` или `u256`. CLMM использует хелперы `U128Sqrt` и паттерны `FullMath::mulDiv` непосредственно перенесенные из Uniswap v3.
+- Округление при делении выбирается по шагам, чтобы обеспечить инвариант `k' ≥ k` локально. `SwapBaseInput` округляет выход **вниз**; `SwapBaseOutput` округляет ввод **вверх**.
+- Пересечения тиков, которые опускают `PoolState.liquidity` на нуль, разрешены (цена может пройти через "дыру ликвидности"), но swap просто переходит к следующему инициализированному тику без потребления ввода, не взимая комиссию.
+- Защита от переполнения: `sqrt_price_x64` держится в включающем диапазоне `[MIN_SQRT_PRICE_X64, MAX_SQRT_PRICE_X64]`, соответствующем `[MIN_TICK, MAX_TICK]`. Swap, который попытается выйти за границы, вернет ошибку `SqrtPriceLimitOverflow`.
+
+## Куда идти дальше
+
+- [`/ru/products/clmm/ticks-and-positions`](/ru/products/clmm/ticks-and-positions) о том, как карта тиков участвует в обходе.
+- [`/ru/products/clmm/fees`](/ru/products/clmm/fees) для деталей математики комиссий/вознаграждений.
+- [`/ru/algorithms/clmm-math`](/ru/algorithms/clmm-math) для выводов позади `L = sqrt(x · y)` и формул диапазона-к-ликвидности.
+
+Источники:
+
+- [`raydium-io/raydium-clmm` — `libraries/swap_math.rs`, `libraries/tick_math.rs`](https://github.com/raydium-io/raydium-clmm)
+- Whitepaper "Uniswap v3 Core", §6–7

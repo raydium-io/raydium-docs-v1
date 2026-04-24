@@ -1,0 +1,202 @@
+---
+title: "聚合器整合"
+description: "如何發現 Raydium 流動性池、跨 CPMM / CLMM / AMM v4 報價，以及通過正確的程式集路由原子交換。適用於 DEX 聚合器和錢包交換界面。"
+---
+
+<Info>
+  **本頁內容由 AI 自動翻譯，所有內容以英文版本為準。**
+
+  [查看英文版 →](/integration-guides/aggregator)
+</Info>
+
+<Info>
+  聚合器的職責是為使用者在多個流動性池中找到最優價格，可能將單筆輸入分散到多個池路由中，並原子地執行。本頁記錄該工作的 Raydium 特定部分：發現、報價和交易組裝。
+</Info>
+
+## 發現
+
+### 流動性池清單
+
+你需要取得每個產品的完整 Raydium 活躍流動性池清單。有三個選項：
+
+1. **REST API**（最簡單）：`GET https://api-v3.raydium.io/pools/info/list?poolType=all&pageSize=1000&page=1` 每次返回 1000 個流動性池。逐頁取得直到集合完整。快取 1–5 分鐘。
+2. **鏈上掃描**：在 CPMM、CLMM 和 AMM v4 程式 ID 上執行 `getProgramAccounts`，並按狀態帳戶判別器過濾。約需 10 秒的 RPC 時間即可產生所有活躍流動性池。在 API 停機或被限制時很有用。
+3. **混合方式**：以 API 作為主要來源，每天執行一次鏈上掃描作為健全性檢查。團隊承諾保持 API 的完整性，但通過直接 CPI 建立的流動性池（無前端）偶爾會有延遲。
+
+### 交易對查詢
+
+針對特定的 `(mintA, mintB)` 交易對，使用 `GET /pools/info/mint?mint1=...&mint2=...&poolType=all&sort=liquidity`。返回任何手續費等級和產品類型的每個流動性池。高流量代幣對通常會有多達 ~10 個結果；按 TVL 排序並選取前幾個用於路由。
+
+## 報價
+
+報價演算法因產品而異。使用 SDK 的純數學函式，不要重新實現：
+
+```ts
+// CPMM
+const cpmmQuote = raydium.cpmm.computeAmountOut({
+  poolInfo: cpmmPool,
+  amountIn,
+  mintIn,
+  mintOut,
+  slippage: 0,        // 計算精確預期；在路由級別應用滑點
+});
+
+// CLMM — 跨 tick；確定性但計算成本較高。
+// `computeAmountOutFormat` 是通過 raydium-sdk-v2 中的 `PoolUtils` 公開的
+// 規範幫助函式：`*Format` 後綴表示它返回預先
+// 成形以供交易建築使用的輸出（包括 tick 陣列的 `remainingAccounts`）。
+const { output: clmmOut, remainingAccounts } = PoolUtils.computeAmountOutFormat({
+  poolInfo:  clmmPool,
+  poolState: clmmPoolState,
+  tickArrayCache,
+  amountIn,
+  tokenIn:   mintIn,
+  slippage:  0,
+});
+
+// AMM v4
+const ammV4Quote = raydium.liquidity.computeAmountOut({
+  poolInfo: ammV4Pool,
+  amountIn,
+  mintIn: mintIn,
+  mintOut: mintOut,
+  slippage: 0,
+});
+```
+
+返回三者的結果：`{ amountOut, fee, priceImpact, minAmountOut }`。為了聚合器比較，使用 `amountOut`（滑點前）。
+
+### 快取新鮮度
+
+流動性池狀態老化很快。建議的新鮮度目標：
+
+| 流動性池類型 | 重新取得頻率 | 原因 |
+|-----------|---------------------|-----|
+| TVL `<$100k` 的 CPMM | `<10s` | 儲備量在每筆交易時變動。 |
+| TVL `>$10M` 的 CPMM | 30–60s | 儲備量佔主導；小交易是噪音。 |
+| CLMM | `<30s` | Tick 邊界；單筆大交易可重新配置流動性。 |
+| AMM v4 | `<30s` | OpenBook 端的移動未被反映在保管庫中。 |
+
+對於以互動延遲獲取報價的聚合器，應訂閱每個相關流動性池狀態的 WebSocket 帳戶更新（`accountSubscribe`）。這會將模式從輪詢轉換為推送。
+
+### Token-2022 調整
+
+如果路由中任何代幣有 Token-2022 轉帳手續費，報價演算法必須根據 [`algorithms/token-2022-transfer-fees`](/zh-Hant/algorithms/token-2022-transfer-fees) 調整輸入和輸出。如果 `poolInfo.mintA.extensions.transferFeeConfig` 已填入，SDK 會處理此問題。在信任報價前，通過查看 `.extensions` 欄位確認。
+
+## 路由
+
+### 單一流動性池路由
+
+大多數路由都是單一流動性池。選擇 `amountOut` 最高的流動性池。如果多個相近，按手續費等級（較低更好）、然後按 TVL（更高更安全）作為平局破解器。
+
+### 分散路由
+
+對於大交易且單一流動性池有 >5% 價格影響的情況，分散到多個流動性池。簡單的貪心演算法：
+
+```
+remaining = amountIn
+routes    = []
+while remaining > 0:
+    best_pool, best_size = argmax over pools of:
+        marginal_out_per_in(pool, current_size_toward_pool + epsilon)
+    size = min(remaining, best_pool.max_size_at_target_impact)
+    routes.append((best_pool, size))
+    remaining -= size
+```
+
+這會產生路由向量 `[(pool_A, 0.6), (pool_B, 0.3), (pool_C, 0.1)]` 以最小化彙總影響。適當的凸最佳化解決方案（例如跨池均衡邊際價格）在實踐中與貪心結果相差約 1%。
+
+### 多跳路由
+
+`USDC → RAY → SOL` 經過兩個獨立流動性池是常見的情況，當沒有直接 `USDC-SOL` 流動性池提供良好報價時（罕見）。應用逐跳滑點邊界；每一跳都強制執行自己的 `minAmountOut`。見 [`algorithms/slippage-and-price-impact`](/zh-Hant/algorithms/slippage-and-price-impact)。
+
+在同一流動性池上的多跳（例如 `SOL-USDC` 上的兩個 CLMM 跳）與單一跳相比總是次優的 — 不要產生此類路由。
+
+## 交易組裝
+
+### 單跳、單一流動性池
+
+直接使用 SDK 的 `raydium.trade.swap`：
+
+```ts
+const { execute } = await raydium.trade.swap({
+  poolKeys:        poolInfo,
+  amountIn,
+  amountOut:       quote.minAmountOut,
+  fixedSide:       "in",
+  inputMint:       mintIn,
+  txVersion:       TxVersion.V0,
+  computeBudgetConfig: {
+    units:         250_000,
+    microLamports: priorityFee,
+  },
+});
+```
+
+### 分散和多跳
+
+手動組成 ATA + 指令。模式：
+
+```
+[1] ComputeBudget set_compute_unit_limit
+[2] ComputeBudget set_compute_unit_price
+[3] createATA（如需要，每個使用者未持有的代幣一次）
+[4..N] 路由中每個 (pool, size) 的 SwapInstruction
+[N+1] CloseAccount（如果你包裝/解包裝 SOL）
+```
+
+全部在一個交易中以保證原子性。對於 V0 上的 3 個流動性池分散與地址查詢表，這通常適應 ~1100 位元組。對於 4 個以上流動性池，交易大小上限迫使要麼多交易，要麼在中樞代幣處合併。
+
+### 原子性
+
+聚合器必須保證原子性：要麼完整路由著陸，要麼都不著陸。Raydium 的交換指令在 `ExceededSlippage` 上回復，所以一個多流動性池路由若其中一跳失敗會導致整個交易回復。免費。
+
+唯一的例外：如果你的路由經過 Raydium + 第三方 DEX，確保該 DEX 也有回復滑點超限模型。某些程式忽略滑點邊界（罕見）。
+
+## 陷阱
+
+### 1. 過期報價
+
+在使用者看到「你將收到 125.43 RAY」與交易著陸之間，儲備量可能轉變。在提交前立即重新取得流動性池狀態；重新報價；如果新報價差 >1%，暫停並重新與使用者確認。
+
+### 2. 流動性池黑名單
+
+一些 Raydium 流動性池是帶有設為 99% 轉帳手續費的詐騙代幣或具有不可轉讓擴展的代幣。REST API 標記這些（見 `tags` 欄位）；跳過任何標記為 `scam` 或 `honeypot` 的流動性池。在 Raydium 標籤之上執行自己的安全檢查是謹慎的做法。
+
+### 3. CLMM 上的觀測狀態要求
+
+CLMM `SwapV2` 取用 `observation_state` 帳戶。SDK 為你填入它；手動建築的指令經常忘記，這會導致程式以 `AccountNotFound` 回復。總是包含它。
+
+### 4. 地址查詢表
+
+Raydium 為其最常用的帳戶（主要代幣、程式 ID、AmmConfigs）維護公開查詢表。聚合器應消費這些 — 它節省每個交易約 100 位元組並使更大路由適應 V0。提取 LUT 位址：
+
+```ts
+const raydiumLUTs = await raydium.getRaydiumLutAddresses();
+```
+
+### 5. 處理擁塞
+
+在高容量時段，交易可能在記憶池中坐數個區塊。激進地在交易過期時重試（不在回復時 — 回復是確定性的）是建議的。SDK 的 `sendAndConfirm` 選項執行基本重試；生產聚合器在其上層疊他們的邏輯（Jito 束、多 RPC 廣播）。
+
+## 檢查清單
+
+在上線前，驗證：
+
+- [ ] 流動性池發現全面涵蓋 CPMM + CLMM + AMM v4。
+- [ ] 報價在少數測試交易上與 Raydium 自身 UI 報價相符在 1 基點內。
+- [ ] 分散路由對任何單一流動性池 >5% 影響的交易啟動。
+- [ ] 優先費用依據最近流動性池程式費用調整大小（見 [`integration-guides/priority-fee-tuning`](/zh-Hant/integration-guides/priority-fee-tuning)）。
+- [ ] Token-2022 轉帳手續費被計算並顯示給使用者。
+- [ ] 超過滑點時交易清晰地回復。
+- [ ] 重試邏輯區分交易過期（重試）與回復（不重試）。
+
+## 指標
+
+- [`integration-guides/routing-and-mev`](/zh-Hant/integration-guides/routing-and-mev) — 三明治抵抗、束。
+- [`integration-guides/priority-fee-tuning`](/zh-Hant/integration-guides/priority-fee-tuning) — 調整計算預算指令大小。
+- [`sdk-api/rest-api`](/zh-Hant/sdk-api/rest-api) — 流動性池清單端點。
+
+來源：
+
+- [Raydium SDK v2 `trade` 模組](https://github.com/raydium-io/raydium-sdk-V2)

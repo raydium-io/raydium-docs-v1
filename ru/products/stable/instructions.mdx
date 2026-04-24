@@ -1,0 +1,349 @@
+---
+title: "Инструкции Stable AMM"
+description: "Полный набор инструкций: Initialize, InitModelData, UpdateModelData, Deposit, Withdraw, SwapBaseIn, SwapBaseOut, MonitorStep, SetParams, WithdrawPnl, WithdrawSrm, PreInitialize, SimulateInfo."
+---
+
+<Info>
+  **Эта страница переведена с помощью ИИ. За эталон принимается английская версия.**
+
+  [Открыть английскую версию →](/products/stable/instructions)
+</Info>
+
+<Info>
+  Stable AMM разделяет большую часть набора инструкций с AMM v4. Уникальными инструкциями являются `InitModelData` и `UpdateModelData`, которые заполняют и обновляют таблицу поиска. Все остальные операции (swap, deposit, withdraw, crank) следуют тому же паттерну, что и AMM v4.
+</Info>
+
+## Перечень инструкций
+
+| Инструкция | Категория | Примечания |
+|-------------|----------|-------|
+| `Initialize` | Lifecycle | Создать пул (требует предварительно выделенного аккаунта model-data). |
+| `PreInitialize` | Lifecycle | Помощник для предварительного выделения (устаревший). |
+| `InitModelData` | Model setup | Создать и инициализировать таблицу поиска. |
+| `UpdateModelData` | Model setup | Заполнить до 5 элементов таблицы за один вызов. |
+| `Deposit` | Liquidity | Добавить ликвидность, получить LP. |
+| `Withdraw` | Liquidity | Сжечь LP, получить обе стороны. |
+| `SwapBaseIn` | Swap | Swap с фиксированным входом. |
+| `SwapBaseOut` | Swap | Swap с фиксированным выходом. |
+| `MonitorStep` | Crank | Обработать OpenBook, обновить ордера. |
+| `SetParams` | Admin | Изменить параметры пула. |
+| `WithdrawPnl` | Admin | Вывести накопленные комиссии протокола. |
+| `WithdrawSrm` | Legacy | Вывести SRM rebates (**устаревший**). |
+| `SimulateInfo` | Diagnostic | Read-only помощник для котировок. |
+
+## `Initialize`
+
+Инициализировать новый пул Stable AMM, привязанный к существующему рынку OpenBook и предварительно созданному аккаунту `ModelDataInfo`.
+
+**Аргументы**
+
+```
+nonce: u8
+open_time: u64
+```
+
+**Аккаунты** (writable `W`, signer `S`)
+
+| # | Имя | W | S | Примечания |
+|---|------|---|---|-------|
+| 1 | `token_program` |   |   | SPL Token. |
+| 2 | `system_program` |   |   | |
+| 3 | `rent` |   |   | |
+| 4 | `amm` | W |   | Аккаунт пула `AmmInfo`. |
+| 5 | `amm_authority` |   |   | PDA программного уровня. |
+| 6 | `amm_open_orders` | W |   | OpenBook `OpenOrders`. |
+| 7 | `lp_mint` | W |   | Fungible LP token mint. |
+| 8 | `coin_mint` |   |   | |
+| 9 | `pc_mint` |   |   | |
+| 10 | `pool_coin_token_account` | W |   | Vault для coin пула. |
+| 11 | `pool_pc_token_account` | W |   | Vault для pc пула. |
+| 12 | `amm_target_orders` | W |   | Сетка для ордеров OpenBook. |
+| 13 | `model_data_account` |   |   | **Аккаунт таблицы поиска.** |
+| 14 | `serum_program` |   |   | Программа OpenBook. |
+| 15 | `serum_market` |   |   | Рынок OpenBook. |
+| 16 | `user_dest_lp_token` | W |   | LP ATA создателя (получает начальные LP). |
+| 17 | `user_wallet` | W | S | Создатель; платит за rent, финансирует начальный депозит. |
+| (opt) | `srm_token` | W |   | Аккаунт SRM токена для скидок на комиссии (устаревший). |
+
+**Предусловия**
+
+- `model_data_account` должен быть уже создан и инициализирован предыдущим вызовом `InitModelData`.
+- `lp_mint` должен быть пуст (нулевое предложение).
+- Vaults должны существовать и быть владены `amm_authority`.
+
+**Постусловия**
+
+- `AmmInfo` инициализируется со всеми ссылками.
+- `TargetOrders` обнуляется и готов к первому `MonitorStep`.
+- Начальные LP токены выпускаются и отправляются на `user_dest_lp_token`.
+- Ордера OpenBook **еще не** размещены; первый `MonitorStep` их размещает.
+
+## `InitModelData`
+
+Создать и инициализировать аккаунт `ModelDataInfo`. Должна быть вызвана один раз перед `Initialize`.
+
+**Аргументы**
+
+```
+multiplier: u64       // scale factor (e.g., 10^6)
+```
+
+**Аккаунты** (writable `W`, signer `S`)
+
+| # | Имя | W | S | Примечания |
+|---|------|---|---|-------|
+| 1 | `model_data_account` | W |   | Аккаунт таблицы с 50k элементами. |
+| 2 | `amm_admin` |   | S | Администратор пула (должен подписать для подтверждения прав). |
+
+**Предусловия**
+
+- `model_data_account` должен быть достаточно большим (~1,2 MB для 50k × 24 bytes).
+- `model_data_account` должен быть владен программой Stable.
+
+**Постусловия**
+
+- `status = Initialized`.
+- `multiplier` установлен.
+- `valid_data_count = 0` (элементы еще не заполнены; вызовите `UpdateModelData` для добавления).
+- Массив `elements` обнулен.
+
+## `UpdateModelData`
+
+Заполнить до 5 элементов таблицы за один вызов. Должна быть вызвана после `InitModelData`, но перед началом использования таблицы в swaps.
+
+**Аргументы**
+
+```
+array_data: [UpdateModelData; 5]
+
+pub struct UpdateModelData {
+  pub index: u64,
+  pub data: DataElement,
+}
+```
+
+**Аккаунты** (writable `W`, signer `S`)
+
+| # | Имя | W | S | Примечания |
+|---|------|---|---|-------|
+| 1 | `amm_admin` |   | S | Подписант (должен быть администратором пула). |
+| 2 | `model_data_account` | W |   | Аккаунт таблицы. |
+
+**Предусловия**
+
+- `amm_admin` должен совпадать с `AmmInfo.amm_admin`.
+- Каждый индекс в `array_data` должен быть корректным (в пределах 50,000).
+- **Элементы должны быть отсортированы** (не проверяется в цепи для скорости): x по возрастанию, y по убыванию, цена по возрастанию.
+
+**Постусловия**
+
+- Элементы записываются в `model_data_account.elements[index]` для каждого входа.
+- `valid_data_count` обновляется до максимального индекса + 1.
+
+**Примечание управления:** Порядок сортировки и согласованность цен не проверяются в цепи. Вредоносный или неосторожный администратор может повредить таблицу и вызвать неправильные котировки. На практике этот адрес контролируется мультиподписью Raydium.
+
+## `Deposit`
+
+Добавить ликвидность, получить LP токены.
+
+**Аргументы**
+
+```
+max_coin_amount: u64
+max_pc_amount: u64
+base_side: u64          // 0 = base on coin, 1 = base on pc
+```
+
+**Аккаунты** — как в AMM v4, ~13 аккаунтов. Должен включать `model_data_account` как read-only.
+
+**Математика** — стандартная pro-rata с использованием таблицы поиска для расчета соотношения. SDK вычисляет пару coin/pc для желаемого количества LP и проверяет против максимальных лимитов.
+
+## `Withdraw`
+
+Сжечь LP, получить обе стороны pro-rata.
+
+**Аргументы**
+
+```
+amount: u64            // LP токены для сжигания
+```
+
+**Аккаунты** — как в AMM v4, с `model_data_account` как read-only.
+
+**Предусловия**
+
+- `user_lp_token_account` содержит минимум `amount`.
+
+**Постусловия**
+
+- `amount` LP токенов сжигаются.
+- Пользователь получает количества coin и pc согласно текущей pro-rata, с учетом накопленных комиссий.
+
+## `SwapBaseIn`
+
+Swap с фиксированным входом, использующий таблицу поиска для определения цены.
+
+**Аргументы**
+
+```
+amount_in: u64
+minimum_amount_out: u64
+```
+
+**Аккаунты** (~17 всего)
+
+| # | Имя | W | S | Примечания |
+|---|------|---|---|-------|
+| 1 | `token_program` |   |   | |
+| 2 | `amm` | W |   | |
+| 3 | `amm_authority` |   |   | |
+| 4 | `amm_open_orders` | W |   | |
+| 5 | `amm_target_orders` | W |   | |
+| 6 | `pool_coin_token_account` | W |   | |
+| 7 | `pool_pc_token_account` | W |   | |
+| 8 | `model_data_account` |   |   | **Read-only таблица поиска.** |
+| 9 | `serum_program` |   |   | |
+| 10 | `serum_market` | W |   | |
+| 11 | `serum_bids` | W |   | |
+| 12 | `serum_asks` | W |   | |
+| 13 | `serum_event_queue` | W |   | |
+| 14 | `serum_coin_vault` | W |   | |
+| 15 | `serum_pc_vault` | W |   | |
+| 16 | `serum_vault_signer` |   |   | |
+| 17 | `user_source_token` | W |   | Аккаунт входящего токена пользователя. |
+| 18 | `user_dest_token` | W |   | Аккаунт исходящего токена пользователя. |
+| 19 | `user_owner` |   | S | Пользователь (подписант транзакции). |
+
+**Предусловия**
+
+- `amm.status` позволяет swap.
+- `user_source_token` содержит ≥ `amount_in`.
+
+**Постусловия**
+
+- Пользователь теряет `amount_in`, получает `amount_out ≥ minimum_amount_out`.
+- Комиссии пула увеличивают счетчики `need_take_pnl_*`.
+- Ордера OpenBook могут быть исполнены, если заполнены.
+
+**Математика** — интерполяция таблицы поиска, как описано в [`products/stable/math`](/ru/products/stable/math).
+
+## `SwapBaseOut`
+
+Swap с фиксированным выходом (противоположность `SwapBaseIn`). Те же аккаунты, направление математики другое.
+
+**Аргументы**
+
+```
+max_amount_in: u64
+amount_out: u64
+```
+
+## `MonitorStep`
+
+Permissionless crank: обработать заполнения OpenBook, обновить сетку лимит-ордеров.
+
+**Аргументы**
+
+```
+plan_order_limit: u16
+place_order_limit: u16
+cancel_order_limit: u16
+```
+
+**Аккаунты** (~18 всего) — то же, что в AMM v4 `MonitorStep`, плюс `model_data_account` как read-only.
+
+**Предусловия**
+
+- Ссылки на аккаунты OpenBook должны совпадать с привязанным рынком пула.
+
+**Постусловия**
+
+- Ожидающие заполнения OpenBook обрабатываются в vaults пула.
+- Новые лимит-ордера размещаются на OpenBook на основе кривой таблицы поиска.
+- `TargetOrders` обновляется.
+
+## `SetParams`
+
+Только администратор. Изменить параметры пула (статус, состояние, комиссии, владелец, ключ model-data и т.д.).
+
+**Аргументы**
+
+```
+param: u8              // какой параметр изменить (Status, State, Fees, и т.д.)
+value: Option<u64>    // новое значение (если param числовой)
+new_pubkey: Option<Pubkey>  // новый адрес (если param ключ аккаунта)
+fees: Option<Fees>    // новые комиссии (если param Fees)
+```
+
+**Аккаунты** — зависит от param. Всегда требует `amm_admin` как подписант.
+
+**Общие params:**
+
+- `param = 0` (Status) — изменить маску операций.
+- `param = 9` (Fees) — изменить trade_fee, pnl split и т.д.
+- `param = 11` (ModelDataKey) — переподключить таблицу поиска (редко, требует действия администратора).
+
+## `WithdrawPnl`
+
+Только администратор. Вывести накопленные комиссии протокола из `need_take_pnl_*` на назначенные аккаунты PnL.
+
+**Аргументы** — нет (управляется состоянием).
+
+**Аккаунты** (~14 всего)
+
+| # | Имя | W | S | Примечания |
+|---|------|---|---|-------|
+| 1 | `token_program` |   |   | |
+| 2 | `amm` | W |   | |
+| 3 | `amm_authority` |   |   | |
+| 4 | `amm_open_orders` | W |   | |
+| 5 | `pool_coin_token_account` | W |   | |
+| 6 | `pool_pc_token_account` | W |   | |
+| 7 | `coin_pnl_dest` | W |   | Аккаунт coin администратора (получает комиссию). |
+| 8 | `pc_pnl_dest` | W |   | Аккаунт pc администратора (получает комиссию). |
+| 9 | `pnl_admin` |   | S | Подписант (должен совпадать с владельцем пула). |
+| 10+ | Аккаунты OpenBook (~4) |   |   | Сначала обработать ожидающие заполнения. |
+
+**Предусловия**
+
+- `pnl_admin` должен быть авторизован.
+
+**Постусловия**
+
+- `need_take_pnl_coin` и `need_take_pnl_pc` передаются на аккаунты администратора.
+- Счетчики обнуляются.
+
+## `WithdrawSrm`
+
+**Устаревший** (**не используйте на новых пулах**). Выводит SRM fee-discount токен rebates из пулов ранней эпохи Serum.
+
+**Аргументы**
+
+```
+amount: u64
+```
+
+## `SimulateInfo`
+
+Read-only помощник для котировок для клиентов и SDK.
+
+**Аргументы**
+
+```
+param: u8              // PoolInfo, SwapBaseInInfo, SwapBaseOutInfo, RunCrankInfo
+swap_base_in_value: Option<SwapInstructionBaseIn>
+swap_base_out_value: Option<SwapInstructionBaseOut>
+```
+
+**Использование** — вызывается через `simulateTransaction` для получения котировки без выполнения swap.
+
+## Что дальше
+
+- [Аккаунты](/ru/products/stable/accounts) — для макетов и размеров полей аккаунтов.
+- [Математика](/ru/products/stable/math) — для логики интерполяции таблицы поиска.
+- [Примеры кода](/ru/products/stable/code-demos) — чтобы увидеть, как вызывать это из SDK.
+
+Источники:
+
+- `raydium-stable/program/src/instruction.rs` (enum и pack/unpack)
+- `raydium-stable/program/src/processor.rs` (логика выполнения)

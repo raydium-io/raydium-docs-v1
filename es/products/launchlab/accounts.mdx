@@ -1,0 +1,219 @@
+---
+title: "Cuentas de LaunchLab"
+description: "PoolState (raíz por lanzamiento), los vaults base y quote, el PDA de autoridad, y el gráfico de cuentas por lanzamiento. GlobalConfig a nivel de protocolo y PlatformConfig a nivel de plataforma viven en sus propias páginas."
+---
+
+<Info>
+  **Esta página fue traducida automáticamente por IA. La versión en inglés es la fuente autorizada.**
+
+  [Ver versión en inglés →](/products/launchlab/accounts)
+</Info>
+
+<Info>
+  Esta página documenta el gráfico de cuentas **por lanzamiento**: la `PoolState` (la cuenta de estado raíz de un lanzamiento), sus dos vaults, el PDA de autoridad, y las referencias posteriores a la graduación que adquiere cuando el lanzamiento se liquida.
+
+  Para la configuración a nivel de protocolo que limita cada lanzamiento, consulta [`products/launchlab/global-config`](/es/products/launchlab/global-config). Para la superposición por plataforma, consulta [`products/launchlab/platform-config`](/es/products/launchlab/platform-config). Para cuentas de vesting (`VestingSchedule` en `PoolState`, `VestingRecord` por beneficiario), consulta [`products/launchlab/vesting`](/es/products/launchlab/vesting).
+</Info>
+
+## Inventario de cuentas
+
+| Cuenta | Propietario | Propósito |
+|---------|----------|---------|
+| [`GlobalConfig`](/es/products/launchlab/global-config) | Programa LaunchLab | Reglas a nivel de protocolo: comisiones, pisos de suministro, billeteras de migración. Una por `(curve_type, index)`. |
+| [`PlatformConfig`](/es/products/launchlab/platform-config) | Programa LaunchLab | Superposición por plataforma: marca, comisión de plataforma, división de NFT en la graduación, lista blanca de formas de curva. |
+| `PoolState` | Programa LaunchLab | Estado raíz por lanzamiento: mints, vaults, parámetros de curva, contadores vendidos, contadores de comisión, cronograma de vesting, estado de graduación. |
+| `authority` | Programa LaunchLab | PDA único en la semilla `[b"vault_auth_seed"]` que posee los vaults en todos los lanzamientos y firma el CPI posterior a la graduación. |
+| `base_vault` | SPL Token / Token-2022 | Vault por lanzamiento que retiene los tokens base no vendidos. |
+| `quote_vault` | SPL Token | Vault por lanzamiento que retiene los tokens quote acumulados. |
+| [`VestingRecord`](/es/products/launchlab/vesting) | Programa LaunchLab | Registro de cliff + desbloqueo lineal por beneficiario. Opcional. |
+| `creator_fee_vault` | SPL Token | Vault por creador + por quote-mint que retiene las comisiones de creador acumuladas, barridas por `ClaimCreatorFee`. |
+| `platform_fee_vault` | SPL Token | Vault por plataforma + por quote-mint que retiene las comisiones de plataforma acumuladas, barridas por `ClaimPlatformFeeFromVault`. |
+| (post-graduación) `cpmm_pool_state` *o* `amm_pool_state` | Programa CPMM / AMM v4 | El pool creado por `MigrateToCpswap` / `MigrateToAmm`. |
+| (post-graduación) Fee Key NFT | Programa LP-Lock | Envuelve la porción de LP del creador en la graduación de CPMM; autoriza al titular a `ClaimCreatorFee` en el pool de CPMM. |
+
+El método `raydium.launchpad.getLaunchById` del SDK devuelve `PoolState` más una bandera que indica si el lanzamiento se ha graduado; si es así, se incluye el ID del pool posterior a la migración.
+
+## `PoolState`
+
+El estado raíz por lanzamiento. Los nombres de campo a continuación coinciden con la estructura Rust en cadena (`states/pool.rs`); algunos valores se han simplificado para legibilidad — consulta la fuente para el diseño exacto de memoria.
+
+```rust
+// states/pool.rs (abridged)
+pub struct PoolState {
+    pub epoch:                     u64,        // recent_epoch tracker
+    pub auth_bump:                 u8,
+    pub status:                    u8,         // PoolStatus enum
+    pub base_decimals:             u8,
+    pub quote_decimals:            u8,
+    pub migrate_type:              u8,         // 0 = AMM v4, 1 = CPMM
+    pub supply:                    u64,        // total base tokens (no decimals)
+    pub total_base_sell:           u64,        // base supply allocated to the curve
+    pub virtual_base:              u64,        // virtual-reserve seed
+    pub virtual_quote:             u64,        // virtual-reserve seed
+    pub real_base:                 u64,        // base sold so far
+    pub real_quote:                u64,        // quote raised so far (excl. fees)
+    pub total_quote_fund_raising:  u64,        // graduation threshold in quote
+
+    pub quote_protocol_fee:        u64,        // accrued, pending CollectFee
+    pub platform_fee:              u64,        // accrued, pending ClaimPlatformFee
+    pub migrate_fee:               u64,        // accrued, pending CollectMigrateFee
+    pub vesting_schedule:          VestingSchedule,
+
+    pub global_config:             Pubkey,
+    pub platform_config:           Pubkey,
+    pub creator:                   Pubkey,
+    pub base_mint:                 Pubkey,
+    pub quote_mint:                Pubkey,
+    pub base_vault:                Pubkey,
+    pub quote_vault:               Pubkey,
+
+    pub amm_creator_fee_on:        u8,         // 0 = QuoteToken, 1 = BothToken (CPMM-only)
+    pub token_program_flag:        u8,         // bit flags for SPL Token vs Token-2022
+    pub padding:                   [u8; 54],
+}
+
+#[derive(Default, Debug, Clone)]
+pub struct VestingSchedule {
+    pub total_locked_amount:    u64,
+    pub cliff_period:           u64,
+    pub unlock_period:          u64,
+    pub start_time:             u64,           // set at graduation
+    pub allocated_share_amount: u64,           // running sum across VestingRecords
+}
+```
+
+Valores de `PoolStatus` (del IDL de Anchor):
+
+```
+0 = Funding         — aceptando compras / ventas; por debajo de quote_reserve_target
+1 = Migrate         — quote_reserve_target alcanzado; esperando MigrateTo*
+2 = Migrated        — MigrateTo* ya ejecutado; reloj de vesting en marcha
+```
+
+Campos orientados al integrador:
+
+- **`status`** — tres valores, monótonos (Funding → Migrate → Migrated). Las lecturas son siempre seguras; las escrituras están controladas.
+- **`real_base`**, **`real_quote`** — estado actual de la curva. Combinados con `virtual_base` / `virtual_quote` son suficientes para calcular el precio spot sin tocar los vaults. Consulta [`bonding-curve`](/es/products/launchlab/bonding-curve).
+- **`total_base_sell`** vs `real_base` — relación de "progreso hacia la graduación" para interfaces de usuario.
+- **`migrate_type`** — selecciona si `MigrateToAmm` o `MigrateToCpswap` es la ruta válida de graduación. Los lanzamientos de Token-2022 deben usar CPMM.
+- **`amm_creator_fee_on`** — solo significativo cuando se gradúa a CPMM. Elige `creator_fee_on = OnlyQuoteToken` (`0`) o `BothToken` (`1`) en el pool de CPMM posterior a la graduación. *A pesar del nombre, este enum también controla efectivamente el objetivo de migración — `BothToken` está emparejado con `MigrateToAmm` en la práctica operacional actual; `QuoteToken` con `MigrateToCpswap`.* Consulta [`creator-fees`](/es/products/launchlab/creator-fees).
+- **`quote_protocol_fee` / `platform_fee` / `migrate_fee`** — tres contadores de comisión independientes. Cada uno tiene su propia instrucción de reclamación; consulta [`instructions`](/es/products/launchlab/instructions).
+- **`vesting_schedule`** — presente en cada `PoolState` pero inactivo cuando `total_locked_amount == 0`. Consulta [`vesting`](/es/products/launchlab/vesting) para el ciclo de vida completo.
+
+## El PDA de autoridad
+
+LaunchLab utiliza un **único** PDA de autoridad en todos los lanzamientos, derivado sin ninguna semilla por lanzamiento:
+
+```ts
+const LAUNCHLAB_PROGRAM_ID = new PublicKey("<LAUNCHLAB_ID>"); // see reference/program-addresses
+
+const [authority, bump] = PublicKey.findProgramAddressSync(
+  [Buffer.from("vault_auth_seed")],
+  LAUNCHLAB_PROGRAM_ID,
+);
+```
+
+Ese único PDA es:
+
+- La autoridad en los `base_vault` y `quote_vault` de cada lanzamiento.
+- El `mint_authority` en el `base_mint` de cada lanzamiento (pre-graduación).
+- El firmante en el CPI posterior a la graduación a AMM v4 / CPMM (`MigrateTo*`).
+- El firmante en las transferencias `ClaimVestedToken` fuera del base vault.
+
+El `mint_authority` se revoca inmediatamente después de `MigrateToAmm` / `MigrateToCpswap` para que el suministro se fije permanentemente.
+
+Dos PDAs adicionales controlan los vaults de comisión:
+
+```ts
+const [creatorFeeVaultAuthority] = PublicKey.findProgramAddressSync(
+  [Buffer.from("creator_fee_vault_auth_seed")],
+  LAUNCHLAB_PROGRAM_ID,
+);
+
+const [platformFeeVaultAuthority] = PublicKey.findProgramAddressSync(
+  [Buffer.from("platform_fee_vault_auth_seed")],
+  LAUNCHLAB_PROGRAM_ID,
+);
+```
+
+Estos firman la transferencia fuera del vault de comisión correspondiente durante `ClaimCreatorFee` y `ClaimPlatformFeeFromVault`.
+
+## Mint base
+
+Creado en línea por `Initialize` con:
+
+- `mint_authority = authority` (revocado en la graduación).
+- `freeze_authority = None`.
+- `supply = supply`, completamente acuñado en `base_vault`.
+- `decimals` elegido por el creador en `Initialize` (comúnmente 6).
+
+Dado que el suministro completo se acuña previamente, `base_mint.supply` es constante durante toda la vida del lanzamiento. Las compras en la curva mueven tokens de `base_vault` al comprador, pero no llaman a `mint_to`.
+
+`Initialize` / `InitializeV2` crean lanzamientos de SPL Token. La instrucción dedicada `InitializeWithToken2022` permite que el mint base sea un mint de Token-2022 (con opcional `TransferFeeConfig`); el mint quote sigue siendo SPL Token. Los lanzamientos de Token-2022 deben graduarse a un pool de CPMM porque AMM v4 solo admite vaults de SPL Token.
+
+## Vaults
+
+Tanto `base_vault` como `quote_vault` son cuentas SPL Token estándar propiedad del PDA de `authority` de LaunchLab. Las direcciones se almacenan en `PoolState` y también pueden derivarse:
+
+```ts
+const [baseVault] = PublicKey.findProgramAddressSync(
+  [Buffer.from("pool_vault"), poolState.toBuffer(), baseMint.toBuffer()],
+  LAUNCHLAB_PROGRAM_ID,
+);
+const [quoteVault] = PublicKey.findProgramAddressSync(
+  [Buffer.from("pool_vault"), poolState.toBuffer(), quoteMint.toBuffer()],
+  LAUNCHLAB_PROGRAM_ID,
+);
+```
+
+(Verifica los prefijos de semilla exactos del struct de cuentas `Initialize` en la fuente antes de depender de una derivación en producción.)
+
+## Vaults de comisión
+
+Dos PDAs agregan comisiones en todos los lanzamientos:
+
+- **Vault de comisión del creador** — PDA en las semillas `[creator, quote_mint]`. Cada lanzamiento que obtiene las mismas comisiones del creador en el mismo quote mint se vierte en el mismo vault. El creador lo barre mediante `ClaimCreatorFee`.
+- **Vault de comisión de plataforma** — PDA en las semillas `[platform_config, quote_mint]`. Cada lanzamiento enrutado a través de la misma plataforma que usa el mismo quote mint se vierte en el mismo vault. El `platform_fee_wallet` de la plataforma lo barre mediante `ClaimPlatformFeeFromVault`. También hay una variante de barrida por lanzamiento (`ClaimPlatformFee`) que extrae del `quote_vault` del lanzamiento directamente sin pasar por el vault agregado.
+
+El patrón de vault agregado es lo que permite que un creador o plataforma de alto volumen amortice el costo de alquiler de la acumulación de comisiones en muchos lanzamientos.
+
+## Quote vault ↔ `real_quote`
+
+`quote_vault.balance` y `PoolState.real_quote` deben mantenerse sincronizados. Pueden desviarse como máximo la suma de los tres contadores de comisión pendientes (`quote_protocol_fee`, `platform_fee`, `migrate_fee`), que se encuentran en el vault pero pertenecen a los contadores de comisión y no a la reserva de la curva. Las matemáticas de la curva siempre usan `real_quote`, nunca el saldo sin procesar del vault.
+
+Invariante pre-graduación:
+
+```
+quote_vault.balance ==
+   real_quote
+ + quote_protocol_fee
+ + platform_fee
+ + migrate_fee
+```
+
+## Transiciones de cuentas del ciclo de vida
+
+| Evento | Estado | `real_base` | `real_quote` | Pool post-graduación |
+|--------|--------|-------------|--------------|----------------------|
+| `Initialize` | Funding | 0 | 0 | — |
+| `BuyExactIn` / `BuyExactOut` | Funding | `+base_out` | `+quote_in_after_fee` | — |
+| `SellExactIn` / `SellExactOut` | Funding | `−base_in` | `−quote_out_before_fee` | — |
+| `MigrateToAmm` / `MigrateToCpswap` | Funding → Migrate → Migrated | (congelado) | (congelado) | creado, LP dividido por `PlatformConfig` |
+| `ClaimCreatorFee` / `ClaimPlatformFee*` | cualquiera | — | — | drena un vault de comisión |
+| `CreateVestingAccount` | Funding | — | — | incrementa `vesting_schedule.allocated_share_amount` |
+| `ClaimVestedToken` | Solo Migrated | — | — | drena `base_vault` |
+
+## A dónde ir a continuación
+
+- [`products/launchlab/bonding-curve`](/es/products/launchlab/bonding-curve) — las matemáticas detrás de `real_base` ↔ `real_quote`.
+- [`products/launchlab/instructions`](/es/products/launchlab/instructions) — listas de cuentas por instrucción.
+- [`products/launchlab/global-config`](/es/products/launchlab/global-config) — vinculación a nivel de protocolo.
+- [`products/launchlab/platform-config`](/es/products/launchlab/platform-config) — superposición de plataforma.
+- [`products/launchlab/vesting`](/es/products/launchlab/vesting) — mecánica de suministro bloqueado.
+- [`products/cpmm/accounts`](/es/products/cpmm/accounts) — cómo se ve el `cpmm_pool_state` posterior a la graduación.
+
+Fuentes:
+
+- `raydium-launch/programs/launchpad/src/states/pool.rs` — `PoolState`, `PoolStatus`, `VestingSchedule`, `AmmCreatorFeeOn`.
+- `raydium-launch/programs/launchpad/src/lib.rs` — constantes de semilla de PDA (`AUTH_SEED`, `CREATOR_FEE_VAULT_AUTH_SEED`, `PLATFORM_FEE_VAULT_AUTH_SEED`).
+- [Módulo `launchpad` del SDK de Raydium v2](https://github.com/raydium-io/raydium-sdk-V2).

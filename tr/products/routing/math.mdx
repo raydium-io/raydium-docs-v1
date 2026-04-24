@@ -1,0 +1,161 @@
+---
+title: "Yönlendirme matematiği"
+description: "Router kendisi fiyatlandırma matematikası yapmaz; her hop, havuz programının eğrisine devrettirir. Çok-hop slippage bileşkelemez; CLMM hopleri limit_prices kullanır."
+---
+
+<Info>
+  **Bu sayfa yapay zekâ tarafından otomatik olarak çevrilmiştir. İngilizce sürüm esas alınır.**
+
+  [İngilizce sürümü görüntüle →](/products/routing/math)
+</Info>
+
+## Router matematik yapmaz
+
+Yönlendirme programı **herhangi bir fiyatlandırma mantığı uygulamaz**. O bir saf düzenleyicidir: bir rotayı kabul eder, hesapları alt programlara geçirir ve token akışlarını zincirler.
+
+Her hop kendi havuz programının eğrisinden fiyat belirler:
+
+- **AMM v4 hopleri:** sabit-çarpım formülünü (`x · y = k`) OpenBook hibrit fiyatlandırmasıyla kullanır. Bkz. [`products/amm-v4/math`](/tr/products/amm-v4/math).
+- **CPMM hopleri:** sabit-çarpım formülünü yapılandırılabilir ücret seviyeleriyle kullanır. Bkz. [`products/cpmm/math`](/tr/products/cpmm/math).
+- **CLMM hopleri:** yoğunlaştırılmış likidite tick matematiğini kullanır. Bkz. [`algorithms/clmm-math`](/tr/algorithms/clmm-math).
+- **Stable hopleri:** benzer türdeki varlıklar için stable-swap eğrisini kullanır. Bkz. [`products/stable/math`](/tr/products/stable/math).
+
+Routerin tek katılımı şudur:
+
+1. Her havuzun swap talimatını CPI aracılığıyla çağırma.
+2. Çıktı miktarını toplama.
+3. Bunu sonraki hopun giriş miktarı olarak geçirme.
+4. Son çıktıyı çağıran tarafın slippage limitine karşı kontrol etme.
+
+## Slippage bileşkeleme
+
+Çok-hop rotada, her hoptaki slippage bileşkelenir. Hop 1'deki küçük slippage, hop 2'ye giren hacim zaten azaldığı için hop 2'de daha büyük bir slippage olur.
+
+**Örnek:**
+
+```
+Rota: USDC → SOL → STEP
+
+Havuz 1 (USDC / SOL):
+  Giriş: 1000 USDC
+  Slippage: %1 (spot 0.5 SOL verirdi, ama 0.495 SOL alıyorsunuz)
+  Çıktı: 0.495 SOL
+
+Havuz 2 (SOL / STEP):
+  Giriş: 0.495 SOL (zaten azalmış)
+  Slippage: %1 (spot 495 STEP verirdi, ama 490 STEP alıyorsunuz)
+  Çıktı: 490 STEP
+
+USDC → STEP üzerinde toplam etkili slippage: %1.99, %1 + %1 = %2 değil.
+```
+
+`minimum_amount_out` sağladığınızda, router son çıktınızı bu global limite karşı kontrol eder. Her hop kendi swap'ını yerel ücret yapısına karşı da kontrol eder, ama router rota ortasında yeniden fiyat vermez—rotayı önceden hesaplamalı ve yeterli slippage toleransı eklemelisiniz.
+
+## CLMM hopleri ve limit_prices
+
+Bir CLMM havuzuna gelen her hop için, router havuzun mevcut `sqrt_price_x64`'ünün belirtilen bir sınır içinde olup olmadığını kontrol eder. Sınırlar `limit_prices` adlı bir `VecDeque<u128>` olarak geçirilir:
+
+- Rotadaki her CLMM hop başına bir `sqrt_price_x64`.
+- `sqrt_price_x64`, CLMM tarafından kullanılan tick tabanlı fiyat gösterimidir. Tanım için [`algorithms/clmm-math`](/tr/algorithms/clmm-math) konusuna bakın.
+- Router şunu uygular:
+
+```
+  sqrt_price_lower <= pool.sqrt_price_x64 <= sqrt_price_upper
+```
+
+her CLMM hop için, fiyat sınırların dışındaysa swap'i reddeder.
+
+### Talimat varyantları ve limit_prices
+
+- **`SwapBaseInWithUserAccount`, `SwapBaseOutWithUserAccount` (Eski, etiketler 0 ve 1):** `limit_prices` VecDeque **gereklidir**. Herhangi bir hop bir CLMM havuzuysa boş deque hatayla reddedilir. Sırada her CLMM hop için bir fiyat sağlamalısınız.
+
+- **`SwapBaseIn`, `SwapBaseOut` (Güncel, etiketler 8 ve 9):** `limit_prices` VecDeque **opsiyoneldir**. Boş deque sessizce yok sayılır; fiyat kontrolü yapılmaz. Yeni kod bunları kullanmalıdır.
+
+### limit_prices oluşturma
+
+M CLMM hop'lu bir rota için, deque tam olarak M giriş içermelidir. Bunları hopa göre sıralayın:
+
+```
+limit_prices = [
+  sqrt_price_for_first_clmm_hop,
+  sqrt_price_for_second_clmm_hop,
+  ...
+]
+```
+
+### limit_prices ne zaman kontrol edilir
+
+`sqrt_price_x64`, havuzun mevcut fiyatının bir anlık görüntüsüdür. Swap'ler yürütüldükçe sürekli değişir. Şunları yapmalısınız:
+
+1. Havuzun mevcut durumunu zincir üstünden getirin.
+2. Kabul edilebilir sınırları hesaplayın (örn. mevcut fiyatın ±%0.5).
+3. Bu sınırları `limit_prices` içine kodlayın.
+4. Sınırları router talimatınıza dahil edin.
+
+İşlem iniş yapmadan önce havuzun fiyatı sınırlarınızın ötesine kayarsa, router bunu reddedecektir.
+
+## Ücret işleme
+
+Her havuz kendi yapılandırmasına göre kendi ücretini alır:
+
+- **AMM v4:** %0.25 (sabit) LP, protokol ve fon arasında bölünür.
+- **CPMM:** `AmmConfig` başına yapılandırılabilir (varsayılan %0.25, bölüm seviyeye göre değişir).
+- **CLMM:** havuz başına yapılandırılabilir, giriş miktarından alınır.
+- **Stable:** AMM v4 gibi, %0.25 bölünür.
+
+Router **kendinin ücret almaz**. Tüm ücret işleme her alt havuza devredilir. Hop N'den çıktı zaten bu hopin ücreti düşülmüş durumdadır.
+
+Bireysel havuzun ücret belgelerine bakın:
+
+- [`products/amm-v4/fees`](/tr/products/amm-v4/fees)
+- [`products/cpmm/fees`](/tr/products/cpmm/fees)
+- [`products/clmm/fees`](/tr/products/clmm/fees) (varsa)
+- [`products/stable/fees`](/tr/products/stable/fees) (varsa)
+
+## Çok-hop muhasebe örneği
+
+USDC → SOL → STEP yolunda iki sabit-çarpım havuzu aracılığıyla rotayı yönlendirdiğinizi, her birinin %0.25 ücrete sahip olduğunu varsayalım:
+
+```
+Giriş: 1000 USDC
+Havuz 1 (USDC/SOL):
+  Alınan ücret: ceil(1000 * %0.25) = 2.5 USDC
+  Eğriye net giriş: 997.5 USDC
+  Eğri çıktısı (slippage öncesi): 0.5 SOL
+  Slippage marjı: %1 varsayıyorum, yani ~0.495 SOL alıyorsunuz
+
+Havuz 2 (SOL/STEP):
+  Giriş: 0.495 SOL
+  Alınan ücret: ceil(0.495 * %0.25) ≈ 0.001 SOL
+  Eğriye net giriş: 0.494 SOL
+  Eğri çıktısı: ~494 STEP
+  Slippage marjı: %1, yani ~489 STEP alıyorsunuz
+
+Son çıktı: ~489 STEP
+```
+
+Router şunu doğrular:
+
+```
+489 >= minimum_amount_out  // çağıran tarafından belirtilir
+```
+
+Yanlış ise, tüm rota atomik olarak başarısız olur.
+
+## Hassasiyet değerlendirmeleri
+
+Tüm Solana programları gibi, router tamsayı aritmetiğini kullanır:
+
+- Tüm miktarlar `u64`'tür (lamportlar veya token en küçük birimleri).
+- Eğri hesaplamaları taşma önlemek için gerekli yerde `u128` ara kullanır.
+- Yuvarlama kuralları alt programa bağlıdır. Router yeniden yuvarlama yapmaz.
+
+Bir hop aşırı fiyat oranları nedeniyle sıfır miktar üretirse (örn. 1B:1 havuzda 1 lamport swap etme), router bunu sonraki hopa geçirir, bu da yetersiz olarak reddedebilir. Bireysel havuzun hata kodlarına bakın.
+
+## Sonraki adımlar
+
+- [`products/amm-v4/math`](/tr/products/amm-v4/math) — sabit-çarpım matematiği.
+- [`products/cpmm/math`](/tr/products/cpmm/math) — Token-2022 ile CPMM sabit-çarpım.
+- [`algorithms/clmm-math`](/tr/algorithms/clmm-math) — yoğunlaştırılmış likidite fiyatlandırması.
+- [`products/stable/math`](/tr/products/stable/math) — stable-swap eğrisi.
+- [`products/routing/code-demos`](/tr/products/routing/code-demos) — yönlendirmeden önce fiyat verme örnekleri.

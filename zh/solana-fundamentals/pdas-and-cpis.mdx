@@ -1,0 +1,279 @@
+---
+title: "PDA 和 CPI"
+description: "程序派生地址和跨程序调用——Raydium 用来确定性管理状态和与其他程序组合的两个基础原语。种子、bump、invoke 与 invoke_signed，以及 Raydium 代码遵循的模式。"
+---
+
+<Info>
+  **本页内容由 AI 自动翻译，所有内容以英文版本为准。**
+
+  [查看英文版 →](/solana-fundamentals/pdas-and-cpis)
+</Info>
+
+<Info>
+  **PDA**（程序派生地址）和 **CPI**（跨程序调用）是使 Raydium 成为可能的两个基础原语。PDA 让程序能够"拥有"确定的地址而无需私钥——这是资金池授权和金库工作的原理。CPI 让一个程序调用另一个程序——这是 Raydium 如何通过 SPL Token 程序交换代币，以及集成者如何将 Raydium 组合到自己流程中的方式。在阅读 Raydium 源代码之前，值得理解这两者。
+</Info>
+
+## PDA：无需密钥的地址
+
+**程序派生地址**是一个公钥，它：
+
+- 不在 ed25519 曲线上（不存在其私钥）。
+- 由程序 ID 和一组种子确定派生。
+- 只能由派生程序通过 `invoke_signed` 签署。
+
+每个 Raydium 资金池授权、每个资金池状态账户、每个金库、每个农场状态——它们都是 PDA。
+
+### 派生
+
+PDA 通过用种子哈希程序 ID，然后找到一个"bump"字节来强制结果离开曲线而计算得出。第一个产生离曲线地址的 bump（通常从 255 开始并递减）胜出；这就是**规范 bump**。
+
+```ts
+import { PublicKey } from "@solana/web3.js";
+
+const [poolAuthority, bump] = PublicKey.findProgramAddressSync(
+  [Buffer.from("authority"), poolId.toBuffer()],
+  CPMM_PROGRAM_ID,
+);
+```
+
+种子可以是任何东西——字符串、其他公钥、`u64` 值作为小端字节。Raydium 的惯例是人类可读的前缀后跟唯一标识符。
+
+### Raydium PDA 模式
+
+Raydium 程序中常见的 PDA：
+
+| PDA | 种子 | 程序 |
+|-----|-------|---------|
+| AMM 授权（AMM v4） | `[b"amm authority"]` + bump | AMM v4 |
+| 资金池状态（CPMM） | `[b"pool", amm_config, mint_a, mint_b]` | CPMM |
+| 资金池金库（CPMM） | `[b"pool_vault", pool, mint]` | CPMM |
+| 授权（CPMM） | `[b"vault_and_lp_mint_auth_seed"]` | CPMM |
+| 资金池状态（CLMM） | `[b"pool", amm_config, mint_0, mint_1]` | CLMM |
+| Tick 数组（CLMM） | `[b"tick_array", pool, start_tick_index]` | CLMM |
+| 观察（CLMM） | `[b"observation", pool]` | CLMM |
+| 个人头寸（CLMM） | `[b"position", position_nft_mint]` | CLMM |
+| 农场状态（Farm v6） | `[b"pool_farm_state", farm_id]` | Farm v6 |
+| 用户账本（Farm v6） | `[b"user_ledger", farm, user]` | Farm v6 |
+
+用户和集成者可以在不获取任何内容的情况下计算这些——给定公开输入（资金池 ID、农场 ID、用户密钥），PDA 是确定的。
+
+### 规范 bump
+
+虽然原则上可能存在多个产生离曲线地址的 bump，Raydium 的程序始终使用**规范 bump**（通过从 255 递减找到）。这存储在 PDA 的账户数据中，以便后续交易可以传入它并跳过（昂贵的）派生循环：
+
+```rust
+#[account]
+pub struct PoolState {
+    pub bump: [u8; 1],
+    // ... 池状态的其余部分
+}
+```
+
+在后续交易中，从池状态读取 bump 而不是重新计算。
+
+## CPI：调用其他程序
+
+**跨程序调用**让程序在单个交易内内联调用另一个程序的指令。Raydium 广泛使用 CPI：
+
+- 交换指令调用 SPL Token 程序来移动代币。
+- CLMM 调用 Metaplex 来铸造头寸 NFT。
+- 资金池创建调用系统程序来分配账户。
+- Farm v6 调用 SPL Token 来转移奖励。
+
+集成者也使用 CPI 来调用 Raydium——这是金库策略、杠杆化 LP 协议和自动复合器工作的方式。参见 [`integration-guides/cpi-integration`](/zh/integration-guides/cpi-integration)。
+
+### invoke 与 invoke_signed
+
+Solana 运行时提供两个 CPI 原语：
+
+- **`invoke`**：调用另一个程序；被调用程序继承外层交易的签署者。
+- **`invoke_signed`**：代表 PDA 调用另一个程序；运行时验证 PDA 的种子并授权签名。
+
+`invoke_signed` 是让程序在不管理私钥的情况下拥有账户权限的魔法。
+
+### 示例：Raydium 从资金池金库转账
+
+资金池金库是一个代币账户，其权限是资金池程序的 PDA。为了在交换期间转出代币，资金池程序必须作为该 PDA 签署：
+
+```rust
+// 资金池授权的种子
+let authority_seeds: &[&[u8]] = &[
+    b"vault_and_lp_mint_auth_seed",
+    &[authority_bump],
+];
+let signer_seeds: &[&[&[u8]]] = &[authority_seeds];
+
+// 构建 CPI 上下文
+let cpi_accounts = Transfer {
+    from:      input_vault.to_account_info(),
+    to:        user_ata.to_account_info(),
+    authority: pool_authority.to_account_info(),
+};
+let cpi_program = token_program.to_account_info();
+let cpi_ctx     = CpiContext::new_with_signer(cpi_program, cpi_accounts, signer_seeds);
+
+// 执行
+token::transfer(cpi_ctx, amount)?;
+```
+
+运行时看到 `invoke_signed` 由 CPMM 程序调用，验证 `vault_and_lp_mint_auth_seed + bump` 与 CPMM 程序 ID 一起哈希时派生到 `pool_authority` 的地址，并允许代币转账上的权限签名。不涉及私钥。
+
+### 示例：集成者调用 Raydium CPMM
+
+集成者程序（例如，托管合约）可以通过 CPI 调用 Raydium 的 `swap_base_input`：
+
+```rust
+use raydium_cpmm::cpi::{self, accounts::Swap};
+
+let cpi_accounts = Swap {
+    payer:                order.to_account_info(),      // PDA，将签署
+    authority:            pool_authority_info,
+    amm_config:           amm_config_info,
+    pool_state:           pool_info,
+    input_token_account:  order_input_ata,
+    output_token_account: order_output_ata,
+    input_vault:          input_vault_info,
+    output_vault:         output_vault_info,
+    input_token_program:  input_token_program_info,
+    output_token_program: output_token_program_info,
+    input_token_mint:     input_mint_info,
+    output_token_mint:    output_mint_info,
+    observation_state:    observation_info,
+};
+
+let seeds = &[b"order", user.key.as_ref(), &[order.bump]];
+let cpi_ctx = CpiContext::new_with_signer(
+    cpmm_program.to_account_info(),
+    cpi_accounts,
+    &[seeds],
+);
+
+cpi::swap_base_input(cpi_ctx, amount_in, min_out)?;
+```
+
+这是规范的集成模式——参见 [`integration-guides/cpi-integration`](/zh/integration-guides/cpi-integration) 获取完整的托管合约示例。
+
+## CPI 深度限制
+
+Solana 将 CPI 深度上限设置为 **4 级**。交易的顶级指令计为深度 0；每次 CPI 调用增加一级深度。
+
+实际影响：Raydium 自己的交换已经使用 1-2 级 CPI（Raydium → SPL Token）。集成者调用 Raydium 使用 2 级。如果该集成者被另一个集成者调用，则为 3 级。第 4 级是限制。
+
+大多数组合都轻松保持在此下，但深层嵌套（聚合器→路由器→Raydium→钩子）可能会触发它。设计应该扁平而非深层。
+
+## 剩余账户
+
+当 Raydium 指令需要可变数量的账户（例如，CLMM 交换跨越未知数量的 tick 数组）时，额外账户作为**剩余账户**传递——附加到固定账户列表，按位置解释。
+
+CPMM 的 `SwapV2` 使用剩余账户来存放转账钩子程序的额外所需账户。客户端获取所需账户并附加它们：
+
+```ts
+const swapIx = await raydium.cpmm.swap({
+  /* ... */
+  // SDK 自动处理剩余账户
+});
+```
+
+在 CPI 级别，集成者必须通过自己的指令转发剩余账户：
+
+```rust
+pub struct Swap<'info> {
+    // ... 固定账户
+    // 加上通过 ctx.remaining_accounts 转发的剩余账户
+}
+
+// 将 remaining_accounts 转发到 CPI
+cpi::swap_base_input(
+    cpi_ctx.with_remaining_accounts(ctx.remaining_accounts.to_vec()),
+    amount_in,
+    min_out,
+)?;
+```
+
+## PDA 陷阱
+
+### 错误的种子 → 错误的地址
+
+种子顺序错误、编码错误或包含/排除额外字节的 bug 会默默产生不同的 PDA。交易以模糊的方式失败（程序尝试读取不存在的账户）。始终对照已知的黄金值进行单元测试种子派生。
+
+### 不存储 bump
+
+如果你在每笔交易上重新派生 bump，你会为派生循环支付计算费用。在 PDA 的数据中存储规范 bump 并从那里读取它。
+
+### 混淆规范 vs 非规范 bump
+
+非规范 bump（如果有人找到产生离曲线的）被 `invoke_signed` 允许但被 Raydium 的程序通过 `assert_eq!(bump, canonical_bump)` 拒绝。如果有人尝试使用非规范 bump 声称 PDA，tx 失败。
+
+### 当你不是拥有程序时将 PDA 作为签署者传递
+
+只有程序 ID 在 PDA 派生中的程序可以 `invoke_signed` 其种子。如果你尝试，运行时拒绝。
+
+## CPI 陷阱
+
+### 忘记转发 `remaining_accounts`
+
+如果你的外层指令在 `remaining_accounts` 中传递转账钩子账户但进入 Raydium 的 CPI 没有转发它们，Raydium 失败因为它找不到钩子账户。始终在需要它们的 CPI 中包含 `with_remaining_accounts`。
+
+### 可写标志不匹配
+
+外层指令标记为可写的账户如果被调用程序打算写入，也必须在 CPI 调用中可写。不匹配 → 运行时拒绝。
+
+### 未考虑租金
+
+对创建账户的程序的 CPI（例如，ATA 创建）要求支付者有足够的 SOL 来支付租金。失败的租金检查表现为晦涩的错误。
+
+## 实际示例：计算 Raydium CPMM PDA
+
+```ts
+import { PublicKey } from "@solana/web3.js";
+
+const CPMM_PROGRAM_ID = new PublicKey("CPMMoo8L3F4NbTegBCKVNunggL7H1Zpdmwpwh8KMoZ0F");
+
+function computeCpmmPdas(ammConfig, mintA, mintB) {
+  const [poolState, poolBump] = PublicKey.findProgramAddressSync(
+    [
+      Buffer.from("pool"),
+      ammConfig.toBuffer(),
+      mintA.toBuffer(),
+      mintB.toBuffer(),
+    ],
+    CPMM_PROGRAM_ID,
+  );
+
+  const [authority] = PublicKey.findProgramAddressSync(
+    [Buffer.from("vault_and_lp_mint_auth_seed")],
+    CPMM_PROGRAM_ID,
+  );
+
+  const [vaultA] = PublicKey.findProgramAddressSync(
+    [Buffer.from("pool_vault"), poolState.toBuffer(), mintA.toBuffer()],
+    CPMM_PROGRAM_ID,
+  );
+
+  const [vaultB] = PublicKey.findProgramAddressSync(
+    [Buffer.from("pool_vault"), poolState.toBuffer(), mintB.toBuffer()],
+    CPMM_PROGRAM_ID,
+  );
+
+  const [observation] = PublicKey.findProgramAddressSync(
+    [Buffer.from("observation"), poolState.toBuffer()],
+    CPMM_PROGRAM_ID,
+  );
+
+  return { poolState, authority, vaultA, vaultB, observation, poolBump };
+}
+```
+
+这正是 Raydium SDK 在调用 `getPoolInfoFromRpc({ poolId })` 时底层所做的——它派生关联的 PDA 而无需往返。
+
+## 相关指南
+
+- [`solana-fundamentals/account-model`](/zh/solana-fundamentals/account-model) — PDA 如何适配账户模型。
+- [`solana-fundamentals/programs-and-anchor`](/zh/solana-fundamentals/programs-and-anchor) — Anchor 用于声明 PDA 的助手。
+- [`integration-guides/cpi-integration`](/zh/integration-guides/cpi-integration) — 构建调用 Raydium 的 CPI 集成。
+- [`sdk-api/rust-cpi`](/zh/sdk-api/rust-cpi) — Raydium 的 Rust CPI 类型。
+
+资源：
+
+- [Solana PDA 文档](https://docs.solana.com/developing/programming-model/calling-between-programs)。
+- [Anchor PDA 和 CPI 文档](https://www.anchor-lang.com/docs/pdas-and-cpis)。

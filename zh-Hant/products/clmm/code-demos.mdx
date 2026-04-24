@@ -1,0 +1,464 @@
+---
+title: "CLMM 程式碼範例"
+description: "端對端 TypeScript 範例：建立 CLMM 池、在指定價格區間開倉、調整流動性、執行 Swap，以及領取手續費與獎勵。"
+---
+
+<Info>
+  **本頁內容由 AI 自動翻譯，所有內容以英文版本為準。**
+
+  [查看英文版 →](/products/clmm/code-demos)
+</Info>
+
+<Info>
+  **版本說明。** 所有範例均以 `@raydium-io/raydium-sdk-v2@0.2.42-alpha` 為目標，對應 Solana mainnet-beta，驗證日期為 2026-04。Program ID 由 SDK 透過 [`reference/program-addresses`](/zh-Hant/reference/program-addresses) 取得。
+</Info>
+
+## 環境設定
+
+```bash
+npm install @raydium-io/raydium-sdk-v2 @solana/web3.js @solana/spl-token bn.js decimal.js
+```
+
+本頁每個範例都對應 [`raydium-sdk-V2-demo/src/clmm`](https://github.com/raydium-io/raydium-sdk-V2-demo/tree/master/src/clmm) 中的同名檔案；各節旁均附有 GitHub 連結。初始化設定參考 demo repo 的 `config.ts.template`（[原始碼](https://github.com/raydium-io/raydium-sdk-V2-demo/blob/master/src/config.ts.template)）——對於任何非簡單整合，建議使用 `disableFeatureCheck: true`：
+
+```ts
+import { Connection, Keypair, clusterApiUrl } from "@solana/web3.js";
+import { Raydium, TxVersion } from "@raydium-io/raydium-sdk-v2";
+import fs from "node:fs";
+
+const connection = new Connection(process.env.RPC_URL ?? clusterApiUrl("mainnet-beta"));
+const owner = Keypair.fromSecretKey(
+  new Uint8Array(JSON.parse(fs.readFileSync(process.env.KEYPAIR!, "utf8"))),
+);
+const raydium = await Raydium.load({
+  owner,
+  connection,
+  cluster: "mainnet",
+  disableFeatureCheck: true,
+  blockhashCommitment: "finalized",
+});
+export const txVersion = TxVersion.V0;
+```
+
+## 建立 CLMM 池
+
+原始碼：[`src/clmm/createPool.ts`](https://github.com/raydium-io/raydium-sdk-V2-demo/blob/master/src/clmm/createPool.ts)
+
+```ts
+import { PublicKey } from "@solana/web3.js";
+import { CLMM_PROGRAM_ID } from "@raydium-io/raydium-sdk-v2";
+import BN from "bn.js";
+import Decimal from "decimal.js";
+
+const mintA = await raydium.token.getTokenInfo(
+  new PublicKey("So11111111111111111111111111111111111111112"));   // wSOL
+const mintB = await raydium.token.getTokenInfo(
+  new PublicKey("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"));   // USDC
+
+const ammConfigs = await raydium.api.getClmmConfigs();
+const ammConfig  = ammConfigs.find((c) => c.index === 1)!;        // 0.05% tier
+
+const initialPrice = new Decimal(160);        // 160 USDC per SOL
+const { execute, extInfo } = await raydium.clmm.createPool({
+  programId: CLMM_PROGRAM_ID,
+  mint1:     mintA,
+  mint2:     mintB,
+  ammConfig,
+  initialPrice,
+  startTime: new BN(0),
+  txVersion: TxVersion.V0,
+});
+
+const { txId } = await execute({ sendAndConfirm: true });
+console.log("Pool:", extInfo.address.id.toBase58(), "tx:", txId);
+```
+
+SDK 的行為如下：
+
+- 在推導地址前，依位元組順序對 `mint1`/`mint2` 排序。
+- 計算 `sqrt_price_x64 = floor(sqrt(initialPrice × 10^(dB−dA)) × 2^64)`。
+- 建立 `observation` 與 `tick_array_bitmap_extension` 帳戶。
+- 依 `ammConfig` 所定義的費率支付建池費用。
+
+## 在指定區間開倉
+
+原始碼：[`src/clmm/createPosition.ts`](https://github.com/raydium-io/raydium-sdk-V2-demo/blob/master/src/clmm/createPosition.ts)
+
+```ts
+import { PoolUtils, TickUtils } from "@raydium-io/raydium-sdk-v2";
+
+const poolId = new PublicKey("<POOL_ID>");
+const { poolInfo, poolKeys, rpcData } = await raydium.clmm.getPoolInfoFromRpc(poolId);
+
+// 設定價格區間，此處為當前價格的 ±10%。
+const currentPrice = new Decimal(poolInfo.price);
+const lowerPrice   = currentPrice.mul(0.9);
+const upperPrice   = currentPrice.mul(1.1);
+
+// 對齊至此池 tick_spacing 的有效 tick。
+const { tick: tickLower } = TickUtils.getPriceAndTick({
+  poolInfo, price: lowerPrice, baseIn: true,
+});
+const { tick: tickUpper } = TickUtils.getPriceAndTick({
+  poolInfo, price: upperPrice, baseIn: true,
+});
+
+// 各代幣的存入數量。
+const inputAmount = new BN(10_000_000);  // 0.01 SOL
+const inputMint   = poolInfo.mintA.address;
+
+const res = PoolUtils.getLiquidityAmountOutFromAmountIn({
+  poolInfo,
+  slippage: 0.01,
+  inputA: true,
+  tickUpper,
+  tickLower,
+  amount: inputAmount,
+  add: true,
+  amountHasFee: true,
+  epochInfo: await raydium.fetchEpochInfo(),
+});
+
+const { execute } = await raydium.clmm.openPositionFromBase({
+  poolInfo,
+  poolKeys,
+  tickUpper,
+  tickLower,
+  base: "MintA",
+  ownerInfo: { useSOLBalance: true },
+  baseAmount: inputAmount,
+  otherAmountMax: res.amountSlippageB.amount,
+  txVersion: TxVersion.V0,
+});
+
+const { txId } = await execute({ sendAndConfirm: true });
+console.log("Position opened, tx:", txId);
+```
+
+SDK 會自動計算該區間涉及哪些 tick array，並在有未初始化的情況下一併打包 `InitTickArray` 指令。
+
+## 增加現有倉位的流動性
+
+原始碼：[`src/clmm/increaseLiquidity.ts`](https://github.com/raydium-io/raydium-sdk-V2-demo/blob/master/src/clmm/increaseLiquidity.ts)
+
+```ts
+const positionNftMint = new PublicKey("<POSITION_NFT_MINT>");
+
+const positionAccount = await raydium.clmm.getPositionInfo({
+  nftMint: positionNftMint,
+});
+
+const { execute } = await raydium.clmm.increasePositionFromBase({
+  poolInfo,
+  poolKeys,
+  ownerPosition: positionAccount,
+  base: "MintA",
+  baseAmount: new BN(5_000_000),
+  otherAmountMax: new BN(1_000_000_000),
+  txVersion: TxVersion.V0,
+});
+
+await execute({ sendAndConfirm: true });
+```
+
+## 減少流動性（同時領取手續費）
+
+原始碼：[`src/clmm/decreaseLiquidity.ts`](https://github.com/raydium-io/raydium-sdk-V2-demo/blob/master/src/clmm/decreaseLiquidity.ts) 與 [`src/clmm/closePosition.ts`](https://github.com/raydium-io/raydium-sdk-V2-demo/blob/master/src/clmm/closePosition.ts)
+
+```ts
+const { execute } = await raydium.clmm.decreaseLiquidity({
+  poolInfo,
+  poolKeys,
+  ownerPosition: positionAccount,
+  liquidity: positionAccount.liquidity.divn(2),   // 減半
+  amountMinA: new BN(0),
+  amountMinB: new BN(0),
+  closePosition: false,
+  txVersion: TxVersion.V0,
+});
+
+await execute({ sendAndConfirm: true });
+```
+
+若只想**領取手續費**，以 `liquidity = new BN(0)` 呼叫 `decreaseLiquidity`。該指令的副作用是結算 `tokens_fees_owed_{0,1}` 並將其轉出。
+
+若要在清零流動性與手續費後完全關閉倉位，請在最後一次 `decreaseLiquidity` 呼叫中傳入 `closePosition: true`。SDK 會附加 `ClosePosition` 指令並銷毀 NFT。
+
+## 領取獎勵
+
+原始碼：[`src/clmm/harvestAllRewards.ts`](https://github.com/raydium-io/raydium-sdk-V2-demo/blob/master/src/clmm/harvestAllRewards.ts)
+
+```ts
+const { execute } = await raydium.clmm.harvestAllRewards({
+  ownerInfo: { useSOLBalance: true },
+  allPoolInfo: { [poolInfo.id]: poolInfo },
+  allPositions: { [poolInfo.id]: [positionAccount] },
+  txVersion: TxVersion.V0,
+});
+
+await execute({ sendAndConfirm: true });
+```
+
+`harvestAllRewards` 會遍歷傳入的每個池的每個倉位，批次打包 `CollectReward`（及任何必要的 `UpdateRewardInfos`）指令，若數量超出單筆交易上限則自動拆分。
+
+## Swap
+
+原始碼：[`src/clmm/swap.ts`](https://github.com/raydium-io/raydium-sdk-V2-demo/blob/master/src/clmm/swap.ts)
+
+```ts
+import { PoolUtils } from "@raydium-io/raydium-sdk-v2";
+
+const amountIn = new BN(10_000_000);
+const baseIn   = true;               // swap A (SOL) → B (USDC)
+const slippage = 0.005;
+
+const { minAmountOut, remainingAccounts, priceImpact } =
+  PoolUtils.computeAmountOutFormat({
+    poolInfo,
+    tickArrayCache: await raydium.clmm.fetchTickArrays({ poolInfo }),
+    amountIn,
+    tokenOut: poolInfo.mintB,
+    slippage,
+    epochInfo: await raydium.fetchEpochInfo(),
+  });
+
+const { execute } = await raydium.clmm.swap({
+  poolInfo,
+  poolKeys,
+  inputMint: new PublicKey(poolInfo.mintA.address),
+  amountIn,
+  amountOutMin: minAmountOut.amount,
+  observationId: poolKeys.observationId,
+  remainingAccounts,
+  txVersion: TxVersion.V0,
+});
+
+await execute({ sendAndConfirm: true });
+```
+
+`computeAmountOutFormat` 使用與鏈上程式相同的邏輯在鏈下遍歷 tick map，並回傳：
+
+- 預期輸出數量，
+- 扣除滑點後的最低輸出數量，
+- 實際 Swap 將存取的 tick array 帳戶清單（`remainingAccounts`）。
+
+請務必傳入模擬所回傳的 `remainingAccounts`：若傳入的帳戶不足，Swap 會在遍歷途中因 `TickArrayNotFound` 而回滾；若傳入的帳戶已過時，則會浪費運算資源。
+
+## 建立可自訂的 CLMM 池
+
+`createCustomizablePool` 是新的建池入口，可在建池時開啟動態手續費與單側手續費開關。其參數結構與 `createPool` 相同，額外新增三個欄位：
+
+```ts
+import { CLMM_PROGRAM_ID, CollectFeeOn } from "@raydium-io/raydium-sdk-v2";
+
+const dynamicFeeConfigs = await raydium.api.getClmmDynamicConfigs();    // GET /main/clmm-dynamic-config
+const dynamicFeeConfig  = dynamicFeeConfigs.find((c) => c.index === 0); // 選擇校準等級
+
+const { execute, extInfo } = await raydium.clmm.createCustomizablePool({
+  programId: CLMM_PROGRAM_ID,
+  mint1:     mintA,
+  mint2:     mintB,
+  ammConfig,
+  initialPrice,
+  startTime: new BN(0),
+  // 新增欄位：
+  collectFeeOn:        CollectFeeOn.Token1Only,   // 0 = FromInput, 1 = Token0Only, 2 = Token1Only
+  enableDynamicFee:    true,
+  dynamicFeeConfigId:  dynamicFeeConfig?.id,      // 不啟用動態手續費時可省略
+  txVersion: TxVersion.V0,
+});
+
+await execute({ sendAndConfirm: true });
+console.log("Customizable pool:", extInfo.address.id.toBase58());
+```
+
+若只需走預設手續費、不需限價單、不需動態手續費，仍可繼續使用 `createPool`。只要需要以上三個新開關中的任何一個，請改用 `createCustomizablePool`。鏈上帳戶清單詳見 [`products/clmm/instructions`](/zh-Hant/products/clmm/instructions)。
+
+## 限價單
+
+限價單會將用戶輸入停靠在單一 tick，並在 Swap 穿越該 tick 時依 FIFO 順序成交。成交後輸出會在結算時推送至持有人的 ATA；持有人無需在線即可被成交。
+
+### 開立限價單
+
+```ts
+import { TickUtils } from "@raydium-io/raydium-sdk-v2";
+
+const limitConfigs = await raydium.api.getClmmLimitOrderConfigs(); // GET /main/clmm-limit-order-config
+const limitConfig  = limitConfigs.find((c) => c.poolId === poolInfo.id);
+
+// 限價必須對齊至 tick_spacing。
+const targetPrice = new Decimal(180);                              // 以 180 USDC 賣出 SOL
+const { tick: limitTick } = TickUtils.getPriceAndTick({
+  poolInfo, price: targetPrice, baseIn: true,
+});
+
+const { execute } = await raydium.clmm.openLimitOrder({
+  poolInfo,
+  poolKeys,
+  limitOrderConfig: limitConfig,
+  inputMint: poolInfo.mintA.address,         // 賣出 SOL
+  inputAmount: new BN(50_000_000),           // 0.05 SOL
+  tick: limitTick,
+  txVersion: TxVersion.V0,
+});
+
+const { txId } = await execute({ sendAndConfirm: true });
+console.log("Limit order opened, tx:", txId);
+```
+
+SDK 依 `(pool, owner, tick, nonce)` 推導 `LimitOrderState` PDA，遞增每個 `(pool, owner)` 的 `LimitOrderNonce`，並將訂單插入該 tick 的 FIFO 佇列。
+
+### 增加／減少未成交訂單數量
+
+```ts
+await raydium.clmm.increaseLimitOrder({
+  poolInfo,
+  poolKeys,
+  limitOrderId: <LIMIT_ORDER_PUBKEY>,
+  addAmount: new BN(20_000_000),
+  txVersion: TxVersion.V0,
+}).then((b) => b.execute({ sendAndConfirm: true }));
+
+await raydium.clmm.decreaseLimitOrder({
+  poolInfo,
+  poolKeys,
+  limitOrderId: <LIMIT_ORDER_PUBKEY>,
+  removeAmount: new BN(10_000_000),
+  txVersion: TxVersion.V0,
+}).then((b) => b.execute({ sendAndConfirm: true }));
+```
+
+`decreaseLimitOrder` 只能從訂單的**未成交**部分移除數量；已成交部分在結算前處於鎖定狀態。若訂單已全數成交，兩個指令均會以 `InvalidOrderPhase` 回滾。
+
+### 結算已成交訂單
+
+```ts
+await raydium.clmm.settleLimitOrder({
+  poolInfo,
+  poolKeys,
+  limitOrderId: <LIMIT_ORDER_PUBKEY>,
+  txVersion: TxVersion.V0,
+}).then((b) => b.execute({ sendAndConfirm: true }));
+```
+
+`settleLimitOrder` 會對照佇列追蹤器讀取訂單的 `unfilled_ratio_x64`，計算已成交輸出，並將其轉入持有人的 ATA。持有人可自行呼叫此指令；`limit_order_admin`（鏈下運維 keeper）也可代為呼叫——輸出仍歸屬持有人。
+
+若要在全額結算後關閉訂單以回收租金，可使用 `closeLimitOrder`（單筆）或 `closeAllLimitOrder`（批次）。若要一次結算多筆，`settleAllLimitOrder` 會盡量將 `SettleLimitOrder` 呼叫打包至一筆 v0 交易。
+
+### 查詢錢包的掛單（鏈下）
+
+```ts
+// API 輔助。詳見 api-reference/temp-api-v1。
+const active = await fetch(
+  `https://temp-api-v1.raydium.io/limit-order/order/list?wallet=<your-wallet-pubkey>`,
+).then((r) => r.json());
+```
+
+掛單查詢端點會在同一回應中回傳未成交與部分成交的訂單（`totalAmount` / `filledAmount` / `pendingSettle` 分別代表各階段）。若要查詢已關閉的歷史訂單，請使用 `/limit-order/history/order/list-by-user?wallet=…`（依錢包查詢，以 `nextPageId` 分頁）；若要查詢特定訂單的完整事件日誌，請使用 `/limit-order/history/event/list-by-pda?pda=…`。
+
+## Rust CPI 骨架
+
+```rust
+use anchor_lang::prelude::*;
+use raydium_amm_v3::cpi;
+use raydium_amm_v3::program::AmmV3;
+use raydium_amm_v3::cpi::accounts::SwapV2;
+
+#[derive(Accounts)]
+pub struct ProxyClmmSwap<'info> {
+    #[account(mut)]
+    pub payer: Signer<'info>,
+    /// CHECK:
+    pub amm_config: UncheckedAccount<'info>,
+    #[account(mut)]
+    /// CHECK:
+    pub pool_state: UncheckedAccount<'info>,
+    #[account(mut)]
+    /// CHECK:
+    pub input_token_account: UncheckedAccount<'info>,
+    #[account(mut)]
+    /// CHECK:
+    pub output_token_account: UncheckedAccount<'info>,
+    #[account(mut)]
+    /// CHECK:
+    pub input_vault: UncheckedAccount<'info>,
+    #[account(mut)]
+    /// CHECK:
+    pub output_vault: UncheckedAccount<'info>,
+    #[account(mut)]
+    /// CHECK:
+    pub observation_state: UncheckedAccount<'info>,
+    /// CHECK:
+    pub token_program: UncheckedAccount<'info>,
+    /// CHECK:
+    pub token_program_2022: UncheckedAccount<'info>,
+    /// CHECK:
+    pub memo_program: UncheckedAccount<'info>,
+    /// CHECK:
+    pub input_vault_mint: UncheckedAccount<'info>,
+    /// CHECK:
+    pub output_vault_mint: UncheckedAccount<'info>,
+    pub clmm_program: Program<'info, AmmV3>,
+    // `remaining_accounts` 存放 tick_array 與 bitmap_extension 帳戶。
+}
+
+pub fn proxy_swap(
+    ctx: Context<ProxyClmmSwap>,
+    amount: u64,
+    other_amount_threshold: u64,
+    sqrt_price_limit_x64: u128,
+    is_base_input: bool,
+) -> Result<()> {
+    let cpi_accounts = SwapV2 {
+        payer:                 ctx.accounts.payer.to_account_info(),
+        amm_config:            ctx.accounts.amm_config.to_account_info(),
+        pool_state:            ctx.accounts.pool_state.to_account_info(),
+        input_token_account:   ctx.accounts.input_token_account.to_account_info(),
+        output_token_account:  ctx.accounts.output_token_account.to_account_info(),
+        input_vault:           ctx.accounts.input_vault.to_account_info(),
+        output_vault:          ctx.accounts.output_vault.to_account_info(),
+        observation_state:     ctx.accounts.observation_state.to_account_info(),
+        token_program:         ctx.accounts.token_program.to_account_info(),
+        token_program_2022:    ctx.accounts.token_program_2022.to_account_info(),
+        memo_program:          ctx.accounts.memo_program.to_account_info(),
+        input_vault_mint:      ctx.accounts.input_vault_mint.to_account_info(),
+        output_vault_mint:     ctx.accounts.output_vault_mint.to_account_info(),
+    };
+    let cpi_ctx = CpiContext::new(ctx.accounts.clmm_program.to_account_info(), cpi_accounts)
+        .with_remaining_accounts(ctx.remaining_accounts.to_vec());
+    cpi::swap_v2(cpi_ctx, amount, other_amount_threshold, sqrt_price_limit_x64, is_base_input)
+}
+```
+
+`SwapV2` 的 remaining account 順序：
+
+```
+[tick_array_bitmap_extension?, tick_array_0, tick_array_1, …]
+```
+
+若 Swap 不需要 extension，可省略；否則它必須是第一個 remaining account。
+
+## 常見錯誤
+
+- **tick 端點未對齊間距** → `InvalidTickIndex`。請務必透過 `TickUtils.getPriceAndTick` 對齊。
+- **`SwapV2` 傳入的 tick array 不足** → `TickArrayNotFound`。請使用 `computeAmountOutFormat` 取得完整清單。
+- **全區間倉位未附帶 bitmap extension** → extension PDA 必須設為可寫入；SDK 會自動處理。
+- **混淆 `sqrt_price_x64` 與 `price`** → 此處的 2 倍誤差特別難以排查。若有疑慮，讓 SDK 從人類可讀的價格自行計算。
+- **過於頻繁地領取獎勵** → 每次領取需消耗一筆交易。請透過 `harvestAllRewards` 跨多個倉位批次領取。
+- **在仍有 mint 租金的情況下銷毀 NFT** → `ClosePosition` 同時會關閉 NFT mint 與 ATA；請勿單獨關閉，否則程式會回滾。
+- **在非對齊 tick 開立限價單** → `InvalidTickIndex`。請務必透過 `TickUtils.getPriceAndTick` 對齊。
+- **對已全數成交的訂單呼叫 `decreaseLimitOrder`** → `InvalidOrderPhase`。請改用 `settleLimitOrder` 後再呼叫 `closeLimitOrder`。
+- **傳入 `enableDynamicFee: true` 卻忘記 `dynamicFeeConfigId`** → `CreateCustomizablePool` 會以 `InvalidDynamicFeeConfigParams` 回滾。請關閉動態手續費，或從 `/main/clmm-dynamic-config` 選擇一個設定。
+
+## 下一步
+
+- [`sdk-api/typescript-sdk`](/zh-Hant/sdk-api/typescript-sdk) — 完整 SDK 介面。
+- [`sdk-api/rest-api`](/zh-Hant/sdk-api/rest-api) — 報價與池元資料端點。
+- [`user-flows/create-clmm-pool`](/zh-Hant/user-flows/create-clmm-pool) — 非程式碼的操作說明。
+- [`integration-guides/aggregator`](/zh-Hant/integration-guides/aggregator) — 將 CLMM 納入路由路徑。
+
+參考來源：
+
+- [Raydium SDK v2](https://github.com/raydium-io/raydium-sdk-V2)
+- [Raydium SDK v2 demos](https://github.com/raydium-io/raydium-sdk-V2-demo)
+- [`raydium-io/raydium-clmm`](https://github.com/raydium-io/raydium-clmm)

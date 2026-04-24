@@ -1,0 +1,196 @@
+---
+title: "Aggregator integration"
+description: "How to discover Raydium pools, quote across CPMM / CLMM / AMM v4, and route atomic swaps through the right set of programs. Written for DEX aggregators and wallet swap UIs."
+---
+
+<Info>
+  An aggregator's job is to give a user the best possible price across many pools, possibly splitting a single input across multiple pool routes, and execute it atomically. This page documents the Raydium-specific pieces of that job: discovery, quoting, and transaction assembly.
+</Info>
+
+## Discovery
+
+### Pool inventory
+
+You need the full list of live Raydium pools for each product. Three options:
+
+1. **REST API** (simplest): `GET https://api-v3.raydium.io/pools/info/list?poolType=all&pageSize=1000&page=1` returns pools in batches of 1000. Paginate until you have them all. Cache for 1–5 minutes.
+2. **On-chain scan**: `getProgramAccounts` on CPMM, CLMM, and AMM v4 program IDs, filtered by the state account discriminator. Yields ~every live pool with ~10s of RPC time. Useful when the API is down or rate-limited.
+3. **Hybrid**: use the API as the primary source; run a daily on-chain scan as a sanity check. The team commits to keeping the API comprehensive, but pools created through direct CPI (no frontend) can occasionally lag.
+
+### Mint-pair lookup
+
+For a specific `(mintA, mintB)` pair, use `GET /pools/info/mint?mint1=...&mint2=...&poolType=all&sort=liquidity`. Returns every pool at any fee tier and product type. Up to ~10 results per pair is common on well-trafficked mints; sort by TVL and take the top few for routing.
+
+## Quoting
+
+Quote math differs per product. Use the SDK's pure math functions so you don't re-implement:
+
+```ts
+// CPMM
+const cpmmQuote = raydium.cpmm.computeAmountOut({
+  poolInfo: cpmmPool,
+  amountIn,
+  mintIn,
+  mintOut,
+  slippage: 0,        // compute exact expected; layer slippage at route level
+});
+
+// CLMM — crosses ticks; deterministic but more expensive.
+// `computeAmountOutFormat` is the canonical helper exposed via `PoolUtils` in
+// raydium-sdk-v2: the `*Format` suffix signals that it returns the output
+// pre-shaped for transaction building (including `remainingAccounts` for tick arrays).
+const { output: clmmOut, remainingAccounts } = PoolUtils.computeAmountOutFormat({
+  poolInfo:  clmmPool,
+  poolState: clmmPoolState,
+  tickArrayCache,
+  amountIn,
+  tokenIn:   mintIn,
+  slippage:  0,
+});
+
+// AMM v4
+const ammV4Quote = raydium.liquidity.computeAmountOut({
+  poolInfo: ammV4Pool,
+  amountIn,
+  mintIn: mintIn,
+  mintOut: mintOut,
+  slippage: 0,
+});
+```
+
+Returns for all three: `{ amountOut, fee, priceImpact, minAmountOut }`. For aggregator comparison, use `amountOut` (pre-slippage).
+
+### Cache freshness
+
+Pool state gets stale fast. Recommended freshness targets:
+
+| Pool type | Re-fetch frequency | Why |
+|-----------|---------------------|-----|
+| CPMM with `<$100k` TVL | `<10s` | Reserves move on every trade. |
+| CPMM with `>$10M` TVL | 30–60s | Reserves dominant; small trades are noise. |
+| CLMM | `<30s` | Tick boundaries; a single big trade can re-config liquidity. |
+| AMM v4 | `<30s` | OpenBook-side movements not captured in vaults. |
+
+For an aggregator taking quotes at interactive latency, subscribe to WebSocket account updates (`accountSubscribe`) on each relevant pool state. That flips the model from polling to push.
+
+### Token-2022 adjustments
+
+If any mint in the route has a Token-2022 transfer fee, the quote math must adjust inputs and outputs per [`algorithms/token-2022-transfer-fees`](/algorithms/token-2022-transfer-fees). The SDK handles this if the `poolInfo.mintA.extensions.transferFeeConfig` is populated. Confirm by looking at the `.extensions` field before trusting the quote.
+
+## Routing
+
+### Single-pool routes
+
+Most routes are single-pool. Pick the pool whose `amountOut` is highest. If multiple are close, tie-break by fee tier (lower is better), then by TVL (more is safer).
+
+### Split routing
+
+For large trades where a single pool has >5% price impact, split across pools. A simple greedy algorithm:
+
+```
+remaining = amountIn
+routes    = []
+while remaining > 0:
+    best_pool, best_size = argmax over pools of:
+        marginal_out_per_in(pool, current_size_toward_pool + epsilon)
+    size = min(remaining, best_pool.max_size_at_target_impact)
+    routes.append((best_pool, size))
+    remaining -= size
+```
+
+This produces a routing vector `[(pool_A, 0.6), (pool_B, 0.3), (pool_C, 0.1)]` that minimizes aggregate impact. A proper convex-optimization solution (e.g. equalize marginal prices across pools) is within ~1% of the greedy result in practice.
+
+### Multi-hop routes
+
+`USDC → RAY → SOL` via two separate pools is common when no direct `USDC-SOL` pool gives a good quote (rare). Apply per-hop slippage bounds; each hop enforces its own `minAmountOut`. See [`algorithms/slippage-and-price-impact`](/algorithms/slippage-and-price-impact).
+
+Multi-hop across the same pool (e.g. two CLMM hops on `SOL-USDC`) is always suboptimal vs a single hop — do not generate such routes.
+
+## Transaction assembly
+
+### Single-hop, single-pool
+
+Use the SDK's `raydium.trade.swap` directly:
+
+```ts
+const { execute } = await raydium.trade.swap({
+  poolKeys:        poolInfo,
+  amountIn,
+  amountOut:       quote.minAmountOut,
+  fixedSide:       "in",
+  inputMint:       mintIn,
+  txVersion:       TxVersion.V0,
+  computeBudgetConfig: {
+    units:         250_000,
+    microLamports: priorityFee,
+  },
+});
+```
+
+### Split and multi-hop
+
+Compose ATAs + instructions manually. Pattern:
+
+```
+[1] ComputeBudget set_compute_unit_limit
+[2] ComputeBudget set_compute_unit_price
+[3] createATA (if needed, once per mint the user doesn't hold)
+[4..N] SwapInstruction for each (pool, size) in routes
+[N+1] CloseAccount (if you wrap/unwrap SOL)
+```
+
+All inside one transaction for atomicity. For a 3-pool split on V0 with address lookup tables, this typically fits in ~1100 bytes. For 4+ pools, the transaction size cap forces either multi-tx or consolidation at a hub mint.
+
+### Atomicity
+
+Aggregators must guarantee atomicity: either the full route lands or none of it does. Raydium's swap instructions revert on `ExceededSlippage`, so a multi-pool route where one hop fails causes the whole transaction to revert. Free.
+
+The one exception: if your route goes through Raydium + a third-party DEX, make sure that DEX also has a revert-on-slippage model. Some programs ignore slippage bounds (rare).
+
+## Pitfalls
+
+### 1. Stale quotes
+
+Between the user seeing "You receive 125.43 RAY" and the transaction landing, reserves can shift. Re-fetch pool state immediately before submission; re-quote; if the new quote is >1% worse, pause and re-confirm with the user.
+
+### 2. Pool blacklists
+
+Some Raydium pools are scam tokens with transfer fees set to 99% or with non-transferable extensions. The REST API tags these (see the `tags` field); skip any pool tagged `scam` or `honeypot`. Running your own safety checks on top of Raydium's tags is prudent.
+
+### 3. Observation-state requirement on CLMM
+
+CLMM `SwapV2` takes an `observation_state` account. The SDK populates it for you; hand-built instructions often forget, which causes the program to revert with `AccountNotFound`. Always include it.
+
+### 4. Address lookup tables
+
+Raydium maintains public lookup tables for its most-used accounts (main mints, program IDs, AmmConfigs). Aggregators should consume these — it saves ~100 bytes per transaction and enables larger routes to fit in V0. Pulling the LUT addresses:
+
+```ts
+const raydiumLUTs = await raydium.getRaydiumLutAddresses();
+```
+
+### 5. Handling congestion
+
+During high-volume windows, transactions can sit in the mempool for multiple blocks. Aggressive retry on TX expiry (not on revert — reverts are deterministic) is recommended. The SDK's `sendAndConfirm` option does basic retries; production aggregators layer their own logic (Jito bundles, multi-RPC broadcast) on top.
+
+## Checklist
+
+Before going live, verify:
+
+- [ ] Pool discovery covers CPMM + CLMM + AMM v4 comprehensively.
+- [ ] Quotes match Raydium's own UI quote within 1 basis point on a handful of test trades.
+- [ ] Split routing kicks in for trades >5% impact on any single pool.
+- [ ] Priority fees are sized against recent pool-program fees (see [`integration-guides/priority-fee-tuning`](/integration-guides/priority-fee-tuning)).
+- [ ] Token-2022 transfer fees are computed and displayed to the user.
+- [ ] Transactions revert cleanly when slippage is exceeded.
+- [ ] Retry logic distinguishes tx expiry (retry) from revert (don't retry).
+
+## Pointers
+
+- [`integration-guides/routing-and-mev`](/integration-guides/routing-and-mev) — sandwich resistance, bundles.
+- [`integration-guides/priority-fee-tuning`](/integration-guides/priority-fee-tuning) — sizing compute-budget instructions.
+- [`sdk-api/rest-api`](/sdk-api/rest-api) — pool-list endpoints.
+
+Sources:
+
+- [Raydium SDK v2 `trade` module](https://github.com/raydium-io/raydium-sdk-V2)

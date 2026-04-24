@@ -1,0 +1,155 @@
+---
+title: "Routing math"
+description: "The router performs no pricing math itself; each hop delegates to its pool program's curve. Multi-hop slippage compounds; CLMM hops use limit_prices."
+---
+
+## The router does no math
+
+The routing program **does not implement any pricing logic**. It is a pure orchestrator: it accepts a route, passes accounts to child programs, and chains token flows.
+
+Each hop prices off its own pool program's curve:
+
+- **AMM v4 hops:** use the constant-product formula (`x · y = k`) with OpenBook hybrid pricing. See [`products/amm-v4/math`](/products/amm-v4/math).
+- **CPMM hops:** use the constant-product formula with configurable fee tiers. See [`products/cpmm/math`](/products/cpmm/math).
+- **CLMM hops:** use concentrated-liquidity tick math. See [`algorithms/clmm-math`](/algorithms/clmm-math).
+- **Stable hops:** use the stable-swap curve for like-kind assets. See [`products/stable/math`](/products/stable/math).
+
+The router's only involvement is:
+
+1. Calling each pool's swap instruction via CPI.
+2. Collecting the output amount.
+3. Passing it as the input amount to the next hop.
+4. Checking the final output against the caller's slippage limit.
+
+## Slippage compounding
+
+On a multi-hop route, slippage at each hop compounds. A small slippage on hop 1 becomes a larger slippage on hop 2 because the volume into hop 2 is already reduced.
+
+**Example:**
+
+```
+Route: USDC → SOL → STEP
+
+Pool 1 (USDC / SOL):
+  Input: 1000 USDC
+  Slippage: 1% (spot would give 0.5 SOL, but you get 0.495 SOL)
+  Output: 0.495 SOL
+
+Pool 2 (SOL / STEP):
+  Input: 0.495 SOL (already reduced)
+  Slippage: 1% (spot would give 495 STEP, but you get 490 STEP)
+  Output: 490 STEP
+
+Total effective slippage on USDC → STEP: 1.99%, not 1% + 1% = 2%.
+```
+
+When you provide `minimum_amount_out`, the router checks your final output against this global limit. Each hop also checks its own swap against its local fee structure, but the router does not re-quote mid-route—you must pre-compute the route and bake in enough slippage tolerance.
+
+## CLMM hops and limit_prices
+
+For each hop into a CLMM pool, the router checks that the pool's current `sqrt_price_x64` is within a specified bound. The bounds are passed as a `VecDeque<u128>` called `limit_prices`:
+
+- One `sqrt_price_x64` per CLMM hop in the route.
+- `sqrt_price_x64` is the tick-based price representation used by CLMM. See [`algorithms/clmm-math`](/algorithms/clmm-math) for the definition.
+- The router enforces:
+
+```
+  sqrt_price_lower <= pool.sqrt_price_x64 <= sqrt_price_upper
+```
+
+for each CLMM hop, rejecting the swap if the price is out of bounds.
+
+### Instruction variants and limit_prices
+
+- **`SwapBaseInWithUserAccount`, `SwapBaseOutWithUserAccount` (Legacy, tags 0 and 1):** the `limit_prices` VecDeque is **required**. An empty deque is rejected with an error if any hop is a CLMM pool. You must provide one price per CLMM hop, in order.
+
+- **`SwapBaseIn`, `SwapBaseOut` (Current, tags 8 and 9):** the `limit_prices` VecDeque is **optional**. An empty deque is silently ignored; no price check is performed. New code should use these.
+
+### Building limit_prices
+
+For a route with M CLMM hops, the deque should contain exactly M entries. Order them by hop:
+
+```
+limit_prices = [
+  sqrt_price_for_first_clmm_hop,
+  sqrt_price_for_second_clmm_hop,
+  ...
+]
+```
+
+### When to check limit_prices
+
+The `sqrt_price_x64` is a snapshot of the pool's current price. It changes continuously as swaps execute. You should:
+
+1. Fetch the pool's current state from on-chain.
+2. Compute acceptable bounds (e.g., ±0.5% of the current price).
+3. Encode those bounds into `limit_prices`.
+4. Include the bounds in your router instruction.
+
+If the pool's price drifts beyond your bounds before the transaction lands, the router will reject it.
+
+## Fee handling
+
+Each pool charges its own fee according to its configuration:
+
+- **AMM v4:** 0.25% (fixed) split between LP, protocol, and fund.
+- **CPMM:** configurable per `AmmConfig` (default 0.25%, split varies by tier).
+- **CLMM:** configurable per pool, taken off the input amount.
+- **Stable:** like AMM v4, 0.25% split.
+
+The router **takes no fee of its own**. All fee handling is delegated to each child pool. The output from hop N already has that hop's fee deducted.
+
+See the individual pool's fee documentation:
+
+- [`products/amm-v4/fees`](/products/amm-v4/fees)
+- [`products/cpmm/fees`](/products/cpmm/fees)
+- [`products/clmm/fees`](/products/clmm/fees) (if available)
+- [`products/stable/fees`](/products/stable/fees) (if available)
+
+## Multi-hop accounting example
+
+Suppose you route USDC → SOL → STEP across two constant-product pools, each with a 0.25% fee:
+
+```
+Input: 1000 USDC
+Pool 1 (USDC/SOL):
+  Fee taken: ceil(1000 * 0.25%) = 2.5 USDC
+  Net input to curve: 997.5 USDC
+  Curve output (before slippage): 0.5 SOL
+  Slippage margin: assume 1%, so you get ~0.495 SOL
+
+Pool 2 (SOL/STEP):
+  Input: 0.495 SOL
+  Fee taken: ceil(0.495 * 0.25%) ≈ 0.001 SOL
+  Net input to curve: 0.494 SOL
+  Curve output: ~494 STEP
+  Slippage margin: 1%, so you get ~489 STEP
+
+Final output: ~489 STEP
+```
+
+The router verifies:
+
+```
+489 >= minimum_amount_out  // specified by caller
+```
+
+If false, the entire route fails atomically.
+
+## Precision considerations
+
+Like all Solana programs, the router uses integer arithmetic:
+
+- All amounts are `u64` (lamports or token smallest units).
+- Curve calculations use `u128` intermediates where needed to avoid overflow.
+- Rounding conventions depend on the child program. The router does not re-round.
+
+If a hop produces a zero amount due to extreme price ratios (e.g., swapping 1 lamport on a 1B:1 pool), the router propagates that zero to the next hop, which may then reject it as insufficient. See the individual pool's error codes.
+
+## Where to go next
+
+- [`products/amm-v4/math`](/products/amm-v4/math) — constant-product math.
+- [`products/cpmm/math`](/products/cpmm/math) — CPMM constant-product with Token-2022.
+- [`algorithms/clmm-math`](/algorithms/clmm-math) — concentrated liquidity pricing.
+- [`products/stable/math`](/products/stable/math) — stable-swap curve.
+- [`products/routing/code-demos`](/products/routing/code-demos) — examples of quoting before routing.

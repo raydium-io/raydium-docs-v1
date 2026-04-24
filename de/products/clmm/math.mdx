@@ -1,0 +1,371 @@
+---
+title: "CLMM Mathematik"
+description: "Sqrt-Preis-Darstellung, Liquidität ↔ Token-Beträge, einzelner Tick-Tausch-Schritt, Multi-Tick-Iteration und Gebühren-Accounting."
+---
+
+<Info>
+  **Diese Seite wurde mit KI automatisch übersetzt. Maßgeblich ist stets die englische Version.**
+
+  [Englische Version ansehen →](/products/clmm/math)
+</Info>
+
+Diese Seite ist operativ: Sie enthält die Formeln, Fixed-Point-Konventionen und Schritt-für-Schritt-Vorgänge, die das CLMM-Programm verwendet. Zur Begründung der konzentrierten Liquiditätskurve selbst — warum `L = sqrt(x · y)` wichtig ist — siehe [`algorithms/clmm-math`](/de/algorithms/clmm-math). Diese Seite setzt voraus, dass Sie diese gelesen haben.
+
+## Sqrt-Preis-Darstellung
+
+CLMM speichert den Preis als `sqrt_price_x64` — die Quadratwurzel des Token1-pro-Token0-Preises, als Q64.64 Fixed-Point-Zahl:
+
+$$
+\text{sqrt\_price\_x64} = \lfloor \sqrt{p} \cdot 2^{64} \rfloor
+$$
+
+wobei `p = token1_amount / token0_amount`. Das Arbeiten mit `sqrt` statt `p` linearisiert die Tausch-Mathematik (Token-Betrags-Deltas werden linear in `Δsqrt_price`), und die `x64` Fixed-Point-Arithmetik erhält die Präzision über viele Ticks.
+
+Tick ↔ Sqrt-Preis-Umrechnung wird über eine `Bit-für-Bit`-Log-Approximation vorberechnet:
+
+$$
+\text{sqrt\_price\_x64}(t) \approx 2^{64} \cdot (1.0001)^{t/2}
+$$
+
+implementiert als lookup-basierte Exponentiation in `tick_math::get_sqrt_price_at_tick`.
+
+## Liquidität als kanonische Einheit
+
+Innerhalb eines Bereichs `[sqrt_a, sqrt_b]` (mit `sqrt_a < sqrt_b`) wird eine Position mit **Liquidität `L`** folgendermaßen auf Token-Beträge abgebildet. Sei `sqrt_c = sqrt_price_x64` der aktuelle Preis des Pools.
+
+| Fall | `amount0` | `amount1` |
+|------|-----------|-----------|
+| `sqrt_c <= sqrt_a` (Pool-Preis unter Bereich) | `L · (sqrt_b - sqrt_a) / (sqrt_a · sqrt_b)` | `0` |
+| `sqrt_a < sqrt_c < sqrt_b` (im Bereich) | `L · (sqrt_b - sqrt_c) / (sqrt_c · sqrt_b)` | `L · (sqrt_c - sqrt_a)` |
+| `sqrt_c >= sqrt_b` (Pool-Preis über Bereich) | `0` | `L · (sqrt_b - sqrt_a)` |
+
+Alle drei Identitäten stammen aus der Invarianten `x = L / sqrt_p`, `y = L · sqrt_p`, die konzentrierte Liquidität innerhalb eines Bereichs erfüllt.
+
+Integratoren möchten normalerweise das Inverse: Bei einer Einzahlung von `amount0` / `amount1` das maximale `L` berechnen, das in den Bereich passt. Die SDK-Methode `LiquidityMath.getLiquidityFromTokenAmounts` macht dies. Die Formel für den In-Range-Fall:
+
+$$
+L_0 = \text{amount0} \cdot \frac{\text{sqrt\_c} \cdot \text{sqrt\_b}}{\text{sqrt\_b} - \text{sqrt\_c}},
+\qquad
+L_1 = \frac{\text{amount1}}{\text{sqrt\_c} - \text{sqrt\_a}},
+\qquad
+L = \min(L_0, L_1)
+$$
+
+Welche Seite bindend ist, bestimmt das tatsächlich verbrauchte Verhältnis; die andere Seite kann Reste haben.
+
+## Einzelner Tick-Tausch-Schritt
+
+Ein Tausch wird in **Schritten** durchgeführt. Jeder Schritt entweder (a) verbraucht die gesamte verfügbare Eingabe innerhalb des aktuellen Tick-Bereichs, ohne einen Tick zu überschreiten, oder (b) bewegt den Preis exakt zum nächsten initialisierten Tick.
+
+Gegeben den aktuellen Zustand `(sqrt_c, L)` und einen Tausch nach **oben** (Token0 rein, Token1 raus, `sqrt_price` steigt), ist die Distanz zum nächsten initialisierten Tick `sqrt_t`. Innerhalb dieses Mikro-Intervalls ist die Beziehung zwischen Eingabe und Preis:
+
+$$
+\Delta\text{amount0} = L \cdot \left( \frac{1}{\text{sqrt\_c}} - \frac{1}{\text{sqrt\_t}} \right)
+= \frac{L \cdot (\text{sqrt\_t} - \text{sqrt\_c})}{\text{sqrt\_c} \cdot \text{sqrt\_t}}
+$$
+
+und
+
+$$
+\Delta\text{amount1} = L \cdot (\text{sqrt\_t} - \text{sqrt\_c})
+$$
+
+Das Programm macht eines von zwei Dingen:
+
+- **Passt die gesamte Eingabe?** Wenn die verbleibende Eingabe (nach Gebühren) kleiner ist als `Δamount0` um `sqrt_t` zu erreichen, lösen Sie für das neue `sqrt_c'` exakt auf:
+
+  $$
+  \text{sqrt\_c}' = \frac{L \cdot \text{sqrt\_c}}{L + \Delta\text{input} \cdot \text{sqrt\_c}}
+  $$
+
+  (für einen exakten `token0 → token1` Tausch). Der Tausch endet in diesem Schritt, ohne einen Tick zu überschreiten.
+
+- **Eingabe übersteigt `Δamount0`?** Setzen Sie `sqrt_c' = sqrt_t`, überschreiten Sie den Tick (wenden Sie `liquidity_net` an), dekrementieren Sie die verbleibende Eingabe um `Δamount0`, inkrementieren Sie die Ausgabe um `Δamount1`, und wiederholen Sie.
+
+Für die entgegengesetzte Richtung (`token1 → token0`, Preis geht hinunter) haben die Formeln `sqrt_c` und `sqrt_t` vertauscht und die Inversion im anderen Slot.
+
+Die vollständige Rust-Implementierung befindet sich in `raydium-clmm/programs/amm/src/libraries/swap_math.rs`. Die Logik dort entspricht Uniswap v3's `SwapMath.computeSwapStep` eins-zu-eins.
+
+## Gebühren bei jedem Schritt
+
+Handelsgebühren werden vom **Eingabe**-Betrag in jedem Schritt abgezogen, gleiche Konvention wie CPMM:
+
+```
+step_fee_amount  = ceil(step_input * trade_fee_rate / 1_000_000)
+step_net_input   = step_input - step_fee_amount
+protocol_portion = floor(step_fee_amount * protocol_fee_rate / 1_000_000)
+fund_portion     = floor(step_fee_amount * fund_fee_rate     / 1_000_000)
+lp_portion       = step_fee_amount - protocol_portion - fund_portion
+```
+
+Der LP-Anteil wird auf die aktuell im Bereich befindliche Liquidität aufgeteilt, indem der globale Gebühren-Wachstums-Akkumulator aktualisiert wird:
+
+$$
+\text{fee\_growth\_global}_{\text{in}} \mathrel{+}= \text{lp\_portion} \cdot \frac{2^{64}}{L}
+$$
+
+— d. h., es ist in *Gebühren pro Liquiditätseinheit* bezeichnet, Q64.64, so dass eine Position der Größe `L_i`, die während dieses Tauschs im Bereich geblieben ist, später `L_i · Δfee_growth_global / 2^{64}` fällige Token zurückliest.
+
+Die Protocol- und Fund-Anteile sammeln sich in `PoolState.protocol_fees_token_{0,1}` bzw. `PoolState.fund_fees_token_{0,1}` an, identisch mit CPMM. Sie werden von `CollectProtocolFee` / `CollectFundFee` eingezogen.
+
+## Gebühren-Wachstum außerhalb und innerhalb
+
+Der knifflige Teil der CLMM Gebühren-Abrechnung: eine Position verdient Gebühren nur, während der Pool-Preis **innerhalb** seines Bereichs ist. Der Pool verfolgt kumulative Gebühren global; die Position muss die kumulativen Gebühren *während sie in seinem spezifischen Bereich ist* kennen.
+
+Die Lösung ist ein **Tick-basierter** Akkumulator. Jeder Tick speichert:
+
+```
+fee_growth_outside_0_x64
+fee_growth_outside_1_x64
+```
+
+Im Moment der Tick-Initialisierung:
+
+- Wenn der Pool-Preis **über** diesem Tick liegt (`tick_current >= this_tick`), ist `fee_growth_outside = fee_growth_global`. (Alles bisher Verdiente ist „außerhalb" — d. h., unter — diesem Tick, relativ zum aktuellen Preis.)
+- Andernfalls `fee_growth_outside = 0`.
+
+Wenn der Preis einen Tick überschreitet, **kehrt** das Programm das `fee_growth_outside` dieses Ticks um:
+
+$$
+\text{fee\_growth\_outside} \gets \text{fee\_growth\_global} - \text{fee\_growth\_outside}
+$$
+
+Die Invariante, die dies bewahrt: für jeden Tick `t`, `fee_growth_outside(t)` gleich die Gebühren, die sich ansammelten, während `tick_current` auf der gegenüberliegenden Seite von `t` war.
+
+**Gebühren-Wachstum innerhalb eines Bereichs `[tick_lower, tick_upper]`** wird dann abgeleitet:
+
+```
+if tick_current >= tick_upper:
+    fee_growth_below = fee_growth_outside(tick_lower)
+    fee_growth_above = fee_growth_global - fee_growth_outside(tick_upper)
+elif tick_current >= tick_lower:
+    fee_growth_below = fee_growth_outside(tick_lower)
+    fee_growth_above = fee_growth_outside(tick_upper)
+else:
+    fee_growth_below = fee_growth_global - fee_growth_outside(tick_lower)
+    fee_growth_above = fee_growth_outside(tick_upper)
+
+fee_growth_inside = fee_growth_global - fee_growth_below - fee_growth_above
+```
+
+Dies ist die Uniswap-v3 Gebühren-Wachstums-Formel, unverändert.
+
+## Was eine Position speichert und was sie liest
+
+Eine `PersonalPositionState` speichert `fee_growth_inside_0_last_x64` und `fee_growth_inside_1_last_x64`: die `fee_growth_inside` Werte zum letzten Mal, als die Position berührt wurde.
+
+Beim nächsten Anfassen (erhöhen, verringern, einziehen), macht das Programm:
+
+1. Berechnet die aktuelle `fee_growth_inside_{0,1}_x64` unter Verwendung der obigen Formel.
+2. Berechnet `Δ = fee_growth_inside_now − fee_growth_inside_last` (modulare Subtraktion auf u128).
+3. Addiert `Δ × position.liquidity / 2^{64}` zu `tokens_fees_owed_{0,1}`.
+4. Aktualisiert `fee_growth_inside_last` auf den neuen Wert.
+
+Token bewegen sich tatsächlich nur aus den Vaults bei `CollectFees` / `DecreaseLiquidity`, gegen `tokens_fees_owed`.
+
+## Belohnungen
+
+Jedes der bis zu 3 Belohnungs-Streams des Pools verwendet die gleiche Growth-Inside-Mechanik in seinem eigenen `reward_growth_global_x64` Akkumulator. Bei Emissionszeit:
+
+$$
+\text{reward\_growth\_global} \mathrel{+}= \text{emission\_per\_second} \cdot \Delta t \cdot \frac{2^{64}}{L}
+$$
+
+— Emissionen skalieren umgekehrt mit aktiver Liquidität, so dass ein dichterer Pool jeder Position proportional weniger pro Sekunde zahlt, aber über mehr Positionen insgesamt. Die pro Position geschuldete Belohnung ist
+
+$$
+\text{reward\_owed} = (\text{reward\_growth\_inside}_{\text{now}} - \text{reward\_growth\_inside}_{\text{last}}) \cdot L / 2^{64}
+$$
+
+und wird via `CollectReward` eingefordert. Siehe [`products/clmm/fees`](/de/products/clmm/fees).
+
+## Durchgerechnetes Beispiel: Exakter-Input-Tausch
+
+Angenommen:
+
+- `tick_spacing = 60`
+- `sqrt_price_x64 = 1 × 2^{64}` — Preis = 1.0, also `tick_current = 0`.
+- Aktive Liquidität `L = 1_000_000 × 2^{64}`.
+- Nächster initialisierter Tick oben: `t = 60` (sqrt_price_b ≈ `1.003004 × 2^{64}`).
+- Handelsgebühren-Satz: 500 (0,05%).
+
+Benutzer: `SwapBaseInput` exakte Eingabe 1.000 Token0.
+
+Schritt 1 — Gebühren:
+
+```
+trade_fee       = ceil(1000 * 500 / 1_000_000)  = 1
+step_net_input  = 999
+```
+
+Schritt 2 — passt 999 in den aktuellen Tick-Bereich?
+
+```
+Δ zum nächsten Tick (amount0):
+  L · (sqrt_t - sqrt_c) / (sqrt_c * sqrt_t)
+  ≈ 1_000_000 · (1.003004 − 1) / (1 · 1.003004)
+  ≈ 2995.5 Token0
+```
+
+`999 < 2995.5`, also passt die gesamte Eingabe ohne Tick-Überschreitung.
+
+Schritt 3 — neuer Preis:
+
+```
+sqrt_c' = L · sqrt_c / (L + Δin · sqrt_c)
+        = 1_000_000 · 1 / (1_000_000 + 999 · 1)
+        ≈ 0.999001
+```
+
+d. h., `sqrt_c'` leicht unter `sqrt_c`. Beachten Sie, dass die obige Formel für einen `token1 → token0` Tausch ist. Das Beispiel hier ist `token0 → token1`, das den Preis **nach oben** treibt, nicht nach unten — also verwenden wir die entsprechende Form für `token0 rein`:
+
+```
+sqrt_c' = sqrt_c + Δin / L
+        = 1 + 999 / 1_000_000
+        = 1.000999
+```
+
+(dies entspricht der erwarteten Tausch-Richtung für `token0 → token1`: `sqrt_c` steigt zusammen mit dem Preis.)
+
+Schritt 4 — Betrag raus:
+
+```
+Δout Token1 = L · (sqrt_c' − sqrt_c)
+            = 1_000_000 · 0.000999
+            = 999.00
+```
+
+Nach Berücksichtigung von Rundung erhält der Benutzer ≈ 999 Token1. Die Gebühr (1 Token0) wird zwischen LP, Protocol und Fund aufgeteilt nach `trade_fee_rate × protocol_fee_rate / 1e6` (und ähnlich für Fund); der LP-Anteil fließt in `fee_growth_global_0_x64`.
+
+## Limit-Order-Matching während Tausch
+
+Wenn ein Tausch-Schritt einen Tick überschreitet, der offene Limit Orders hält, verbrauchen diese Orders Tausch-Eingabe **vor** der LP-Kurve, zum exakten Preis des Ticks. Das Matching ist FIFO innerhalb des Ticks nach `order_phase` Kohorte.
+
+### Pro-Kohorte-Status auf `TickState`
+
+```
+order_phase                  : u64    monotone Kohorten-ID
+orders_amount                : u64    Input-Token-Summe in der aktuellen (neuesten) Kohorte
+part_filled_orders_remaining : u64    verbleibende Eingabe der Kohorte, die der Tausch gerade füllt
+unfilled_ratio_x64           : u128   Q64.64 Füllverhältnis für die teilweise gefüllte Kohorte
+```
+
+Das Zwei-Kohorten-Layout existiert, weil neue Orders auf einem Tick geöffnet werden können, *während* eine ältere Kohorte noch gefüllt wird. Neu geöffnete Orders treten `orders_amount` bei und erben die nächste `order_phase`; sie können nicht füllen, bis die vorherige Kohorte vollständig verbraucht ist.
+
+### Matching-Schritt
+
+Pseudo-Code für das Matching, das bei jedem Tick-Überschreitung während eines Tauschs geschieht:
+
+```
+fn match_limit_orders_at_tick(tick, swap_input_remaining, sqrt_p):
+    # 1. Versuchen Sie zuerst die teilweise gefüllte Kohorte zu füllen.
+    if tick.part_filled_orders_remaining > 0:
+        consume = min(tick.part_filled_orders_remaining, swap_input_remaining)
+        # Aktualisieren Sie das Unfilled-Verhältnis für diese Kohorte.
+        tick.unfilled_ratio_x64 *= (1 - consume / tick.part_filled_orders_remaining)
+        tick.part_filled_orders_remaining -= consume
+        swap_input_remaining -= consume
+        if tick.part_filled_orders_remaining == 0:
+            tick.unfilled_ratio_x64 = 0
+        if swap_input_remaining == 0: return
+
+    # 2. Befördern Sie die aktive Kohorte.
+    if tick.orders_amount > 0:
+        tick.part_filled_orders_remaining = tick.orders_amount
+        tick.orders_amount = 0
+        tick.order_phase += 1
+        tick.unfilled_ratio_x64 = ONE_X64
+        # Rekurieren Sie mit der frisch beförderten Kohorte.
+        return match_limit_orders_at_tick(tick, swap_input_remaining, sqrt_p)
+
+    return  # tick hat keine Limit Orders mehr
+```
+
+Ausgabe-Token, die an die Limit-Order-Besitzer gehen, werden **nicht** pro Tausch transferiert. Sie sitzen virtuell im Output-Vault des Pools, bis der Order-Besitzer `SettleLimitOrder` (oder `DecreaseLimitOrder`) aufruft. Der Pool verfolgt einfach, wie viel von der Kohorte nun gefüllt ist via `unfilled_ratio_x64`. Jedes `LimitOrderState` speichert seine eigene `(order_phase, unfilled_ratio_x64)` Momentaufnahme bei der Eröffnung, also reduziert sich die Abrechnung auf:
+
+```
+filled_amount  = total_amount × (1 − tick_now.unfilled_ratio_x64 / order.unfilled_ratio_x64)
+                if tick_now.order_phase > order.order_phase
+                else 0
+output_amount  = price_at(tick_index) × filled_amount   # adjusted for direction
+```
+
+Diese O(1) Abrechnung ist der ganze Sinn des Kohorten-Designs — ein Tick kann beliebig viele Orders füllen, ohne Pro-Order-Gas.
+
+### Interaktion mit der LP-Kurve
+
+In einem Tausch-Schritt geschieht Limit-Order-Matching **am** Tick (null `Δsqrt_price`); LP-Kurven-Verbrauch geschieht **zwischen** Ticks. Die Reihenfolge ist daher:
+
+1. Überschreiten Sie Tick `t_cross` (wenden Sie LP `liquidity_net` Änderung zuerst an, da dies ist, wie Uniswap-V3 es macht).
+2. Füllen Sie alle Limit Orders, die auf `t_cross` sitzen.
+3. Fahren Sie entlang der LP-Kurve zum nächsten initialisierten Tick oder zur `swap_input` Erschöpfung fort.
+
+Limit Orders geben Händlern somit *mehr* effektive Liquidität genau zum Order-Preis (ein Preis-Verbesserungs-Effekt), auf Kosten, dass LPs keine Gebühren auf diesem Portion des Tausch-Volumens verdienen — die Limit-Order-Portion des Handels ist gebührenfrei für den Swapper, da der Limit-Order-Platzerer als Maker agiert. Der dynamische Gebühren-Aufschlag (falls aktiviert) gilt immer noch für die LP-Portion desselben Tauschs.
+
+## Dynamische Gebühren-Ableitung
+
+`PoolState.dynamic_fee_info` trägt den Volatilitätszustand. Jeder Tausch-Schritt berechnet den Pro-Schritt-Gebührensatz als:
+
+$$
+\text{fee\_rate}_{\text{total}} = \text{trade\_fee\_rate}_{\text{config}} +
+\underbrace{\frac{\text{dynamic\_fee\_control} \cdot (\text{vol\_acc} \cdot \text{tick\_spacing})^2}
+{D_{\text{ctrl}} \cdot S_{\text{vol}}^2}}_{\text{dynamic surcharge}}
+$$
+
+wobei:
+
+- $D_{\text{ctrl}} = 100{,}000$ — `DYNAMIC_FEE_CONTROL_DENOMINATOR`
+- $S_{\text{vol}} = 10{,}000$ — `VOLATILITY_ACCUMULATOR_SCALE`
+- `vol_acc` ist der Pro-Tausch-Akkumulator nach der Aktualisierungsregel unten
+- `tick_spacing` ist aus `PoolState.tick_spacing`
+
+Das Ergebnis wird bei $100{,}000 / 10^6 = 10\%$ begrenzt.
+
+### Akkumulator-Aktualisierung
+
+Zwei Regeln werden bei jedem Tausch angewendet, in dieser Reihenfolge:
+
+**Zerfall.** Die Referenz-Bodensatz verfällt basierend auf der Zeit seit letzter Aktualisierung:
+
+$$
+\text{vol\_ref} = \begin{cases}
+0 & \text{wenn } \Delta t > \text{decay\_period} \\
+\text{vol\_acc}_{\text{prev}} \cdot \dfrac{\text{reduction\_factor}}{10{,}000} & \text{wenn } \text{filter\_period} < \Delta t \le \text{decay\_period} \\
+\text{vol\_ref}_{\text{prev}} & \text{wenn } \Delta t \le \text{filter\_period}
+\end{cases}
+$$
+
+**Akkumulieren.** Der neue Akkumulator ist die Referenz plus Tick-Distanz durchlaufen seit dem vorherigen Referenz-Index:
+
+$$
+\text{vol\_acc} = \min\left(
+    \text{vol\_ref} + \left| t_{\text{ref}} - t_{\text{now}} \right| \cdot S_{\text{vol}},
+    \text{max\_vol\_acc}
+\right)
+$$
+
+`tick_spacing_index_reference` ($t_{\text{ref}}$) ist in Tick-Spacing-Einheiten, nicht rohen Ticks: $t_{\text{ref}} = \lfloor \text{tick\_current} / \text{tick\_spacing} \rfloor$.
+
+### Warum parabolisch in Tick-Distanz
+
+Das Quadrieren des Akkumulators bedeutet, die Gebühr steigt als das *Quadrat* wie weit der Preis von seinem Referenzpunkt weggelaufen ist. Empirisch stimmt dies mit der Varianz-Skalierung des Preises unter Random-Walk-Druck überein: eine 2× Tick-Exkursion impliziert 4× die implizierte Volatilität, also berechnet 4× den Aufschlag. Der `dynamic_fee_control` Parameter kalibriert das absolute Niveau.
+
+Das `filter_period` Fenster verhindert, dass winzige Sub-Sekunden-Oszillationen (z. B. MEV-Bots-Sandwiching) den Akkumulator aufblasen. Das `decay_period` Fenster verhindert, dass ein einzelner vergangener Spike Gebühren auf unbestimmte Zeit nach der Markt-Beruhigung berechnet.
+
+## Numerische Robustheit
+
+- Alle Zwischenprodukte durchlaufen `u128` oder `u256`-ähnliche Arithmetik. CLMM verwendet `U128Sqrt` Hilfsmittel und `FullMath::mulDiv` Muster direkt aus Uniswap v3 portiert.
+- Divisions-Rundung wird pro Schritt gewählt, um die Invariante `k' ≥ k` lokal durchzusetzen. `SwapBaseInput` rundet Ausgabe **hinunter**; `SwapBaseOutput` rundet Eingabe **hinauf**.
+- Tick-Überschreitungen, die `PoolState.liquidity` auf Null fallen lassen, sind erlaubt (der Preis kann ein „Liquiditätsloch" durchlaufen), aber der Tausch rückt einfach zum nächsten initialisierten Tick vor, ohne Eingabe zu verbrauchen, ohne Gebühren zu berechnen.
+- Overflow-Schutz: `sqrt_price_x64` wird im inklusiven Bereich `[MIN_SQRT_PRICE_X64, MAX_SQRT_PRICE_X64]` entsprechend `[MIN_TICK, MAX_TICK]` gehalten. Ein Tausch, der über beide Grenzen hinaus gehen würde, wird mit `SqrtPriceLimitOverflow` rückgängig gemacht.
+
+## Nächste Schritte
+
+- [`products/clmm/ticks-and-positions`](/de/products/clmm/ticks-and-positions) wie die Tick-Karte bei dem Durchgang teilnimmt.
+- [`products/clmm/fees`](/de/products/clmm/fees) für die Gebühren-/Belohnungs-Seite der Mathematik im Detail.
+- [`algorithms/clmm-math`](/de/algorithms/clmm-math) für die Ableitungen hinter `L = sqrt(x · y)` und den Bereichs-vs-Liquiditäts-Formeln.
+
+Quellen:
+
+- [`raydium-io/raydium-clmm` — `libraries/swap_math.rs`, `libraries/tick_math.rs`](https://github.com/raydium-io/raydium-clmm)
+- "Uniswap v3 Core" Whitepaper, §6–7

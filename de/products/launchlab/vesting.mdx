@@ -1,0 +1,241 @@
+---
+title: "LaunchLab-Vesting"
+description: "Gesperrte Token, Cliff- und linearer Freigabezeitplan, das VestingRecord-Konto pro Begünstigtem sowie die Create- und Claim-Instruktionen, die Gründer und Plattformen verwenden, um die reservierte Versorgung nach der Graduation zu verteilen."
+---
+
+<Info>
+  **Diese Seite wurde mit KI automatisch übersetzt. Maßgeblich ist stets die englische Version.**
+
+  [Englische Version ansehen →](/products/launchlab/vesting)
+</Info>
+
+<Info>
+  Vesting ist **optional** bei einem LaunchLab-Launch. Setzen Sie `vesting_param.total_locked_amount = 0` bei `Initialize`, und der folgende Abschnitt gilt nicht. Einmal aktiviert, bleibt der Zeitplan für die gesamte Lebensdauer des Launches festgelegt; Cliff und Unlock-Perioden können später nicht rückwirkend geändert werden.
+</Info>
+
+## Warum Vesting?
+
+Die Bonding Curve verkauft während der Fundraising-Phase `base_supply_graduation` Token und bestückt den Pool nach der Graduation mit dem Rest. Vesting entzieht der Versorgung zusätzlich eine Portion, sperrt sie für einen konfigurierbaren Cliff, gibt sie dann aber linear an einen oder mehrere Begünstigte frei – typischerweise das Team des Gründers, Berater oder Plattformpartner.
+
+Praktische Anwendungsfälle:
+
+- **Team-Zuteilung.** Ein Gründer reserviert z. B. 5 % der Versorgung für das Gründungsteam, gesperrt für 6 Monate und linear über die folgenden 12 Monate freigegeben.
+- **Plattform-Zuteilung.** Eine Launch-Plattform erhält einen Anteil an jedem Token, den sie auflistet, nach dem gleichen Zeitplan, über `CreatePlatformVestingAccount`.
+- **Berater- / Mitwirkendenzuschüsse.** Mehrere Begünstigte mit eigenen `VestingRecord`-Konten, die jeweils ihren beanspruchten Betrag unabhängig nachverfolgen.
+
+Gesperrte Token treten nie in die Curve ein und sind nicht Teil der Graduation LP. Sie ruhen untätig im `base_vault` des Pools, bis jeder Begünstigte `ClaimVestedToken` aufruft.
+
+## Zeitplan-Form
+
+Vesting für einen Launch wird durch drei Zahlen beschrieben, die einmalig bei `Initialize` erfasst werden:
+
+| Feld | Typ | Bedeutung |
+|------|-----|----------|
+| `total_locked_amount` | `u64` | Summe aller Basis-Token, die über alle Begünstigten gesperrt sind (Gründer + Plattform). Muss `total_locked_amount <= supply * max_lock_rate / 1_000_000` aus der `GlobalConfig` erfüllen. |
+| `cliff_period` | `u64` (Sekunden) | Wartezeit nach Abschluss der Fundraising, bevor Token freigeschaltet werden. |
+| `unlock_period` | `u64` (Sekunden) | Dauer des linearen Freigabefensters nach dem Cliff. `0` bedeutet, dass alles am Ende des Cliff sofort freigegeben wird. |
+
+Diese drei Werte befinden sich auf `PoolState.vesting_schedule` (eine `VestingSchedule`-Struktur) plus dem On-Chain-`start_time`, den das Programm als `block_time + cliff_period` in dem Moment erfasst, in dem die Fundraising erfolgreich endet (wenn Graduationsbedingungen zuerst erfüllt sind).
+
+```rust
+// states/pool.rs
+pub struct VestingSchedule {
+    pub total_locked_amount:     u64,
+    pub cliff_period:            u64,
+    pub unlock_period:           u64,
+    pub start_time:              u64,   // von Programm bei Fundraising-Ende gesetzt
+    pub allocated_share_amount:  u64,   // laufende Summe der Zuordnungen zu Vesting-Records
+}
+```
+
+`allocated_share_amount` ist der Gesamtbetrag, der bereits über `CreateVestingAccount` / `CreatePlatformVestingAccount` `VestingRecord`-Konten zugeordnet wurde. Darf nie `total_locked_amount` überschreiten. Wenn ein Gründer über-allokiert, wird der nächste `CreateVestingAccount`-Aufruf mit `InvalidTotalLockedAmount` rückgängig gemacht.
+
+## Lineare Freigabeformel
+
+Nach Ende der Fundraising berechnet das Programm den kumulativen freigegeben Betrag für jeden `VestingRecord` wie folgt:
+
+```
+elapsed         = min(now, start_time + unlock_period) − start_time
+unlocked_amount = token_share_amount × elapsed / unlock_period
+```
+
+Wenn `unlock_period == 0`, wird der gesamte `token_share_amount` in einem Schritt bei `start_time` abrufbar. Andernfalls ist die Kurve eine gerade Linie von 0 bei `start_time` bis `token_share_amount` bei `start_time + unlock_period`, danach auf `token_share_amount` begrenzt.
+
+Der auf jedem `ClaimVestedToken`-Aufruf übertragene Betrag ist die Differenz zwischen dem neu berechneten kumulativen freigegeben Betrag und dem laufenden `claimed_amount`-Feld im Record.
+
+```
+delta_amount    = unlocked_amount − vesting_record.claimed_amount
+vesting_record.claimed_amount = unlocked_amount
+```
+
+Eine Inanspruchnahme vor `start_time` wird mit `VestingNotStarted` rückgängig gemacht. Eine Inanspruchnahme nach `start_time + unlock_period` begleicht den verbleibenden Rest.
+
+## Konto-Layouts
+
+### `VestingSchedule`
+
+Befindet sich inline auf `PoolState`. Siehe [`accounts`](/de/products/launchlab/accounts).
+
+### `VestingRecord`
+
+Pro-Begünstigter Record. PDA abgeleitet als:
+
+```
+seeds = [
+  b"pool_vesting",
+  pool_state.key(),
+  beneficiary.key(),
+]
+program = LaunchLab-Programm
+```
+
+```rust
+// states/vesting.rs
+#[account]
+pub struct VestingRecord {
+    pub epoch:               u64,         // recent_epoch-Tracker
+    pub pool:                Pubkey,      // Rückverweis auf PoolState
+    pub beneficiary:         Pubkey,      // wer ClaimVestedToken aufrufen darf
+    pub claimed_amount:      u64,         // kumulativ beansprucht
+    pub token_share_amount:  u64,         // insgesamt diesem Begünstigten zugeordnet
+    pub padding:             [u64; 8],
+}
+```
+
+Ein Begünstigter kann nur **einen** `VestingRecord` pro Launch haben. Eine erneute Zuordnung zum gleichen Begünstigten auf dem gleichen Launch wird rückgängig gemacht, da die PDA bereits existiert.
+
+## Instruktionen
+
+### `CreateVestingAccount`
+
+Nur Gründer. Weist einen Anteil des Pools `total_locked_amount` einem neuen Begünstigten zu, indem eine neue `VestingRecord`-PDA initialisiert wird.
+
+**Argumente**
+
+```
+share_amount: u64    // Token, die diesem Begünstigten zugeordnet werden
+```
+
+**Konten**
+
+| # | Name | W | S | Anmerkungen |
+|---|------|---|---|-----------|
+| 1 | `creator` | W | S | Muss `pool_state.creator` entsprechen; zahlt Miete für das neue Konto. |
+| 2 | `beneficiary` | W |   | Empfängt die entsperrten Token später. Der Pubkey ist hier gesperrt – kann nicht geändert werden. |
+| 3 | `pool_state` | W |   | Mutiert, um `vesting_schedule.allocated_share_amount` zu erhöhen. |
+| 4 | `vesting_record` | W |   | `init`; PDA `[b"pool_vesting", pool_state, beneficiary]`. |
+| 5 | `system_program` |   |   | Erforderlich für Kontoerstellung. |
+
+**Vorbedingungen**
+
+- `share_amount > 0`.
+- `pool_state.vesting_schedule.allocated_share_amount + share_amount <= total_locked_amount`.
+- Der `beneficiary`-Pubkey hat keinen bestehenden `VestingRecord` für diesen Pool.
+
+**Nachbedingungen**
+
+- `vesting_record` initialisiert mit `token_share_amount = share_amount`, `claimed_amount = 0`.
+- `pool_state.vesting_schedule.allocated_share_amount += share_amount`.
+
+**Häufige Fehler** — `InvalidTotalLockedAmount`, `InvalidInput`.
+
+### `CreatePlatformVestingAccount`
+
+Plattform-Admin-Variante von `CreateVestingAccount`. Das Vesting-Wallet der Plattform (gespeichert auf `PlatformConfig.platform_vesting_wallet`) ist der Begünstigte, und der Anteil ist durch `PlatformConfig.platform_vesting_scale` begrenzt.
+
+Der Unterzeichner muss `platform_config.platform_vesting_wallet` entsprechen. Andere Konten spiegeln `CreateVestingAccount`. Verwenden Sie dies, wenn sich eine Plattform darauf einigt, auf jedem Launch, den sie auflistet, einen festen Vesting-Anteil zu erhalten.
+
+### `ClaimVestedToken`
+
+Nur Begünstigter. Überträgt alle neu freigegeben Token aus dem `base_vault` des Pools auf das ATA des Begünstigten.
+
+**Argumente**
+
+Keine (das Programm berechnet den Beanspruchungsbetrag aus dem Zeitplan).
+
+**Konten**
+
+| # | Name | W | S | Anmerkungen |
+|---|------|---|---|-----------|
+| 1 | `beneficiary` | W | S | Muss `vesting_record.beneficiary` entsprechen. |
+| 2 | `authority` |   |   | PDA `[b"vault_auth_seed"]`; unterzeichnet die Tresor-Übertragung. |
+| 3 | `pool_state` | W |   | Mutiert nur wenn der Zeitplan neu validiert werden muss. |
+| 4 | `vesting_record` | W |   | `claimed_amount` wird aktualisiert. |
+| 5 | `base_vault` | W |   | Basis-Token-Tresor des Pools; wird belastet. |
+| 6 | `beneficiary_ata` | W |   | Empfängt die entsperrten Token; `init_if_needed`. |
+| 7 | `base_mint` |   |   | Basis-Mint des Pools. |
+| 8 | `token_program` |   |   | SPL Token oder Token-2022-Programm. |
+| 9 | `associated_token_program` |   |   | Zur ATA-Erstellung falls nötig. |
+| 10 | `system_program` |   |   | Erforderlich für Kontoerstellung. |
+
+**Vorbedingungen**
+
+- `block_time >= pool_state.vesting_schedule.start_time` (andernfalls `VestingNotStarted`).
+- `pool_state.status == PoolStatus::Migrated` – Graduation muss bereits stattgefunden haben. Ein Aufruf vor Graduation wird rückgängig gemacht.
+- Das entsperrte-Betrag-Delta ist größer als Null. Ein No-Op-Aufruf (berechneters Delta ist 0) wird rückgängig gemacht.
+
+**Nachbedingungen**
+
+- `vesting_record.claimed_amount` geht zum neuen kumulativen entsperrten Betrag über.
+- `delta_amount` Basis-Token wird zu `beneficiary_ata` übertragen.
+
+**Häufige Fehler** — `VestingNotStarted`, `NoAssetsToCollect`, `MathOverflow`.
+
+## Bearbeitetes Beispiel
+
+Ein Launch setzt:
+
+- `supply = 1_000_000_000`
+- `total_locked_amount = 100_000_000` (10 % der Versorgung)
+- `cliff_period = 180 * 86400` (180 Tage)
+- `unlock_period = 365 * 86400` (1 Jahr linear nach dem Cliff)
+
+Der Gründer weist sofort nach `Initialize` zwei `VestingRecord`-Konten zu:
+
+- Begünstigter A (Team): `share_amount = 70_000_000`
+- Begünstigter B (Berater): `share_amount = 30_000_000`
+
+`allocated_share_amount = 100_000_000`, gleich `total_locked_amount` – weitere Zuordnungen sind nicht möglich.
+
+Fundraising wird am `2027-01-01T00:00Z` abgeschlossen. Das Programm setzt `start_time = 2027-01-01 + 180 Tage = 2027-06-30`.
+
+Am `2027-09-30` (90 Tage nach `start_time`) ruft Begünstigter A `ClaimVestedToken` auf:
+
+```
+elapsed         = min(now, start_time + 365·86400) − start_time
+                = 90 · 86400
+unlocked_amount = 70_000_000 × (90 / 365) ≈ 17_260_274
+delta_amount    = 17_260_274 − 0 = 17_260_274
+```
+
+A's Wallet empfängt 17,26 M Basis-Token. `vesting_record.claimed_amount` geht zu 17_260_274 über.
+
+Sechs Monate später (`2028-03-31`, 270 Tage nach `start_time`) macht A Anspruch:
+
+```
+unlocked_amount = 70_000_000 × (270 / 365) ≈ 51_780_822
+delta_amount    = 51_780_822 − 17_260_274 = 34_520_548
+```
+
+A empfängt weitere 34,52 M Token. Nach `2028-06-30` (Ende von `unlock_period`) überträgt der nächste Anspruch die verbleibenden ~18,22 M und lässt `claimed_amount == token_share_amount`.
+
+## Grenzfälle
+
+- **Begünstigter verliert seinen Schlüssel.** Der Pubkey auf `VestingRecord.beneficiary` ist der einzige Unterzeichner, der `ClaimVestedToken` aufrufen kann. Es gibt keinen Wiederherstellungspfad. Setzen Sie den Begünstigten auf eine Multisig, wenn Wiederherstellung wichtig ist.
+- **Token-2022-Transfergebühren.** Wenn die Basis-Mint eine Token-2022-Mint mit einer Transfergebührerweiterung ist, empfängt der Begünstigte `delta_amount − transfer_fee`, nicht das vollständige Delta. Der Vault des Pools erfasst immer noch den Bruttobetrag als übertragen – die Differenz wird dem Withheld-Fee-Konto der Mint zugerechnet.
+- **Pool nicht graduiert.** Ein Aufruf von `ClaimVestedToken` vor Graduation wird rückgängig gemacht. Die Vesting-Uhr beginnt nur, wenn die Fundraising tatsächlich abgeschlossen ist; ein abgebrochener Launch (der nie `start_time` setzt) hinterlässt gesperrte Token unerreichbar im Vault.
+- **Über-Allokations-Versuche.** Das Programm setzt `allocated_share_amount <= total_locked_amount` auf jedem `CreateVestingAccount` durch. Der Rest (falls vorhanden) von `total_locked_amount` bleibt unzugeordnet und ist **verloren** – diese Token bleiben einmal Graduation für immer im Vault. Ordnen Sie den vollständigen Betrag zu, es sei denn, das ist beabsichtigt.
+
+## Verweise
+
+- [`products/launchlab/accounts`](/de/products/launchlab/accounts) – vollständiges `PoolState`-Layout inklusive `VestingSchedule`.
+- [`products/launchlab/instructions`](/de/products/launchlab/instructions) – Graduation-Lebenszyklus.
+- [`products/launchlab/platform-config`](/de/products/launchlab/platform-config) – `platform_vesting_scale`-Semantik für Plattform-Zuordnungen.
+- [`products/launchlab/global-config`](/de/products/launchlab/global-config) – `max_lock_rate`-Obergrenze, die `total_locked_amount` begrenzt.
+
+Quellen:
+
+- `raydium-launch/programs/launchpad/src/states/vesting.rs` – `VestingRecord`.
+- `raydium-launch/programs/launchpad/src/states/pool.rs` – `VestingSchedule`, `VestingParams`, `is_vesting_started`, `vesting_end_time`.
+- `raydium-launch/programs/launchpad/src/instructions/create_vesting_account.rs`.
+- `raydium-launch/programs/launchpad/src/instructions/claim_vested_token.rs`.

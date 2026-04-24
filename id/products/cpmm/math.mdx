@@ -1,0 +1,258 @@
+---
+title: "Matematika CPMM"
+description: "Invariant constant-product, SwapBaseInput vs SwapBaseOutput, penanganan transfer-fee Token-2022, dan cara observation account diperbarui."
+---
+
+<Info>
+  **Halaman ini diterjemahkan secara otomatis oleh AI. Versi bahasa Inggris adalah acuan resmi.**
+
+  [Lihat versi bahasa Inggris →](/products/cpmm/math)
+</Info>
+
+## Invariant
+
+CPMM mempertahankan invariant constant-product klasik pada dua vault-nya:
+
+$$
+x \cdot y = k
+$$
+
+di mana `x` adalah saldo vault0 **setelah** biaya transfer Token-2022 diterima, dan sama halnya untuk `y`. Setiap swap harus meninggalkan `k' ≥ k` setelah memperhitungkan trade fee yang dikreditkan ke LP (bucket protocol, fund, dan creator *tidak* dihitung menuju `k` — ada di vault tetapi dikecualikan dari tampilan kurva, lihat [Biaya pada kurva](#biaya-pada-kurva) di bawah). `k` oleh karena itu tumbuh secara monoton seiring waktu saat LP mengumpulkan biaya.
+
+Saham LP dihargai menurut cadangan pool, bukan menurut `k`:
+
+$$
+\text{LP price in token0} = \frac{x}{\text{lpSupply}}, \qquad \text{LP price in token1} = \frac{y}{\text{lpSupply}}
+$$
+
+Membakar `ΔLP` token LP mengembalikan tepat `ΔLP × x / lpSupply` dari token0 dan `ΔLP × y / lpSupply` dari token1. Kurva dan `k` tidak bergerak saat deposit atau penarikan — hanya swap yang mengubah harga.
+
+## Model biaya pada jalur swap
+
+CPMM menerapkan **dua biaya berperingkat independen** pada setiap swap:
+
+- **Trade fee** diambil di sisi input, dikenakan pada `AmmConfig.trade_fee_rate`. Kemudian dibagi menjadi saham LP, protocol, dan fund (saham LP tetap di vault dan menumbuhkan `k`; saham protocol dan fund diekstraksi dari akuntansi vault).
+- **Creator fee** (aktif hanya ketika `enable_creator_fee == true`) dikenakan pada `AmmConfig.creator_fee_rate`. Diambil di sisi **input** atau sisi **output** tergantung pada `PoolState.creator_fee_on` dan arah swap (lihat [`products/cpmm/fees`](/id/products/cpmm/fees#which-side-of-the-trade-the-fees-are-taken-from)). Ini adalah bucket sendiri — tidak pernah potongan dari trade fee.
+
+Misalkan:
+
+- `FEE_RATE_DENOMINATOR = 1_000_000`
+- `trade_fee_rate` — dari `AmmConfig`, misalnya `2500` = 0,25% dari volume sisi yang relevan
+- `creator_fee_rate` — dari `AmmConfig`, misalnya `1000` = 0,10% dari volume sisi yang relevan
+- `protocol_fee_rate`, `fund_fee_rate` — didenominasikan dalam unit `1/FEE_RATE_DENOMINATOR` **dari trade fee**, bukan dari volume
+
+Ketika creator fee ada di sisi input:
+
+```
+total_input_fee = ceil(amount_in * (trade_fee_rate + creator_fee_rate) / FEE_RATE_DENOMINATOR)
+creator_fee     = floor(total_input_fee * creator_fee_rate / (trade_fee_rate + creator_fee_rate))
+trade_fee       = total_input_fee - creator_fee
+amount_in_after_fees = amount_in - total_input_fee
+```
+
+Ketika creator fee ada di sisi output:
+
+```
+trade_fee            = ceil(amount_in * trade_fee_rate / FEE_RATE_DENOMINATOR)
+amount_in_after_fees = amount_in - trade_fee
+amount_out_curve     = curve_output(amount_in_after_fees, ...)
+creator_fee          = ceil(amount_out_curve * creator_fee_rate / FEE_RATE_DENOMINATOR)
+amount_out           = amount_out_curve - creator_fee
+```
+
+Dalam kedua kasus trade fee dibagi dengan cara yang sama:
+
+```
+protocol_fee   = floor(trade_fee * protocol_fee_rate / FEE_RATE_DENOMINATOR)
+fund_fee       = floor(trade_fee * fund_fee_rate     / FEE_RATE_DENOMINATOR)
+lp_fee         = trade_fee - protocol_fee - fund_fee     // creator_fee adalah NOT dikurangi di sini
+```
+
+Jumlah `protocol_fee + fund_fee + creator_fee` disimpan di vault tetapi dilacak secara terpisah pada pool state (`protocol_fees_token*`, `fund_fees_token*`, `creator_fees_token*`). Ketika pemeriksaan invariant constant-product memeriksa `k' ≥ k`, ia menggunakan saldo vault **minus** ketiga biaya yang terkumpul tetapi belum diswep — sehingga LP hanya menangkap `lp_fee`.
+
+Lihat [`products/cpmm/fees`](/id/products/cpmm/fees) untuk instruksi pengumpulan dan contoh numerik yang dikerjakan.
+
+## SwapBaseInput (input-exact)
+
+"Pengguna memberi kami tepat `amount_in` dari input mint dan menerima minimal `minimum_amount_out` dari output mint."
+
+Mengabaikan Token-2022 sebentar:
+
+```
+amount_in_after_trade_fee = amount_in - trade_fee
+amount_out                = y − (x * y) / (x + amount_in_after_trade_fee)
+```
+
+Menurut aljabar:
+
+$$
+\text{amount\_out} = \frac{y \cdot \Delta x_{\text{net}}}{x + \Delta x_{\text{net}}}
+$$
+
+di mana `Δx_net = amount_in_after_trade_fee`.
+
+Program kemudian memperbarui akuntansi vault sehingga porsi `trade_fee` yang terutang kepada protocol/fund/creator duduk di bucket "accrued" (tidak termasuk dalam `x` kurva berikutnya), sementara saham LP bergabung dengan `x` untuk swap berikutnya.
+
+### Token-2022 di sisi input
+
+Jika input mint memiliki extension transfer-fee, **mint** mengurangi biayanya pada transfer dari user → vault. Jadi vault benar-benar menerima `amount_in − transfer_fee_in(amount_in)`. Program CPMM oleh karena itu menghitung:
+
+```
+amount_actually_received = amount_in − transfer_fee_in(amount_in)
+trade_fee                = ceil(amount_actually_received * trade_fee_rate / FEE_RATE_DENOMINATOR)
+amount_in_after_trade_fee = amount_actually_received − trade_fee
+```
+
+dan menjalankan kurva terhadap `amount_in_after_trade_fee`. Ini penting karena **harga kurva dihitung dari jumlah bersih yang mendarat di vault**, bukan dari jumlah judul pengguna.
+
+### Token-2022 di sisi output
+
+Jika output mint memiliki transfer fee, pool mengirim `amount_out` dari vault-nya ke pengguna. **Mint** kemudian akan mengambil biayanya dalam perjalanan keluar, sehingga pengguna menerima `amount_out − transfer_fee_out(amount_out)`. Program menghitung `amount_out` dari kurva seperti biasa, tetapi adalah tanggung jawab integrator untuk mengonversi angka "vault send" pool menjadi angka "user receive" saat menampilkan penawaran.
+
+### Pemeriksaan slippage
+
+Setelah menghitung `amount_out`:
+
+```
+require(amount_out >= minimum_amount_out, "AmountSpecifiedLessThanMinimum")
+```
+
+Jika output mint mengenakan transfer fee, SDK menerapkan transfer fee *sebelum* menetapkan `minimum_amount_out` sehingga konstanta slippage didenominasikan dalam apa yang benar-benar akan diterima pengguna, bukan dalam apa yang vault kirim.
+
+## SwapBaseOutput (output-exact)
+
+"Pengguna akan menerima tepat `amount_out` dari output mint dan bersedia membayar hingga `maximum_amount_in` dari input mint."
+
+Membalik kurva untuk `Δx_net`:
+
+$$
+\Delta x_{\text{net}} = \left\lceil \frac{x \cdot \text{amount\_out}}{y - \text{amount\_out}} \right\rceil
+$$
+
+Ceiling penting — ia menjamin `k' ≥ k` setelah pemotongan integer. Kemudian:
+
+```
+// Bekerja mundur dari net in ke gross in.
+// fee diterapkan pada gross, jadi:
+//   net = gross − ceil(gross * rate / D)
+//       ≈ gross * (D − rate) / D
+// inverting dengan ceiling di tempat yang tepat:
+gross_needed = ceil(Δx_net * D / (D − trade_fee_rate))
+```
+
+Pada Token-2022 input, bungkus dengan:
+
+```
+gross_needed_before_mint_fee
+  = inflate_for_transfer_fee(gross_needed, input_mint)
+```
+
+sehingga pengguna membayar cukup sehingga setelah pengurangan transfer-fee mint pool masih menerima `gross_needed`.
+
+### Pemeriksaan slippage
+
+```
+require(gross_needed_before_mint_fee <= maximum_amount_in, "AmountSpecifiedExceedsMaximum")
+```
+
+## Contoh yang dikerjakan
+
+Pool state, mengabaikan Token-2022:
+
+- `x = 1_000_000_000_000` (1.000.000,000000 dari token0, 6 desimal)
+- `y = 2_000_000_000_000` (2.000.000,000000 dari token1, 6 desimal)
+- `AmmConfig`: `trade_fee_rate = 2500`, `protocol_fee_rate = 120_000`, `fund_fee_rate = 40_000`, `creator_fee_rate = 0`
+
+Pengguna: `SwapBaseInput` dengan `amount_in = 1_000_000_000` (1.000,000000 dari token0). Creator fee dinonaktifkan (`enable_creator_fee = false`).
+
+```
+trade_fee                = ceil(1_000_000_000 * 2500 / 1_000_000)       = 2_500_000
+  protocol_fee           = floor(2_500_000 * 120_000 / 1_000_000)       = 300_000
+  fund_fee               = floor(2_500_000 *  40_000 / 1_000_000)       = 100_000
+  lp_fee                 = 2_500_000 − 300_000 − 100_000                 = 2_100_000
+creator_fee              = 0                                              // dinonaktifkan
+
+amount_in_after_trade_fee = 1_000_000_000 − 2_500_000                    = 997_500_000
+
+amount_out = y − (x * y) / (x + Δx_net)
+           = 2_000_000_000_000
+             − (1_000_000_000_000 * 2_000_000_000_000)
+               / (1_000_000_000_000 + 997_500_000)
+           ≈ 1_995_015_009
+
+new_vault0_raw   = x + amount_in                                        = 1_001_000_000_000
+new_vault1       = y − amount_out                                       ≈ 1_998_004_984_991
+
+// Dari 1_000_000_000 yang diterima di vault0, 400_000 adalah "accrued fee"
+// (protocol + fund) yang kurva harus kecualikan:
+curve_x          = new_vault0_raw − (protocol_fees_token0 + fund_fees_token0)
+                 = 1_001_000_000_000 − 400_000
+                 = 1_000_999_600_000
+
+k' = curve_x * new_vault1 ≈ 2.000_002_501_E24  ≥  k = 2.0E24   ✓
+```
+
+Jika pool yang sama memiliki `enable_creator_fee = true` dengan `creator_fee_rate = 1000` (0,10%) di sisi input, program akan mengenakan `total_input_fee = ceil(1_000_000_000 * 3500 / 1_000_000) = 3_500_000`, kemudian membaginya sebagai `creator_fee = 1_000_000` dan `trade_fee = 2_500_000`. Aritmetika protocol/fund/LP pada `trade_fee` tidak berubah dari contoh di atas — creator fee adalah bucket sendiri, terkumpul ke `creator_fees_token0` dan dikecualikan dari `curve_x` bersama dengan bucket protocol dan fund.
+
+Jika input mint memiliki transfer fee Token-2022 1%, vault menerima `990_000_000` token alih-alih `1_000_000_000`, dan setiap perhitungan berikutnya menggunakan jumlah bersih tersebut.
+
+## Aturan pembaruan observation
+
+Pada setiap swap, program mengevaluasi apakah akan mendorong observation baru ke ring buffer:
+
+```
+let since_last = now − observations[head].block_timestamp;
+if since_last >= MIN_OBSERVATION_INTERVAL {
+    let price0 = (vault1 << 32) / vault0;            // Q32.32-ish
+    let price1 = (vault0 << 32) / vault1;
+    let head' = (head + 1) % OBSERVATION_NUM;
+    observations[head'] = Observation {
+        block_timestamp: now,
+        cumulative_token0_price_x32:
+            observations[head].cumulative_token0_price_x32 + price0 * since_last,
+        cumulative_token1_price_x32:
+            observations[head].cumulative_token1_price_x32 + price1 * since_last,
+    };
+    head = head';
+}
+```
+
+Dua properti:
+
+- **Harga kumulatif, bukan harga spot.** Satu observation bukan harga. Untuk mendapatkan TWAP dari waktu `t0` ke `t1`, baca observation terdekat dengan setiap ujung dan hitung `(cumulative(t1) − cumulative(t0)) / (t1 − t0)`.
+- **Sampel dibatasi kecepatan.** Swap back-to-back di slot yang sama dapat berbagi satu observation. Membaca observation segera setelah swap oleh karena itu dapat terlihat usang satu slot — ini normal.
+
+Lebih lanjut di [`products/clmm/accounts`](/id/products/clmm/accounts).
+
+## Biaya pada kurva
+
+Ini adalah bagian yang halus dan layak diperingatkan. Aritmetika kurva bekerja terhadap saldo vault **bersih** — yaitu, saldo SPL mentah dikurangi biaya protocol, fund, dan creator yang terkumpul (ketiga-tiganya adalah bucket independen — lihat [`products/cpmm/fees`](/id/products/cpmm/fees)). Gambaran konkret:
+
+```
+raw_vault_balance   = apa yang dikembalikan RPC getTokenAccountBalance
+accrued_fees        = protocol_fees_token{0,1} + fund_fees_token{0,1} + creator_fees_token{0,1}
+curve_balance       = raw_vault_balance − accrued_fees
+invariant           = curve_balance0 * curve_balance1
+```
+
+Konsekuensi untuk integrator:
+
+- **Jangan quote dari saldo mentah.** Kurangi bidang accrued-fee terlebih dahulu, atau panggil `SwapBaseInput` sebagai simulasi dan ambil hasilnya.
+- **`CollectProtocolFee` memindahkan token keluar dari vault.** Setelah pengumpulan, `raw_vault_balance` turun tetapi `curve_balance` tidak berubah; harga pool tidak bergerak. Ini disengaja.
+
+## Presisi dan overflow
+
+- Semua aritmetika kurva menggunakan intermediate `u128` untuk mencegah overflow pada `x * y`.
+- Divisi dibulatkan menuju nol kecuali untuk `Δx_net` milik `SwapBaseOutput`, yang dibulatkan ke atas, dan komputasi fee, yang dibulatkan ke atas pada `trade_fee` dan ke bawah pada sub-split. Arah pembulatan ini dipilih sehingga invariant tidak pernah berkurang karena pemotongan integer.
+- Pool dengan rasio vault ekstrem (miliaran : 1) dapat mengalami lantai presisi pada perdagangan kecil; program mengembalikan `ZeroTradingTokens` dalam hal itu. Lihat [`reference/error-codes`](/id/reference/error-codes).
+
+## Ke mana selanjutnya
+
+- [`products/cpmm/fees`](/id/products/cpmm/fees) — semantik tier dan pengumpulan fee lengkap.
+- [`products/cpmm/instructions`](/id/products/cpmm/instructions) — instruksi yang menjalankan matematika ini.
+- [`algorithms/constant-product`](/id/algorithms/constant-product) — derivasi dan edge case dari `x · y = k` yang dibagikan di seluruh AMM v4 dan CPMM.
+
+Sumber:
+
+- [`raydium-io/raydium-cp-swap` — swap math dalam `states/curve.rs`](https://github.com/raydium-io/raydium-cp-swap)
+- Laporan audit Raydium tertaut dalam [`security/audits`](/id/security/audits)

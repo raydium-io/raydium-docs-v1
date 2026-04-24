@@ -1,0 +1,241 @@
+---
+title: "Vesting trong LaunchLab"
+description: "Token bị khóa, lịch cliff và linear-unlock, tài khoản VestingRecord theo từng người thụ hưởng, và các instruction create/claim mà các nhà tạo và nền tảng sử dụng để phân phối cung cấp dự phòng sau khi khóa."
+---
+
+<Info>
+  **Trang này được dịch tự động bằng AI. Phiên bản tiếng Anh là bản chính thức.**
+
+  [Xem bản tiếng Anh →](/products/launchlab/vesting)
+</Info>
+
+<Info>
+  Vesting là **tùy chọn** trong một lần phát hành LaunchLab. Đặt `vesting_param.total_locked_amount = 0` tại `Initialize` và phần bên dưới không áp dụng. Khi được bật, lịch trình được cố định trong suốt vòng đời của lần phát hành; cliff và unlock period không thể thay đổi hồi tưởng.
+</Info>
+
+## Tại sao cần vesting
+
+Bonding curve bán `base_supply_graduation` token trong giai đoạn gây quỹ và cấp nguồn cho pool sau graduation với phần còn lại. Vesting cắt ra một phần bổ sung từ cung cấp, khóa nó trong một khoảng thời gian có thể cấu hình (cliff), sau đó giải phóng nó tuyến tính cho một hoặc nhiều người thụ hưởng — thường là đội founding của nhà tạo, cố vấn hoặc các đối tác nền tảng.
+
+Các trường hợp sử dụng thực tế:
+
+- **Phân bổ cho đội.** Một nhà tạo dự trữ, chẳng hạn, 5% cung cấp cho đội founding, bị khóa trong 6 tháng và mở khóa tuyến tính trong 12 tháng tiếp theo.
+- **Phân bổ cho nền tảng.** Một nền tảng phát hành nhận được một phần từ mọi token mà nó liệt kê, theo cùng một lịch trình, thông qua `CreatePlatformVestingAccount`.
+- **Các khoản cấp cho cố vấn/người đóng góp.** Nhiều người thụ hưởng có tài khoản `VestingRecord` riêng của họ, mỗi tài khoản theo dõi số tiền đã yêu cầu của chính mình một cách độc lập.
+
+Token bị khóa không bao giờ vào curve và không phải là một phần của LP graduation. Chúng nằm ẩn nơi `base_vault` của pool cho đến khi mỗi người thụ hưởng gọi `ClaimVestedToken`.
+
+## Hình dạng lịch trình
+
+Vesting cho một lần phát hành được mô tả bằng ba số, được ghi lại một lần tại thời điểm `Initialize`:
+
+| Field | Type | Meaning |
+|-------|------|---------|
+| `total_locked_amount` | `u64` | Tổng tất cả base token bị khóa trên tất cả các người thụ hưởng (nhà tạo + nền tảng). Phải thỏa mãn `total_locked_amount <= supply * max_lock_rate / 1_000_000` từ `GlobalConfig` ràng buộc. |
+| `cliff_period` | `u64` (seconds) | Thời gian chờ đợi sau khi gây quỹ kết thúc trước khi bất kỳ token nào mở khóa. |
+| `unlock_period` | `u64` (seconds) | Khoảng thời gian của cửa sổ mở khóa tuyến tính sau cliff. `0` nghĩa là mọi thứ mở khóa ngay lập tức ở cuối cliff. |
+
+Ba giá trị này nằm trên `PoolState.vesting_schedule` (struct `VestingSchedule`) cộng với `start_time` trên chuỗi, mà chương trình ghi lại là `block_time + cliff_period` tại thời điểm gây quỹ kết thúc thành công (khi điều kiện graduation được đáp ứng lần đầu tiên).
+
+```rust
+// states/pool.rs
+pub struct VestingSchedule {
+    pub total_locked_amount:     u64,
+    pub cliff_period:            u64,
+    pub unlock_period:           u64,
+    pub start_time:              u64,   // set by the program at fundraising end
+    pub allocated_share_amount:  u64,   // running sum of allocations to vesting records
+}
+```
+
+`allocated_share_amount` là tổng số tiền đã được gán cho tài khoản `VestingRecord` thông qua `CreateVestingAccount` / `CreatePlatformVestingAccount`. Nó không bao giờ được vượt quá `total_locked_amount`. Nếu một nhà tạo phân bổ quá mức, lệnh gọi `CreateVestingAccount` tiếp theo sẽ trả về `InvalidTotalLockedAmount`.
+
+## Công thức mở khóa tuyến tính
+
+Sau khi gây quỹ kết thúc, chương trình tính toán số tiền mở khóa tích lũy cho mỗi `VestingRecord` là:
+
+```
+elapsed         = min(now, start_time + unlock_period) − start_time
+unlocked_amount = token_share_amount × elapsed / unlock_period
+```
+
+Nếu `unlock_period == 0`, toàn bộ `token_share_amount` trở nên có thể yêu cầu trong một bước ở `start_time`. Nếu không, đường cong là một đường thẳng từ 0 tại `start_time` đến `token_share_amount` tại `start_time + unlock_period`, được giới hạn tại `token_share_amount` sau đó.
+
+Số tiền được chuyển giao trên mỗi lệnh gọi `ClaimVestedToken` là sự khác biệt giữa số tiền mở khóa tích lũy được tính toán lại và trường `claimed_amount` đang chạy trên bản ghi.
+
+```
+delta_amount    = unlocked_amount − vesting_record.claimed_amount
+vesting_record.claimed_amount = unlocked_amount
+```
+
+Một yêu cầu trước `start_time` sẽ trả về `VestingNotStarted`. Một yêu cầu sau `start_time + unlock_period` giải quyết phần còn lại đầy đủ.
+
+## Bố cục tài khoản
+
+### `VestingSchedule`
+
+Nằm trực tiếp trên `PoolState`. Xem [`accounts`](/vi/products/launchlab/accounts).
+
+### `VestingRecord`
+
+Bản ghi cho từng người thụ hưởng. PDA được dẫn xuất là:
+
+```
+seeds = [
+  b"pool_vesting",
+  pool_state.key(),
+  beneficiary.key(),
+]
+program = LaunchLab program
+```
+
+```rust
+// states/vesting.rs
+#[account]
+pub struct VestingRecord {
+    pub epoch:               u64,         // recent_epoch tracker
+    pub pool:                Pubkey,      // back-pointer to PoolState
+    pub beneficiary:         Pubkey,      // who can call ClaimVestedToken
+    pub claimed_amount:      u64,         // cumulative claimed
+    pub token_share_amount:  u64,         // total allocated to this beneficiary
+    pub padding:             [u64; 8],
+}
+```
+
+Một người thụ hưởng chỉ có thể có **một** `VestingRecord` cho mỗi lần phát hành. Phân bổ lại cho cùng một người thụ hưởng trên cùng một lần phát hành sẽ trả về vì PDA đã tồn tại.
+
+## Các instruction
+
+### `CreateVestingAccount`
+
+Chỉ dành cho creator. Phân bổ một phần `total_locked_amount` của pool cho một người thụ hưởng mới bằng cách khởi tạo một PDA `VestingRecord` mới.
+
+**Arguments**
+
+```
+share_amount: u64    // tokens to assign to this beneficiary
+```
+
+**Accounts**
+
+| # | Name | W | S | Notes |
+|---|------|---|---|-------|
+| 1 | `creator` | W | S | Phải bằng `pool_state.creator`; trả tiền thuê cho tài khoản mới. |
+| 2 | `beneficiary` | W |   | Nhận các token được mở khóa sau. Pubkey được khóa ở đây — nó không thể được thay đổi. |
+| 3 | `pool_state` | W |   | Được thay đổi để tăng `vesting_schedule.allocated_share_amount`. |
+| 4 | `vesting_record` | W |   | `init`; PDA `[b"pool_vesting", pool_state, beneficiary]`. |
+| 5 | `system_program` |   |   | Bắt buộc để tạo tài khoản. |
+
+**Preconditions**
+
+- `share_amount > 0`.
+- `pool_state.vesting_schedule.allocated_share_amount + share_amount <= total_locked_amount`.
+- Pubkey `beneficiary` không có `VestingRecord` hiện có cho pool này.
+
+**Postconditions**
+
+- `vesting_record` được khởi tạo với `token_share_amount = share_amount`, `claimed_amount = 0`.
+- `pool_state.vesting_schedule.allocated_share_amount += share_amount`.
+
+**Lỗi thường gặp** — `InvalidTotalLockedAmount`, `InvalidInput`.
+
+### `CreatePlatformVestingAccount`
+
+Biến thể dành cho nền tảng admin của `CreateVestingAccount`. Ví tiền vesting của nền tảng (được lưu trữ trên `PlatformConfig.platform_vesting_wallet`) là người thụ hưởng, và share được giới hạn bởi `PlatformConfig.platform_vesting_scale`.
+
+Người ký phải bằng `platform_config.platform_vesting_wallet`. Các tài khoản khác phản chiếu `CreateVestingAccount`. Sử dụng cái này khi một nền tảng hợp đồng để nhận một share vesting cố định trên mọi lần phát hành nó liệt kê.
+
+### `ClaimVestedToken`
+
+Chỉ dành cho người thụ hưởng. Chuyển bất kỳ token mới được mở khóa nào từ `base_vault` của pool đến ATA của người thụ hưởng.
+
+**Arguments**
+
+Không có (chương trình tính toán số tiền yêu cầu từ lịch trình).
+
+**Accounts**
+
+| # | Name | W | S | Notes |
+|---|------|---|---|-------|
+| 1 | `beneficiary` | W | S | Phải bằng `vesting_record.beneficiary`. |
+| 2 | `authority` |   |   | PDA `[b"vault_auth_seed"]`; ký chuyển vault. |
+| 3 | `pool_state` | W |   | Chỉ được thay đổi nếu lịch trình cần được xác thực lại. |
+| 4 | `vesting_record` | W |   | `claimed_amount` được cập nhật. |
+| 5 | `base_vault` | W |   | Base-token vault của pool; được ghi nợ. |
+| 6 | `beneficiary_ata` | W |   | Nhận các token được mở khóa; `init_if_needed`. |
+| 7 | `base_mint` |   |   | Mint base của pool. |
+| 8 | `token_program` |   |   | Chương trình SPL Token hoặc Token-2022. |
+| 9 | `associated_token_program` |   |   | Để tạo ATA nếu cần. |
+| 10 | `system_program` |   |   | Bắt buộc để tạo tài khoản. |
+
+**Preconditions**
+
+- `block_time >= pool_state.vesting_schedule.start_time` (nếu không `VestingNotStarted`).
+- `pool_state.status == PoolStatus::Migrated` — graduation phải đã xảy ra. Gọi trước graduation sẽ trả về.
+- Delta mở khóa-amount lớn hơn không. Một lệnh gọi không hoạt động (delta được tính toán là 0) sẽ trả về.
+
+**Postconditions**
+
+- `vesting_record.claimed_amount` tiến tới mở khóa tích lũy mới.
+- `delta_amount` của base token được chuyển giao đến `beneficiary_ata`.
+
+**Lỗi thường gặp** — `VestingNotStarted`, `NoAssetsToCollect`, `MathOverflow`.
+
+## Ví dụ đã hoạt động
+
+Một lần phát hành thiết lập:
+
+- `supply = 1_000_000_000`
+- `total_locked_amount = 100_000_000` (10% cung cấp)
+- `cliff_period = 180 * 86400` (180 ngày)
+- `unlock_period = 365 * 86400` (1 năm tuyến tính sau cliff)
+
+Nhà tạo phân bổ hai tài khoản `VestingRecord` ngay sau `Initialize`:
+
+- Người thụ hưởng A (đội): `share_amount = 70_000_000`
+- Người thụ hưởng B (cố vấn): `share_amount = 30_000_000`
+
+`allocated_share_amount = 100_000_000`, bằng `total_locked_amount` — không có phân bổ nào khác có thể.
+
+Gây quỹ hoàn thành vào `2027-01-01T00:00Z`. Chương trình thiết lập `start_time = 2027-01-01 + 180 ngày = 2027-06-30`.
+
+Trên `2027-09-30` (90 ngày sau `start_time`), Người thụ hưởng A gọi `ClaimVestedToken`:
+
+```
+elapsed         = min(now, start_time + 365·86400) − start_time
+                = 90 · 86400
+unlocked_amount = 70_000_000 × (90 / 365) ≈ 17_260_274
+delta_amount    = 17_260_274 − 0 = 17_260_274
+```
+
+Ví của A nhận 17.26M base token. `vesting_record.claimed_amount` tiến tới 17_260_274.
+
+Sáu tháng sau (`2028-03-31`, 270 ngày sau `start_time`), A yêu cầu lại:
+
+```
+unlocked_amount = 70_000_000 × (270 / 365) ≈ 51_780_822
+delta_amount    = 51_780_822 − 17_260_274 = 34_520_548
+```
+
+A nhận thêm 34.52M token. Sau `2028-06-30` (cuối `unlock_period`), yêu cầu tiếp theo chuyển giao ~18.22M còn lại và để lại `claimed_amount == token_share_amount`.
+
+## Trường hợp đặc biệt
+
+- **Người thụ hưởng mất khóa của họ.** Pubkey trên `VestingRecord.beneficiary` là signer duy nhất có thể gọi `ClaimVestedToken`. Không có đường dẫn khôi phục. Đặt người thụ hưởng thành multisig nếu khôi phục là vấn đề.
+- **Phí chuyển Token-2022.** Nếu base mint là mint Token-2022 có extension phí chuyển giao, người thụ hưởng nhận `delta_amount − transfer_fee`, không phải delta đầy đủ. Vault của pool vẫn ghi lại số tiền được chuyển giao là số lượng brutto — sự khác biệt tích lũy vào tài khoản phí được giữ lại của mint.
+- **Pool chưa graduation.** Gọi `ClaimVestedToken` trước graduation sẽ trả về. Đồng hồ vesting chỉ bắt đầu khi gây quỹ thực sự hoàn thành; một lần phát hành bị hủy (cái không bao giờ đặt `start_time`) để các token bị khóa không thể tiếp cận trong vault.
+- **Cố gắng phân bổ quá mức.** Chương trình thực thi `allocated_share_amount <= total_locked_amount` trên mọi `CreateVestingAccount`. Phần còn lại (nếu có) của `total_locked_amount` để không được phân bổ là **mất** — những token đó nằm trong vault mãi mãi khi lần phát hành graduation. Phân bổ số tiền đầy đủ trừ khi đó là ý định.
+
+## Con trỏ
+
+- [`products/launchlab/accounts`](/vi/products/launchlab/accounts) — bố cục đầy đủ `PoolState` bao gồm `VestingSchedule`.
+- [`products/launchlab/instructions`](/vi/products/launchlab/instructions) — vòng đời graduation.
+- [`products/launchlab/platform-config`](/vi/products/launchlab/platform-config) — ngữ nghĩa `platform_vesting_scale` cho phân bổ nền tảng.
+- [`products/launchlab/global-config`](/vi/products/launchlab/global-config) — trần `max_lock_rate` ràng buộc `total_locked_amount`.
+
+Nguồn:
+
+- `raydium-launch/programs/launchpad/src/states/vesting.rs` — `VestingRecord`.
+- `raydium-launch/programs/launchpad/src/states/pool.rs` — `VestingSchedule`, `VestingParams`, `is_vesting_started`, `vesting_end_time`.
+- `raydium-launch/programs/launchpad/src/instructions/create_vesting_account.rs`.
+- `raydium-launch/programs/launchpad/src/instructions/claim_vested_token.rs`.

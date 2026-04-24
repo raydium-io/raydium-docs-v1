@@ -1,0 +1,285 @@
+---
+title: "LaunchLab コード例"
+description: "エンドツーエンド TypeScript：LaunchLab のローンチを作成し、ボンディングカーブで買収・売却を行い、CPMM プールへの卒業を実行し、クリエイター手数料を徴収します。"
+---
+
+<Info>
+  **このページは AI による自動翻訳です。すべての内容は英語版を正とします。**
+
+  [英語版を表示 →](/products/launchlab/code-demos)
+</Info>
+
+<Info>
+  **バージョン情報**
+
+  - SDK: `@raydium-io/raydium-sdk-v2@0.2.42-alpha`
+  - クラスタ：Solana `mainnet-beta`
+  - プログラム ID：[`reference/program-addresses`](/ja/reference/program-addresses) を参照
+  - 最終確認：2026-04
+
+  `package.json` の SDK バージョンはピン留めしてください。ボンディングカーブのインターフェイスはマイナーリリース間で変更される可能性があります。
+</Info>
+
+## セットアップ
+
+ここのデモは [`raydium-sdk-V2-demo/src/launchpad`](https://github.com/raydium-io/raydium-sdk-V2-demo/tree/master/src/launchpad) のファイルを反映しています。ブートストラップはデモリポジトリの [`config.ts.template`](https://github.com/raydium-io/raydium-sdk-V2-demo/blob/master/src/config.ts.template) に従います。
+
+```ts
+import { Connection, Keypair, clusterApiUrl, PublicKey } from "@solana/web3.js";
+import { Raydium, TxVersion } from "@raydium-io/raydium-sdk-v2";
+import BN from "bn.js";
+import fs from "node:fs";
+
+const connection = new Connection(process.env.RPC_URL ?? clusterApiUrl("mainnet-beta"));
+const owner = Keypair.fromSecretKey(
+  new Uint8Array(JSON.parse(fs.readFileSync(process.env.KEYPAIR!, "utf8"))),
+);
+const raydium = await Raydium.load({
+  owner,
+  connection,
+  cluster: "mainnet",
+  disableFeatureCheck: true,
+  blockhashCommitment: "finalized",
+});
+export const txVersion = TxVersion.V0;
+```
+
+## ローンチを作成する
+
+ソース：[`src/launchpad/createMint.ts`](https://github.com/raydium-io/raydium-sdk-V2-demo/blob/master/src/launchpad/createMint.ts)（および API 駆動型の Bonk バージョンの [`createBonkMintApi.ts`](https://github.com/raydium-io/raydium-sdk-V2-demo/blob/master/src/launchpad/createBonkMintApi.ts)）
+
+```ts
+import { NATIVE_MINT } from "@solana/spl-token";
+
+const { execute, extInfo } = await raydium.launchpad.createLaunchpad({
+  programId: /* reference/program-addresses のLaunchLab プログラムID */,
+  // 新しいベースミントのトークンメタデータ：
+  name:   "Example Token",
+  symbol: "EXMPL",
+  uri:    "https://example.com/metadata.json",
+  decimals: 6,
+
+  // カーブパラメータ：
+  curveType: 0,                                      // 0 = 二次関数
+  supply:    new BN(1_000_000_000).mul(new BN(10).pow(new BN(6))), // 1B ベース（6 小数点）
+  graduationFractionBps: 8000,                       // 80% → 卒業
+  initialK:  new BN("40"),                           // カーブ形状パラメータ
+
+  // クォート側：
+  quoteMint: NATIVE_MINT,                            // WSOL
+  openTime:  new BN(Math.floor(Date.now() / 1000) + 60),  // 1分で開く
+
+  // 手数料ポリシー：
+  fees: {
+    buyNumerator:   new BN(100),                     // 1.00%
+    buyDenominator: new BN(10_000),
+    sellNumerator:  new BN(100),
+    sellDenominator: new BN(10_000),
+    lpShare:         new BN(60),
+    creatorShare:    new BN(20),
+    protocolShare:   new BN(20),
+    totalShare:      new BN(100),
+  },
+
+  postGraduationLpPolicy: "burn",                    // "burn" | "lock" | "toCreator"
+
+  txVersion: TxVersion.V0,
+});
+
+const { txId } = await execute({ sendAndConfirm: true });
+console.log("Launch:", extInfo.launchState.toBase58());
+console.log("Base mint:", extInfo.baseMint.toBase58());
+console.log("Create tx:", txId);
+```
+
+注：
+
+- `initialK` は二次カーブのスケール係数です。卒業時に特定のオープニング CPMM 価格をターゲットにするように調整します。導出については [`products/launchlab/bonding-curve`](/ja/products/launchlab/bonding-curve) を参照してください。
+- SDK は、ベースミント、メタデータ PDA、および両方のボルトを 1 つのトランザクションで作成します。メタデータ URI が長い場合は 1232 バイトを超える可能性があります。その場合、SDK は 2 つのトランザクションに分割します。
+- `Initialize` 後、ローンチは `openTime` まで取引できません。`openTime` を 1～2 分先に設定して、フロントランナーが最初の買収をつかむ機会を減らします。
+
+## ローンチ状態を取得する
+
+```ts
+const launchId = new PublicKey("<LAUNCH_STATE>");
+
+const launch = await raydium.launchpad.getLaunchById({ launchId });
+console.log("Status:", ["Active","Graduated","Cancelled"][launch.status]);
+console.log("Base sold:", launch.baseSold.toString(),
+            "/", launch.baseSupplyMax.toString());
+console.log("Quote collected:", launch.quoteReserveReal.toString(),
+            "target:", launch.quoteReserveTarget.toString());
+if (launch.status === 1) {
+  console.log("Post-graduation CPMM pool:", launch.cpmmPoolState.toBase58());
+}
+```
+
+`getLaunchById` はデコードされた `LaunchState` と、計算された「卒業に向けた進捗」分数を `Decimal` として返します。
+
+## 買い - 正確なクォートイン
+
+ソース：[`src/launchpad/buy.ts`](https://github.com/raydium-io/raydium-sdk-V2-demo/blob/master/src/launchpad/buy.ts)
+
+```ts
+const quoteIn        = new BN(1).mul(new BN(10).pow(new BN(9)));  // 1 SOL
+const minimumBaseOut = new BN(0);  // いかなる値でも受け入れる；本番環境では厳しくする
+
+// クォートをオフチェーンでプレビューして、UI が期待されるベース出力を表示できるようにします：
+const preview = raydium.launchpad.computeBuyBase({
+  launchState: launch,
+  quoteIn,
+});
+console.log("Expected base_out:", preview.baseOut.toString(),
+            "price impact:", preview.priceImpact.toString());
+
+const { execute } = await raydium.launchpad.buyExactIn({
+  launchInfo: launch,
+  quoteIn,
+  minimumBaseOut,
+  txVersion: TxVersion.V0,
+});
+
+const { txId } = await execute({ sendAndConfirm: true });
+console.log("Buy tx:", txId);
+```
+
+`computeBuyBase` はオンチェーン Newton ソルバー（二次曲線）または閉じた形式の CPMM 逆関数（curve_type 1）を反映しています。「受け取り金額」UI フィールドを入力するために使用します。
+
+## 買い - 正確なベース出力
+
+```ts
+const baseOut         = new BN(1_000_000).mul(new BN(10).pow(new BN(6)));  // 1M ベース
+const maximumQuoteIn  = new BN(2).mul(new BN(10).pow(new BN(9)));          // 2 SOL でキャップ
+
+const { execute } = await raydium.launchpad.buyExactOut({
+  launchInfo: launch,
+  baseOut,
+  maximumQuoteIn,
+  txVersion: TxVersion.V0,
+});
+
+await execute({ sendAndConfirm: true });
+```
+
+「正確に X トークンを購入」UI に便利です。カーブが十分に移動した場合、クォート要件が `maximumQuoteIn` を超える場合は、`ExceededSlippage` で拒否されます。
+
+## 売り
+
+ソース：[`src/launchpad/sell.ts`](https://github.com/raydium-io/raydium-sdk-V2-demo/blob/master/src/launchpad/sell.ts)
+
+```ts
+const baseIn           = new BN(500_000).mul(new BN(10).pow(new BN(6)));  // 0.5M ベース
+const minimumQuoteOut  = new BN(0);
+
+const { execute } = await raydium.launchpad.sellExactIn({
+  launchInfo: launch,
+  baseIn,
+  minimumQuoteOut,
+  txVersion: TxVersion.V0,
+});
+
+await execute({ sendAndConfirm: true });
+```
+
+カーブの売却パスは買却パスに対称です。`base_sold` を `baseIn` で減らすと、`quote_out` は `base_sold − baseIn` と `base_sold` の間のカーブの下の統合領域から売却手数料を引いたものと同じになります。
+
+## 閾値交差買収時の自動卒業
+
+SDK は、買収後の状態が閾値を超えると検出した場合、`buy*` トランザクション内で `Graduate` 命令をチェーンします。
+
+```ts
+const { execute, willGraduate } = await raydium.launchpad.buyExactIn({
+  launchInfo: launch,
+  quoteIn: new BN(100).mul(new BN(10).pow(new BN(9))),    // 大きな買収
+  minimumBaseOut: new BN(0),
+  txVersion: TxVersion.V0,
+  autoGraduate: true,                                      // デフォルト
+});
+
+if (willGraduate) {
+  console.log("This buy will trigger graduation.");
+}
+
+const { txId } = await execute({ sendAndConfirm: true });
+```
+
+`Graduate` はパーミッションレスなため、誰でも（MEV ボットを含む）閾値が交差した後の最初の `Graduate` をレースして実行できます。通常、数分後ではなく数秒後です。最初のランダーは CPMM プール アカウントの賃料を支払うだけで、他の利益は得られません。
+
+## 手動 `Graduate`
+
+`autoGraduate` が無効だったか、閾値交差トランザクションが失敗した場合、卒業を別々に実行できます。
+
+```ts
+const { execute } = await raydium.launchpad.graduate({
+  launchInfo: launch,
+  txVersion: TxVersion.V0,
+});
+
+await execute({ sendAndConfirm: true });
+```
+
+送信時に `quote_reserve_real < quote_reserve_target` の場合、`NotAtThreshold` で戻ります。再試行安全性 — 成功後の 2 番目の `Graduate` 試行は `NotActive` で戻ります。
+
+## クリエイター手数料を徴収する
+
+ソース：[`src/launchpad/claimCreatorFee.ts`](https://github.com/raydium-io/raydium-sdk-V2-demo/blob/master/src/launchpad/claimCreatorFee.ts)（シングルミント）および [`collectAllCreatorFees.ts`](https://github.com/raydium-io/raydium-sdk-V2-demo/blob/master/src/launchpad/collectAllCreatorFees.ts)（バッチ）
+
+```ts
+const { execute } = await raydium.launchpad.collectCreatorFees({
+  launchInfo: launch,
+  txVersion: TxVersion.V0,
+});
+
+await execute({ sendAndConfirm: true });
+```
+
+累積されたクリエイター手数料カウンターのクォート金額をクリエイターのクォートミント上の ATA に転送します。卒業前後に呼び出し可能です。巨大な残高が蓄積するのを待つのではなく、定期的に使用します。
+
+## ローンチのライフサイクルを通じて追跡する
+
+まとめると、監視スクリプトは次のようになります。
+
+```ts
+async function watch(launchId: PublicKey) {
+  while (true) {
+    const launch = await raydium.launchpad.getLaunchById({ launchId });
+    const progress =
+      Number(launch.quoteReserveReal) /
+      Number(launch.quoteReserveTarget);
+
+    console.log(
+      `status=${["Active","Graduated","Cancelled"][launch.status]}`,
+      `progress=${(progress * 100).toFixed(2)}%`,
+      `num_buys=${launch.stateData.numBuys}`,
+    );
+
+    if (launch.status === 1) {
+      console.log("Graduated to CPMM pool:", launch.cpmmPoolState.toBase58());
+      break;
+    }
+    await new Promise(r => setTimeout(r, 10_000));
+  }
+}
+```
+
+## Rust CPI
+
+独自の Anchor プログラムから LaunchLab を呼び出すことはまれです（ほとんどのローンチ統合は TS 側のみです）。実行する場合、プログラムは `cpi::accounts::Buy`、`cpi::accounts::Sell` などを備えた Anchor クレート `raydium_launchlab` を提供します。パターンは CPMM・CLMM CPI の例を反映しています。このサイトが入力されたら [`sdk-api/rust-cpi`](/ja/sdk-api/rust-cpi) を汎用テンプレートとして参照してください。
+
+## 落とし穴
+
+- **手数料分割の算術オフバイワン。** `total_share` が正確に `lp_share + creator_share + protocol_share` でない場合、`Initialize` は `InvalidFeeShares` で戻ります。`totalShare` を合計と同じに設定します。
+- **許可されていないクォートミントを使用。** `launch_config.allowed_quote_mints` は固定リストです。他のミントを渡すと戻ります。最初に `raydium.launchpad.getConfig()` で確認してください。
+- **メタデータサイズ。** 長い `uri` 文字列は Metaplex CPI を予算内に押し込みます。`uri` を ~200 文字未満に保ちます — ほとんどの CDN でホストされている JSON メタデータは簡単にフィットします。
+- **卒業競争。** 自動化ボットは `quote_reserve_real` を監視し、閾値交差の 1 スロット以内で `Graduate` をフロントランします。これは良性です — 賃料しかコストがありません — しかしそれはあなたの UI が `status` 遷移を高速イベントとして扱う必要があることを意味します。
+
+## 次のステップ
+
+- [`products/launchlab/bonding-curve`](/ja/products/launchlab/bonding-curve) — カーブ数学。
+- [`products/cpmm/code-demos`](/ja/products/cpmm/code-demos) — 結果のプールで行うこと。
+- [`user-flows/launch-token-launchlab`](/ja/user-flows/launch-token-launchlab) — オフチェーン手順を含むエンドツーエンドのトークン起動ガイド。
+
+ソース：
+
+- [Raydium SDK v2](https://github.com/raydium-io/raydium-sdk-V2)
+- Raydium LaunchLab プログラムソース

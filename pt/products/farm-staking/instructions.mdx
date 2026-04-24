@@ -1,0 +1,267 @@
+---
+title: "Instruções Farm / Staking"
+description: "CreateFarm, Deposit, Withdraw, Harvest, AddReward / SetRewards / RestartRewards, WithdrawReward — toda a superfície de instruções nas versões v3, v5 e v6 do farm."
+---
+
+<Info>
+  **Esta página foi traduzida automaticamente por IA. A versão em inglês é a fonte oficial.**
+
+  [Ver versão em inglês →](/products/farm-staking/instructions)
+</Info>
+
+<Info>
+  As instruções de farm são específicas de versão. Um `Deposit` na v6 não é executável em um farm v5 e vice-versa. O SDK faz o despacho lendo o proprietário do programa do farm; para CPI on-chain você deve escolher o ID do programa correto antecipadamente.
+</Info>
+
+## Inventário de instruções
+
+| Propósito | v3 | v5 | v6 |
+|---------|----|----|----|
+| Criar um farm | `CreateFarm` | `CreateFarm` | `CreateFarm` |
+| Adicionar um ledger de usuário (pode ser implícito) | `CreateUserLedger` | `CreateAssociatedLedger` | Implícito em `Deposit` |
+| Fazer stake | `Deposit` | `Deposit` | `Deposit` |
+| Remover stake | `Withdraw` | `Withdraw` | `Withdraw` |
+| Reclamar apenas recompensas | N/A (use `Deposit 0`) | N/A (use `Deposit 0`) | `Harvest` |
+| Adicionar um fluxo de recompensas após criação | N/A | `AddReward` | `AddReward` |
+| Editar um fluxo de recompensas existente | N/A | `SetRewards` | `SetRewards` |
+| Reiniciar uma recompensa após end_time | N/A | `RestartRewards` | `RestartRewards` |
+| Retirar orçamento de recompensas não reclamadas (admin) | N/A | `WithdrawReward` | `WithdrawReward` |
+
+Na v3 e v5, a forma canônica de reclamar recompensas sem alterar o stake é chamar `Deposit` com `amount = 0`. O programa trata isso como um liquidamento puro. A v6 introduziu um `Harvest` explícito para clareza.
+
+O SDK abstrai tudo isso por trás de `raydium.farm.deposit({ ... })` etc. As seções abaixo documentam as listas de contas subjacentes para integradores que precisam construir instruções manualmente (agregadores, ferramentas de monitoramento, extensões do SDK).
+
+## `CreateFarm` (v6)
+
+Ativar um novo farm v6.
+
+**Argumentos**
+
+```
+reward_info_count: u8               // número de fluxos de recompensas na criação (1..=5)
+reward_infos: [
+  {
+    open_time:            u64,
+    end_time:             u64,
+    emission_per_second_x64: u128,   // Q64.64
+    mint:                 Pubkey,    // reward mint
+    token_program:        Pubkey,    // SPL ou Token-2022
+  }
+]
+```
+
+**Contas** (abreviado, para `reward_info_count = 1`)
+
+| # | Nome | W | S | Notas |
+|---|------|---|---|-------|
+| 1 | `creator` | W | S | Paga aluguel, possui o farm. |
+| 2 | `farm_state` | W |   | Nova conta `FarmState`. |
+| 3 | `farm_authority` |   |   | PDA `[farm_id]`. |
+| 4 | `staking_mint` |   |   | |
+| 5 | `staking_vault` | W |   | Criado como ATA da autoridade ou um vault PDA. |
+| 6 | `staking_token_program` |   |   | |
+| 7 | `reward_mint` |   |   | |
+| 8 | `reward_vault` | W |   | Receberá o orçamento inicial. |
+| 9 | `reward_token_program` |   |   | |
+| 10 | `reward_sender_ata` | W |   | ATA do criador no mint de recompensas; drenado por esta instrução. |
+| 11 | `system_program` |   |   | |
+| 12 | `token_program` |   |   | |
+| 13 | `associated_token_program` |   |   | |
+| 14 | `rent` |   |   | |
+
+**Pré-condições**
+
+- `open_time > now`, `end_time > open_time`.
+- ATAs do `creator` possuem pelo menos `emission_per_second_x64 × (end_time − open_time) / 2^64` do mint de recompensas.
+- `staking_mint` não tem autoridade de congelamento, ou ela está desabilitada.
+
+**Pós-condições**
+
+- `FarmState` inicializado, `total_staked = 0`.
+- Vault(s) de recompensas financiados com o orçamento completo do fluxo.
+- A ATA de recompensas do criador é drenada por essa quantidade.
+
+## `Deposit` (v6)
+
+Fazer stake de `amount` do mint de staking.
+
+**Argumentos**
+
+```
+amount: u64
+```
+
+**Contas**
+
+| # | Nome | W | S |
+|---|------|---|---|
+| 1 | `user` | W | S |
+| 2 | `user_ledger` | W |   |
+| 3 | `farm_state` | W |   |
+| 4 | `farm_authority` |   |   |
+| 5 | `staking_vault` | W |   |
+| 6 | `user_staking_ata` | W |   |
+| 7..(7+n) | `reward_vault_{i}` | W |   |
+| ... | `user_reward_ata_{i}` | W |   |
+| last−2 | `system_program` |   |   |
+| last−1 | `token_program` |   |   |
+| last | `associated_token_program` |   |   |
+
+Se o `user_ledger` não existe, o SDK antecede uma ix no estilo `CreateAccount`; o programa v6 também pode criá-la lazily dado a conta do system program. Padrão de contas restantes: para cada recompensa ativa, anexar `(reward_vault, user_reward_ata)` para que o liquidamento possa fazer pagamentos.
+
+**Efeito**
+
+1. Atualizar `reward_per_share_x64[i]` para cada fluxo de recompensas ativo usando a fórmula de atualização lazy.
+2. Calcular `pending_i = user_ledger.deposited × reward_per_share_x64[i] / 2^64 − user_ledger.reward_debts[i]`.
+3. Transferir `pending_i` de `reward_vault_{i}` para `user_reward_ata_{i}`.
+4. Transferir `amount` do mint de staking de `user_staking_ata` para `staking_vault`.
+5. Atualizar `user_ledger.deposited += amount` e re-fazer snapshot de `reward_debts[i]`.
+6. Atualizar `farm_state.total_staked += amount`.
+
+**Pré-condições**
+
+- `amount > 0` para um stake verdadeiro (v6 proíbe `amount = 0` — use `Harvest` para claim-only).
+- `user_staking_ata` contém pelo menos `amount`.
+- Cada vault de recompensa ativo contém pelo menos o pendente devido a este usuário.
+
+## `Withdraw` (v6)
+
+Remover stake de `amount`.
+
+**Argumentos**
+
+```
+amount: u64
+```
+
+**Contas** — idênticas a `Deposit`.
+
+**Efeito** — mesmo liquidamento que `Deposit`, depois mover o mint de staking de volta para o usuário: `staking_vault → user_staking_ata`. Ambos `total_staked` e `user_ledger.deposited` diminuem.
+
+**Pré-condições**
+
+- `amount ≤ user_ledger.deposited`.
+- Farm não está pausado.
+
+## `Harvest` (v6)
+
+Reclamar recompensas pendentes sem alterar o stake.
+
+**Argumentos** — nenhum.
+
+**Contas** — mesmo que `Deposit`, sem movimento no lado do staking.
+
+**Efeito** — atualizar `reward_per_share_x64[i]`, fazer payout de `pending_i`, re-fazer snapshot de `reward_debts[i]`. Sem mudança em `total_staked` ou `deposited`.
+
+## `AddReward` (v5/v6)
+
+Adicionar um novo fluxo de recompensas a um farm existente que tem um slot não usado.
+
+**Argumentos**
+
+```
+reward_info: {
+  open_time:            u64,
+  end_time:             u64,
+  emission_per_second_x64: u128,
+  mint:                 Pubkey,
+  token_program:        Pubkey,
+}
+```
+
+**Pré-condições**
+
+- Existe um slot livre (`reward_info_count < 5` na v6, `< 2` na v5).
+- `open_time ≥ now` (pode estar no futuro) ou `open_time < now` é permitido apenas se a versão do programa permitir — v6 permite, v5 não.
+
+**Pós-condições**
+
+- O novo fluxo é inicializado no índice `reward_info_count`, `reward_info_count++`.
+- O vault de recompensas é creditado com o orçamento completo do fluxo a partir da ATA do chamador.
+
+**Erro comum** — `RewardAlreadyExists` se o mint colide com um slot existente.
+
+## `SetRewards` (v5/v6)
+
+Estender ou complementar um fluxo de recompensas existente. Não pode mudar o mint; não pode encurtar `end_time`; não pode reduzir `emission_per_second_x64` uma vez em execução.
+
+**Argumentos**
+
+```
+reward_index:         u8
+new_open_time:        u64,
+new_end_time:         u64,
+new_emission_per_second_x64: u128,
+```
+
+**Pré-condições**
+
+- O fluxo ainda está em execução (`reward_state == 1`).
+- `new_end_time ≥ current end_time`.
+- O orçamento adicional requerido `(new_emission × new_duration − already_emissioned)` está presente na ATA do remetente e é transferido para o vault de recompensas pela instrução.
+
+Na v5, a chamada equivalente é `SetRewards` com um conjunto de argumentos menor (sem mudanças por segundo em fluxos vivos).
+
+## `RestartRewards` (v5/v6)
+
+Reiniciar um fluxo após seu `end_time` ter passado. Conceitualmente o mesmo que `AddReward` para um mint que já possui um slot.
+
+**Argumentos** — forma idêntica a `AddReward` naquele índice.
+
+**Pré-condições**
+
+- `reward_state == 2` (encerrado).
+- Chamador é `reward_sender` do slot (v6) ou farm `owner` (v5).
+
+## `WithdrawReward` (v5/v6)
+
+Limpeza administrativa do saldo do vault de recompensas não reclamadas após um fluxo ter terminado e todos os stakers terem tido a chance de fazer harvest.
+
+**Argumentos**
+
+```
+reward_index: u8
+```
+
+**Pré-condições**
+
+- Fluxo encerrado (`reward_state == 2`).
+- `reward_total_emissioned == reward_claimed + vault_balance` (nada está atualmente devido).
+
+**Efeito** — move o restante para `reward_sender_ata`. O programa não impede retirar enquanto stakers ainda têm claims pendentes; espera-se que o admin faça harvest em nome de stakers lentos primeiro (ou deixe-os fazer harvest). Se você retirar cedo, os usuários perdem acesso às suas recompensas não reclamadas. **Não chame isso cedo.**
+
+## Variações v5
+
+- `Deposit` / `Withdraw` têm a mesma forma que v6 mas usam até 2 slots de recompensas e `reward_per_share` é `u128` (ponto fixo com um radicix diferente).
+- `CreateAssociatedLedger` é uma chamada separada obrigatória antes do primeiro `Deposit`; v6 a incorporou.
+- `AddReward` está disponível, `Harvest` não (use `Deposit 0`).
+
+## Variações v3
+
+- Fluxo único de recompensas. Sem `AddReward`, sem segundo slot.
+- `Deposit 0` é a única forma de reclamar.
+- `CreateUserLedger` deve ser chamado antes do primeiro `Deposit`.
+
+## Matriz de mudança de estado
+
+| Instrução | `total_staked` | `user.deposited` | `reward_per_share` | Vaults de recompensas |
+|-------------|----------------|------------------|---------------------|----------------|
+| `CreateFarm` | 0 | — | 0 | financiados pelo criador |
+| `Deposit(n)` | +n | +n | atualizado | −pending (pago) |
+| `Withdraw(n)` | −n | −n | atualizado | −pending |
+| `Harvest` | — | — | atualizado | −pending |
+| `AddReward` | — | — | — | +novo orçamento |
+| `SetRewards` | — | — | — | +delta orçamento |
+| `RestartRewards` | — | — | — | +orçamento |
+| `WithdrawReward` | — | — | — | −restante |
+
+## Próximos passos
+
+- [`products/farm-staking/code-demos`](/pt/products/farm-staking/code-demos) — exemplos TypeScript.
+- [`products/farm-staking/accounts`](/pt/products/farm-staking/accounts) — layouts `FarmState` / `UserLedger` / `UserStake`.
+- [`reference/error-codes`](/pt/reference/error-codes) — enum de erros do farm.
+
+Fontes:
+
+- [Módulo `Farm` do Raydium SDK v2](https://github.com/raydium-io/raydium-sdk-V2)
+- Código-fonte do programa Raydium farm (v3 / v5 / v6)

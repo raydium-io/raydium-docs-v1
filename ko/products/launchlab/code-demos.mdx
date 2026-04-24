@@ -1,0 +1,274 @@
+---
+title: "LaunchLab 코드 데모"
+description: "엔드투엔드 TypeScript: LaunchLab 론칭 생성, 본딩 곡선에서 매수/매도, CPMM 풀로 졸업, 크리에이터 수수료 수집."
+---
+
+<Info>
+  **이 페이지는 AI 자동 번역입니다. 모든 내용은 영문판을 기준으로 합니다.**
+
+  [영문판 보기 →](/products/launchlab/code-demos)
+</Info>
+
+## 설정
+
+여기의 데모는 [`raydium-sdk-V2-demo/src/launchpad`](https://github.com/raydium-io/raydium-sdk-V2-demo/tree/master/src/launchpad) 폴더의 파일을 반영합니다. 부트스트랩은 데모 저장소의 [`config.ts.template`](https://github.com/raydium-io/raydium-sdk-V2-demo/blob/master/src/config.ts.template)을 따릅니다:
+
+```ts
+import { Connection, Keypair, clusterApiUrl, PublicKey } from "@solana/web3.js";
+import { Raydium, TxVersion } from "@raydium-io/raydium-sdk-v2";
+import BN from "bn.js";
+import fs from "node:fs";
+
+const connection = new Connection(process.env.RPC_URL ?? clusterApiUrl("mainnet-beta"));
+const owner = Keypair.fromSecretKey(
+  new Uint8Array(JSON.parse(fs.readFileSync(process.env.KEYPAIR!, "utf8"))),
+);
+const raydium = await Raydium.load({
+  owner,
+  connection,
+  cluster: "mainnet",
+  disableFeatureCheck: true,
+  blockhashCommitment: "finalized",
+});
+export const txVersion = TxVersion.V0;
+```
+
+## 론칭 생성
+
+소스: [`src/launchpad/createMint.ts`](https://github.com/raydium-io/raydium-sdk-V2-demo/blob/master/src/launchpad/createMint.ts) (및 API 기반 Bonk 변형의 경우 [`createBonkMintApi.ts`](https://github.com/raydium-io/raydium-sdk-V2-demo/blob/master/src/launchpad/createBonkMintApi.ts))
+
+```ts
+import { NATIVE_MINT } from "@solana/spl-token";
+
+const { execute, extInfo } = await raydium.launchpad.createLaunchpad({
+  programId: /* LaunchLab program ID from reference/program-addresses */,
+  // Token metadata for the new base mint:
+  name:   "Example Token",
+  symbol: "EXMPL",
+  uri:    "https://example.com/metadata.json",
+  decimals: 6,
+
+  // Curve params:
+  curveType: 0,                                      // 0 = quadratic
+  supply:    new BN(1_000_000_000).mul(new BN(10).pow(new BN(6))), // 1B base (6 dec)
+  graduationFractionBps: 8000,                       // 80% → graduation
+  initialK:  new BN("40"),                           // curve shape parameter
+
+  // Quote side:
+  quoteMint: NATIVE_MINT,                            // WSOL
+  openTime:  new BN(Math.floor(Date.now() / 1000) + 60),  // opens in 1min
+
+  // Fee policy:
+  fees: {
+    buyNumerator:   new BN(100),                     // 1.00%
+    buyDenominator: new BN(10_000),
+    sellNumerator:  new BN(100),
+    sellDenominator: new BN(10_000),
+    lpShare:         new BN(60),
+    creatorShare:    new BN(20),
+    protocolShare:   new BN(20),
+    totalShare:      new BN(100),
+  },
+
+  postGraduationLpPolicy: "burn",                    // "burn" | "lock" | "toCreator"
+
+  txVersion: TxVersion.V0,
+});
+
+const { txId } = await execute({ sendAndConfirm: true });
+console.log("Launch:", extInfo.launchState.toBase58());
+console.log("Base mint:", extInfo.baseMint.toBase58());
+console.log("Create tx:", txId);
+```
+
+주의사항:
+
+- `initialK`는 이차 곡선의 스케일 팩터입니다. 졸업 시 특정 개장 CPMM 가격을 목표로 조정하세요. 유도 과정은 [`products/launchlab/bonding-curve`](/ko/products/launchlab/bonding-curve)를 참조하세요.
+- SDK는 단일 트랜잭션으로 베이스 민트, 메타데이터 PDA 및 두 개의 볼트 생성을 처리합니다. 메타데이터 URI가 길면 1232 바이트를 초과할 수 있으며, 이 경우 SDK가 두 개의 트랜잭션으로 분할합니다.
+- `Initialize` 후, `openTime`까지 론칭은 거래 불가능합니다. `openTime`을 1~2분 앞으로 설정하여 선주자들이 첫 매수를 확보할 기회를 줄이세요.
+
+## 론칭 상태 조회
+
+```ts
+const launchId = new PublicKey("<LAUNCH_STATE>");
+
+const launch = await raydium.launchpad.getLaunchById({ launchId });
+console.log("Status:", ["Active","Graduated","Cancelled"][launch.status]);
+console.log("Base sold:", launch.baseSold.toString(),
+            "/", launch.baseSupplyMax.toString());
+console.log("Quote collected:", launch.quoteReserveReal.toString(),
+            "target:", launch.quoteReserveTarget.toString());
+if (launch.status === 1) {
+  console.log("Post-graduation CPMM pool:", launch.cpmmPoolState.toBase58());
+}
+```
+
+`getLaunchById`는 디코딩된 `LaunchState`와 "졸업을 향한 진행률" 분수(`Decimal`)를 반환합니다.
+
+## 매수 — 정확한 인용 입력
+
+소스: [`src/launchpad/buy.ts`](https://github.com/raydium-io/raydium-sdk-V2-demo/blob/master/src/launchpad/buy.ts)
+
+```ts
+const quoteIn        = new BN(1).mul(new BN(10).pow(new BN(9)));  // 1 SOL
+const minimumBaseOut = new BN(0);  // accept any; tighten for production
+
+// Preview the quote off-chain so your UI can show expected base_out:
+const preview = raydium.launchpad.computeBuyBase({
+  launchState: launch,
+  quoteIn,
+});
+console.log("Expected base_out:", preview.baseOut.toString(),
+            "price impact:", preview.priceImpact.toString());
+
+const { execute } = await raydium.launchpad.buyExactIn({
+  launchInfo: launch,
+  quoteIn,
+  minimumBaseOut,
+  txVersion: TxVersion.V0,
+});
+
+const { txId } = await execute({ sendAndConfirm: true });
+console.log("Buy tx:", txId);
+```
+
+`computeBuyBase`는 온체인 뉴턴 솔버(이차 곡선) 또는 폐쇄형 CPMM 역함수(curve_type 1)를 반영합니다. "받을 예상량" UI 필드를 채우는 데 사용하세요.
+
+## 매수 — 정확한 베이스 출력
+
+```ts
+const baseOut         = new BN(1_000_000).mul(new BN(10).pow(new BN(6)));  // 1M base
+const maximumQuoteIn  = new BN(2).mul(new BN(10).pow(new BN(9)));          // cap at 2 SOL
+
+const { execute } = await raydium.launchpad.buyExactOut({
+  launchInfo: launch,
+  baseOut,
+  maximumQuoteIn,
+  txVersion: TxVersion.V0,
+});
+
+await execute({ sendAndConfirm: true });
+```
+
+"정확히 X 토큰 매수" UI에 유용합니다. 곡선이 충분히 이동하여 인용 요구량이 `maximumQuoteIn`을 초과하면 `ExceededSlippage`로 거부합니다.
+
+## 매도
+
+소스: [`src/launchpad/sell.ts`](https://github.com/raydium-io/raydium-sdk-V2-demo/blob/master/src/launchpad/sell.ts)
+
+```ts
+const baseIn           = new BN(500_000).mul(new BN(10).pow(new BN(6)));  // 0.5M base
+const minimumQuoteOut  = new BN(0);
+
+const { execute } = await raydium.launchpad.sellExactIn({
+  launchInfo: launch,
+  baseIn,
+  minimumQuoteOut,
+  txVersion: TxVersion.V0,
+});
+
+await execute({ sendAndConfirm: true });
+```
+
+곡선의 매도 경로는 매수 경로와 대칭입니다: `base_sold`를 `baseIn`만큼 감소시키면 `base_sold − baseIn`과 `base_sold` 사이의 곡선 아래 적분 영역에서 매도 수수료를 뺀 값과 같은 `quote_out`을 반환합니다.
+
+## 임계값 교차 매수에서 자동 졸업
+
+SDK는 매수 후 상태가 임계값을 초과할 것으로 감지할 때 `buy*` 트랜잭션 내에 `Graduate` 명령을 체이닝합니다:
+
+```ts
+const { execute, willGraduate } = await raydium.launchpad.buyExactIn({
+  launchInfo: launch,
+  quoteIn: new BN(100).mul(new BN(10).pow(new BN(9))),    // large buy
+  minimumBaseOut: new BN(0),
+  txVersion: TxVersion.V0,
+  autoGraduate: true,                                      // default
+});
+
+if (willGraduate) {
+  console.log("This buy will trigger graduation.");
+}
+
+const { txId } = await execute({ sendAndConfirm: true });
+```
+
+`Graduate`는 권한 없이 실행 가능하므로, 누구든지(MEV 봇 포함) 임계값 교차 후 첫 번째 `Graduate`를 착륙시키기 위해 경주할 수 있습니다. 일반적으로 몇 분이 아닌 몇 초 후입니다. 첫 착륙자는 CPMM 풀 계정에 대한 임차료만 지불하고 다른 이점은 없습니다.
+
+## 수동 `Graduate`
+
+`autoGraduate`가 꺼져 있거나 임계값 교차 트랜잭션이 실패한 경우 졸업을 별도로 실행할 수 있습니다:
+
+```ts
+const { execute } = await raydium.launchpad.graduate({
+  launchInfo: launch,
+  txVersion: TxVersion.V0,
+});
+
+await execute({ sendAndConfirm: true });
+```
+
+제출 시점에 `quote_reserve_real < quote_reserve_target`이면 `NotAtThreshold`로 되돌립니다. 재시도 안전 — 성공 후 두 번째 `Graduate` 시도는 `NotActive`로 되돌립니다.
+
+## 크리에이터 수수료 수집
+
+소스: [`src/launchpad/claimCreatorFee.ts`](https://github.com/raydium-io/raydium-sdk-V2-demo/blob/master/src/launchpad/claimCreatorFee.ts) (단일 민트) 및 [`collectAllCreatorFees.ts`](https://github.com/raydium-io/raydium-sdk-V2-demo/blob/master/src/launchpad/collectAllCreatorFees.ts) (배치)
+
+```ts
+const { execute } = await raydium.launchpad.collectCreatorFees({
+  launchInfo: launch,
+  txVersion: TxVersion.V0,
+});
+
+await execute({ sendAndConfirm: true });
+```
+
+누적된 크리에이터 수수료 카운터 인용 금액을 크리에이터의 인용 민트 ATA로 전송합니다. 졸업 전/후 호출 가능합니다. 거대한 잔액이 쌓일 때까지 기다리지 말고 주기적으로 사용하세요.
+
+## 론칭의 생명주기를 통해 추적
+
+모두를 합치면 모니터링 스크립트는 다음과 같습니다:
+
+```ts
+async function watch(launchId: PublicKey) {
+  while (true) {
+    const launch = await raydium.launchpad.getLaunchById({ launchId });
+    const progress =
+      Number(launch.quoteReserveReal) /
+      Number(launch.quoteReserveTarget);
+
+    console.log(
+      `status=${["Active","Graduated","Cancelled"][launch.status]}`,
+      `progress=${(progress * 100).toFixed(2)}%`,
+      `num_buys=${launch.stateData.numBuys}`,
+    );
+
+    if (launch.status === 1) {
+      console.log("Graduated to CPMM pool:", launch.cpmmPoolState.toBase58());
+      break;
+    }
+    await new Promise(r => setTimeout(r, 10_000));
+  }
+}
+```
+
+## Rust CPI
+
+자신의 Anchor 프로그램에서 LaunchLab을 호출하는 것은 드문 일입니다(대부분의 론칭 통합은 TS 측면만). 프로그램이 Anchor 크레이트 `raydium_launchlab`을 배송하는 경우 `cpi::accounts::Buy`, `cpi::accounts::Sell` 등이 있습니다. 패턴은 CPMM / CLMM CPI 예제를 반영합니다. 이 사이트가 채워지면 [`sdk-api/rust-cpi`](/ko/sdk-api/rust-cpi)를 일반화된 템플릿으로 참조하세요.
+
+## 주의사항
+
+- **수수료 분할 산술 오프-바이-원.** `total_share`가 정확히 `lp_share + creator_share + protocol_share`이 아니면 `Initialize`가 `InvalidFeeShares`로 되돌립니다. `totalShare`를 합계와 같게 설정하세요.
+- **허용되지 않은 인용 민트 사용.** `launch_config.allowed_quote_mints`는 고정 목록입니다. 다른 민트를 전달하면 되돌립니다. 먼저 `raydium.launchpad.getConfig()`로 확인하세요.
+- **메타데이터 크기.** 긴 `uri` 문자열은 Metaplex CPI를 예산 이상으로 밀어냅니다. `uri`를 ~200자 미만으로 유지하세요. 대부분의 CDN 호스팅 JSON 메타데이터는 쉽게 맞습니다.
+- **졸업 경주.** 자동화된 봇은 `quote_reserve_real`을 모니터링하고 임계값 교차 후 한두 슬롯 내에 `Graduate`를 선행합니다. 이것은 무해합니다(임차료만 드는). UI는 `status` 전환을 빠른 이벤트로 취급해야 합니다.
+
+## 다음 단계
+
+- [`products/launchlab/bonding-curve`](/ko/products/launchlab/bonding-curve) — 곡선 수학.
+- [`products/cpmm/code-demos`](/ko/products/cpmm/code-demos) — 결과 풀로 할 일.
+- [`user-flows/launch-token-launchlab`](/ko/user-flows/launch-token-launchlab) — 오프체인 단계를 포함한 엔드투엔드 론칭 토큰 가이드.
+
+소스:
+
+- [Raydium SDK v2](https://github.com/raydium-io/raydium-sdk-V2)
+- Raydium LaunchLab 프로그램 소스

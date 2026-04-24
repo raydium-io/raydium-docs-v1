@@ -1,0 +1,440 @@
+---
+title: "Routing kod örnekleri"
+description: "TypeScript örnekleri: SDK tabanlı çok atlı swap işlemi router aracılığıyla ve ham instruction oluşturma."
+---
+
+<Info>
+  **Bu sayfa yapay zekâ tarafından otomatik olarak çevrilmiştir. İngilizce sürüm esas alınır.**
+
+  [İngilizce sürümü görüntüle →](/products/routing/code-demos)
+</Info>
+
+## Sürüm bilgisi
+
+- **SDK:** `@raydium-io/raydium-sdk-v2@0.2.42-alpha`
+- **Network:** mainnet-beta
+- **Router program ID:** `routeUGWgWzqBWFcrCfv8tritsqukccJPu3q5GPP3xS`
+- **Doğrulandı:** Nisan 2026
+
+## Örnek 1: SDK tabanlı routing
+
+Kaynak: [`src/trade/routeSwap.ts`](https://github.com/raydium-io/raydium-sdk-V2-demo/blob/master/src/trade/routeSwap.ts)
+
+Raydium SDK, route oluşturmayı soyutlar. Multi-hop route oluşturmak ve router aracılığıyla otomatik olarak yürütmek için SDK'nın trade fonksiyonlarını kullanın.
+
+### Kurulum
+
+```typescript
+import {
+  Raydium,
+  Router,
+  Token,
+  TokenAmount,
+  toApiV3Token,
+  toFeeConfig,
+  TxVersion,
+} from "@raydium-io/raydium-sdk-v2";
+import {
+  Connection,
+  Keypair,
+  PublicKey,
+} from "@solana/web3.js";
+import { NATIVE_MINT, TOKEN_2022_PROGRAM_ID } from "@solana/spl-token";
+
+const connection = new Connection("https://api.mainnet-beta.solana.com", "confirmed");
+const wallet = Keypair.fromSecretKey(/* your key bytes */);
+
+const raydium = await Raydium.load({
+  connection,
+  owner: wallet,                 // SDK bu Keypair ile imzalayacak
+  cluster: "mainnet",
+  disableFeatureCheck: true,
+  blockhashCommitment: "finalized",
+});
+
+// Router, CLMM hopları için zincir zamanı çıpasına ihtiyaç duyar.
+await raydium.fetchChainTime();
+```
+
+### Multi-hop swap oluşturun
+
+`@raydium-io/raydium-sdk-v2` içinde routing, `raydium.tradeV2` üzerinde gösterilir. Uçtan uca şekil — havuz verilerini getirme, routeları hesaplama, çıktıya göre sıralama ve swap işlemini oluşturma — aşağıda gösterilmiştir; bu [`raydium-sdk-V2-demo/src/trade/routeSwap.ts`](https://github.com/raydium-io/raydium-sdk-V2-demo/blob/master/src/trade/routeSwap.ts) içindeki kanonik örnek ile eşleşir.
+
+```typescript
+// 1. Giriş/çıkış mintleri ve tutarı seçin.
+const inputMint = NATIVE_MINT;                                     // wSOL
+const outputMint = new PublicKey("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"); // USDC
+const inputAmount = "8000000";                                     // 0.008 SOL (lamports)
+
+// 2. Tüm havuz temel bilgilerini getirin. Bunu agresif bir şekilde önbelleğe alın — büyük bir RPC fan-out'tur.
+const poolData = await raydium.tradeV2.fetchRoutePoolBasicInfo();
+
+// 3. AMM v4, CPMM, CLMM ve Stable AMM arasında yapılabilir her routeyi numaralandırın.
+const routes = raydium.tradeV2.getAllRoute({
+  inputMint,
+  outputMint,
+  ...poolData,
+});
+
+// 4. Routeları canlı RPC durumuyla besleyin (rezervler, tickler, mint bilgisi).
+const {
+  routePathDict,
+  mintInfos,
+  ammPoolsRpcInfo,
+  ammSimulateCache,
+  clmmPoolsRpcInfo,
+  computeClmmPoolInfo,
+  computePoolTickData,
+  computeCpmmData,
+} = await raydium.tradeV2.fetchSwapRoutesData({
+  routes,
+  inputMint,
+  outputMint,
+});
+
+// 5. Her aday route için çıkış tutarlarını hesaplayın. Sonuç çıktıya göre azalan şekilde sıralanır.
+const swapRoutes = raydium.tradeV2.getAllRouteComputeAmountOut({
+  inputTokenAmount: new TokenAmount(
+    new Token({
+      mint: inputMint.toBase58(),
+      decimals: mintInfos[inputMint.toBase58()].decimals,
+      isToken2022: mintInfos[inputMint.toBase58()].programId.equals(TOKEN_2022_PROGRAM_ID),
+    }),
+    inputAmount,
+  ),
+  directPath: routes.directPath.map(
+    (p) =>
+      ammSimulateCache[p.id.toBase58()] ||
+      computeClmmPoolInfo[p.id.toBase58()] ||
+      computeCpmmData[p.id.toBase58()],
+  ),
+  routePathDict,
+  simulateCache: ammSimulateCache,
+  tickCache: computePoolTickData,
+  mintInfos,
+  outputToken: toApiV3Token({
+    ...mintInfos[outputMint.toBase58()],
+    programId: mintInfos[outputMint.toBase58()].programId.toBase58(),
+    address: outputMint.toBase58(),
+    freezeAuthority: undefined,
+    mintAuthority: undefined,
+    extensions: { feeConfig: toFeeConfig(mintInfos[outputMint.toBase58()].feeConfig) },
+  }),
+  chainTime: Math.floor(raydium.chainTimeData?.chainTime ?? Date.now() / 1000),
+  slippage: 0.005, // 0.5%
+  epochInfo: await raydium.connection.getEpochInfo(),
+});
+
+const targetRoute = swapRoutes[0];
+if (!targetRoute) throw new Error("no swap routes were found");
+
+// 6. Seçilen route için havuz anahtarlarını çözün.
+const poolKeys = await raydium.tradeV2.computePoolToPoolKeys({
+  pools: targetRoute.poolInfoList,
+  ammRpcData: ammPoolsRpcInfo,
+  clmmRpcData: clmmPoolsRpcInfo,
+});
+
+// 7. Swap işlemini oluşturun, imzalayın ve yürütün.
+const { execute, transactions } = await raydium.tradeV2.swap({
+  routeProgram: Router,
+  txVersion: TxVersion.V0,
+  swapInfo: targetRoute,
+  swapPoolKeys: poolKeys,
+  ownerInfo: {
+    associatedOnly: true,
+    checkCreateATAOwner: true,
+  },
+  computeBudgetConfig: {
+    units: 600_000,
+    microLamports: 465_915,
+  },
+});
+
+// `sequentially: true` önemlidir — ilk işlem, sonraki işlemlerin bağlı olduğu
+// ara ATA'lar oluşturmak gerekebilir.
+const { txIds } = await execute({ sequentially: true });
+console.log("txIds:", txIds);
+```
+
+### Beklenen davranış
+
+SDK aşağıdakileri yönetir:
+
+- AMM v4, CPMM, CLMM ve Stable AMM arasında route keşfi.
+- Account türetme (havuz durumları, vault'lar, gözlem hesapları, ATA önceden oluşturma).
+- Rota multi-hop olduğunda router programı (`Router`) için instruction paketleme veya tek havuz zaten en iyi fiyatı verdiğinde doğrudan havuz swap'ı.
+- `getAllRouteComputeAmountOut` üzerindeki `slippage` parametresi aracılığıyla slippage uygulanması.
+
+`raydium.tradeV2.swap`, birden fazla `transaction` döndürebilir — birincisi yaygın olarak ara ATA'ları başlatır ve ikincisi swap işlemini gerçekleştirir. Her zaman `execute()` öğesine `sequentially: true` öğesini iletin, böylece sırayla onaylanırlar.
+
+---
+
+## Örnek 2: Ham instruction oluşturma (Rust benzeri sözde kod)
+
+Daha ince kontrol gerekiyorsa veya router'a CPI yapan bir program oluşturuyorsanız, instruction'ları elle oluşturun. Aşağıdaki örnek **tag 8 (`SwapBaseIn`)** kullanır — önerilen Current varyantı — ve kullanıcıya ait ATA'lar aracılığıyla sondan sona yönlendirir.
+
+### Senaryo: USDC → SOL (CPMM) → mSOL (CPMM)
+
+#### Adım 1: Kullanıcının ATA'larını türetin
+
+```typescript
+import { getAssociatedTokenAddressSync } from "@solana/spl-token";
+import { PublicKey } from "@solana/web3.js";
+
+const ROUTER_PROGRAM_ID = new PublicKey(
+  "routeUGWgWzqBWFcrCfv8tritsqukccJPu3q5GPP3xS"
+);
+
+const USDC_MINT = new PublicKey(
+  "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+);
+const SOL_MINT = new PublicKey(
+  "So11111111111111111111111111111111111111112"
+);
+const MSOL_MINT = new PublicKey(
+  "mSoL1MK4LCEDcTYVhPnD6DHK4PMGQ8WyXDEMXbnQAaW"
+);
+
+// Kullanıcı giriş / ara / çıkış ATA'ları — hepsi çağırıcı tarafından sahip olunan.
+const user_usdc_ata = getAssociatedTokenAddressSync(USDC_MINT, wallet.publicKey);
+const user_sol_ata  = getAssociatedTokenAddressSync(SOL_MINT,  wallet.publicKey, true); // wSOL: allowOwnerOffCurve
+const user_msol_ata = getAssociatedTokenAddressSync(MSOL_MINT, wallet.publicKey);
+
+// Kullanıcının ara / çıkış ATA'ları henüz mevcut değilse, bunları önceden
+// Associated Token Account programı aracılığıyla (veya tag 5 üzerinde wSOL ATA'sı
+// için CreateSyncNative'i) oluşturun.
+```
+
+#### Adım 2: Her hop için hesapları toplayın
+
+Hop 1 USDC/SOL üzerinde CPMM'dir. Hop 2 SOL/mSOL üzerinde CPMM'dir.
+
+```typescript
+// Hop 1: CPMM üzerinde USDC/SOL swap
+const CPMM_PROGRAM_ID = new PublicKey(
+  "CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C"
+);
+
+// USDC/SOL için havuz durumunu getirin
+const usdc_sol_pool = await connection.getParsedAccountInfo(
+  USDC_SOL_POOL_STATE
+);
+
+// Havuz durumu, yetki, vault'lar, mintler, token programları vb.
+// (tam 11 account listesi için products/cpmm/accounts'a bakın)
+const hop1_accounts = [
+  CPMM_PROGRAM_ID,           // Bunun CPMM olduğunu tanımlar
+  USDC_SOL_POOL_STATE,
+  CPMM_AUTHORITY,
+  USDC_SOL_VAULT_TOKEN0,
+  USDC_SOL_VAULT_TOKEN1,
+  USDC_MINT,
+  SOL_MINT,
+  LP_MINT,
+  OBSERVATION_STATE,
+  TOKEN_PROGRAM,
+  ASSOCIATED_TOKEN_PROGRAM,
+  SYSTEM_PROGRAM,
+];
+
+// Hop 2: CPMM üzerinde SOL/mSOL swap
+const sol_msol_pool = await connection.getParsedAccountInfo(
+  SOL_MSOL_POOL_STATE
+);
+
+const hop2_accounts = [
+  CPMM_PROGRAM_ID,           // Bunun CPMM olduğunu tanımlar
+  SOL_MSOL_POOL_STATE,
+  CPMM_AUTHORITY,
+  SOL_MSOL_VAULT_TOKEN0,
+  SOL_MSOL_VAULT_TOKEN1,
+  SOL_MINT,
+  MSOL_MINT,
+  LP_MINT_2,
+  OBSERVATION_STATE_2,
+  TOKEN_PROGRAM,
+  ASSOCIATED_TOKEN_PROGRAM,
+  SYSTEM_PROGRAM,
+];
+```
+
+#### Adım 3: Instruction'ı oluşturun
+
+```typescript
+import BN from "bn.js";
+
+// Argümanlar
+const amount_in = new BN(1_000_000_000); // 1000 USDC (6 decimals)
+const minimum_amount_out = new BN(500_000_000_000); // 500 mSOL (9 decimals)
+
+// CLMM hopları yok, bu nedenle limit_prices boş
+const limit_prices: BN[] = [];
+
+// Argümanları paketleyin
+let data = Buffer.alloc(1024);
+let offset = 0;
+
+// Tag 8: SwapBaseIn (Current varyantı; boş limit_prices'e izin verilir)
+data[offset++] = 8;
+
+// amount_in (u64)
+data.writeBigUInt64LE(BigInt(amount_in.toString()), offset);
+offset += 8;
+
+// minimum_amount_out (u64)
+data.writeBigUInt64LE(BigInt(minimum_amount_out.toString()), offset);
+offset += 8;
+
+// limit_prices (VecDeque<u128>) — boş (bu route'da CLMM hopları yok).
+// Tag 8 hata olmadan boş deque kabul eder. Sıfır giriş yazın (u128 yok).
+
+data = data.slice(0, offset);
+
+// Hesaplar listesini oluşturun — her ara ATA kullanıcı tarafından sahip olunan.
+const accounts = [
+  { pubkey: user_usdc_ata, isSigner: true,  isWritable: true },
+  { pubkey: user_sol_ata,  isSigner: false, isWritable: true },
+  { pubkey: user_msol_ata, isSigner: false, isWritable: true },
+  ...hop1_accounts.map((pk, i) => ({
+    pubkey: pk,
+    isSigner: false,
+    isWritable: i === 0 ? false : true, // program ID yazılabilir değildir
+  })),
+  ...hop2_accounts.map((pk, i) => ({
+    pubkey: pk,
+    isSigner: false,
+    isWritable: i === 0 ? false : true,
+  })),
+];
+
+const instruction = new TransactionInstruction({
+  programId: ROUTER_PROGRAM_ID,
+  keys: accounts,
+  data,
+});
+```
+
+#### Adım 4: İşlemi gönderin
+
+```typescript
+const { blockhash } = await connection.getLatestBlockhash();
+
+const tx = new VersionedTransaction(
+  new TransactionMessage({
+    instructions: [instruction],
+    payerKey: wallet.publicKey,
+    recentBlockhash: blockhash,
+  }).compileToV0Message()
+);
+
+tx.sign([wallet]);
+const sig = await connection.sendTransaction(tx);
+await connection.confirmTransaction(sig);
+```
+
+---
+
+## Örnek 3: Hata işleme
+
+Yaygın hatalar ve nasıl kurtarılacağı:
+
+### ExceededSlippage
+
+Çıktı `minimum_amount_out` öğesinden daha az idi. Daha yüksek slippage toleransıyla yeniden deneyin veya route'ı yeniden alıntılayın.
+
+```typescript
+try {
+  const sig = await connection.sendTransaction(tx);
+} catch (error) {
+  if (error.message.includes("ExceededSlippage")) {
+    console.log(
+      "Route fiyatı hareket etti. Yeniden alıntılayın ve işlemi yeniden oluşturun."
+    );
+  }
+}
+```
+
+### SqrtPriceX64 (CLMM)
+
+Bir CLMM hop'ının fiyatı `limit_prices` sınırları dışına çıktı. Sınırları güncelleyin ve yeniden deneyin.
+
+### InvalidOwner
+
+Bir ara veya çıkış ATA çağırıcı tarafından sahip olunan değildir. Router her slot'ta sahipliği doğrular; her geçirilen ATA'nın kullanıcının cüzdanından türetildiğinden emin olun (başka bir otoriteden değil).
+
+---
+
+## İpuçları ve en iyi uygulamalar
+
+### Ara ATA'ları önceden oluşturun
+
+İlk kez yeni bir ara token aracılığıyla yönlendirmeden önce, route'ın doğrulama başarısız olmaması için kullanıcının ATA'sını oluşturun:
+
+```typescript
+import { createAssociatedTokenAccountInstruction } from "@solana/spl-token";
+
+const createAtaIx = createAssociatedTokenAccountInstruction(
+  wallet.publicKey,  // payer
+  user_sol_ata,      // oluşturulacak ATA
+  wallet.publicKey,  // owner — her zaman kullanıcı
+  SOL_MINT,
+);
+
+// createAtaIx'i ilk route ile aynı işlemde paketleyin veya önceden bir kez gönderin;
+// kira (~0.002 SOL) daha sonra tag 6 (CloseTokenAccount) aracılığıyla ATA boş
+// olduğunda geri talep edilebilir.
+```
+
+wSOL için özellikle [`CreateSyncNative`](/tr/products/routing/instructions#createsyncnative-tag-5) (tag 5) tercih edin — ATA'yı oluşturur, SOL'yi transfer eder ve bir instruction'da senkronize eder.
+
+### Yürütmeden önce fiyat belirleyin
+
+Instruction'ı oluşturmadan önce her zaman havuzları sorgulayın ve beklenen çıktıyı hesaplayın:
+
+```typescript
+// Sözde kod: mevcut havuz durumunu alın ve fiyatı hesaplayın
+const pool1State = await connection.getAccountInfo(USDC_SOL_POOL_STATE);
+const amount_out_hop1 = computeSwapOutput(
+  amount_in,
+  pool1State,
+  USDC_MINT,
+  SOL_MINT
+);
+
+const pool2State = await connection.getAccountInfo(SOL_MSOL_POOL_STATE);
+const amount_out_hop2 = computeSwapOutput(
+  amount_out_hop1,
+  pool2State,
+  SOL_MINT,
+  MSOL_MINT
+);
+
+const minimum_amount_out = amount_out_hop2 * 0.99; // %1 slippage
+```
+
+### Daha yeni instruction varyantlarını kullanın (8–9)
+
+Taglar 8 ve 9 (`SwapBaseIn` ve `SwapBaseOut`), `limit_prices` ile daha hoşgörülüdür. Eski varyantlar yerine bunları tercih edin, CLMM fiyat doğrulamasına ihtiyacınız yoksa.
+
+```typescript
+// Tag 8: limit_prices isteğe bağlı olarak SwapBaseIn
+data[offset++] = 8;
+// ... paketlemenin geri kalanı; limit_prices deque boş olabilir
+```
+
+---
+
+## Sonraki adımlar
+
+- [`products/routing/instructions`](/tr/products/routing/instructions) — tam instruction referansı.
+- [`products/routing/accounts`](/tr/products/routing/accounts) — account türetme detayları.
+- [`products/cpmm/code-demos`](/tr/products/cpmm/code-demos) — karşılaştırma için CPMM swap örnekleri.
+- [`reference/program-addresses`](/tr/reference/program-addresses) — kanonik program ID'leri ve devnet adresleri.
+
+Kaynaklar:
+
+- [`@raydium-io/raydium-sdk-v2` on npm](https://www.npmjs.com/package/@raydium-io/raydium-sdk-v2)
+- [`raydium-io/raydium-sdk-V2`](https://github.com/raydium-io/raydium-sdk-V2) (açık kaynak)
+- [`raydium-io/raydium-sdk-V2-demo`](https://github.com/raydium-io/raydium-sdk-V2-demo) — `routeSwap.ts` dahil resmi uçtan uca demolar
+- AMM Routing program kaynağı herkese açık değildir; program ID'sini canlı API'ye ve zincir üzerindeki bytecode'a göre doğrulayın

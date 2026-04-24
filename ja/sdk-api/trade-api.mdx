@@ -1,0 +1,238 @@
+---
+title: "Trade API"
+description: "Raydiumのサーバー構築スワップトランザクションエンドポイント: クオート、ビルド、署名、送信。SDKをシップせずにRaydiumルーティングを利用したいアプリ向けの統合パターン — 戻り値、SDKとの違い、アグリゲーターの利用方法。"
+---
+
+<Info>
+  **このページは AI による自動翻訳です。すべての内容は英語版を正とします。**
+
+  [英語版を表示 →](/sdk-api/trade-api)
+</Info>
+
+<Info>
+  **Trade API** は `transaction-v1.raydium.io`（および `api-v3.raydium.io` のミラーパス）上の軽量エンドポイントセットで、スワップをクオートし、署名済み実行可能なSolanaトランザクションをビルドして、1回のラウンドトリップで返します。Raydium UIが使用するのと同じサーフェスです。TS SDKをバンドルせずにRaydiumルーティングを利用したい場合に使用してください — バックエンド、Blinksハンドラー、Telegramボット、サードパーティアプリなど。
+</Info>
+
+## Trade API と SDK の使い分け
+
+| やりたいこと | 使用するもの |
+|---|---|
+| npm パッケージをバンドルできないバックエンド（Python ボット、Go サービス、Rust サービスなど）にスワップを統合する | **Trade API** |
+| ソーシャルポストに Swap Blink をレンダリングする | **Trade API** |
+| キロバイト削減が重要なブラウザアプリを構築する | **Trade API** |
+| 別の Solana プログラム内にルーティングロジックを埋め込む（CPI） | どちらでもない — [`sdk-api/rust-cpi`](/ja/sdk-api/rust-cpi) を使用 |
+| カスタムルートプレビュー、チャートオーバーレイ、優先度フィーヒューリスティックスを備えた完全な DEX のようなクライアントを構築する | **TS SDK** |
+| ネットワークラウンドトリップなしで確定的なオフラインクオーティングが必要 | **TS SDK**（ローカルプール状態） |
+
+SDK はより機能が豊富です。Trade API はシンプルです。どちらも同じ CPMM/CLMM/AMM v4 プログラムをラップするため、結果のオンチェーンスワップは同一です。
+
+## 3つのエンドポイント
+
+### 1. `GET /compute/swap-base-in`
+
+入力額が与えられるとルートを選択し、クオートを返します。
+
+```
+GET https://transaction-v1.raydium.io/compute/swap-base-in
+  ?inputMint=So11111111111111111111111111111111111111112
+  &outputMint=EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v
+  &amount=1000000000
+  &slippageBps=50
+  &txVersion=V0
+```
+
+レスポンス:
+
+```json
+{
+  "id": "b2e4...",
+  "success": true,
+  "version": "V1",
+  "data": {
+    "swapType": "BaseIn",
+    "inputMint":  "So11111111111111111111111111111111111111112",
+    "inputAmount":  "1000000000",
+    "outputMint": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+    "outputAmount": "165234567",
+    "otherAmountThreshold": "164408394",
+    "slippageBps": 50,
+    "priceImpactPct": 0.0012,
+    "referrerAmount": "0",
+    "routePlan": [
+      { "poolId": "58oQ...", "inputMint": "So11...", "outputMint": "USDC...", "feeAmount": "2500000", "feeMint": "So11..." }
+    ]
+  }
+}
+```
+
+`id` フィールドは次のエンドポイントに渡すクオートハンドルです。クオートは約 30 秒間安定しており、それ以降は再クオートしてください。
+
+### 2. `GET /compute/swap-base-out`
+
+逆形式：「出力からちょうど N を受け取りたい、必要な入力をクオートしてください」。
+
+```
+GET /compute/swap-base-out
+  ?inputMint=<MINT_IN>
+  &outputMint=<MINT_OUT>
+  &amount=<DESIRED_OUTPUT_AMOUNT>
+  &slippageBps=50
+  &txVersion=V0
+```
+
+`swap-base-in` と対称的なレスポンス形状。`amount` フィールドのセマンティクスが反転します。
+
+### 3. `POST /transaction/swap-base-in` および `/transaction/swap-base-out`
+
+ステップ 1 からのクオートを受け取り、署名済み実行可能なバージョン付きトランザクションを返します:
+
+```
+POST https://transaction-v1.raydium.io/transaction/swap-base-in
+Content-Type: application/json
+
+{
+  "computeUnitPriceMicroLamports": "50000",
+  "swapResponse": { ... swap-base-in からの data オブジェクトをペーストします ... },
+  "txVersion": "V0",
+  "wallet": "<user_pubkey>",
+  "wrapSol": true,
+  "unwrapSol": false,
+  "inputAccount": "<optional_token_account>",
+  "outputAccount": "<optional_token_account>"
+}
+```
+
+レスポンス:
+
+```json
+{
+  "id": "9f1c...",
+  "success": true,
+  "version": "V1",
+  "data": [
+    { "transaction": "<base64-encoded-versioned-transaction>" }
+  ]
+}
+```
+
+スワップがセットアップを必要とする場合、複数のトランザクションが返される可能性があります（例：ATA の作成、SOL のラップ）。順序通りに署名して送信してください。
+
+## 最小限のエンドツーエンドの例（Python）
+
+```python
+import base64, requests
+from solders.transaction import VersionedTransaction
+from solders.keypair import Keypair
+from solana.rpc.api import Client
+
+rpc = Client("https://api.mainnet-beta.solana.com")
+kp = Keypair.from_bytes(bytes([...]))    # your signer
+
+SOL  = "So11111111111111111111111111111111111111112"
+USDC = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+
+quote = requests.get(
+    "https://transaction-v1.raydium.io/compute/swap-base-in",
+    params={
+        "inputMint": SOL, "outputMint": USDC,
+        "amount": 1_000_000_000, "slippageBps": 50, "txVersion": "V0",
+    },
+).json()
+
+built = requests.post(
+    "https://transaction-v1.raydium.io/transaction/swap-base-in",
+    json={
+        "computeUnitPriceMicroLamports": "50000",
+        "swapResponse": quote,
+        "txVersion": "V0",
+        "wallet": str(kp.pubkey()),
+        "wrapSol": True,
+        "unwrapSol": False,
+    },
+).json()
+
+for entry in built["data"]:
+    raw = base64.b64decode(entry["transaction"])
+    tx = VersionedTransaction.from_bytes(raw)
+    tx.sign([kp])
+    sig = rpc.send_raw_transaction(bytes(tx)).value
+    print(f"Sent: {sig}")
+```
+
+これは約 20 行です。同等の TS SDK は約 30 行ですが、より豊富な制御が得られます（カスタムルートピッカー、プールごとの Compute Unit 予算、詳細なエラーメタデータ）。
+
+## ルーティングとプール選択
+
+Trade API は**すべての** Raydium プログラム（CPMM、CLMM、AMM v4）をルーティングし、クオートされたサイズに対して最良の実行を選択します。特性：
+
+- **マルチホップ対応。** SOL→USDC スワップは、より安い場合 wSOL→JUP→USDC 経由でルーティングできます。
+- **同一プログラムマルチプール分割は非対応。** 単一のクオートは正確に 1 つのパスを通ります。サイズをプール全体に分割したい場合は、クライアント側で実行してください（2 つのクオート、2 つのトランザクション）。
+- **安定対濃縮。** ルーターはレンジ内流動性が十分な場合は CLMM を優先的に使用し、ロングテール ペアは CPMM にフォールバックします。
+- **AMM v4 インクルージョン。** AMM v4 プールはルーティングに含まれていますが、CPMM/CLMM の代替品より優れた価格設定を提供する場合のみ選択されます。
+
+特定のプールをピンするようにルーティングを強制するには、SDK を代わりに使用してください — Trade API はプールピンパラメータを公開していません。
+
+## リファラーパラメータ
+
+計算エンドポイントに `&referrer=<wallet_pubkey>` を追加して、スワップで 1% のリファラルカットを取得します。[`user-flows/referrals-and-blinks`](/ja/user-flows/referrals-and-blinks) でセマンティクスを確認してください。存在する場合：
+
+- クオートレスポンスの `referrerAmount` は、リファラーにルーティングされる絶対額（入力ミント）です。
+- 最終トランザクションには、リファラーの ATA への追加の SPL トークン転送が含まれます。
+
+## 優先度フィー
+
+ビルドリクエストの `computeUnitPriceMicroLamports` は、返されるトランザクションの優先度フィーを設定します。経験則：
+
+- `50_000`（0.00005 lamports/CU × 200k CU ≈ 0.00001 SOL）：最小限。混雑していない時間帯に適しています。
+- `200_000`：中程度の混雑。
+- `1_000_000`：高混雑。
+
+適応チューニングの場合、最初に RPC で `getRecentPrioritizationFees` を呼び出し、中央値を渡します。[`integration-guides/priority-fee-tuning`](/ja/integration-guides/priority-fee-tuning) を参照。
+
+## トランザクションバージョン
+
+- `"V0"` は、一般的なアカウント用ルックアップテーブルを備えたバージョン付き（`MessageV0`）トランザクションを返します。より小さく、高速。**推奨。**
+- `"LEGACY"` はレガシートランザクションを返します。より大きい。V0 をサポートしないウォレット/インフラの場合のみ使用。
+
+## エラー形状
+
+API は論理エラーの場合 HTTP 200 と `success: false` を返し、トランスポート/インフラエラーの場合は HTTP 4xx/5xx を返します。
+
+一般的な論理エラー：
+
+- `"No route found"` — このサイズの 2 つのミント間にパスがありません。`amount` を減らすか、ペアを再検討してください。
+- `"Insufficient liquidity"` — ルートは存在しますが、`slippageBps` を超えます。スリッページを拡大してください。
+- `"Quote expired"` — `swapResponse` が 30 秒以上前です。再クオートしてください。
+- `"Unsupported mint"` — ミントが Raydium のユニバース（リストされていない、または廃止プログラム上）にありません。
+
+## レート制限
+
+- **クオートエンドポイント:** IP あたり 120 req/min。
+- **ビルドエンドポイント:** IP あたり 60 req/min（サーバー上でより高いコスト）。
+- 制限を超えると、HTTP 429 と `Retry-After` ヘッダーが返されます。
+
+より高いスループットについては、Raydium 開発者関係に問い合わせてください。アグリゲーター階層のキーが利用可能です。
+
+## 統合者向けアーキテクチャパターン
+
+```
+┌─────────────┐   quote   ┌───────────────┐   build   ┌───────────────┐   sign/send   ┌──────────┐
+│ Your front  │──────────►│ Trade API     │──────────►│ Trade API     │──────────────►│ Solana   │
+│   end       │◄──────────│ /compute/...  │◄──────────│ /transaction/ │               │   RPC    │
+└─────────────┘           └───────────────┘           └───────────────┘               └──────────┘
+                              (stateless)                 (stateless)
+```
+
+すべてがステートレスです — クオート呼び出しとビルド呼び出しの間にスレッド化する必要があるのは、クオートレスポンス本体だけです。
+
+## 次に進む
+
+- [`sdk-api/typescript-sdk`](/ja/sdk-api/typescript-sdk) — 同じ基盤となるプログラムをもつ、より豊富なプログラマティックインターフェース。
+- [`sdk-api/rest-api`](/ja/sdk-api/rest-api) — Trade API の書き込み側を補完する読み取り側エンドポイント（プール情報、ミント情報）。
+- [`user-flows/swap`](/ja/user-flows/swap) — エンドツーエンド UI スワップフロー。
+- [`integration-guides/aggregator`](/ja/integration-guides/aggregator) — 多くの DEX をまたがってルーティングするアグリゲーターのパターン。
+
+ソース：
+
+- `transaction-v1.raydium.io` ライブエンドポイント。
+- Raydium UI ネットワークタブ検査（同じサーフェス利用）。

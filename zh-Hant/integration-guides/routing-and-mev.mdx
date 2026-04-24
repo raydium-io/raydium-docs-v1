@@ -1,0 +1,224 @@
+---
+title: "路由和 MEV"
+description: "跨 Raydium 產品的分路由、三明治攻擊抵抗模式、Jito 組合集成，以及私有與公開記憶池提交路徑之間的權衡。"
+---
+
+<Info>
+  **本頁內容由 AI 自動翻譯，所有內容以英文版本為準。**
+
+  [查看英文版 →](/integration-guides/routing-and-mev)
+</Info>
+
+<Info>
+  Solana 上的「MEV」與以太坊的記憶池驅動型 MEV 並不相同。區塊領導者看到的是交易包到達時的順序，而非有序的記憶池；搶先交易發生在領導者端重新排序或共置搜索器的方式，三明治攻擊由監視池狀態並用更高費用競速你交易的機器人執行。相應地，緩解措施也不同。
+</Info>
+
+## 分路由入門
+
+「分路由」是指將一次邏輯交換拆分到多個池中，使邊際價格均衡——與在各自池的價格下交易每一片的輸出相同。當任何單個池相對於交易規模都很淺時，它可以減少有效價格影響。
+
+問題陳述：給定池 `P_1, ..., P_n`，其函數 `f_i(x)` 將輸入 `x` 映射到輸出，找到分配 `x_1 + ... + x_n = X` 以最大化 `Σ f_i(x_i)`。由於每個 `f_i` 都是凹函數，最優值滿足 `f'_1(x_1) = f'_2(x_2) = ... = f'_n(x_n)`（邊際價格相等）。
+
+### 貪心實現
+
+一個在實踐中能達到最優值 ~1% 的簡單方法：
+
+```
+remaining = X
+routes    = []
+step      = X / 1000     // slice size
+while remaining > 0:
+    best_pool = argmax over i of f'_i(current_x_i + step)
+    x_i += step
+    routes.append((best_pool, step))
+    remaining -= step
+```
+
+更細的 `step` → 更接近最優，更多迭代。在實踐中，100–500 片是合理的甜蜜點。
+
+### 凸優化實現
+
+對於生產級聚合器，直接求解優化。每個池有一個閉形式 `f'_i(x)`：
+
+- **恆積（CPMM / AMM v4）**：`f'(x) = y * R_y / (R_x + x)^2`，其中 `R_x, R_y` 是儲備，`y = R_x * R_y / (R_x + x) - R_y` ...（更簡單的推導：邊際價格是 `R_y / (R_x + x)`，所以分配以均衡邊際價格是一次 1D 搜索）。
+- **CLMM**：分段光滑——在一個 tick 內，`f'(x)` 是 `sqrt_price` 的有理函數；跨 tick，它離散步進。使用小步求解器進行分配，或將每個連續 tick 視為其自身的「池」。
+
+分路由的輸出是一個向量 `[(pool_1, x_1), (pool_2, x_2), ...]`，你的交易組裝步驟將其轉換為一系列交換指令。
+
+### 分路由何時有幫助
+
+| 交易規模與 TVL | 分路由有幫助？ |
+|-------------------|--------------|
+| `<0.1%` | 否——單池主導 |
+| 0.1–1% | 邊際有幫助 |
+| 1–5% | 是，10–50 bps 改進 |
+| `>5%` | 是，大幅改進 |
+
+如果你在錢包的 UI 交換中為零售用戶進行 `<$10k` 的深度池交換，不要費力分割——gas 開銷會超過改進。對於聚合器報價機構流動，始終分割。
+
+## 多跳路由
+
+當不存在直接池時，或直接池的影響巨大時，通過中介進行中繼：
+
+```
+tokenA → tokenHub → tokenB
+```
+
+常見中樞：USDC、SOL、RAY。每次中繼有：
+
+- 其自身的滑點界限（直接中繼上較低；多跳上按中繼）。
+- 其自身支付的費用。
+- 其自身的價格影響。
+
+總影響複合：`(1 - impact_1) * (1 - impact_2)`。1% 影響中繼兩次是 1.99% 總計，而非 2%。
+
+**永遠不要通過同一池中繼兩次。** 通過同一 CLMM 進行 `A → B → A → B` 只是燃燒費用和滑點。聚合器應在生成時篩選此類路由。（注意：這是*同對循環*，不是多跳一般情況——通過不同池路由 `A → USDC → B` 是標準、有用的模式，在上面得到認可。）
+
+**按中繼與端到端最小值。** 使用 CPI 組合（[`integration-guides/cpi-integration`](/zh-Hant/integration-guides/cpi-integration)），你可以將每個中繼的 `minimum_amount_out` 設置為 0，並在你的代理中實施單一端到端最小值。沒有 CPI，每個中繼實施其自身最小值，這要求計算合理的中間邊界——通常按中繼 `quote_i * (1 - slippage_bps/10000)`。
+
+## 三明治攻擊
+
+### 機制
+
+一個機器人監視交易八卦流。當它看到你的交換時：
+
+1. 搶先交易：機器人在你之前購買相同令牌，將池價格推高。
+2. 受害者交易：你以更差的價格交換。
+3. 逆向交易：機器人以升高的價格賣出，捕捉差價。
+
+機器人為其兩次交易都支付優先費；利潤是三明治差減去兩倍的優先費。僅在你的交易有意義地移動價格的池上有利可圖。
+
+### 緩解措施
+
+**緊滑點。** 如果你的最小輸出比報價低 0.5%，移動價格超過 0.5% 的三明治會撤銷你但機器人的前交易仍以你的舊價格執行。他們虧錢。三明治機器人針對寬滑點（≥1–2%）；sub-0.3% 滑點在很大程度上是免疫的。
+
+**私有記憶池提交（Jito）。** 將你的交易作為 Jito 組合的一部分提交。組合不會出現在公開八卦流中；機器人在飛行中看不到交易並搶先交易。權衡：組合需要驗證者端小費，並非每個領導者都啟用 Jito（雖然大多數都是）。
+
+**較小的交易規模。** 跨多個交易分割交易，使沒有單個交易移動足夠的價格成為有利可圖的三明治目標。增加總 gas 成本。
+
+**時間隨機化。** 如果可能，在低交易量時提交。不適用於互動用戶交換但適用於計劃的機器人流量。
+
+Raydium 的 CLMM 池通常比 CPMM 看到的三明治活動少，因為單 tick 流動性結構意味著小型交易根本不移動價格（它們保持在 tick 內）。深 CLMM 池是最好的三明治抵抗場所。
+
+## Jito 組合
+
+Jito 是一個修改的 Solana 驗證者客戶端，接受**組合**——原子級登錄的有序交易組。機器人使用 Jito 進行 MEV 提取；普通用戶使用 Jito 保護自己免受相同機器人的侵害。
+
+### 組合如何工作
+
+- 連接到 Jito 區塊引擎端點（例如 `https://mainnet.block-engine.jito.wtf`）。
+- 將 1–5 個交易的組合加上小費提交到 Jito 的小費帳戶之一。
+- 如果當前領導者運行 Jito，你的組合會被考慮。此插槽的拍賣贏家（每 CU 小費最高的組合）登錄；其他人則被丟棄。
+
+### 調整小費
+
+小費大小遵循最近組合分佈。Jito 發佈實時百分位：
+
+```ts
+const tipRes = await fetch("https://worker.jito.wtf/api/v1/bundles/tip_floor");
+const tips   = await tipRes.json();
+// { ema_landed_tips_25th_percentile, 50th, 75th, 95th, 99th }
+
+// 普通日子的面向用戶的交換——50th 百分位很好。
+const tipSol = tips.ema_landed_tips_50th_percentile_lamports / 1e9;
+
+// 擁塞期間時間敏感的機器人交易——75–95th 百分位。
+```
+
+典型範圍：非緊急用戶交換 0.0001–0.001 SOL；擁塞期間高優先級機器人 0.01–0.1 SOL。
+
+### 構建組合
+
+```ts
+import { SearcherClient } from "jito-ts";
+
+const client = new SearcherClient("https://mainnet.block-engine.jito.wtf");
+
+const tipIx = SystemProgram.transfer({
+  fromPubkey: user.publicKey,
+  toPubkey:   JITO_TIP_ACCOUNTS[Math.floor(Math.random() * 8)],  // 8 tip accts
+  lamports:   tipLamports,
+});
+
+const tx1 = new VersionedTransaction(...);  // the swap
+tx1.sign([user]);
+
+const bundleUuid = await client.sendBundle([tx1], tipLamports);
+// Optionally: await confirmation via client.getBundleStatuses([bundleUuid])
+```
+
+陷阱：
+
+- **小費必須在組合內。** 將 `SystemProgram.transfer` 包含到 Jito 小費帳戶作為組合的一個交易內的指令（通常是最後一個）。不是組合一部分的單獨小費交易被忽略。
+- **領導者未啟用 Jito。** ~75% 的領導者運行 Jito；~25% 不運行。當非 Jito 領導者持有插槽時提交的組合被丟棄。客戶端將自動重試。
+- **過期。** 組合使用與常規交易相同的區塊哈希過期模型。快速組裝和發送；~60s 窗口。
+
+### 組合與優先費
+
+優先費賄賂領導者更快地包含你的交易。Jito 組合還從公開記憶池中隱藏交易。使用優先費以確保緊急性；使用組合以防止三明治。雙重保險：在高價值用戶交換上同時使用兩者。
+
+參見 [`integration-guides/priority-fee-tuning`](/zh-Hant/integration-guides/priority-fee-tuning) 以調整優先費大小。
+
+## MEV 共享 / 撤銷保護 RPC
+
+某些 RPC 提供商提供「MEV 共享」或「撤銷保護」端點，內部通過 Jito 組合或等效私有路徑路由你的交易：
+
+- **Helius** —— 質押連接，組合支持。
+- **QuickNode** —— 「Revert Protect」端點；自動在提交的交易周圍形成組合。
+- **Triton** —— 私有流層。
+
+使用其中之一是對於不想自己管理組合邏輯的項目的最簡單路徑。權衡：不透明的內部機制；你信任提供商的組合構建。
+
+## 擁塞處理
+
+在高交易量窗口期間（主網啟動、主要上市、持續上漲），領導者包隊列填滿。症狀：
+
+- 交易保持未確認 60+ 秒，然後以「blockhash not found」過期。
+- 昨天有效的優先費今天不足。
+- 模擬成功但執行從未登錄。
+
+策略：
+
+1. **過期時的激進重試。** 在 `TransactionExpiredBlockheightExceeded` 上，以新區塊哈希重建並重新提交。*不要*在撤銷上重試——撤銷是確定性的。
+2. **多 RPC 廣播。** 同時向多個 RPC 提交相同交易；先到達領導者的獲勝。
+3. **優先費提升。** 從 50th 百分位開始；如果第一次嘗試過期，在 75th 重試，然後 95th。
+4. **Jito 組合作為後備。** Jito 領導者往往不那麼擁塞，因為區塊引擎按每 CU 小費排序組合；高小費組合獲得優先級。
+5. **模擬較少。** 在擁塞下，模擬一次前期；不要在重試上重新模擬，因為池狀態無論如何都會轉變。在擁塞期間重新模擬經常會虛假失敗。
+
+## 按產品 MEV 考慮
+
+**CPMM。** 在低 TVL 池上高度可被三明治化。恆積曲線放大甚至小型機器人前交易。建議對任何 CPMM 交易 >0.5% 池 TVL 使用 Jito 組合。
+
+**CLMM。** 在深池上不那麼可被三明治化，因為 tick 內交易不移動價格。但跨 tick 交易絕對可以；針對 tick 交叉的三明治攻擊是已知模式。緊滑點（`<0.3%`）是最好的防禦。
+
+**AMM v4 + OpenBook。** OpenBook 訂單簿填充通過同一交易運行，所以不知道訂單簿狀態的三明治機器人低估價格影響並經常失敗。因此有機低 MEV 場地。
+
+**LaunchLab。** 在早期結合曲線階段，搶先交易在炒作的啟動中猖獗。曲線移動快速，滑點寬。強烈建議使用 Jito 組合。畢業後，生成的 CPMM 遵循正常 CPMM 動態。
+
+**Farms。** 收穫和質押操作不是交換，不可被三明治化。無需特殊處理。
+
+## 檢查清單
+
+對於生產聚合器 / 錢包交換 UI：
+
+- [ ] 滑點默認值在正常對上 ≤0.5%；用戶可以覆蓋。
+- [ ] Jito 組合提交對 >\$1k USD 價值的交換默認啟用。
+- [ ] 優先費來自實時估計（不硬編碼）。
+- [ ] 重試邏輯區分撤銷（不重試）與過期（使用新區塊哈希重試）。
+- [ ] 多跳路由設置按中繼最小值，而非端到端。
+- [ ] 分路由對 >1% 任何單個池 TVL 的交易有效。
+- [ ] 池新鮮度：在提交前立即重新獲取狀態；如果陳舊重新報價。
+- [ ] 在淺池上對三明治有抵抗：要麼僅 Jito，要麼如果滑點 >1% 則拒絕。
+
+## 指標
+
+- [`integration-guides/aggregator`](/zh-Hant/integration-guides/aggregator) —— 池發現、報價、交易組裝。
+- [`integration-guides/priority-fee-tuning`](/zh-Hant/integration-guides/priority-fee-tuning) —— CU 和優先費調整。
+- [`integration-guides/cpi-integration`](/zh-Hant/integration-guides/cpi-integration) —— 單滑點門多跳組合。
+- [`algorithms/slippage-and-price-impact`](/zh-Hant/algorithms/slippage-and-price-impact) —— 正式定義。
+
+來源：
+
+- [Jito docs](https://docs.jito.wtf)
+- [Solana validator docs on priority fees](https://docs.solana.com/transaction_fees)
+- [jito-ts](https://github.com/jito-labs/jito-ts) — TypeScript 組合客戶端。

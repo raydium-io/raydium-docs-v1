@@ -1,0 +1,224 @@
+---
+title: "Аккаунты Farm / Staking"
+description: "FarmState, UserStake / Ledger, хранилища вознаграждений и PDA органов управления — разметки и семена PDA для farm v3, v5 и v6."
+---
+
+<Info>
+  **Эта страница переведена с помощью ИИ. За эталон принимается английская версия.**
+
+  [Открыть английскую версию →](/products/farm-staking/accounts)
+</Info>
+
+<Info>
+  **Три программы, три схемы.** Farm v3, v5 и v6 — это отдельные программы с отличающейся разметкой состояния. На этой странице они документированы параллельно. На практике большинство новых интеграций ориентируются на v6; v3 и v5 используются в режиме чтения для большинства интеграторов (стейкинг там произошёл давно, и пулы находятся на завершающей стадии).
+</Info>
+
+## Инвентарь аккаунтов (на один ферм, любая версия)
+
+| Аккаунт | Владелец | Назначение |
+|---------|----------|-----------|
+| `FarmState` | Farm программа (v3/v5/v6) | Корневое состояние: стейкинг-монета, общее количество в ставке, потоки вознаграждения. |
+| `farm_authority` | Farm программа | PDA, владеющий хранилищем стейкинга и хранилищами вознаграждений. |
+| `staking_vault` | SPL Token | Содержит LP в ставке (или другой монету для стейкинга). |
+| `reward_vault_{i}` | SPL Token | Содержит неиспользованный бюджет для потока вознаграждения `i`. Один на поток. |
+| `UserStake` (v3/v5) / `UserLedger` (v6) | Farm программа | Реестр на `(ферм, пользователь)`: сумма в ставке + снимок вознаграждения за акцию на каждый поток. |
+
+SDK возвращает полный набор на `raydium.farm.getFarmById`. Для произвольных сторонних ферм конечная точка API `GET https://api-v3.raydium.io/main/farms/info?ids=<FARM_ID>` тоже их возвращает.
+
+## Разметка `FarmState` — v6
+
+v6 — текущая версия. Её структура аккаунта наиболее универсальна.
+
+```rust
+// programs/farm_v6/src/state/farm.rs (сокращённо)
+pub struct FarmState {
+    pub state: u64,                // битовое поле: 0 = активна, 1 = пауза, ...
+    pub nonce: u64,                 // bump для farm_authority
+    pub creator: Pubkey,            // исходный создатель (может добавлять награды / передавать админ)
+    pub staking_mint: Pubkey,
+    pub staking_vault: Pubkey,
+    pub staking_token_program: Pubkey, // SPL Token или Token-2022
+    pub lp_mint_decimals: u8,
+    pub reward_period_len: u64,     // минимальная длительность между редактированиями SetRewards
+    pub reward_period_min: u64,
+    pub total_staked: u64,
+    pub reward_info_count: u8,
+    pub _reserved: [u8; ...],
+    pub reward_infos: [RewardInfo; 5], // до 5 потоков вознаграждений
+}
+
+pub struct RewardInfo {
+    pub reward_state: u8,           // 0 = неиспользуется, 1 = активна, 2 = завершена
+    pub open_time: u64,             // время_начала
+    pub end_time: u64,
+    pub last_update_time: u64,
+    pub emission_per_second_x64: u128, // Q64.64 скорость с фиксированной точкой
+    pub reward_total_emissioned: u64,   // сумма выпущенных вознаграждений
+    pub reward_claimed: u64,            // сумма выплачена стейкерам
+    pub reward_vault: Pubkey,
+    pub reward_mint: Pubkey,
+    pub reward_sender: Pubkey,          // кто внёс бюджет; может пополнить
+    pub reward_token_program: Pubkey,   // SPL или Token-2022
+    pub reward_per_share_x64: u128,     // Q64.64 счётчик
+}
+```
+
+Поля для интеграторов:
+
+- **`staking_mint`, `staking_vault`** — что ставится и где находится.
+- **`total_staked`** — текущее количество. Необходимо для подсчёта APR: `reward_per_second × 86400 / total_staked`.
+- **`reward_infos[i].emission_per_second_x64`** — скорость Q64.64. Разделите на `2^64` для истинного количества токенов в секунду.
+- **`reward_infos[i].open_time` / `end_time`** — для отображения UI «X дней осталось».
+- **`reward_infos[i].reward_per_share_x64`** — счётчик, на который срезается `UserLedger`.
+
+## Разметка `FarmState` — v5
+
+```rust
+pub struct FarmStateV5 {
+    pub state: u64,
+    pub nonce: u64,
+    pub lp_vault: Pubkey,            // aka стейкинг-хранилище
+    pub reward_vaults: [Pubkey; 2],
+    pub owner: Pubkey,
+    pub reward_mints: [Pubkey; 2],
+    pub reward_total_emissioned: [u64; 2],
+    pub reward_claimed: [u64; 2],
+    pub reward_per_second: [u64; 2],  // целое число, не с фиксированной точкой
+    pub reward_open_time: [u64; 2],
+    pub reward_end_time: [u64; 2],
+    pub reward_per_share: [u128; 2],  // Q56.8 или подобное; проверьте исходный код программы
+    pub total_staked: u64,
+    pub last_slot: u64,               // v5 обновляется на каждый слот в mainnet
+    pub _reserved: [u8; 256],
+}
+```
+
+Отличия от v6:
+
+- **По слотам, не по секундам.** Цикл обновления v5 работает на слотах, а не на часах. SDK нормализует это в «в секунду» для UI, но в блокчейне единица — слоты.
+- **Целая скорость эмиссии.** `reward_per_second` — это `u64`. Это ограничивает минимальную выражаемую скорость одним токеном в секунду, что слишком грубо для потоков с низким выпуском на 9-десятичных монетах. v6 исправила это скоростью Q64.64.
+- **Нет `reward_sender`**. В v5 владелец — неявный отправитель; только `owner` может пополнить.
+
+## Разметка `FarmState` — v3
+
+```rust
+pub struct FarmStateV3 {
+    pub state: u64,
+    pub nonce: u64,
+    pub lp_vault: Pubkey,
+    pub reward_vault: Pubkey,          // единственное вознаграждение
+    pub owner: Pubkey,
+    pub reward_mint: Pubkey,
+    pub reward_total_emissioned: u64,
+    pub reward_claimed: u64,
+    pub reward_per_slot: u64,
+    pub reward_per_share: u128,
+    pub total_staked: u64,
+    pub last_slot: u64,
+    pub _reserved: [u8; 256],
+}
+```
+
+Единственное вознаграждение. На основе слотов. Самое старое поколение программы, поддерживаемое живым для фермерских пар RAY-USDC и SOL-USDC, датирующихся задолго до v5.
+
+## `UserLedger` (v6) / `UserStake` (v5/v3)
+
+Состояние каждого пользователя, один аккаунт на пару `(ферм, пользователь)`. Seeded PDA:
+
+```ts
+// v6
+const [ledgerPda] = PublicKey.findProgramAddressSync(
+  [farmId.toBuffer(), user.toBuffer(), Buffer.from("user_stake_info_v2")],
+  FARM_V6_PROGRAM_ID,
+);
+
+// v5
+const [stakePda] = PublicKey.findProgramAddressSync(
+  [farmId.toBuffer(), user.toBuffer(), Buffer.from("user_stake_info")],
+  FARM_V5_PROGRAM_ID,
+);
+
+// v3
+const [stakePda] = PublicKey.findProgramAddressSync(
+  [farmId.toBuffer(), user.toBuffer(), Buffer.from("staker_info")],
+  FARM_V3_PROGRAM_ID,
+);
+```
+
+(Строки семян — это значения, фактически используемые SDK; версии программы исторически варьировались. Проверьте источник v6 для всего, что критично для безопасности.)
+
+```rust
+// v6
+pub struct UserLedger {
+    pub version: u64,
+    pub farm_id: Pubkey,
+    pub owner: Pubkey,
+    pub deposited: u64,                          // текущая ставка
+    pub reward_debts: [u128; 5],                 // снимок reward_per_share_x64 × deposited
+}
+```
+
+Долг по каждому потоку — это смещение учёта, описанное в обзоре:
+
+```
+pending_for_stream_i = deposited × reward_per_share_x64[i] / 2^64  − reward_debts[i]
+```
+
+После каждой операции `Deposit`, `Withdraw` или `Harvest` долг переустанавливается на текущее значение `deposited × reward_per_share_x64[i] / 2^64`.
+
+## PDA органов управления
+
+```ts
+// v6
+const [farmAuthorityV6] = PublicKey.findProgramAddressSync(
+  [farmId.toBuffer()],
+  FARM_V6_PROGRAM_ID,
+);
+
+// v5
+const [farmAuthorityV5] = PublicKey.findProgramAddressSync(
+  [farmId.toBuffer()],
+  FARM_V5_PROGRAM_ID,
+);
+
+// v3
+const [farmAuthorityV3] = PublicKey.findProgramAddressSync(
+  [farmId.toBuffer()],
+  FARM_V3_PROGRAM_ID,
+);
+```
+
+Все три версии получают орган управления фермой на ферму с одним семенем. Этот PDA является органом управления хранилищем стейкинга и каждым хранилищем вознаграждения. Он подписывает каждый трансфер, который делает ферма.
+
+## Хранилища
+
+Хранилища стейкинга и вознаграждения — это стандартные аккаунты SPL Token, чей `owner` — PDA органа управления фермой. Адреса хранятся на `FarmState` — не переделывайте; читайте из состояния. Органы замораживания должны быть отключены на монете стейкинга для v5/v6 (программа проверяет).
+
+Заметки об Token-2022:
+
+- **v3**: Только SPL Token.
+- **v5**: Только SPL Token.
+- **v6**: Поддерживает Token-2022 как на монетах стейкинга, так и на монетах вознаграждения, управляется полями `staking_token_program` / `reward_token_program`. Комиссии за трансфер на монетах Token-2022 вознаграждения взимаются при выпуске (хранилище → пользователь).
+
+## Наблюдение и APR
+
+Фермы не хранят APR в блокчейне. Для подсчёта:
+
+```
+annualized_rewards_value_usd = reward_per_second × 86400 × 365 × reward_usd_price
+tvl_usd                     = total_staked / 10^decimals × staking_mint_usd_price
+apr                         = annualized_rewards_value_usd / tvl_usd
+```
+
+Потребители обычно берут `staking_mint_usd_price` из пула, к которому относится LP (через `api-v3.raydium.io/pools/info/ids`), и `reward_usd_price` из любого оракула цен.
+
+## Дальше
+
+- [`products/farm-staking/instructions`](/ru/products/farm-staking/instructions) — справочник инструкций по версиям.
+- [`products/farm-staking/code-demos`](/ru/products/farm-staking/code-demos) — стейкинг, сбор урожая и создание ферм через SDK.
+- [`reference/program-addresses`](/ru/reference/program-addresses) — все три ID программ.
+
+Источники:
+
+- [Raydium SDK v2 `Farm` модуль](https://github.com/raydium-io/raydium-sdk-V2)
+- Исходный код программы Farm v6 в настоящее время не опубликован как отдельный репозиторий; IDL входит в состав SDK в [`raydium-io/raydium-sdk-V2`](https://github.com/raydium-io/raydium-sdk-V2) под `src/raydium/farm/`.

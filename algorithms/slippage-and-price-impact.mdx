@@ -1,0 +1,152 @@
+---
+title: "Slippage and price impact"
+description: "Precise definitions of slippage vs price impact, how Raydium's SDK sizes minAmountOut and maxAmountIn, differences across AMM types, and MEV considerations for production routing."
+---
+
+## Two distinct concepts
+
+**Price impact** and **slippage** are frequently conflated in UIs but refer to different things.
+
+- **Price impact** is a deterministic property of a trade against a specific pool state. Given `(Δin, reserves)`, price impact is fully computable before the trade is submitted.
+
+- **Slippage** is the realized difference between the price you *expected* at quote time and the price you *actually got* at execution time. It is a function of latency, concurrent transactions, and block inclusion order — not of the pool math.
+
+A 1% quote against an otherwise-idle pool has 0% slippage if it lands in the next block; the 1% was the price impact. That same quote lands 0.2% worse if another trade hits the pool first — the extra 0.2% is slippage.
+
+## Formal definitions
+
+### Price impact
+
+```
+p_before = pool.spot_price()
+p_after  = pool.spot_price_if_trade(Δin) applied
+impact   = (p_before − p_after) / p_before       // can be signed
+```
+
+For a CPMM: `impact ≈ 2 · Δin / reserve_in` for small trades. For CLMM: depends on how many ticks the trade crosses; often flat within the current tick range, jumping at each tick cross.
+
+### Realized slippage
+
+```
+quoted_out = amount_out computed at quote time
+actual_out = amount_out observed on-chain
+slippage   = (quoted_out − actual_out) / quoted_out
+```
+
+Slippage is always non-negative (or zero), assuming the quote was honest. A negative value would mean you got *more* than quoted — possible if the pool state moved in your favor between quote and execution.
+
+## Sizing `minAmountOut` and `maxAmountIn`
+
+Every Raydium swap takes a slippage-protection bound:
+
+- `SwapBaseInput(amount_in, min_amount_out)` — exact-input, lower-bound the output.
+- `SwapBaseOutput(max_amount_in, amount_out)` — exact-output, upper-bound the input.
+
+The SDK computes these as:
+
+```ts
+const computed = raydium.<pool_type>.computeAmountOut({
+  poolInfo,
+  amountIn,
+  mintIn,
+  mintOut,
+  slippage: 0.005,     // 0.5% tolerance
+});
+
+// computed.amountOut         — the "expected" quote
+// computed.minAmountOut      — amountOut × (1 − slippage), used as the on-chain bound
+// computed.priceImpact       — deterministic, pool-state-only
+// computed.fee               — total fee charged (all components summed)
+```
+
+The slippage tolerance is a **buffer around the price impact**, not the price impact itself. A 0.5% tolerance means "accept at most 0.5% worse than my quote" — independent of whether the price impact was 0.01% (a tiny trade) or 2% (a large trade). For a 2% price-impact trade with 0.5% tolerance, `minAmountOut` is `2.5%` below the pre-trade spot — the sum of impact and tolerance, essentially.
+
+## Recommended slippage tolerances
+
+There is no single right number; the right bound depends on:
+
+1. **Pair stability.** Stablecoin-stablecoin pools can safely use 0.1%. Volatile meme-pair pools often need 3–5% just to reliably land.
+2. **Trade size.** Larger trades have larger price impacts, so tolerance needs to scale with them to avoid reversion. The SDK's auto-slippage defaults around `max(0.5%, 2 × price_impact)` for this reason.
+3. **Block inclusion latency.** Transactions that sit in the mempool for multiple blocks are exposed to more concurrent trades. Jito bundles and priority fees reduce this.
+
+Rules of thumb (Raydium UI defaults):
+
+| Pair type | Default tolerance |
+|-----------|-------------------|
+| Stable-stable (USDC-USDT, USDC-USDS) | 0.1% |
+| Stable-major (USDC-SOL, USDC-BTC) | 0.5% |
+| Major-major (SOL-BTC, SOL-ETH) | 1% |
+| Volatile (meme tokens, illiquid long-tail) | 3–5% |
+
+## Differences across AMM types
+
+### CPMM
+
+Price impact is smooth and continuous (closed-form `2 · Δin / reserve_in`). Slippage tolerance scales linearly with trade size.
+
+### AMM v4
+
+Same curve math as CPMM, but the "effective reserves" include the pool's OpenBook-posted limit orders. In practice this means:
+
+- Quoting off raw vault balances *underestimates* reserves and therefore overestimates impact.
+- The SDK fetches `AmmInfo` and sums `vault + on_book.free + on_book.locked` to get the right number.
+- Stale OpenBook state (crank blocked) can cause the quoted impact to diverge from on-chain reality. Aggregators routinely pre-crank (permissionless `MonitorStep`) before a large AMM-v4 trade.
+
+### CLMM
+
+Price impact is **piecewise**. Within the current tick range, impact is approximately linear in `Δin / L`. Crossing a tick boundary can change `L` discretely, causing a sudden jump in the marginal price. A trade that crosses several sparsely-populated ticks can have much higher impact than the `2 · Δin / reserve` rule of thumb suggests.
+
+The SDK's CLMM quote iterates the swap step deterministically to return an exact expected `amountOut`, so `minAmountOut = amountOut · (1 − slippage)` is correct. But the **priceImpact** return value should be interpreted as "the spread between pre-trade spot and post-trade spot", which on CLMM can be much larger than the swap's effective slippage for a user who only cares about `amount_out`.
+
+### LaunchLab curve
+
+Similar to CPMM but with an asymmetric curve (quadratic or virtual-reserves). Impact grows faster for late buyers as the curve steepens toward graduation. Pre-buyer UIs should warn when a buy is expected to push the curve more than ~5% of `quote_reserve_target` in one transaction.
+
+## MEV considerations
+
+On Solana, MEV extraction against swaps mostly takes the form of **sandwich attacks**: a bot places a back-run transaction that trades after yours, plus a front-run that trades before, both at the same slot. Your trade fills at a worse price than it would have absent the sandwich; the back-run captures the difference.
+
+Mitigations:
+
+1. **Tight `minAmountOut`.** Aggressive slippage bounds cause the victim transaction to revert if sandwiched heavily, protecting funds (but wasting gas). On Solana this is standard practice — rejection is cheap.
+2. **Jito bundles.** Submitting through Jito with a bundled tip excludes middlemen from reordering your tx. Bundles land as atomic blocks.
+3. **Priority fees.** A high priority fee increases the chance your trade lands in the current leader's block before a sandwicher can react. Less robust than bundles, more standard.
+4. **Private RPC.** Submitting through a private RPC (or via a validator's direct endpoint) reduces the window during which a mempool sandwicher can observe your transaction.
+
+Raydium's SDK does not bundle; integrators typically layer Jito on top. See [`integration-guides/routing-and-mev`](/integration-guides/routing-and-mev) for patterns.
+
+## Slippage for multi-hop routes
+
+When a swap routes through multiple pools (e.g. `USDC → SOL → RAY`), slippage tolerance should be applied per-hop, not just end-to-end:
+
+```ts
+// Bad: 0.5% applied at the end only, so any intermediate hop sliding fails the second hop.
+const finalMin = finalAmount * (1 - 0.005);
+
+// Better: each hop enforces its own bound.
+const hop1Min  = hop1Amount * (1 - 0.005);
+const hop2Min  = hop2Amount * (1 - 0.005);
+// End-to-end this is tighter (compound), but atomic — if either hop degrades, the tx reverts early.
+```
+
+The SDK's router applies per-hop bounds automatically when you call `raydium.trade.swap`. For custom routers, replicate the pattern.
+
+## Reporting to users
+
+Rules-of-thumb for a good swap UI:
+
+- Display **both** expected price impact and slippage tolerance separately.
+- Highlight when price impact exceeds ~2% — "high impact" warning.
+- Highlight when price impact exceeds tolerance — the transaction is almost certain to revert.
+- For volatile pairs, offer a "high slippage mode" that relaxes the bound and shows a stronger warning.
+
+## Pointers
+
+- [`products/cpmm/math`](/products/cpmm/math), [`products/amm-v4/math`](/products/amm-v4/math), [`products/clmm/math`](/products/clmm/math) — impact derivations per pool type.
+- [`integration-guides/routing-and-mev`](/integration-guides/routing-and-mev) — multi-hop routing + MEV defenses.
+- [`integration-guides/priority-fee-tuning`](/integration-guides/priority-fee-tuning) — sizing priority fees to reduce slippage.
+
+Sources:
+
+- Raydium SDK v2 slippage / impact implementation.
+- Flashbots / Jito on Solana MEV.

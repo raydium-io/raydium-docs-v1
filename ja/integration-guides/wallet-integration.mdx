@@ -1,0 +1,213 @@
+---
+title: "ウォレット統合"
+description: "ウォレット UI での Raydium ポジション、プール シェア、ファーム ステーク、保留中の報酬の表示 — 検出パターン、トランザクション プレビューのシミュレーション、Token-2022 表示の詳細。"
+---
+
+<Info>
+  **このページは AI による自動翻訳です。すべての内容は英語版を正とします。**
+
+  [英語版を表示 →](/integration-guides/wallet-integration)
+</Info>
+
+<Info>
+  Raydium と統合するウォレットは、通常、ユーザーごとに 4 つの質問に答える必要があります。このユーザーはどのプールで LP ポジションを持っているか、どのポジション（CLMM NFT）を保有しているか、どのファームにステークしているか、そしてそれらの総価値はいくらか。このページではそれぞれについて説明します。
+</Info>
+
+## Raydium ポジションの検出
+
+### クラシック LP トークン（CPMM、AMM v4）
+
+これらは他の SPL トークンと同様に見えます。ユーザーの ATA がバランスを保持しています。ウォレットはデフォルトではこれを単なる別のトークンとして表示します。これを Raydium LP ポジションとして表示するには：
+
+1. ユーザーのトークン アカウントを列挙します：`connection.getParsedTokenAccountsByOwner(user, { programId: TOKEN_PROGRAM_ID })`。
+2. 各ミントについて、Raydium のミント リストを確認します：`GET https://api-v3.raydium.io/pools/info/lps?lps=<LP_MINT>,...`（1 回の呼び出しで最大 50 個の LP ミントをバッチ処理）。
+3. ミントが一致するもの については、API はプール参照を返します。これを使用してポジションのトークン建て価値を計算します：
+
+```
+token_a_owned = user_lp_balance * poolReserves.A / lpMint.supply
+token_b_owned = user_lp_balance * poolReserves.B / lpMint.supply
+usd_value     = token_a_owned * priceA_usd + token_b_owned * priceB_usd
+```
+
+LP バランスとアンラップされた量の両方を表示します — ユーザーは LP ユニットではなく、基礎となるトークンで考えます。
+
+### CLMM ポジション NFT
+
+CLMM ポジションは NFT です。各ポジションの `PersonalPositionState` PDA は NFT ミントから導出されます。検出するには：
+
+1. ユーザーの NFT を列挙します。レガシー Metaplex NFT の場合：供給量 1 と小数点以下 0 のトークン アカウントにフィルタリングします。
+2. 各 NFT ミントについて、PersonalPositionState PDA を導出してみます：
+
+```ts
+import { CLMM_PROGRAM_ID } from "@raydium-io/raydium-sdk-v2";
+
+const [positionPda] = PublicKey.findProgramAddressSync(
+  [Buffer.from("position"), nftMint.toBuffer()],
+  CLMM_PROGRAM_ID,
+);
+
+const accountInfo = await connection.getAccountInfo(positionPda);
+if (!accountInfo || !accountInfo.owner.equals(CLMM_PROGRAM_ID)) return null;
+// It's a Raydium CLMM position — decode.
+```
+
+3. `raydium.clmm.getPositionInfo({ positionPda })` で デコードして以下を取得します：
+   - `poolId` → プールをフェッチしてミントを解決
+   - `tickLower`、`tickUpper` → 範囲を表示
+   - `liquidity`、`tokensOwedA/B` → ポジション価値と保留中の手数料を計算
+   - `rewardInfos` → ストリームごとの保留中報酬
+
+4. Token-2022（`OpenPositionWithToken22Nft`）の下で発行されたポジション NFT の場合、NFT ミントのプログラムは SPL Token ではなく Token-2022 です。スキャン時に両方を列挙します。
+
+### ファーム ステーク
+
+Farm v3 / v5 / v6 はそれぞれ、ユーザーあたりの台帳 PDA を持っています。導出：
+
+```ts
+// Try all three farm versions for each of the user's potential farm interactions.
+// Cheapest approach: ask the API first, which has indexed all user positions.
+
+const r = await fetch(
+  `https://api-v3.raydium.io/positions/staking?wallet=${user.toBase58()}`
+).then(r => r.json());
+
+for (const s of r.data.stakings) {
+  // s.farmId, s.stakedAmount, s.pendingRewards[], s.poolApr, ...
+}
+```
+
+完全なオンチェーン検出を優先するウォレットの場合：ユーザーをハッシュ化することで可能な `UserLedger` PDA を反復処理し、「可能性の高い」ファーム ID のキュレーションされたリストを使用します。すべてのファーム ID を徹底的に列挙することは実用的ではありません（数千存在します）。API を使用します。
+
+## ポジション価値の計算
+
+### CPMM / AMM v4 LP
+
+```ts
+const poolInfo = await raydium.<type>.getPoolInfoFromRpc({ poolId });
+const myShare  = userLpBalance / poolInfo.lpMint.supply;
+const tokensA  = BigInt(poolInfo.mintAmountA) * BigInt(userLpBalance)
+                / BigInt(poolInfo.lpMint.supply);
+const tokensB  = BigInt(poolInfo.mintAmountB) * BigInt(userLpBalance)
+                / BigInt(poolInfo.lpMint.supply);
+```
+
+次に、各トークンに対応するミントの USD 価格を乗算します（`raydium.token` または価格オラクルから）。
+
+### CLMM ポジション
+
+```ts
+const position = await raydium.clmm.getPositionInfo({ positionPda });
+const pool     = await raydium.clmm.getPoolInfoFromRpc({ poolId: position.poolId });
+
+const { amountA, amountB } = PoolUtils.getAmountsFromLiquidity({
+  sqrtPriceX64:  pool.sqrtPriceX64,
+  tickLower:     position.tickLower,
+  tickUpper:     position.tickUpper,
+  liquidity:     position.liquidity,
+  slippage:      0,  // for display, no slippage
+});
+
+// Pending fees — display separately as "uncollected"
+const fees = {
+  A: position.tokenFeesOwedA,
+  B: position.tokenFeesOwedB,
+};
+
+// Pending rewards — a CLMM pool has 0–3 reward streams.
+const rewards = position.rewardInfos.map(r => ({
+  mint:          r.rewardMint,
+  rewardAmount:  r.rewardAmountOwed,
+}));
+```
+
+以下のようにレンダリングします：
+
+- リクイディティ価値（現在の価格）
+- 未回収の手数料
+- ストリームごとの保留中報酬
+- 範囲：`[tickLower_price, tickUpper_price]`。現在の価格が範囲内かどうかを示すビジュアル バーを含む
+
+### ファーム ステーク
+
+```ts
+// The API response already includes pending rewards; use it directly.
+const apr       = stakingFarm.apr;               // %, annualized
+const staked    = stakingFarm.stakedAmount;      // smallest units of staking mint
+const rewards   = stakingFarm.pendingRewards;    // array of { mint, amount }
+```
+
+オンチェーン計算の場合、ファームのアカウンティングを反映します：
+
+```
+pending_reward_i = user.deposited
+                 * farm.reward_per_share_x64[i] / 2^64
+                 - user.reward_debts[i]
+```
+
+計算する前に `reward_per_share_x64` を遅延更新フォーミュラで更新することを確認してください（経過時間 × 放出率 ÷ 合計ステーク数）。
+
+## トランザクション シミュレーションによるプレビュー
+
+ユーザーが署名する前に、ウォレットは通常バランスの変更をプレビューします。`simulateTransaction` を使用します：
+
+```ts
+const sim = await connection.simulateTransaction(tx, {
+  sigVerify: false,
+  commitment: "confirmed",
+  accounts: {
+    encoding: "base64",
+    addresses: [userTokenAtaA, userTokenAtaB, userLpAta].map(a => a.toBase58()),
+  },
+});
+
+// Decode each returned account's balance and diff against pre-tx balances.
+for (const [i, acctData] of sim.value.accounts!.entries()) {
+  const newBalance = decodeTokenAccount(acctData!.data[0]).amount;
+  // compare to pre-tx balance, show Δ
+}
+```
+
+`accounts` パラメーターは、バリデーターに対して、リストされたアドレスのシミュレーション後のアカウント状態を返すよう要求します。命令形だけからバランス変更を予測しようとするより、はるかに正確です。
+
+### シミュレーションの落とし穴
+
+- **CLMM スワップには有効なティック配列が必要です。** ユーザーの入力サイズが初期化されていないティック配列に交差する場合、シミュレーションは失敗します（実行と同じ）。これを UI で明確に表示してください。
+- **優先度手数料。** シミュレーションは、計算予算の命令を適用せずに実行されます。デフォルトの 200k CU を超える大規模なトランザクションの場合、シミュレーションは失敗しますが、明示的な CU 制限での実際の実行は成功します。シミュレーション tx にも常に CU 制限を設定してください。
+- **新しい ブロックハッシュ。** シミュレーションは現在のブロックハッシュを使用します。署名に 60 秒以上かかる場合、tx は無効になります。ユーザーが躊躇した場合は再度シミュレーションしてください。
+
+## Token-2022 表示
+
+Token-2022 プログラムの下のトークンは、ウォレットのトークン リストで明確にラベル付けされるべきです。異なるリスク サーフェスがあるためです：
+
+- **転送手数料ミント**：現在の `transferFeeBasisPoints` をバランスの横に「転送手数料：X%」として表示します。受信時に警告します — ユーザーは送信者が送信した量より少ない額を受け取ることに気付かないかもしれません。
+- **転送フック ミント**：フック プログラム ID を表示します。悪意のあるフックは送信転送をブロックできます。ユーザーはフックが期待したものであることを確認する必要があります。
+- **非転送可能なミント**：「Non-transferable」を表示し、スワップ/送信を無効にします。これらは通常、ソウルバウンド トークンまたは認証情報です。
+- **利息が付くミント**：`TokenAccount.amount` から派生した UI バランスは、累積利息を **反映しません**。表示される値については、`@solana/spl-token` の `amountToUiAmount` を使用します（これはスケーリング係数を適用します）。
+
+## ファーム APR 表示
+
+ユーザーに表示される APR は、すべてのライブ報酬ストリームを組み合わせ、USD に変換し、年率化したものである必要があります：
+
+```ts
+let apr = 0;
+for (const r of farm.rewardInfos) {
+  if (r.rewardState !== 1) continue;   // skip not-running
+  const annualRewardTokens = Number(r.emissionPerSecond) * 86400 * 365 / 1e<decimals>;
+  const annualRewardValue  = annualRewardTokens * priceUsd(r.rewardMint);
+  const tvlValue           = Number(farm.totalStaked) * priceUsd(farm.stakingMint) / 1e<decimals>;
+  apr += annualRewardValue / tvlValue;
+}
+```
+
+`APR: X.Y%` として表示します。ステーキング ミントが LP トークンの場合、基礎となる LP の基本手数料 APR も計算し、合計を「Total APR」または「APR + fees」としてラベル付けします。
+
+## ポインター
+
+- [`products/clmm/ticks-and-positions`](/ja/products/clmm/ticks-and-positions) — ポジション価値の導出。
+- [`products/farm-staking/accounts`](/ja/products/farm-staking/accounts) — ファーム状態フィールド。
+- [`algorithms/token-2022-transfer-fees`](/ja/algorithms/token-2022-transfer-fees) — 転送手数料トークンの表示セマンティクス。
+
+ソース：
+
+- Raydium SDK v2 — ポジション/ファーム ヘルパー。
+- `api-v3.raydium.io` のユーザー ポジション エンドポイント。

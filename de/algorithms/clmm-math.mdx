@@ -1,0 +1,252 @@
+---
+title: "Concentrated-Liquidity-Mathematik"
+description: "sqrt-price-Darstellung, Liquidity-zu-Betrag-Formeln, Single-Tick- und Multi-Tick-Swap-Schritte, Fee-Growth-Accounting — die Mathematik hinter Raydium CLMM."
+---
+
+<Info>
+  **Diese Seite wurde mit KI automatisch übersetzt. Maßgeblich ist stets die englische Version.**
+
+  [Englische Version ansehen →](/algorithms/clmm-math)
+</Info>
+
+## Warum sqrt-price statt price
+
+CLMMs der Uniswap-v3-Familie stellen den Preis als Quadratwurzel dar, gespeichert im Fixed-Point-Format `Q64.64`:
+
+```
+sqrt_price_x64 = floor(sqrt(price) · 2^64)
+```
+
+Es gibt drei Gründe dafür:
+
+1. **Lineare Liquiditätsmathematik.** Die Menge von Token0 oder Token1 in einer Preisrange ist eine lineare Funktion von `sqrt_price`, nicht von `price`. Das Speichern von `sqrt_price` ermöglicht es dem Swap-Schritt, diese linearen Formeln auszuwerten, ohne eine Quadratwurzel zu berechnen.
+2. **Überflutungsschutz.** `sqrt_price · L` passt für alle sinnvollen Parameter in `u256`; `price · L` kann viel früher überfluten.
+3. **Einheitliche Tick-Arithmetik.** Da Ticks als `1.0001^i` definiert sind, ist `sqrt(price) = 1.00005^i` auch eine exakte Potenz-von-1.00005-Leiter. Jeder Tick-Übergang entspricht einer kleinen Multiplikation im `sqrt_price_x64`-Raum.
+
+Preis und sqrt-price sind eineindeutig; die Umwandlung ist `price = (sqrt_price_x64 / 2^64)^2`.
+
+## Tick-Gitter
+
+Preise werden auf ein Gitter diskretisiert:
+
+```
+price(tick_i) = 1.0001^i
+```
+
+`tick_i` ist ein `i32`. Der aktive Bereich ist `[MIN_TICK, MAX_TICK] = [−443636, 443636]`, was einen Preisbereich von etwa `[2^−128, 2^128]` ergibt. Der `tick_spacing` jedes Pools wird durch seinen Gebührentarif festgelegt: kleinere Abstände für enge Paare (z. B. Stablecoin-0,01%-Tarif verwendet Abstand 1), größere Abstände für volatile Paare (0,25%-Tarif verwendet 60, 1%-Tarif verwendet 120).
+
+Positionen müssen `tick_lower` und `tick_upper` am `tick_spacing` ausgerichtet haben. Die aktiven Ticks eines Pools (diejenigen, bei denen Liquidität beginnt oder endet) sind die einzigen Ticks, die der Swap-Schritt beachtet.
+
+## Liquidity-zu-Betrag
+
+Für eine Position mit Liquidität `L` und Preisrange `[sqrt_lo, sqrt_hi]` (alle `sqrt_price`-Werte):
+
+| Pool-Status | Token0-Betrag | Token1-Betrag |
+|------------|-------------------|-------------------|
+| Preis über Range (`sqrt_p ≥ sqrt_hi`) | 0 | `L · (sqrt_hi − sqrt_lo)` |
+| Preis im Bereich | `L · (sqrt_hi − sqrt_p) / (sqrt_p · sqrt_hi)` | `L · (sqrt_p − sqrt_lo)` |
+| Preis unter Range (`sqrt_p ≤ sqrt_lo`) | `L · (sqrt_hi − sqrt_lo) / (sqrt_lo · sqrt_hi)` | 0 |
+
+Ableitung: Differenzieren Sie die CPMM-Invariante lokal. Innerhalb eines einzelnen Tick-Bereichs verhält sich die Position wie ein CPMM mit virtuellen Rücklagen `(x_v, y_v)`, die so gewählt werden, dass der aktuelle `(sqrt_p, L)` des Pools mit `L = sqrt(x_v · y_v)` übereinstimmt. Die Integration von `sqrt_p` zur Reichweitenbegrenzung ergibt die obigen Beträge.
+
+**Inverse Formeln** (verwendet beim Prägen einer Position für einen bestimmten `amount0` oder `amount1`):
+
+```
+L_from_amount0(amount0, sqrt_lo, sqrt_hi, sqrt_p) =
+    amount0 · sqrt_p · sqrt_hi / (sqrt_hi − sqrt_p)
+
+L_from_amount1(amount1, sqrt_lo, sqrt_hi, sqrt_p) =
+    amount1 / (sqrt_p − sqrt_lo)
+
+// Für eine symmetrische Hinterlegung in eine aktive Position nimm das Minimum.
+L = min(L_from_amount0, L_from_amount1)
+```
+
+## Single-Tick-Swap-Schritt
+
+Innerhalb eines einzelnen Tick-Bereichs verhält sich der Pool wie ein CPMM. Bei gegebenen aktuellen `sqrt_p` und Ziel `sqrt_target`:
+
+```
+Δamount0_step = L · (sqrt_target − sqrt_p) / (sqrt_p · sqrt_target)     // beim Tausch für Token0
+Δamount1_step = L · (sqrt_target − sqrt_p)                              // beim Tausch für Token1
+```
+
+### Exact-Input-Schritt
+
+Bei gegebener `Δin_remaining`:
+
+```
+// Kandidat neuer sqrt_p, wenn wir bis zur Tick-Grenze aufgefüllt hätten:
+sqrt_after_full = sqrt_target
+amount_to_full  = Δamount_in_to_reach(sqrt_p → sqrt_target)
+
+if Δin_remaining ≥ amount_to_full:
+    // Rest des Eimers verbrauchen
+    sqrt_p'         = sqrt_target
+    Δin_consumed    = amount_to_full
+    Δout            = amount_out_at_boundary
+else:
+    // wir überqueren nicht; lösen für den End-sqrt_p
+    sqrt_p'         = L · sqrt_p / (L + Δin_remaining · sqrt_p)      // für 0→1-Swaps
+    Δin_consumed    = Δin_remaining
+    Δout            = L · (sqrt_p − sqrt_p')                          // proportional zu Δsqrt
+```
+
+Der `0→1`-Swap senkt `sqrt_p` (Preis sinkt, während wir Token0 verkaufen). Ein `1→0`-Swap hebt ihn an. Die Formeln sind symmetrisch, wobei `sqrt_p` und `sqrt_target` vertauscht werden.
+
+### Exact-Output-Schritt
+
+Gleiche Struktur, lösen für `Δin` statt.
+
+## Multi-Tick-Swap-Schleife
+
+Ein Swap durchläuft Ticks, bis die Eingabe verbraucht ist oder das Preislimit erreicht wird:
+
+```
+while Δin_remaining > 0 and sqrt_p != sqrt_price_limit:
+    next_tick = find_next_initialized_tick(pool.tick_current, direction)
+    sqrt_target = min(next_tick.sqrt_price, sqrt_price_limit)       // direktional
+
+    (Δin, Δout, sqrt_p') = single_step(sqrt_p, sqrt_target, L, Δin_remaining)
+
+    Δin_remaining -= Δin
+    accumulated_out += Δout
+
+    if sqrt_p' == next_tick.sqrt_price:
+        // Tick überqueren
+        L += next_tick.liquidity_net * direction_sign
+        flip_fee_growth_outside(next_tick)
+        match_limit_orders_at_tick(next_tick, ...)        // siehe products/clmm/math
+        pool.tick_current = next_tick.tick_index
+    sqrt_p = sqrt_p'
+```
+
+Jeder `single_step` verwendet die aktuelle `L` des Pools. `L` ändert sich **nur** beim Überqueren eines initialisierten Ticks. Liquidität zwischen Ticks ist konstant, was die geschlossene Form der Schritt-Mathematik ermöglicht.
+
+`liquidity_net` bei einem Tick ist die vorzeichenbehaftete Summe der Positionsliquiditäten, die bei diesem Tick beginnen, minus denen, die dort enden. Ein Aufwärtsübergang addiert `liquidity_net`; ein Abwärtsübergang subtrahiert es.
+
+Wenn der Pool Limit-Orders bei einem Tick offen hat, verbraucht der Tick-Übergang auch opportunistisch einen Teil der Swap-Eingabe, um diese Orders zu erfüllen (FIFO über Kohorten hinweg). Der Matching-Algorithmus und die dynamische Gebührenspanne, die möglicherweise auf dem Basisschritt anfallen, sind in [`products/clmm/math`](/de/products/clmm/math) dokumentiert; sie ändern die obigen geschlossenen Single-Step-Formeln nicht.
+
+## Fee-Growth-Akkumulatoren
+
+CLMM verfolgt Gebühren pro Einheit aktiver Liquidität, pro Seite, global und pro Tick:
+
+```
+fee_growth_global_0_x64     // Q64.64, monoton
+fee_growth_global_1_x64
+tick.fee_growth_outside_0_x64   // „Gebühren aufgelaufen, während dieser Tick außerhalb des aktiven Bereichs war"
+tick.fee_growth_outside_1_x64
+```
+
+Bei jedem `single_step`:
+
+```
+step_lp_fee = (Δin · fee_rate) · (1 − protocol_fraction − fund_fraction)
+fee_growth_global += step_lp_fee · 2^64 / L     // nur für die Input-Seite
+```
+
+(Die `fee_growth_global` der anderen Seite bewegt sich nicht bei diesem Schritt, da kein Token auf dieser Seite als Input bezahlt wurde.)
+
+Beim Überqueren eines Ticks **dreht** das Programm `fee_growth_outside` um:
+
+```
+tick.fee_growth_outside_0_x64 = fee_growth_global_0_x64 − tick.fee_growth_outside_0_x64
+tick.fee_growth_outside_1_x64 = fee_growth_global_1_x64 − tick.fee_growth_outside_1_x64
+```
+
+„Außen" ist relativ zu `tick_current`. Wenn `tick_current` über dem Tick liegt, bedeutet außen „darunter". Wenn `tick_current` darunter liegt, bedeutet außen „darüber". Die Umkehrung wechselt die Interpretation.
+
+### `fee_growth_inside` für eine Position
+
+Bei gegebener Position `[tick_lower, tick_upper]` und dem aktuellen `tick_current`:
+
+```
+if tick_current >= tick_upper:
+    inside = tick_lower.fee_growth_outside − tick_upper.fee_growth_outside
+else if tick_current < tick_lower:
+    inside = tick_upper.fee_growth_outside − tick_lower.fee_growth_outside
+else:     // Position ist im Bereich
+    inside = fee_growth_global
+           − tick_lower.fee_growth_outside
+           − tick_upper.fee_growth_outside
+```
+
+Die nicht eingezogenen Gebühren einer Position für die Token-Seite `s` sind:
+
+```
+tokens_owed_s += L · (fee_growth_inside_s − fee_growth_inside_last_s) / 2^64
+fee_growth_inside_last_s = fee_growth_inside_s
+```
+
+Diese Aktualisierung wird bei jeder Interaktion mit der Position ausgeführt (`IncreaseLiquidity`, `DecreaseLiquidity`, `CollectFees`).
+
+## Durchgerechnetes Beispiel — Überqueren eines Ticks
+
+Pool (vereinfacht):
+
+- `sqrt_p_x64 = 2^64 · 1.0 = 2^64` (price = 1.0)
+- `L = 1_000_000`
+- `tick_current = 0`
+- Nächster initialisierter Tick darunter: `tick = −60`, `sqrt_price = 1.0001^(−30) ≈ 0.99700`, `liquidity_net = −400_000` (dieser Tick beendet eine Position, daher entfernt ein Abwärtsübergang 400k)
+- Gebührensatz: 0,25%
+
+Swap: `Δin = 10_000` Token0, direction = 0→1.
+
+**Schritt 1 — bis zu `sqrt_target = 0.99700 · 2^64`**:
+
+```
+amount_in_to_target = L · (1/sqrt_target − 1/sqrt_p)
+                    = 1_000_000 · (1/0.99700 − 1/1.0)
+                    ≈ 1_000_000 · 0.003009
+                    ≈ 3_009
+```
+
+3.009 &lt; 10.000, also füllen wir diesen Schritt vollständig aus:
+
+```
+Δin_step  = 3_009 / (1 − 0.0025)  = 3_017    // brutto inklusive Gebühr
+Δout_step = L · (sqrt_p − sqrt_target) ≈ 1_000_000 · 0.00299 ≈ 2_990
+sqrt_p    = 0.99700 · 2^64
+tick_current = −60
+L         = 1_000_000 + (−400_000)  = 600_000         // Tick überquert
+fee_growth_outside at tick −60 is flipped
+Δin_remaining = 10_000 − 3_017 = 6_983
+```
+
+**Schritt 2 — mit neuem `L = 600_000`**:
+
+Der nächste initialisierte Tick (sagen wir `tick = −120`) liegt bei `sqrt = 0.99402`. Berechne `amount_in_to_target` neu:
+
+```
+amount_in_to_target = 600_000 · (1/0.99402 − 1/0.99700)
+                    ≈ 600_000 · 0.003010
+                    ≈ 1_806
+```
+
+Immer noch weniger als `Δin_remaining`. Überquere erneut. Fortfahren, bis `Δin_remaining` null erreicht.
+
+Die vollständige Abfolge von `Δout` akkumuliert sich zur endgültigen Swap-Ausgabe.
+
+## Initialisierung und Überflutungsschutz
+
+- `MIN_SQRT_PRICE_X64` und `MAX_SQRT_PRICE_X64` entsprechen `tick = ±443636`. Jeder Swap, der `sqrt_p` außerhalb dieser Range drücken würde, wird rückgängig gemacht.
+- Der Parameter `sqrt_price_limit` des Benutzers muss in demselben Intervall liegen; das Programm prüft dies.
+- Produkte von `L · Δsqrt` werden in `u256` berechnet, dann zurück zu `u128` verschoben, um Überflutung zu vermeiden.
+
+## Unterschiede zu Uniswap v3
+
+- **Oracle.** Raydiums `ObservationState` speichert einen Ring-Buffer von `(block_timestamp, tick_cumulative, seconds_per_liquidity_cumulative)`; leicht unterschiedliches Drahtkabel-Format als Uniswap, aber gleiche TWAP-Mathematik.
+- **Token-2022.** Raydiums CLMM unterstützt Token-2022-Mints; die Transfer-Fee-Variante erfordert zusätzliche Pre/Post-Swap-Betrag-Anpassungen. Siehe [`algorithms/token-2022-transfer-fees`](/de/algorithms/token-2022-transfer-fees).
+- **Tick-Bitmap.** Raydium packt die initialisierte Tick-Bitmap in `[u64; 16]` pro Pool für schnelle `find_next_initialized_tick`; Uniswap verwendet eine On-Chain-Zuordnung pro Wort. Der Tradeoff ist Miete vs. Lookup-Kosten.
+- **Reward-Slots.** Raydium unterstützt 3 Pool-übergreifende Reward-Streams mit separaten `reward_growth_global_x64`-Zählern; gleiche Struktur wie der Fee-Growth-Akkumulator.
+
+## Verweise
+
+- [`products/clmm/math`](/de/products/clmm/math) — die On-Chain-Implementierung und durchgerechnetes Beispiel mit tatsächlichen CLMM-Struct-Feldern.
+- [`products/clmm/ticks-and-positions`](/de/products/clmm/ticks-and-positions) — Tick-Gitter, `liquidity_net`/`gross`, Semantik des aktiven Bereichs.
+- [`products/clmm/fees`](/de/products/clmm/fees) — der Fee-Growth-Akkumulator in Aktion.
+
+Quellen:
+
+- Uniswap v3 Whitepaper (kanonische Ableitung der sqrt-price-Mathematik).
+- Raydium CLMM Programmquelle.

@@ -1,0 +1,224 @@
+---
+title: "路由和 MEV"
+description: "Raydium 产品的分割路由、抢先交易防护模式、Jito 捆绑集成，以及私有和公开内存池提交路径之间的权衡。"
+---
+
+<Info>
+  **本页内容由 AI 自动翻译，所有内容以英文版本为准。**
+
+  [查看英文版 →](/integration-guides/routing-and-mev)
+</Info>
+
+<Info>
+  Solana 上的 MEV 与以太坊的内存池驱动 MEV 并不相同。区块领导者看到的是交易包到达时的顺序，而非有序的内存池；抢先交易可以通过领导者端重新排序或共置搜索者执行，而三明治攻击是由监控池状态并用更高费用竞争你的交易的机器人执行的。相应地，防御措施也不同。
+</Info>
+
+## 分割路由入门
+
+"分割路由"指的是将一笔逻辑上的交换分散到多个流动性池，使边际价格相等——与在各自池的价格处交易每个部分的输出相同。当单个池相对于交易规模来说流动性不足时，它可以降低有效的价格冲击。
+
+问题表述：给定池 `P_1, ..., P_n`，函数 `f_i(x)` 将输入 `x` 映射到输出，找到分割 `x_1 + ... + x_n = X` 来最大化 `Σ f_i(x_i)`。因为每个 `f_i` 是凹函数，最优解满足 `f'_1(x_1) = f'_2(x_2) = ... = f'_n(x_n)`（边际价格相等）。
+
+### 贪心实现
+
+一个实践中能达到最优解约 1% 以内的简单方法：
+
+```
+remaining = X
+routes    = []
+step      = X / 1000     // 分片大小
+while remaining > 0:
+    best_pool = argmax over i of f'_i(current_x_i + step)
+    x_i += step
+    routes.append((best_pool, step))
+    remaining -= step
+```
+
+较小的 `step` → 更接近最优，更多迭代。实际上 100–500 个分片是一个合理的平衡点。
+
+### 凸优化实现
+
+对于生产级聚合器，直接求解优化问题。每个池都有一个闭式形式的 `f'_i(x)`：
+
+- **常数乘积（CPMM / AMM v4）**：`f'(x) = y * R_y / (R_x + x)^2`，其中 `R_x, R_y` 是准备金，`y = R_x * R_y / (R_x + x) - R_y` ...（更简单的推导：边际价格是 `R_y / (R_x + x)`，因此分割以相等边际价格是一个 1D 搜索）。
+- **CLMM**：分段光滑——在一个 tick 内，`f'(x)` 是 `sqrt_price` 的有理函数；跨越 tick，它离散地跳跃。使用小步长求解器进行分割，或将每个连续 tick 视为其自己的"池"。
+
+分割路由的输出是一个向量 `[(pool_1, x_1), (pool_2, x_2), ...]`，你的交易组装步骤将其转换为一系列交换指令序列。
+
+### 分割路由何时有用
+
+| 交易规模 vs TVL | 分割有用？ |
+|-------------------|-----------|
+| `<0.1%` | 否——单池主导 |
+| 0.1–1% | 略微有用 |
+| 1–5% | 是的，改进 10–50 bps |
+| `>5%` | 是的，显著改进 |
+
+如果你在运行钱包的 UI 交换，零售用户在深度池上进行 `<$10k` 交易，不要费力分割——燃气开销会超过改进。对于聚合器报价制度流动性，总是要分割。
+
+## 多跳路由
+
+当不存在直接池或直接池的冲击巨大时，通过中介 token 跳跃：
+
+```
+tokenA → tokenHub → tokenB
+```
+
+常见的中介：USDC、SOL、RAY。每一跳都有：
+
+- 自己的滑点界限（直接跳更低；多跳时按跳计算）。
+- 自己的费用。
+- 自己的价格冲击。
+
+总冲击是复合的：`(1 - impact_1) * (1 - impact_2)`。跳两次 1% 的冲击是 1.99% 总计，不是 2%。
+
+**永远不要通过同一个池跳跃两次。** 走 `A → B → A → B` 通过同一个 CLMM 只是燃烧费用和滑点。聚合器应该在生成时过滤此类路由。（注意：这是*循环同一个交易对*，不是一般的多跳——通过不同的池路由 `A → USDC → B` 是标准的、有用的、上面认可的模式。）
+
+**按跳 vs 端到端最小值。** 使用 CPI 组合（[`integration-guides/cpi-integration`](/zh/integration-guides/cpi-integration)），你可以将每一跳的 `minimum_amount_out` 设置为 0，并在代理中强制执行单个端到端最小值。没有 CPI，每一跳都强制执行自己的最小值，这需要计算合理的中间边界——通常每跳 `quote_i * (1 - slippage_bps/10000)`。
+
+## 三明治攻击
+
+### 机制
+
+一个机器人监视交易八卦流。当它看到你的交换时：
+
+1. 抢先交易：机器人在你之前购买同一代币，推高池价格。
+2. 受害交易：你以更差的价格交换。
+3. 回溯交易：机器人以提升的价格卖出，捕获差价。
+
+机器人支付优先级费用给其两笔交易；利润是三明治差价减去两倍优先级费用。仅当你的交易在你的交易有意义地移动价格的池上盈利时。
+
+### 防御措施
+
+**紧密的滑点。** 如果你的最小输出比报价低 0.5%，三明治将价格移动超过 0.5% 会让你恢复但机器人的前期交易仍以你的旧价格执行。他们亏钱。三明治机器人针对宽滑点（≥1–2%）；sub-0.3% 滑点基本上是免疫的。
+
+**私有内存池提交（Jito）。** 将你的交易作为 Jito 捆绑的一部分提交。捆绑不会出现在公开八卦流上；机器人看不到交易进行中并抢先交易。权衡：捆绑需要验证器端提示，而不是每个领导者都启用了 Jito（尽管大多数都是）。
+
+**较小的交易规模。** 将交易分散到多个交易，使没有单笔交易移动足够的价格成为有利可图的三明治目标。增加总燃气成本。
+
+**时间随机化。** 尽可能在低成交量时期提交。对于交互式用户交换不可用，但对于计划的机器人流是可行的。
+
+Raydium 的 CLMM 池通常比 CPMM 看到的三明治活动更少，因为单 tick 流动性结构意味着小交易根本不移动价格（它们停留在一个 tick 内）。深度 CLMM 池有机地是最好的三明治抵抗场所。
+
+## Jito 捆绑
+
+Jito 是一个修改的 Solana 验证器客户端，接受**捆绑**——原子落地的有序交易组。机器人使用 Jito 进行 MEV 提取；普通用户使用 Jito 以防止相同的机器人。
+
+### 捆绑如何工作
+
+- 连接到 Jito 区块引擎端点（例如 `https://mainnet.block-engine.jito.wtf`）。
+- 提交 1–5 笔交易的捆绑加上到 Jito 提示账户之一的提示。
+- 如果当前领导者运行 Jito，你的捆绑被考虑。该 slot 的拍卖赢家（单位 CU 最高提示的捆绑）落地；其他被丢弃。
+
+### 调整提示大小
+
+提示大小遵循最近的捆绑分布。Jito 发布实时百分位数：
+
+```ts
+const tipRes = await fetch("https://worker.jito.wtf/api/v1/bundles/tip_floor");
+const tips   = await tipRes.json();
+// { ema_landed_tips_25th_percentile, 50th, 75th, 95th, 99th }
+
+// 正常日期的面向用户的交换——50th 百分位数很好。
+const tipSol = tips.ema_landed_tips_50th_percentile_lamports / 1e9;
+
+// 拥堵期间时间敏感的机器人交易——75–95th 百分位数。
+```
+
+典型范围：非紧急用户交换为 0.0001–0.001 SOL；拥堵期间高优先级机器人为 0.01–0.1 SOL。
+
+### 构建捆绑
+
+```ts
+import { SearcherClient } from "jito-ts";
+
+const client = new SearcherClient("https://mainnet.block-engine.jito.wtf");
+
+const tipIx = SystemProgram.transfer({
+  fromPubkey: user.publicKey,
+  toPubkey:   JITO_TIP_ACCOUNTS[Math.floor(Math.random() * 8)],  // 8 tip accts
+  lamports:   tipLamports,
+});
+
+const tx1 = new VersionedTransaction(...);  // the swap
+tx1.sign([user]);
+
+const bundleUuid = await client.sendBundle([tx1], tipLamports);
+// Optionally: await confirmation via client.getBundleStatuses([bundleUuid])
+```
+
+陷阱：
+
+- **提示必须在捆绑内。** 在捆绑的其中一个交易内（通常是最后一个）包含到 Jito 提示账户的 `SystemProgram.transfer` 作为指令。不属于捆绑的单独提示交易会被忽略。
+- **领导者不支持 Jito。** 约 75% 的领导者运行 Jito；约 25% 不运行。当非 Jito 领导者持有 slot 时发送的捆绑被丢弃。客户端会自动重试。
+- **过期。** 捆绑使用与常规交易相同的 blockhash 过期模型。快速组装和发送；~60s 窗口。
+
+### 捆绑 vs 优先级费用
+
+优先级费用贿赂领导者更快地包括你的交易。Jito 捆绑还将交易隐藏在公开内存池之外。对于紧急情况使用优先级费用；对于三明治防护使用捆绑。双管齐下：在高价值用户交换上同时使用两者。
+
+看到 [`integration-guides/priority-fee-tuning`](/zh/integration-guides/priority-fee-tuning) 来调整优先级费用。
+
+## MEV 分享 / 恢复保护的 RPC
+
+一些 RPC 提供商提供"MEV 分享"或"恢复保护"端点，在内部通过 Jito 捆绑或等效私有路径路由你的交易：
+
+- **Helius** — 具有捆绑支持的质押连接。
+- **QuickNode** — "Revert Protect" 端点；自动在提交的交易周围形成捆绑。
+- **Triton** — 私有流层。
+
+使用其中之一是不想自己管理捆绑逻辑的项目的最简单路径。权衡：不透明的内部；你信任提供商的捆绑构造。
+
+## 拥堵处理
+
+在高成交量时期（主网启动、主要上市、持续上升期间），领导者数据包队列会填满。症状：
+
+- 交易未确认超过 60 秒，然后以"blockhash not found"过期。
+- 昨天有效的优先级费用今天不足。
+- 模拟成功但执行永不落地。
+
+策略：
+
+1. **对过期进行激进重试。** 在 `TransactionExpiredBlockheightExceeded` 上，使用新的 blockhash 重新构建并重新提交。*不*要在恢复时重试——恢复是确定性的。
+2. **多 RPC 广播。** 并行提交相同的交易到多个 RPC；先到达领导者的赢。
+3. **优先级费用上升。** 从 50th 百分位数开始；如果第一次尝试过期，以 75th，然后 95th 重试。
+4. **Jito 捆绑作为后备。** Jito 领导者往往不那么拥堵，因为区块引擎按单位 CU 提示对捆绑进行排序；高提示捆绑获得优先级。
+5. **模拟较少。** 在拥堵下，向前模拟一次；不要在重试时重新模拟，因为池状态无论如何都会改变。在拥堵期间重新模拟通常会虚假地失败。
+
+## 按产品的 MEV 考虑
+
+**CPMM。** 在低 TVL 池上高度可三明治化。常数乘积曲线放大甚至小的机器人前期交易。建议对任何 CPMM 交换 >0.5% 的池 TVL 使用 Jito 捆绑。
+
+**CLMM。** 在深度池上三明治化程度较低，因为 tick 内交易不移动价格。但跨 tick 交易绝对会；针对 tick 穿越的三明治是一个已知的模式。紧密的滑点（`<0.3%`）是最好的防御。
+
+**AMM v4 + OpenBook。** OpenBook 订单簿填充运行通过同一交易，所以不知道订单簿状态的三明治机器人低估价格冲击并经常失败。因此是有机的低 MEV 场所。
+
+**LaunchLab。** 在早期绑定曲线阶段，炒作启动的抢先交易是猖獗的。曲线移动快速，滑点很宽。强烈建议 Jito 捆绑。毕业后，生成的 CPMM 遵循正常的 CPMM 动态。
+
+**Farms。** 收获和质押操作不是交换，不可三明治化。不需要特殊处理。
+
+## 检查表
+
+对于生产聚合器 / 钱包交换 UI：
+
+- [ ] 滑点在正常对上默认为 ≤0.5%；用户可以覆盖。
+- [ ] 对于 >\$1k USD 价值的交换，默认启用 Jito 捆绑提交。
+- [ ] 优先级费用来自实时估计（不是硬编码）。
+- [ ] 重试逻辑区分恢复（不重试）和过期（使用新的 blockhash 重试）。
+- [ ] 多跳路由设置按跳最小值，不是端到端。
+- [ ] 对于 >1% 任何单个池的 TVL 的交易，分割路由活跃。
+- [ ] 池新鲜度：在提交前立即重新获取状态；如果过时则重新报价。
+- [ ] 在浅池上三明治抵抗：要么仅 Jito，要么如果滑点 >1% 则拒绝。
+
+## 指针
+
+- [`integration-guides/aggregator`](/zh/integration-guides/aggregator) — 池发现、报价、交易组装。
+- [`integration-guides/priority-fee-tuning`](/zh/integration-guides/priority-fee-tuning) — CU 和优先级费用调整。
+- [`integration-guides/cpi-integration`](/zh/integration-guides/cpi-integration) — 单滑点门多跳组合。
+- [`algorithms/slippage-and-price-impact`](/zh/algorithms/slippage-and-price-impact) — 正式定义。
+
+来源：
+
+- [Jito docs](https://docs.jito.wtf)
+- [Solana validator docs on priority fees](https://docs.solana.com/transaction_fees)
+- [jito-ts](https://github.com/jito-labs/jito-ts) — TypeScript 捆绑客户端。

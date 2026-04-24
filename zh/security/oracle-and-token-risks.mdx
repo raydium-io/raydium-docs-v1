@@ -1,0 +1,170 @@
+---
+title: "预言机和代币风险"
+description: "Raydium 如何处理预言机输入以及 Token-2022 扩展带来的特定风险（冻结权限、转账钩子、永久委托、默认冻结），包括程序保护的内容和用户必须接受的风险。"
+---
+
+<Info>
+  **本页内容由 AI 自动翻译，所有内容以英文版本为准。**
+
+  [查看英文版 →](/security/oracle-and-token-risks)
+</Info>
+
+## Raydium 中的预言机
+
+### 内部：池本身就是预言机
+
+对于 AMM v4、CPMM 和 CLMM，协议的「当前价格」定义完全来自池状态：
+
+- AMM v4 / CPMM：`price = vaultB_balance / vaultA_balance`（考虑小数位）。
+- CLMM：`price = (sqrtPriceX64 / 2^64)^2 × 10^(decimalsA - decimalsB)`。
+
+在交换、存入或取出期间，不查询外部预言机。这是 AMM 设计中「无需信任」的部分：如果池数学正确，任何外部操纵价格源的尝试都无法破坏它。
+
+### CLMM `ObservationState` 作为 TWAP 预言机
+
+CLMM 池维护一个 `ObservationState` 账户，记录历史的 `sqrt_price` 快照。其他程序可以基于此构建，推导出抗操纵的时间加权平均价格：
+
+```rust
+// 一个简化的 TWAP：当前和 N 个槽位前的平均。
+let obs_now  = load_observation(pool, Clock::slot());
+let obs_past = load_observation(pool, Clock::slot() - 300);  // ~2 分钟前
+let twap = (obs_now.price_cumulative - obs_past.price_cumulative)
+         / (obs_now.slot - obs_past.slot);
+```
+
+这与 Uniswap V3 使用的模式相同。短期价格操纵（鲸鱼临时推动池）不会破坏 TWAP，因为它是在数百个槽位上取平均。
+
+需要更安全价格源的程序（CLMM 代币的清算预言机、期权定价等）应使用 ObservationState TWAP 而非即时价格。
+
+**不要将即时 CLMM 价格用于可组合性。** 单次大额交换在浅池上可能将现货价格推高 10% 以上；TWAP 可以平缓这种波动。详见 [`products/clmm/accounts#observation-state`](/zh/products/clmm/accounts) 获取数据布局。
+
+### 外部：前端/API 上的 USD 价格
+
+Raydium 前端和 `api-v3.raydium.io` 显示 USD 价值（TVL、费用 APR、\$ 交易量）。这些来自：
+
+- **Pyth** 作为主要预言机，用于主流代币。
+- **Jupiter 的聚合器价格** 作为备选。
+- **池推导价格** 用于无外部预言机覆盖的长尾代币。
+
+USD 显示完全是装饰性的——链上操作永远不会读取 Pyth，也没有池数学使用 USD。如果 Pyth 停止为某个代币提供数据，UI 显示「——」；池继续运行。
+
+### 预言机操纵不适用于 Raydium 池
+
+因为池状态就是预言机，所以不存在漏洞赏金文献所说的「预言机攻击」——没有可被攻击者破坏的外部可操纵数据源。对池状态的经济攻击（闪电贷式操纵）在 [`security/attack-vectors`](/zh/security/attack-vectors) 中有说明。
+
+## Token-2022 扩展风险
+
+SPL Token-2022（又称「Token Extensions」）通过扩展向代币添加可配置行为。某些扩展改变了包含它们的池的信任属性。Raydium 程序会自动处理某些扩展，并将其他的显示为用户警告。
+
+### 转账费用
+
+**是什么：** 可配置的费用（转账的百分比，上限为 `maximum_fee` 上限），由发送者在每次转账时支付给代币权限。
+
+**风险：** 费用可由代币的费用配置权限持有者更改。如果你在费用为 1% 时存入流动性，而权限将其提高到 50%，后续交换的返回会大幅减少。
+
+**Raydium 中的缓解：** 池在交换时读取当前 `transferFeeConfig` 并调整数学。池本身不会损坏，但用户看到更差的输出。费用权限也可以安排延迟费用更改；Raydium 的 UI 会标记有即将更改费用的池。
+
+**残留风险：** 如果恶意费用权限在你的交换进行中改变费用，你的 `minimumAmountOut` 会保护下行风险——交易会回滚。如果你信任代币发行者，这没问题；如果不信任，就不要提供流动性。
+
+### 转账钩子
+
+**是什么：** 转账调用一个单独的程序（「钩子」）来运行自定义验证或副作用。
+
+**风险：** 钩子可以阻止任何转账，包括池在交换期间的内部转账。可升级的钩子稍后可能变为恶意——在存入时安全的东西在取出时可能变为无法交换。
+
+**Raydium 中的缓解：** Raydium 在池状态中列出钩子程序 ID。集成应该向用户显示钩子程序 ID，以便他们验证它是预期的（不可升级、已审计）程序。
+
+**残留风险：** 如果钩子可升级且其权限变为敌对，池可能被冻结。Raydium 不阻止带转账钩子的池，但会对其进行标记。只有在钩子经过验证安全时，才应提供流动性。
+
+### 冻结权限
+
+**是什么：** 代币的冻结权限可以冻结任何持有该代币的代币账户，防止所有转账。
+
+**风险：** 具有冻结池的保险库账户能力的冻结权限实际上会关闭池——用户无法取出，交易者无法交换。这适用于 SPL Token 和 Token-2022；这不是 Token-2022 的新东西，但仍然是风险。
+
+**Raydium 中的缓解：** 程序级别没有缓解——SPL Token 的冻结对池是透明的。Raydium 的 UI 在有可冻结代币的池上发出警告。存入的用户应验证冻结权限为空或受信任的多签（USDC 有冻结权限；由发行商 Circle 持有）。
+
+**残留风险：** 接受可冻结代币可能被冻结的事实。主流代币（USDC、USDT、USDY）的冻结权限由发行商持有，仅用于监管合规；这通常是可接受的。
+
+### 永久委托
+
+**是什么：** Token-2022 扩展，指定永久委托人可以在没有批准的情况下从任何持有人转账代币。
+
+**风险：** 永久委托人可以随时耗尽池的保险库。
+
+**Raydium 中的缓解：** CPMM 和 CLMM **拒绝创建**有永久委托代币的池。初始化会回滚。没有运行中的 Raydium 池有永久委托代币。
+
+**残留风险：** 零（只要检查正确，两项审计都验证了）。
+
+### 不可转账
+
+**是什么：** 持有人无法转账的代币。
+
+**风险：** 池依赖可转账性在用户 ATA 和池保险库之间移动代币。不可转账代币会直接破坏池。
+
+**Raydium 中的缓解：** 在不可转账代币上池创建会回滚。农场也拒绝不可转账的质押代币。
+
+### 默认冻结 / 关闭权限 / 计息
+
+由 Raydium 处理的低影响扩展：
+
+- **默认冻结**：新代币账户在使用前需要解冻。Raydium 在 ATA 创建时透明地处理此问题。
+- **关闭权限**：指定的权限可以关闭代币账户。池保险库由池的程序派生权限拥有，所以*代币*上的关闭权限不适用于保险库。
+- **计息**：显示的余额会产生利息；`amount` 保持固定但 `uiAmount` 增长。Raydium 池数学使用 `amount`，而非计息；显示单独调整。
+
+### 铸币权限
+
+不是 Token-2022 特定风险，但值得注意：如果代币保留铸币权限，持有人可以随意膨胀供应。对于已启动的代币，这会以池当前价格稀释 LP。LaunchLab 拒绝创建启动，除非铸币权限为空。
+
+## UI 中的风险标签
+
+Raydium 前端用适用的风险标签标记每个池：
+
+- **TRANSFER_FEE** —— 非零转账费用。
+- **TRANSFER_HOOK** —— 转账钩子扩展活跃。
+- **FREEZE** —— 代币有冻结权限。
+- **MINT** —— 代币有铸币权限（供应可膨胀）。
+- **CLOSE** —— 代币有关闭权限。
+
+使用 Raydium API 的聚合器应向用户显示这些标签。
+
+## 集成者检查清单
+
+在与 Raydium 池组合之前：
+
+- [ ] 通过 `getMint(mint, TOKEN_2022_PROGRAM_ID)` 检查每个代币的扩展。
+- [ ] 跳过任何代币有 permanent_delegate 或 non_transferable 的池（这些不应该存在于 Raydium，但深度防御）。
+- [ ] 检查两个代币的冻结权限；仅限空或受信任的权限。
+- [ ] 对于转账钩子池，根据白名单验证钩子程序 ID。
+- [ ] 根据转账费用情景确定风险敞口规模（如果费用达到最大值会怎样？）。
+- [ ] 对衍生品定价使用 CLMM TWAP（ObservationState）而非现货价格。
+
+## 残留风险接受声明
+
+Raydium 程序强制执行程序级别可以强制的内容：
+
+- 池创建拒绝 permanent-delegate / non-transferable 代币。
+- 交换数学针对当前转账费用正确调整。
+- ObservationState 提供抗操纵预言机。
+
+用户必须接受的残留风险：
+
+- 代币的冻结权限可以冻结池。
+- 代币的费用权限可以随时提高转账费用（至 `maximum_fee` 上限）。
+- 转账钩子程序可升级为恶意代码。
+- 计息代币的应计率可被更改。
+
+正确的防护是提供流动性前的勤奋：不要存入有你不信任的集中权限代币的池。Raydium 无法为你决定信任；它只能显示相关事实。
+
+## 指引
+
+- [`algorithms/token-2022-transfer-fees`](/zh/algorithms/token-2022-transfer-fees) —— 转账费用代币的数学调整。
+- [`security/attack-vectors`](/zh/security/attack-vectors) —— 这些风险如何表现为具体攻击。
+- [`integration-guides/wallet-integration`](/zh/integration-guides/wallet-integration) —— 显示 Token-2022 风险标签。
+- [`products/clmm/accounts`](/zh/products/clmm/accounts) —— ObservationState 布局。
+
+来源：
+
+- [SPL Token-2022 扩展文档](https://spl.solana.com/token-2022/extensions)。
+- 池初始化验证逻辑：`src/raydium/cpmm/instrument.ts`、`src/raydium/clmm/instrument.ts`。
+- [Pyth](https://pyth.network) —— 前端使用的外部价格预言机。

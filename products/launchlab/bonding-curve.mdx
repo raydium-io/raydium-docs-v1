@@ -1,0 +1,202 @@
+---
+title: "LaunchLab bonding curve"
+description: "The curve formulas LaunchLab supports, closed-form buy and sell cost, graduation threshold derivation, and a worked numeric walk-through of a launch from first buy to graduation."
+---
+
+<Info>
+  LaunchLab supports three curve shapes selected at `Initialize`: **constant-product** (the most common, virtual-reserve form of the standard `x · y = k` curve), **linear-price**, and **fixed-price**. The graduation threshold formula is shared across all three. This page walks through the constant-product math in detail; the linear and fixed forms are summarised at the end.
+</Info>
+
+## Parameters stored on `LaunchState`
+
+| Field | Meaning |
+|-------|---------|
+| `curve_type` | `0` = constant-product (virtual-reserves), `1` = fixed-price, `2` = linear-price. |
+| `base_supply_max` | Total base tokens the curve can ever mint. |
+| `base_supply_graduation` | Base tokens that must be sold to reach graduation. Usually `0.8 × base_supply_max`; the remaining 20% becomes the post-graduation pool's initial LP. |
+| `quote_reserve_target` | Quote amount that triggers graduation. Derived at `Initialize` from the curve params + `base_supply_graduation`. |
+| `virtual_base` / `virtual_quote` | Virtual-reserve seeds for the constant-product curve. |
+| `migrate_type` | Selects the graduation target: AMM v4 vs CPMM. See [`instructions`](/products/launchlab/instructions). |
+| `fees.buy_numerator / buy_denominator` | Buy-side fee, e.g. `100 / 10_000 = 1.00%`. |
+| `fees.sell_numerator / sell_denominator` | Sell-side fee. Often same as buy. |
+| `fees.protocol_share`, `fees.creator_share`, `fees.lp_share` | Split of the above, summing to denominator. |
+
+Field names in the Rust struct match the `PoolState` fields described in [`accounts`](/products/launchlab/accounts); units above are conceptual.
+
+## Constant-product curve with virtual reserves (`curve_type = 0`)
+
+The default and most-used curve. Pump-style launches all use this form. The curve pretends there is a **virtual quote reserve** `V_q` and a **virtual base reserve** `V_b` from the start (stored as `virtual_quote` and `virtual_base` on `PoolState`), so the effective pool looks like a CPMM with those reserves. Buys follow `x · y = k` math:
+
+```
+(V_q + real_quote_in_after_fee) × (V_b + real_base_remaining − base_out) = V_q × V_b
+```
+
+solved for `base_out`:
+
+```
+base_out = (V_b + real_base_remaining) × quote_in_after_fee / (V_q + real_quote_in_after_fee)
+```
+
+Effective price at base-sold `s`:
+
+```
+price(s) = (V_q + real_quote_in(s)) / (V_b + real_base_remaining(s))
+```
+
+The same `x · y = k` invariant LaunchLab applies pre-graduation is then literally the CPMM (or AMM v4) curve post-graduation, so the graduation handoff is mechanically seamless: the marginal price at `base_sold = base_supply_graduation` equals the price the post-graduation pool opens at with `(quote_vault, base_vault_remaining)` as its reserves.
+
+## Fixed-price curve (`curve_type = 1`)
+
+A flat-price curve. Every buy/sell happens at a constant price, configurable at `Initialize`:
+
+```
+price(s) = virtual_quote / virtual_base    (constant for all s)
+```
+
+Useful for fair launches where the team wants uniform pricing for all participants regardless of when they buy. Graduation triggers when `base_supply_graduation` has been sold (the linear-cost relationship makes `quote_reserve_target` straightforward to derive).
+
+## Linear-price curve (`curve_type = 2`)
+
+Price increases linearly with `base_sold`:
+
+```
+price(s) = a · s     (a = slope, derived from virtual_base / virtual_quote)
+```
+
+Integrated cost:
+
+```
+cost(s_0, s_1) = a · (s_1² − s_0²) / 2
+```
+
+Quadratic in `base_sold` — early buyers pay close to zero, late buyers pay substantially more, with the marginal price always rising at a fixed slope. The on-chain implementation lives in `curve/linear_price.rs`.
+
+## Curve-shape comparison
+
+```
+price
+  │   linear (steep tail)               linear (curve_type = 2)
+  │       ╱
+  │      ╱
+  │     ╱            const-product (curve_type = 0)
+  │    ╱            ╱
+  │   ╱           ╱
+  │  ╱         ╱
+  │ ╱       ╱
+  │╱_____╱_______________________  fixed-price (curve_type = 1)
+  └──────────────────────────────── base_sold
+  0                  S_grad         S_max
+```
+
+## Graduation threshold
+
+`quote_reserve_target` is computed at `Initialize` as the quote required to drive `base_sold` from 0 to `base_supply_graduation`:
+
+```
+quote_reserve_target = cost(0, base_supply_graduation) × (1 + buy_fee_rate)
+                                                         ^^^^^^^^^^^^^^^^^
+                                                         approximate; exact
+                                                         form matches the fee
+                                                         rounding used on Buy.
+```
+
+A launch graduates as soon as `quote_vault.balance ≥ quote_reserve_target`. Because buys come in at discrete sizes, the actual balance at graduation can slightly exceed the target — the surplus becomes extra quote-side liquidity in the resulting CPMM pool.
+
+## Worked example — a quadratic launch
+
+Parameters:
+
+- `base_supply_max        = 1_000_000_000` (1 billion base tokens, 6 decimals)
+- `base_supply_graduation = 800_000_000`   (80% sold triggers graduation)
+- `k                      = 40` (price scale)
+- Fees: 1% buy, 1% sell, split `lp:creator:protocol = 60:20:20`.
+
+**Initial price** (`s = 0`): `0` (pure quadratic starts at zero).
+
+**Price at 50% sold** (`s = 500_000_000`):
+
+```
+price = 40 × (500e6 / 1e9)² = 40 × 0.25 = 10  (quote per base, 6 decimals)
+```
+
+**Price at graduation** (`s = 800_000_000`):
+
+```
+price = 40 × (800e6 / 1e9)² = 40 × 0.64 = 25.6
+```
+
+**Quote required to reach graduation** (integrated cost):
+
+```
+cost(0, 800_000_000) = (40 / (3 × 1e18)) × ((800e6)³ − 0)
+                     = (40 / 3e18) × 5.12e26
+                     ≈ 6.827e9
+```
+
+So ≈ 6.827 quote-native units (in whichever 6-decimal quote mint is configured, e.g. ~6,827 USDC if the quote is USDC).
+
+**Fee applied on top**:
+
+```
+quote_reserve_target ≈ 6.827e9 × 1.01 ≈ 6.895e9  (6,895 USDC)
+```
+
+**First buy** of `10 USDC`:
+
+- Virtual state: `s = 0`, `quote_vault = 0`.
+- Subtract fee: `quote_after_fee = 10 × 0.99 = 9.9`.
+- Solve `(40 / (3e18)) × s³ = 9.9` ⇒ `s ≈ 6.22e6` base tokens bought.
+- 1% fee (`0.1 USDC`) split: lp `0.06`, creator `0.02`, protocol `0.02`. The lp share stays in `quote_vault`; the other two route to their respective accrual counters.
+
+**Buy at 75% sold** (approaching graduation):
+
+Same 10 USDC buys far less base now because the curve is steep. A Newton solve at `s₀ = 750e6` with `quote_in_after_fee = 9.9` gives roughly `∆s ≈ 0.4e6` — a ~15× reduction in base per USDC compared to the first buy.
+
+## Fee mechanics during the curve phase
+
+On every `Buy`:
+
+```
+gross_fee      = ceil(quote_in_gross × buy_numerator / buy_denominator)
+lp_share       = gross_fee × fees.lp_share / fees.total_share
+protocol_share = gross_fee × fees.protocol_share / fees.total_share
+creator_share  = gross_fee × fees.creator_share / fees.total_share
+```
+
+- `lp_share` is left in `quote_vault`. This is what makes the effective curve tighter (more quote reserve against the same base supply).
+- `protocol_share` increments `LaunchState.state_data.protocol_fees_quote`.
+- `creator_share` increments `LaunchState.state_data.creator_fees_quote`.
+
+On `Sell` the same split applies but the fee is taken from the outbound `quote_out`.
+
+Both counters are swept via `CollectFees` (admin or creator, each to their own counter).
+
+## Precision
+
+- Base-side amounts: `u64`.
+- Quote-side amounts: `u64`.
+- Intermediate cubes / products: `u128`.
+- Newton solves for "buy exact quote" and "sell exact quote" iterate in `u128` fixed-point with a configurable max iteration count (default 10). Failure mode is `NotConverged` — rare outside of near-graduation edge cases.
+
+## Handoff to CPMM
+
+When `Graduate` fires:
+
+```
+cpmm_quote_reserve = quote_vault − swept_protocol_fees − swept_creator_fees
+cpmm_base_reserve  = base_vault                       // i.e. base_supply_max − base_sold
+cpmm_initial_price = cpmm_quote_reserve / cpmm_base_reserve
+```
+
+For the quadratic curve, `cpmm_initial_price` is `price(base_sold)` mechanically (it is the marginal curve price at the moment of handoff). The CPMM pool opens at exactly that price, so an observer switching from the curve UI to the CPMM UI sees no jump.
+
+## Where to go next
+
+- [`products/launchlab/accounts`](/products/launchlab/accounts) — the `LaunchState` fields storing these parameters.
+- [`products/launchlab/instructions`](/products/launchlab/instructions) — `Buy`, `Sell`, `Graduate` account lists.
+- [`algorithms/constant-product`](/algorithms/constant-product) — the CPMM math the post-graduation pool uses.
+
+Sources:
+
+- [Raydium SDK v2 `LaunchLab` module](https://github.com/raydium-io/raydium-sdk-V2)
+- Raydium LaunchLab program source

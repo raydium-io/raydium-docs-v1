@@ -1,0 +1,159 @@
+---
+title: "Ticks dan posisi"
+description: "Bagaimana CLMM mendiskritisasi harga menjadi ticks, bagaimana tick-arrays memampatkan penyimpanan, dan aturan yang mengatur di mana posisi dapat berada."
+---
+
+<Info>
+  **Halaman ini diterjemahkan secara otomatis oleh AI. Versi bahasa Inggris adalah acuan resmi.**
+
+  [Lihat versi bahasa Inggris →](/products/clmm/ticks-and-positions)
+</Info>
+
+## Mengapa ticks ada
+
+Likuiditas CLMM terkonsentrasi ke dalam rentang harga. Untuk membuat rentang dapat dikelola di chain, harga dikuantisasi menjadi integer **ticks**, di mana setiap tick adalah kelipatan konstan dari yang sebelumnya:
+
+$$
+\text{price}(i) = 1.0001^{\,i}
+$$
+
+Satu tick sesuai dengan pergerakan harga 0,01%, atau ~1 basis point. Pemetaannya adalah:
+
+| Indeks tick `i` | Pengali harga |
+|---|---|
+| `0` | `1.0000` |
+| `100` | `1.0100` (≈ +1.00%) |
+| `-100` | `0.9900` (≈ −0.99%) |
+| `10000` | `2.7181` (≈ e) |
+| `MAX_TICK = 443636` | ≈ `1.84e19` |
+| `MIN_TICK = -443636` | ≈ `5.42e-20` |
+
+`MIN_TICK` dan `MAX_TICK` dipilih sehingga `sqrt_price_x64` pas dalam `u128` di kedua ujung. Setiap pool menegakkan bahwa `tick_lower >= MIN_TICK` dan `tick_upper <= MAX_TICK`. Dalam praktik, UI web membatasi rentang ke sesuatu yang jauh lebih sempit untuk mencegah pengguna mengunci likuiditas ke ticks yang tidak dapat dijangkau.
+
+## Spasi tick
+
+`AmmConfig` pool menetapkan **tick spacing** — satu-satunya ticks yang diizinkan posisi untuk digunakan sebagai endpoint. Jika `tick_spacing = 60`, hanya ticks `…, −120, −60, 0, 60, 120, …` yang valid. Upaya untuk membuka posisi dengan endpoint `31` akan membatalkan dengan `InvalidTickIndex`.
+
+Spasi yang dipublikasikan secara umum:
+
+| Tingkat biaya | `trade_fee_rate` | Spasi tick | Langkah harga paling kasar per posisi tick |
+|----------|------------------|--------------|---------------------------------------|
+| 0.01% | `100` | 1 | 0.01% |
+| 0.05% | `500` | 10 | 0.10% |
+| 0.25% | `2500` | 60 | 0.60% |
+| 1.00% | `10000` | 120 | 1.21% |
+
+Semakin besar spasi, semakin sedikit tick arrays yang perlu diinisialisasi, semakin murah membuka posisi yang luas, dan semakin kabur batas harganya. Pasangan volatil biasanya berada di tier spasi 120; stables berada di tier spasi 1.
+
+## Tick arrays
+
+Pool tidak menyimpan state per-tick dalam akun terpisah. Sebaliknya, `TICK_ARRAY_SIZE` ticks yang berdekatan (60 dalam CLMM Raydium saat ini) dikemas ke dalam satu `TickArrayState`. Array pertama tick adalah `start_tick_index`-nya, dan itu mencakup tepat `TICK_ARRAY_SIZE * tick_spacing` unit integer-tick.
+
+Untuk `tick_spacing = 60` dan `TICK_ARRAY_SIZE = 60`:
+
+- Setiap tick array mencakup `60 × 60 = 3600` integer ticks.
+- `start_tick_index` adalah kelipatan dari 3600: `…, -7200, -3600, 0, 3600, 7200, …`.
+
+Endpoint posisi `t = 2040` pada `tick_spacing = 60` berada di tick array dengan `start_tick_index = 0`. Endpoint posisi `t = 4200` berada di array dengan `start_tick_index = 3600`.
+
+### Ketika array diinisialisasi
+
+Tick array adalah lazy: posisi **pertama** yang merujuk ke tick apa pun di dalamnya menginisialisasi array, membayar rent. Swap tidak menginisialisasi tick arrays — mereka melewati array yang belum diinisialisasi menggunakan bitmap. Alur open-position SDK memeriksa rentang yang dipilih, menghitung daftar tick arrays yang disentuhnya, dan menambahkan instruksi `init_tick_array` dalam transaksi yang sama dengan `OpenPosition` jika ada yang hilang.
+
+### Tick arrays tidak ditutup
+
+Setelah tick array telah diinisialisasi, itu persisten untuk seumur hidup pool. Program **tidak** mengekspos path untuk menutup tick array, bahkan setelah `initialized_tick_count` kembali ke nol. Tidak ada pemulihan rent untuk tick arrays; rent yang dibayar oleh posisi pertama yang menyentuh array dikunci ke akun tersebut secara permanen. Ini adalah trade-off yang disengaja: menggunakan kembali tick array yang ada adalah gratis untuk setiap posisi berikutnya, jadi pool yang banyak diperdagangkan hanya membayar biaya rent sekali per slot `(pool, start_tick_index)` terlepas dari pergantian.
+
+### Bitmap
+
+Menemukan "tick yang diinisialisasi berikutnya ke kiri/kanan dari tick saat ini" harus cepat — swap dapat melintasi banyak ticks. Pool menyimpan bitmap 1-bit-per-tick-array inline dalam `PoolState` untuk rentang ±1.024 arrays di sekitar tick 0. Di luar rentang tersebut (posisi full-range, setup eksotis), `TickArrayBitmapExtension` menyediakan overflow.
+
+Swap berjalan di bitmap: `lowest_set_bit_above(tick_current_array_index)` memberikan array berikutnya dengan tick yang diinisialisasi di sisi yang sedang dilintasi swap. Dalam array tersebut, bit-scan serupa menemukan tick yang diinisialisasi berikutnya.
+
+## `liquidity_gross` dan `liquidity_net`
+
+Setiap tick yang **diinisialisasi** menyimpan dua nilai likuiditas:
+
+- **`liquidity_gross`** — jumlah `L` di semua posisi yang merujuk ke tick ini sebagai endpoint. Ketika `liquidity_gross` mencapai nol, tick menjadi belum diinisialisasi dan dapat dihapus dari bitmap.
+- **`liquidity_net`** — perubahan *bertanda* ke level-pool `liquidity` ketika harga melintasi tick ini **bergerak ke atas** (kiri-ke-kanan dalam ruang tick). Jika tick ini adalah batas bawah posisi dengan ukuran `L`, itu berkontribusi `+L`; jika itu adalah batas atas posisi tersebut, itu berkontribusi `−L`.
+
+Contoh kerja: dua posisi di pool yang sama.
+
+- Posisi A: `tick_lower = -120`, `tick_upper = 0`, likuiditas `L_A = 100`.
+- Posisi B: `tick_lower = -60`, `tick_upper = 60`, likuiditas `L_B = 50`.
+
+State tick-by-tick:
+
+| Tick | Disentuh oleh | `liquidity_gross` | `liquidity_net` |
+|------|------------|-------------------|------------------|
+| `-120` | A lower | 100 | +100 |
+| `-60` | B lower | 50 | +50 |
+| `0` | A upper | 100 | −100 |
+| `60` | B upper | 50 | −50 |
+
+Level-pool `liquidity` untuk nilai `tick_current` yang berbeda:
+
+- `tick_current = -180`: `liquidity = 0` (sebelum posisi apa pun)
+- `tick_current = -90`: `liquidity = 100` (hanya di dalam A)
+- `tick_current = -30`: `liquidity = 150` (di dalam A dan B)
+- `tick_current = 30`: `liquidity = 50` (hanya di dalam B)
+- `tick_current = 90`: `liquidity = 0` (melewati keduanya)
+
+Pada setiap tick cross selama swap, program menambahkan `liquidity_net` (mungkin negatif) ke `PoolState.liquidity`. Ini adalah mekanisme Uniswap-v3 yang tepat.
+
+## Posisi sebagai NFTs
+
+Posisi CLMM Raydium adalah NFT. Membuka posisi mencetak mint baru dengan supply 1 ke dalam dompet pemanggil, dan otoritas mint adalah program CLMM. Program menghubungkan kepemilikan posisi ke **siapa pun yang memegang saldo dalam ATA mint tersebut** pada waktu CPI.
+
+Konsekuensi:
+
+- **Posisi dapat ditransfer.** Dompet dapat menjual atau airdrop posisi dengan mentransfer NFT. Pemegang baru kemudian dapat memanggil `CollectRewards`, `IncreaseLiquidity`, dll.
+- **Posisi dapat dialamatkan di luar CLMM.** Marketplace dan dompet menampilkan posisi seperti NFT lainnya. SDK menetapkan `name`/`symbol` yang masuk akal pada metadata mint.
+- **PDA posisi diturunkan dari mint NFT.** Anda dapat menemukan `PersonalPositionState` tanpa mengetahui siapa yang saat ini menahannya.
+
+### Posisi Token-2022
+
+Pool CLMM yang lebih baru dapat mencetak posisi di bawah Token-2022 bukan SPL Token klasik. Program mengekspos dua instruksi open paralel — `OpenPosition` dan `OpenPositionWithToken22Nft` — dengan semantik identik di luar program token mana yang memiliki mint NFT. Kompatibilitas dompet dan marketplace berbeda; UI Raydium melacak keduanya.
+
+## Aturan rentang yang diizinkan
+
+Pada waktu `OpenPosition` program menegakkan:
+
+1. `tick_lower < tick_upper`.
+2. `tick_lower % tick_spacing == 0` dan `tick_upper % tick_spacing == 0`.
+3. `MIN_TICK <= tick_lower` dan `tick_upper <= MAX_TICK`.
+4. Pemanggil telah memasok tick arrays yang berisi `tick_lower` dan `tick_upper` — baik sudah diinisialisasi atau melalui `init_tick_array` dalam transaksi yang sama.
+5. Akun bitmap extension, jika posisi ini meluas ke dalam rentang extension.
+
+Jika pemeriksaan apa pun gagal, instruksi membatalkan dengan `InvalidTickIndex`, `NotApproved`, atau `InsufficientLiquidity` tergantung pada kendala mana. Lihat [`reference/error-codes`](/id/reference/error-codes).
+
+## "In-range" vs "out-of-range"
+
+Posisi adalah **in range** ketika `tick_lower <= tick_current < tick_upper`. Hanya posisi in-range yang berkontribusi pada `PoolState.liquidity` dan karena itu hanya mereka yang mendapatkan biaya swap.
+
+Posisi out-of-range:
+
+- Memegang 100% dari *satu* token (yang rentangnya telah dilalui). Secara spesifik, jika `tick_current < tick_lower`, posisi hanya memegang token1 (sudah "dijual" oleh harga yang bergerak menjauh); jika `tick_current >= tick_upper`, itu hanya memegang token0.
+- **Tidak** mendapatkan biaya swap.
+- **Lanjutkan** mengakrual rewards jika aliran reward pool memancarkan ke likuiditas out-of-range — tetapi perilaku default Raydium adalah "emit hanya ke in-range", mencocokkan konvensi Uniswap v3. Lihat [`products/clmm/fees`](/id/products/clmm/fees).
+
+LP yang mengelola posisi CLMM menghabiskan sebagian besar perhatian mereka untuk menjaga posisi tetap in range saat harga bergerak.
+
+## Jebakan integrasi umum
+
+- **Endpoint tidak sesuai spasi.** Kode yang menghitung tick dari target harga harus snap ke kelipatan `tick_spacing` sebelum melewatinya ke `OpenPosition`. Helper SDK (`TickUtils.getTickWithPriceAndTickspacing`) melakukan ini; matematika home-grown sering kali tidak.
+- **Tick arrays yang hilang.** Membuka posisi yang luas mungkin memerlukan inisialisasi beberapa tick arrays; lupa melewati mereka sebagai akun writable membatalkan. `openPositionFromBase` SDK mengembalikan daftar untuk Anda.
+- **Tick basi setelah swap.** `tick_current` dapat melintasi banyak ticks dalam satu swap. Jika UX Anda menampilkan "current tick" dari satu panggilan RPC dan kemudian membuka posisi di panggilan yang lebih baru, posisi relatif vs harga live bisa mati puluhan ticks. Re-fetch tepat sebelum menandatangani.
+- **Posisi NFTs dengan metadata tambahan.** Jika Anda membangun dompet yang mengenali posisi Raydium, deteksi mereka oleh otoritas mint mereka (= PDA program CLMM), bukan oleh bidang metadata hardcode.
+
+## Kemana selanjutnya
+
+- [Math](/id/products/clmm/math) — step-through swap dan derivasi fee-growth yang batas tick berpartisipasi.
+- [Accounts](/id/products/clmm/accounts) — tata letak `TickArrayState` dan `PositionState`.
+- [Biaya dan rewards](/id/products/clmm/fees) — bagaimana in-range-ness gerbang akrual biaya.
+- [`algorithms/clmm-math`](/id/algorithms/clmm-math) — derivasi bersama dari rumus concentrated-liquidity.
+
+Sumber:
+
+- [`raydium-io/raydium-clmm` — modul `tick_array`, `tick`, `position`](https://github.com/raydium-io/raydium-clmm)
+- "Uniswap v3 Core" whitepaper, §6 (ticks), §7 (fee growth)

@@ -1,0 +1,266 @@
+---
+title: "CLMMの手数料とリワード"
+description: "CLMMがトレード手数料をLP・プロトコル・ファンドに分配する仕組み、3スロットのリワードシステムがレンジ内ポジションに排出される仕組み、そして両者がポジションごとの残高に決済される仕組みを解説します。"
+---
+
+<Info>
+  **このページは AI による自動翻訳です。すべての内容は英語版を正とします。**
+
+  [英語版を表示 →](/products/clmm/fees)
+</Info>
+
+## 手数料ティア
+
+CLMMプールは作成時に `AmmConfig` に紐付けられます。この設定がトレード手数料率、プロトコルおよびファンドの分配比率、そして**ティック間隔**を決定します（[`products/clmm/ticks-and-positions`](/ja/products/clmm/ticks-and-positions) を参照）。代表的な公開ティア（実際の値は `GET https://api-v3.raydium.io/main/clmm-config` で確認してください）：
+
+| `AmmConfig` インデックス | `trade_fee_rate` | ティック間隔 | 主な用途 |
+|---|---|---|---|
+| 0 | `100`（0.01%） | 1 | ステーブルペア |
+| 1 | `500`（0.05%） | 10 | 相関性の高いブルーチップ |
+| 2 | `2_500`（0.25%） | 60 | 標準的なペア |
+| 3 | `10_000`（1.00%） | 120 | ボラティリティの高いペアや長尾トークン |
+
+トレード手数料率の単位は `1/FEE_RATE_DENOMINATOR = 1/1_000_000` の出来高比です。プロトコルおよびファンドの率は同じ分母ですが、出来高ではなく**トレード手数料**に適用されます。これはCPMMと同じ慣例です。
+
+## スワップごとの手数料分配
+
+スワップの各ステップ（[`products/clmm/math`](/ja/products/clmm/math) を参照）において：
+
+```
+step_trade_fee   = ceil(step_input * trade_fee_rate / 1_000_000)
+step_protocol    = floor(step_trade_fee * protocol_fee_rate / 1_000_000)
+step_fund        = floor(step_trade_fee * fund_fee_rate     / 1_000_000)
+step_lp          = step_trade_fee - step_protocol - step_fund
+```
+
+- `step_lp` は現在のアクティブなリクイディティでスケールされ、`fee_growth_global_{input_side}_x64` に流入します：`fee_growth_global += step_lp × 2^64 / pool.liquidity`
+- `step_protocol` は `PoolState.protocol_fees_token_{input_side}` に累積され、`CollectProtocolFee` で回収されます。
+- `step_fund` は `PoolState.fund_fees_token_{input_side}` に累積され、`CollectFundFee` で回収されます。
+
+CPMMと同様に、プロトコルおよびファンドの分配額はボールト内に保持されますが、**カーブのリクイディティビューからは除外**されます。スワップ計算は `pool.liquidity` を参照しますが、これは未回収の保留手数料によって膨らんでいません。
+
+## 手数料がサイドごとである理由
+
+CPMMではスワップの手数料は常に入力トークンで徴収され、プール反対側のトークンはそのスワップのプロトコル／ファンド累積を受けません。CLMMでも各ステップで同じルールが適用されます：**手数料はそのステップの入力トークンに累積されます**。マルチティックのスワップは一貫した方向を持つため、すべてのステップが同じトークンで手数料を徴収します。つまり、実際には特定のスワップの手数料は*片側のみ*に発生します。
+
+ユーザーがtoken0をtoken1にスワップする場合、`fee_growth_global_0_x64` が上昇し、`fee_growth_global_1_x64` は変化しません。そのスワップではポジションはtoken0で手数料を獲得します。次のスワップが逆方向の場合は `fee_growth_global_1_x64` に積み上がります。バランスの取れたプールでは時間をかけて両サイドで累積されます。
+
+## 片側手数料（`CollectFeeOn`）
+
+[`CreateCustomizablePool`](/ja/products/clmm/instructions) で作成されたプールは、デフォルト以外の手数料徴収モードを選択できます。このモードはプール作成時に固定され、`PoolState.fee_on` に保存されます。
+
+| `CollectFeeOn` 値 | `fee_on` バイト | 動作 |
+|---|---|---|
+| `FromInput`（デフォルト） | `0` | Uniswap V3 のクラシックモード — 手数料は各スワップステップの入力トークンから常に差し引かれます。入力トークンはスワップの方向によって変わります。 |
+| `Token0Only` | `1` | 手数料は常にtoken0建てです。0→1スワップでは手数料は入力トークン（`FromInput`と同じ）。1→0スワップでは手数料はスワップのアウトプット（token0）から徴収されます。 |
+| `Token1Only` | `2` | `Token0Only` と対称 — 手数料は常にtoken1建てです。 |
+
+**`Token0Only` または `Token1Only` を選ぶ理由** — LPに単一の予測可能な累積通貨を提供するためです。`MEMECOIN / USDC` のようにLPがドル建てのペアでは、`Token1Only`（手数料が常にUSDCで決済される）が有効です。どちらの方向のトレードが多くても、LP損益に影響しません。一方、手数料がスワップアウトプットから差し引かれる方向では、ユーザーは `out − fee` を受け取ることになるため（入力側の微小なεではなく）、クォートロジックはアウトプット側から手数料を差し引く必要があります。SDKの `computeAmountOut` は `fee_on` に基づいてこの分岐を処理します。`pool.fee_on` を直接読み取るクライアントコードは、`PoolState` のヘルパー関数を参照してください：
+
+```rust
+pool.is_fee_on_input(zero_for_one: bool) -> bool   // true → fee is deducted from input
+pool.is_fee_on_token0(zero_for_one: bool) -> bool  // for telemetry / accounting
+```
+
+**LPレベルへの影響** — 手数料は引き続き各スワップステップで標準の `fee_growth_global_{0,1}_x64` アキュムレータを経由するため、ポジションは同じ `fee_growth_inside` 計算式で手数料を決済します。非対称性はサイド累積の*方向*のみで、数式自体に変更はありません。
+
+`fee_on` は作成後に変更**できません**。レガシーの `CreatePool` で作成されたプールは永続的に `FromInput` です。
+
+## ダイナミック手数料
+
+`enable_dynamic_fee = true` で作成されたプールは、`AmmConfig.trade_fee_rate` に加えてボラティリティ駆動のサーチャージを適用します。この仕組みはTrader Joe / Meteoraのダイナミック手数料設計を簡略化したものです。
+
+### 状態
+
+`PoolState.dynamic_fee_info` には5つのキャリブレーションパラメータ（プール作成時の `DynamicFeeConfig` のスナップショット）と、スワップごとに更新される4つの状態フィールドが含まれます。バイトレイアウトの詳細は [`products/clmm/accounts`](/ja/products/clmm/accounts#dynamicfeeconfig-and-dynamicfeeinfo) を参照してください。
+
+### スワップごとの更新
+
+スワップステップごとにプログラムは3つのサブステップを実行します：
+
+1. **リファレンスのデケイ**。`now - last_update_timestamp > filter_period` の場合、ボラティリティリファレンスがデケイします：
+
+    ```
+    if elapsed > decay_period:
+        volatility_reference = 0
+    elif elapsed > filter_period:
+        volatility_reference = volatility_accumulator * reduction_factor / 10_000
+    # else: hold the previous reference
+    ```
+
+2. **アキュムレータの更新**。新しいアキュムレータはリファレンスに、移動した絶対距離（`tick_spacing` 単位）に粒度スケールを掛けた値を加算し、設定された最大値でキャップします：
+
+    ```
+    delta_idx     = abs(tick_spacing_index_reference - current_tick_spacing_index)
+    accumulator   = volatility_reference + delta_idx * 10_000   // VOLATILITY_ACCUMULATOR_SCALE
+    accumulator   = min(accumulator, max_volatility_accumulator)
+    ```
+
+3. **サーチャージの計算**。サーチャージはアキュムレータに対して放物線的（スワップの「ティック距離」は正規の計算式で二乗される）で、`dynamic_fee_control` でゲインスケールされます：
+
+    ```
+    fee_increment_rate = dynamic_fee_control * (accumulator * tick_spacing)^2
+                       / (100_000 * 10_000^2)
+    fee_rate           = AmmConfig.trade_fee_rate + fee_increment_rate
+    fee_rate           = min(fee_rate, 100_000)              // 10% cap
+    ```
+
+10%キャップ（`1e6` 単位で `MAX_FEE_RATE_NUMERATOR = 100_000`）はセーフティレールとしてハードコードされています。実際にはよくチューニングされた設定はこの値を大きく下回ります。
+
+### パラメータの選択
+
+パイロットプールで機能した代表的な範囲：
+
+| パラメータ | 一般的な範囲 | 備考 |
+|---|---|---|
+| `filter_period` | 30〜60秒 | マイクロボラティリティ中にリファレンスを保持します。低いほど反応が速い |
+| `decay_period` | 300〜1800秒 | この閑散期間を過ぎると手数料がベースに戻ります |
+| `reduction_factor` | 4,000〜8,000 | `10_000` に対する値。高いほど高水準の手数料が長続きします |
+| `dynamic_fee_control` | 1,000〜50,000 | `100_000` に対する値。カーブのゲイン |
+| `max_volatility_accumulator` | 100,000〜10,000,000 | サーチャージが上昇できる最大値を飽和させます |
+
+キャリブレーションは過去のスワップをオフラインで計算式に照らし合わせて再現し、`dynamic_fee_control` を調整して平均手数料が目標値（例：1σの日には基準の1.5倍、3σの日には5倍）になるようにします。
+
+### LPから見た挙動
+
+ダイナミック手数料の収益は基本手数料と同じアキュムレータ（`fee_growth_global_{0,1}_x64`）を通じて流れます。「ダイナミック手数料成長」の専用フィールドはありません。ボラティリティの高いプールのLPは、ボラティリティが高い期間により高い手数料を獲得できます。追加のクレームや決済インストラクションは不要です。
+
+### インテグレーターが知っておくべきこと
+
+- クォートが返す手数料は、プールの準備金が変動していなくても、ブロックNとブロックN+1の間で変わる可能性があります。スワップのたびにボラティリティアキュムレータが更新されるためです。Trade APIのクォートはクォート時のブロックで有効であり、反応性の高いプールがクォートと実行の間に動いた場合、数bpsのズレが生じることがあります。
+- `volatility_accumulator` と `last_update_timestamp` はオンチェーンで公開されているため、クライアントがオフラインシミュレーション用に計算式をクライアントサイドで再現できます。
+
+## ポジションごとの手数料会計
+
+各ポジションは最後にタッチされた時点の以下の情報を保存します：
+
+- `fee_growth_inside_0_last_x64` と `fee_growth_inside_1_last_x64` — そのスナップショット時点のレンジ固有の手数料成長。
+
+その後のタッチ（`IncreaseLiquidity`、`DecreaseLiquidity`、および暗黙的にティックバウンド手数料成長を更新する状態遷移）のたびに：
+
+1. プログラムはグローバル手数料成長と2つのエンドポイントティックの `fee_growth_outside_*` から `fee_growth_inside_{0,1}_x64` を再計算します。
+2. Δをポジションのリクイディティで重み付けして `tokens_fees_owed_{0,1}` に加算します：
+
+   ```
+   Δ_fee_growth_inside_0 = fee_growth_inside_now_0 - fee_growth_inside_last_0
+   tokens_fees_owed_0  += Δ_fee_growth_inside_0 * position.liquidity / 2^64
+   ```
+
+3. `fee_growth_inside_{0,1}_last_x64` が更新されます。
+
+トークンが物理的に移動するのは `DecreaseLiquidity` または専用の `CollectFees` パス（Raydiumの現在のインストラクションセットでは、手数料は `DecreaseLiquidity` の一部として回収されます）のみです。`DecreaseLiquidity` の呼び出しで `liquidity = 0` を設定するのが「収集のみ」の標準的な方法です。
+
+### レンジ外ポジションは手数料を獲得しない
+
+ポジションのレンジに `tick_current` が含まれていない場合、そのポジションの `fee_growth_inside` は**上限でバインド**され、価格がレンジ外にある間は変動しません。価格がレンジ内に戻るまで、ポジションは手数料の累積を停止します。これはバグではなく仕様です — 集中流動性が*手数料収益*と資本の両方を集中させる仕組みです。
+
+## リワードストリーム
+
+CLMMプールは最大**3つ**のリワードストリームを同時にアクティブにできます。各ストリームは（リワードミント、排出率、開始時刻、終了時刻）のタプルとして `PoolState.reward_infos[i]` に保存されます。
+
+```rust
+pub struct RewardInfo {
+    pub reward_state: u8,               // Uninitialized | Initialized | Open | Ended
+    pub open_time: u64,
+    pub end_time: u64,
+    pub last_update_time: u64,
+    pub emissions_per_second_x64: u128, // Q64.64 reward tokens per second
+    pub reward_total_emissioned: u64,
+    pub reward_claimed: u64,
+    pub token_mint:    Pubkey,
+    pub token_vault:   Pubkey,
+    pub authority:     Pubkey,           // who can SetRewardParams / fund
+    pub reward_growth_global_x64: u128,  // accumulator, Q64.64
+}
+```
+
+### 決済ループ
+
+リクイディティに触れるすべてのインストラクション（および独立した `UpdateRewardInfos`）は、すべてのアクティブなストリームを `now` まで進めます：
+
+```
+for each reward_info with state in {Open, Ended within grace}:
+    elapsed         = min(now, end_time) − last_update_time
+    if elapsed > 0 && pool.liquidity > 0:
+        reward_growth_global_x64 += emissions_per_second_x64 × elapsed × 2^64 / pool.liquidity
+        reward_total_emissioned  += emissions_per_second × elapsed
+    last_update_time = min(now, end_time)
+```
+
+ある期間中に `pool.liquidity == 0` の場合、その期間の排出は**分配されません**（レンジ内のリクイディティが存在しないため分配できません）。残りの予算はリワードボールトに残ります。ミントしたまま放置しているプロトコルは `SetRewardParams` でストリームへの追加補充や終了を行えます。
+
+### ポジションごとのリワード累積
+
+手数料と全く同じ仕組みで、ストリームごとに追加の次元があります：
+
+```
+for each stream i:
+    reward_growth_inside_now_i   = compute_inside_i(pool, tick_lower, tick_upper)
+    Δ_i = reward_growth_inside_now_i - personal_position.reward_infos[i].growth_inside_last_x64
+    personal_position.reward_infos[i].reward_amount_owed += Δ_i * personal_position.liquidity / 2^64
+    personal_position.reward_infos[i].growth_inside_last_x64 = reward_growth_inside_now_i
+```
+
+ユーザーは `CollectReward` でクレームします。これにより `reward_amount_owed` がストリームのボールトからユーザーに転送され、カウンターがゼロにリセットされます。
+
+### レンジ内ポジションのみリワードを獲得
+
+`reward_growth_inside` は `fee_growth_inside` と同じ計算式（ティック外アキュムレータ経由）を使用するため、現在の価格レンジ外のポジションはリワードを累積しません。これはUniswap v3の「インセンティブはアクティブなリクイディティへ」という設計思想と一致しており、LPの利益をスポット価格のカバレッジと整合させます。
+
+### ストリームの資金調達と終了
+
+ストリームは `InitializeReward` で作成され、総予算（`emissions_per_second × (end_time − open_time)`）がストリームのリワードボールトに事前にデポジットされます。資金調達者の残高が不足している場合、プログラムは `InitializeReward` を拒否します。`SetRewardParams` で `end_time` の延長や排出率の引き上げが可能です。LPにすでに約束された排出のラグプルを防ぐため、縮小はブロックされています。
+
+`now > end_time` になるとストリームは `Ended` に移行しますが、`reward_growth_global_x64` は引き続き読み取られます。排出が停止した後でも、LPは過去に獲得した分を `CollectReward` でクレームできます。
+
+## 管理者による回収
+
+| 署名者 | インストラクション | 効果 |
+|--------|-------------|--------|
+| `amm_config.owner` | `CollectProtocolFee` | `protocol_fees_token_{0,1}` を受取先にスイープします。 |
+| `amm_config.fund_owner` | `CollectFundFee` | `fund_fees_token_{0,1}` を受取先にスイープします。 |
+
+どちらもカーブを移動しません — 累積額はすでに `pool.liquidity` の外側に保持されています。メインネットでこれらの署名者を保持しているのが誰かは [`security/admin-and-multisig`](/ja/security/admin-and-multisig) を参照してください。
+
+## Token-2022との相互作用
+
+手数料とリワードはすべてプールまたはストリームのトークンの一つで計算されます。Token-2022の拡張はCPMMと同じように動作します：
+
+- **スワップの入力ミントにトランスファーフィーがある場合。** プールが受け取るのは `amount_in − mint_transfer_fee` です。CLMMプログラムのステップ入力は純額に対して計算されるため、プールの手数料アキュムレータは実際にボールトに存在するトークンを反映します。
+- **アウトプットミントにトランスファーフィーがある場合。** プールは `amount_out` を送金し、ユーザーは `amount_out − mint_transfer_fee` を受け取ります。スリッページ確認はユーザーの受取金額に対して行う必要があります。
+- **リワードミントにトランスファーフィーがある場合。** 排出は `InitializeReward` 時の「ボールトへの入金」単位で計算されます（資金調達者がミントのトランスファーフィーをボールトに支払います）。`CollectReward` での引き出し時にも別途ミントのトランスファーフィーが発生するため、LPはトランスファーフィー付きのリワードトークンで若干のカットが生じることを想定してください。
+- **転送不可・機密・グループメンバーミント。** `CreatePool` / `InitializeReward` で拒否されます。
+
+マルチホップのトランスファーフィースワップでは、複合的な影響が大きくなる場合があります。これを無視したクォーターは過大な約束をしてしまいます。参照計算については [`algorithms/token-2022-transfer-fees`](/ja/algorithms/token-2022-transfer-fees) を参照してください。
+
+## オフチェーンでの手数料とリワードの読み取り
+
+```ts
+const pool = await raydium.clmm.getPoolInfoFromRpc(poolId);
+const position = await raydium.clmm.getOwnerPositionInfo({
+  wallet: owner.publicKey,
+});
+
+for (const p of position) {
+  console.log("Position", p.nftMint.toBase58(),
+              "range", p.tickLower, "→", p.tickUpper,
+              "L", p.liquidity.toString(),
+              "fees owed:", p.tokenFeesOwed0.toString(),
+              p.tokenFeesOwed1.toString(),
+              "rewards owed:", p.rewardInfos.map(r => r.rewardAmountOwed.toString()));
+}
+```
+
+`tokenFeesOwed*` と `rewardAmountOwed` は、ポジションが最後にタッチされた時点のスナップショットです。**現在の**値（それ以降の成長を反映したもの）を確認するには、シミュレーションでリクイディティ0の `IncreaseLiquidity` を呼び出すか、グローバルの `fee_growth_*` と2つのティック外スナップショットを使って再計算してください。
+
+## 次のステップ
+
+- [`products/clmm/math`](/ja/products/clmm/math) — `fee_growth_inside` の完全な導出。
+- [`products/clmm/instructions`](/ja/products/clmm/instructions) — `CollectReward`、`InitializeReward`、`SetRewardParams` のアカウント一覧。
+- [`algorithms/token-2022-transfer-fees`](/ja/algorithms/token-2022-transfer-fees) — トランスファーフィーミントを使ったクォーティング。
+- [`reference/fee-comparison`](/ja/reference/fee-comparison) — CLMM/CPMM/AMM-v4の手数料マトリクスの比較。
+
+出典：
+
+- [`raydium-io/raydium-clmm` — `states/pool.rs`, `libraries/fixed_point_64.rs`](https://github.com/raydium-io/raydium-clmm)
+- "Uniswap v3 Core" ホワイトペーパー、§7（手数料成長）

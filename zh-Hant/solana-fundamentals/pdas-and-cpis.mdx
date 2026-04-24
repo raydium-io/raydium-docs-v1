@@ -1,0 +1,279 @@
+---
+title: "PDAs 和 CPIs"
+description: "程式衍生位址和跨程式調用 — Raydium 用於確定性管理狀態和與其他程式組合的兩個基元。Seeds、bumps、invoke 與 invoke_signed，以及 Raydium 程式遵循的模式。"
+---
+
+<Info>
+  **本頁內容由 AI 自動翻譯，所有內容以英文版本為準。**
+
+  [查看英文版 →](/solana-fundamentals/pdas-and-cpis)
+</Info>
+
+<Info>
+  **PDAs**（程式衍生位址）和 **CPIs**（跨程式調用）是構成 Raydium 基礎的兩個基元。PDA 讓程式能「擁有」確定性位址，而不需要私鑰 — 這就是池授權人和金庫的運作方式。CPI 允許一個程式呼叫另一個程式 — Raydium 透過 SPL Token 程式交換代幣，整合者也透過 CPI 將 Raydium 整合到自己的流程中。在閱讀 Raydium 原始碼前，理解這兩個概念非常重要。
+</Info>
+
+## PDAs：無金鑰的位址
+
+**程式衍生位址**（Program-Derived Address）是一個公鑰，具有以下特點：
+
+- 不在 ed25519 曲線上（不存在其對應的私鑰）。
+- 由程式 ID 和一組 seeds 確定性衍生而來。
+- 只能由衍生程式透過 `invoke_signed` 來簽署。
+
+Raydium 的每個池授權人、每個池狀態帳戶、每個金庫、每個農場狀態 — 都是 PDAs。
+
+### 衍生方式
+
+PDA 透過將程式 ID 與 seeds 進行雜湊運算，然後找到一個「bump」位元組使結果離開曲線而計算得出。第一個產生離線曲線位址的 bump（通常從 255 開始遞減）就是**正規 bump**。
+
+```ts
+import { PublicKey } from "@solana/web3.js";
+
+const [poolAuthority, bump] = PublicKey.findProgramAddressSync(
+  [Buffer.from("authority"), poolId.toBuffer()],
+  CPMM_PROGRAM_ID,
+);
+```
+
+Seeds 可以是任何東西 — 字串、其他公鑰、編碼為小端位元組的 `u64` 值。Raydium 的慣例是使用易讀的前綴後跟唯一識別符。
+
+### Raydium PDA 模式
+
+Raydium 程式中常見的 PDAs：
+
+| PDA | Seeds | 程式 |
+|-----|-------|------|
+| AMM 授權人（AMM v4） | `[b"amm authority"]` + bump | AMM v4 |
+| 池狀態（CPMM） | `[b"pool", amm_config, mint_a, mint_b]` | CPMM |
+| 池金庫（CPMM） | `[b"pool_vault", pool, mint]` | CPMM |
+| 授權人（CPMM） | `[b"vault_and_lp_mint_auth_seed"]` | CPMM |
+| 池狀態（CLMM） | `[b"pool", amm_config, mint_0, mint_1]` | CLMM |
+| Tick 陣列（CLMM） | `[b"tick_array", pool, start_tick_index]` | CLMM |
+| 觀察（CLMM） | `[b"observation", pool]` | CLMM |
+| 個人頭寸（CLMM） | `[b"position", position_nft_mint]` | CLMM |
+| 農場狀態（Farm v6） | `[b"pool_farm_state", farm_id]` | Farm v6 |
+| 使用者帳冊（Farm v6） | `[b"user_ledger", farm, user]` | Farm v6 |
+
+使用者和整合者可以計算這些位址而無需獲取任何東西 — 給定公開輸入（池 ID、農場 ID、使用者鑰匙），PDA 是確定性的。
+
+### 正規 bump
+
+雖然原則上可能有多個 bump 產生離線曲線位址，但 Raydium 的程式總是使用**正規 bump**（透過從 255 開始遞減找到）。這個值儲存在 PDA 的帳戶資料中，以便後續交易可以傳遞它，並跳過昂貴的衍生迴圈：
+
+```rust
+#[account]
+pub struct PoolState {
+    pub bump: [u8; 1],
+    // ... 池狀態的其餘部分
+}
+```
+
+在後續交易中，bump 是從池狀態讀取的，而不是重新計算的。
+
+## CPIs：呼叫其他程式
+
+**跨程式調用**允許程式在單一交易中內聯調用另一個程式的指令。Raydium 大量使用 CPIs：
+
+- 交換指令呼叫 SPL Token 程式移動代幣。
+- CLMM 呼叫 Metaplex 鑄造頭寸 NFT。
+- 池建立呼叫 System Program 分配帳戶。
+- Farm v6 呼叫 SPL Token 轉移獎勵。
+
+整合者也使用 CPIs 來呼叫 Raydium — 這就是金庫策略、槓桿 LP 協議和自動複合器的運作方式。見 [`integration-guides/cpi-integration`](/zh-Hant/integration-guides/cpi-integration)。
+
+### invoke 與 invoke_signed
+
+Solana 執行時提供了兩個 CPI 基元：
+
+- **`invoke`**：呼叫另一個程式；被呼叫程式繼承外層交易的簽署者。
+- **`invoke_signed`**：代表 PDA 呼叫另一個程式；執行時驗證 PDA 的 seeds 並授權簽署。
+
+`invoke_signed` 是讓程式掌握帳戶授權而無需管理私鑰的魔法。
+
+### 示例：Raydium 從池金庫轉移
+
+池金庫是一個代幣帳戶，其授權人是池程式的 PDA。為了在交換期間轉移代幣，池程式必須以該 PDA 的身份簽署：
+
+```rust
+// 池授權人的 seeds
+let authority_seeds: &[&[u8]] = &[
+    b"vault_and_lp_mint_auth_seed",
+    &[authority_bump],
+];
+let signer_seeds: &[&[&[u8]]] = &[authority_seeds];
+
+// 建立 CPI 上下文
+let cpi_accounts = Transfer {
+    from:      input_vault.to_account_info(),
+    to:        user_ata.to_account_info(),
+    authority: pool_authority.to_account_info(),
+};
+let cpi_program = token_program.to_account_info();
+let cpi_ctx     = CpiContext::new_with_signer(cpi_program, cpi_accounts, signer_seeds);
+
+// 執行
+token::transfer(cpi_ctx, amount)?;
+```
+
+執行時看到 CPMM 程式呼叫了 `invoke_signed`，驗證了 `vault_and_lp_mint_auth_seed + bump` 使用 CPMM 程式 ID 雜湊後衍生到 `pool_authority` 的位址，並允許授權人在代幣轉移上簽署。不涉及任何私鑰。
+
+### 示例：整合者呼叫 Raydium CPMM
+
+整合者程式（例如，一個託管合約）可以透過 CPI 調用 Raydium 的 `swap_base_input`：
+
+```rust
+use raydium_cpmm::cpi::{self, accounts::Swap};
+
+let cpi_accounts = Swap {
+    payer:                order.to_account_info(),      // PDA，將簽署
+    authority:            pool_authority_info,
+    amm_config:           amm_config_info,
+    pool_state:           pool_info,
+    input_token_account:  order_input_ata,
+    output_token_account: order_output_ata,
+    input_vault:          input_vault_info,
+    output_vault:         output_vault_info,
+    input_token_program:  input_token_program_info,
+    output_token_program: output_token_program_info,
+    input_token_mint:     input_mint_info,
+    output_token_mint:    output_mint_info,
+    observation_state:    observation_info,
+};
+
+let seeds = &[b"order", user.key.as_ref(), &[order.bump]];
+let cpi_ctx = CpiContext::new_with_signer(
+    cpmm_program.to_account_info(),
+    cpi_accounts,
+    &[seeds],
+);
+
+cpi::swap_base_input(cpi_ctx, amount_in, min_out)?;
+```
+
+這是規範的整合模式 — 見 [`integration-guides/cpi-integration`](/zh-Hant/integration-guides/cpi-integration) 以瞭解完整的託管範例。
+
+## CPI 深度限制
+
+Solana 將 CPI 深度上限設為 **4 級**。交易的頂級指令計為深度 0；每次 CPI 調用遞增深度。
+
+實際影響：Raydium 本身的交換已經使用了 1-2 級 CPI（Raydium → SPL Token）。整合者呼叫 Raydium 使用 2 級。如果該整合者被另一個整合者呼叫，則是 3 級。第 4 級是上限。
+
+大多數組合輕鬆保持在此限制以下，但深層巢狀（聚合器 → 路由器 → Raydium → 鉤子）可能會達到限制。設計應該扁平而不是深層。
+
+## 剩餘帳戶
+
+當 Raydium 指令需要可變數量的帳戶時（例如，CLMM 交換跨越未知數量的 tick 陣列），額外帳戶被傳遞為**剩餘帳戶** — 附加到固定帳戶列表，按位置解釋。
+
+CPMM 的 `SwapV2` 使用剩餘帳戶來處理轉移鉤子程式的額外必需帳戶。客戶端獲取所需帳戶並附加它們：
+
+```ts
+const swapIx = await raydium.cpmm.swap({
+  /* ... */
+  // SDK 自動處理剩餘帳戶
+});
+```
+
+在 CPI 級別，整合者必須透過自己的指令轉發剩餘帳戶：
+
+```rust
+pub struct Swap<'info> {
+    // ... 固定帳戶
+    // 加上透過 ctx.remaining_accounts 轉發的剩餘帳戶
+}
+
+// 將 remaining_accounts 轉發到 CPI
+cpi::swap_base_input(
+    cpi_ctx.with_remaining_accounts(ctx.remaining_accounts.to_vec()),
+    amount_in,
+    min_out,
+)?;
+```
+
+## PDA 陷阱
+
+### 錯誤的 seeds → 錯誤的位址
+
+Seeds 順序錯誤、編碼錯誤或包含/排除額外位元組的錯誤會無聲地產生不同的 PDA。交易會模糊地失敗（程式試圖讀取不存在的帳戶）。始終針對已知的黃金值單元測試 seed 衍生。
+
+### 未儲存 bump
+
+如果你在每筆交易上重新衍生 bump，你將為衍生迴圈支付計算成本。將正規 bump 儲存在 PDA 的資料中並從那裡讀取它。
+
+### 混淆正規 vs 非正規 bump
+
+非正規 bumps（如果有人找到產生離線曲線的）被 `invoke_signed` 允許但被 Raydium 程式透過 `assert_eq!(bump, canonical_bump)` 拒絕。如果有人試圖以非正規 bump 聲稱一個 PDA，交易會失敗。
+
+### 在你不是擁有程式時將 PDA 作為簽署者傳遞
+
+只有 PDA 衍生中程式 ID 的程式才能以其 seeds 使用 `invoke_signed`。如果你嘗試，執行時會拒絕。
+
+## CPI 陷阱
+
+### 忘記轉發 `remaining_accounts`
+
+如果你的外層指令在 `remaining_accounts` 中傳遞轉移鉤子帳戶，但 CPI 到 Raydium 沒有轉發它們，Raydium 會失敗，因為它找不到鉤子帳戶。始終在需要它們的 CPIs 中包含 `with_remaining_accounts`。
+
+### 可寫標誌不匹配
+
+外層指令標記為可寫的帳戶，如果被呼叫程式打算寫入，在 CPI 呼叫中也必須是可寫的。不匹配 → 執行時拒絕。
+
+### 未計入租金
+
+CPI 到建立帳戶的程式（例如，ATA 建立）需要支付者有足夠的 SOL 用於租金。失敗的租金檢查會顯示為模糊的錯誤。
+
+## 實際示例：計算 Raydium CPMM PDAs
+
+```ts
+import { PublicKey } from "@solana/web3.js";
+
+const CPMM_PROGRAM_ID = new PublicKey("CPMMoo8L3F4NbTegBCKVNunggL7H1Zpdmwpwh8KMoZ0F");
+
+function computeCpmmPdas(ammConfig, mintA, mintB) {
+  const [poolState, poolBump] = PublicKey.findProgramAddressSync(
+    [
+      Buffer.from("pool"),
+      ammConfig.toBuffer(),
+      mintA.toBuffer(),
+      mintB.toBuffer(),
+    ],
+    CPMM_PROGRAM_ID,
+  );
+
+  const [authority] = PublicKey.findProgramAddressSync(
+    [Buffer.from("vault_and_lp_mint_auth_seed")],
+    CPMM_PROGRAM_ID,
+  );
+
+  const [vaultA] = PublicKey.findProgramAddressSync(
+    [Buffer.from("pool_vault"), poolState.toBuffer(), mintA.toBuffer()],
+    CPMM_PROGRAM_ID,
+  );
+
+  const [vaultB] = PublicKey.findProgramAddressSync(
+    [Buffer.from("pool_vault"), poolState.toBuffer(), mintB.toBuffer()],
+    CPMM_PROGRAM_ID,
+  );
+
+  const [observation] = PublicKey.findProgramAddressSync(
+    [Buffer.from("observation"), poolState.toBuffer()],
+    CPMM_PROGRAM_ID,
+  );
+
+  return { poolState, authority, vaultA, vaultB, observation, poolBump };
+}
+```
+
+這正是 Raydium SDK 在呼叫 `getPoolInfoFromRpc({ poolId })` 時在幕後所做的 — 它衍生關聯的 PDAs，不需要往返。
+
+## 參考資源
+
+- [`solana-fundamentals/account-model`](/zh-Hant/solana-fundamentals/account-model) — PDA 如何適應帳戶模型。
+- [`solana-fundamentals/programs-and-anchor`](/zh-Hant/solana-fundamentals/programs-and-anchor) — Anchor 宣告 PDAs 的輔助工具。
+- [`integration-guides/cpi-integration`](/zh-Hant/integration-guides/cpi-integration) — 構建呼叫 Raydium 的 CPIs 的整合。
+- [`sdk-api/rust-cpi`](/zh-Hant/sdk-api/rust-cpi) — Raydium 的 Rust CPI 類型。
+
+來源：
+
+- [Solana PDA 文件](https://docs.solana.com/developing/programming-model/calling-between-programs)。
+- [Anchor PDA & CPI 文件](https://www.anchor-lang.com/docs/pdas-and-cpis)。

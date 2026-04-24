@@ -1,0 +1,257 @@
+---
+title: "Token-2022 支持矩陣"
+description: "Raydium 哪些程式支援 Token-2022、每個程式在建立流動性池時執行的明確擴展許可清單，以及允許被拒絕的代幣的繞過路徑（靜態代幣白名單、每個代幣登記表、Superstate 偵測）。"
+---
+
+<Info>
+  **本頁內容由 AI 自動翻譯，所有內容以英文版本為準。**
+
+  [查看英文版 →](/reference/token-2022-support)
+</Info>
+
+<Info>
+  Raydium 不會接受任意 Token-2022 代幣。CPMM 和 CLMM 都運行嚴格的**許可清單模式**：只有一小部分擴展預設通過；其他所有擴展在建立流動性池時都會被拒絕。一些信任的代幣透過硬編碼位址被認可；CLMM 另外支援管理員管理的每個代幣登記表以及執行時 Superstate 代幣偵測。本頁是單一參考頁面，說明執行的內容以及位置，並附上程式原始碼的檔案和行號引用。
+</Info>
+
+## 程式級別支援
+
+| 程式 | Token-2022 基礎/報價代幣？ | 模式 |
+|---|---|---|
+| **CPMM** | 可以 — 受限 | 嚴格的擴展許可清單 + 4 個代幣靜態白名單。 |
+| **CLMM** | 可以 — 受限 | 嚴格的擴展許可清單 + 6 個代幣靜態白名單 + 管理員每個代幣登記表 + Superstate 偵測。 |
+| **AMM v4** | 否 | 程式發佈於 Token-2022 之前；兩個代幣都必須是經典 SPL Token。 |
+| **Stable AMM** | 否 | 與 AMM v4 相同的限制。 |
+| **Farm v6** | 是，部分 | 獎勵代幣可以是 Token-2022（受相同許可清單限制，當農場包裝 CPMM/CLMM LP 時）；使用者質押的 LP 代幣繼承自包裝的池。 |
+| **LaunchLab** | 是，由程式管理 | 基礎代幣可以是 Token-2022，但只能透過專用的 `initialize_with_token_2022` 指令；程式本身建立具有 `MetadataPointer`（總是）和可選 `TransferFeeConfig`（速率 ≤ 5%）的代幣。具有任意擴展的預先存在的 Token-2022 代幣無法用作基礎。 |
+| **Burn & Earn** | 鏡像池程式 | 繼承 CPMM / CLMM 門控。 |
+
+許可清單檢查位於：
+
+- **CPMM**: `is_supported_mint` 在 [`raydium-cp-swap/programs/cp-swap/src/utils/token.rs:178`](https://github.com/raydium-io/raydium-cp-swap)，從 `Initialize` 呼叫。
+- **CLMM**: `is_supported_mint` 在 [`raydium-clmm/programs/amm/src/util/token.rs:280`](https://github.com/raydium-io/raydium-clmm)，從 `CreatePool` 呼叫。
+- **LaunchLab**: `initialize_with_token_2022` 在 `raydium-launchpad/programs/launchpad/src/instructions/initialize_with_token_2022.rs`（原始碼未公開）。
+
+CPMM 或 CLMM 上**沒有**交換時間的代幣檢查 — 門控僅在建立池時啟動。建立池後，交換只信任代幣沒有變化，這對於 Token-2022 代幣狀態的不可變部分是正確的。
+
+## CPMM 和 CLMM 擴展許可清單
+
+在靜態白名單短路後（下面涵蓋），程式會遍歷代幣的擴展，如果它帶有除了這五個以外的**任何**擴展，就會拒絕該代幣：
+
+| 擴展 | 允許的原因 |
+|---|---|
+| `TransferFeeConfig` | 池數學會減去入站費用；Token-2022 程式處理出站費用。見 [`algorithms/token-2022-transfer-fees`](/zh-Hant/algorithms/token-2022-transfer-fees)。 |
+| `MetadataPointer` | 裝飾性 — 指向鏈上中繼資料。 |
+| `TokenMetadata` | 裝飾性 — 內聯中繼資料。 |
+| `InterestBearingConfig` | 池看到本金數額；UI 乘數只是裝飾品，底層餘額保持不變。 |
+| `ScaledUiAmount` | 與計息相同形狀 — 比例因數僅適用於 UI 顯示。 |
+
+任何不在此列表中的內容 — `TransferHook`、`NonTransferable`、`ConfidentialTransferMint`、`PermanentDelegate`、`MintCloseAuthority`、`DefaultAccountState`、`GroupPointer`、`GroupMemberPointer`、`MemberPointer`、`Pausable` 等 — 會導致 `is_supported_mint` 返回 `false` 並且池建立還原。
+
+相關行（CPMM，CLMM 中形狀相同）：
+
+```rust
+for e in extensions {
+    if e != ExtensionType::TransferFeeConfig
+        && e != ExtensionType::MetadataPointer
+        && e != ExtensionType::TokenMetadata
+        && e != ExtensionType::InterestBearingConfig
+        && e != ExtensionType::ScaledUiAmount
+    {
+        return Ok(false);
+    }
+}
+Ok(true)
+```
+
+— [`cp-swap/src/utils/token.rs:190–200`](https://github.com/raydium-io/raydium-cp-swap)
+
+## 繞過路徑
+
+不符合許可清單的 Token-2022 代幣仍可透過三個明確繞過之一被認可。它們會在擴展遍歷執行前按順序嘗試。
+
+### 1. 靜態代幣白名單
+
+一個常數 `MINT_WHITELIST` 陣列，包含 base58 字串，在每個程式中硬編碼。如果代幣的位址匹配，函數立即返回 `true`，不執行任何擴展檢查。
+
+| 程式 | 白名單代幣 |
+|---|---|
+| CPMM | `HVbpJAQGNpkgBaYBZQBR1t7yFdvaYVp2vCQQfKKEN4tM`、`Crn4x1Y2HUKko7ox2EZMT6N2t2ZyH7eKtwkBGVnhEq1g`、`FrBfWJ4qE5sCzKm3k3JaAtqZcXUh4LvJygDeketsrsH4`、`2b1kV6DkPAnxd5ixfnxCpjxmKwqjjaYmCZfHsFu24GXo` |
+| CLMM | 前四個，加上 `DAUcJBg4jSpVoEzASxYzdqHMUN8vuTpQyG2TvDcCHfZg`、`AUSD1jCcCyPLybk1YnvPWsHQSrZ46dxwoMniN4N2UEB9` |
+
+這些位址被烤入程式中；更新清單需要透過 3/4 升級多簽進行程式升級。
+
+### 2. 每個代幣登記表 — 僅 CLMM
+
+CLMM 另外查詢種子為 `[b"support_mint", mint]` 的 `SupportMintAssociated` PDA。如果該 PDA 對代幣存在，無論其擴展集如何，它都被認可。
+
+PDA 由 `CreateSupportMintAssociated` 建立（[`admin/create_support_mint_associated.rs`](https://github.com/raydium-io/raydium-clmm)）。指令受限於兩個簽署者：
+
+- `crate::admin::ID` — 標準 Raydium 管理員權限。
+- `crate::create_support_mint_associated_owner::ID` — 用於此目的的專用權限：`RayVyjyJQz9vAi126A4sGexKnSU1XeZaHTRcM1mZMPY`（主網）、`rayf3nEbb3bnfN6RDGFpqPbjc5uUa3tRUzu6UVYrRx5`（開發網）。
+
+效果：CLMM 團隊可以為特定 Token-2022 代幣啟用池建立，而無需程式升級。CPMM 沒有等效項 — 其許可清單嚴格來自原始碼。
+
+### 3. Superstate 偵測 — 僅 CLMM
+
+CLMM 有第三條路徑專門針對 Superstate 的代幣化資產，它們使用 `ScaledUiConfig` 擴展，鏈接到 CLMM 程式的 `spl-token-2022` 版本無法解開。CLMM 不升級依賴，而是透過其權限形狀偵測 Superstate 代幣：
+
+```rust
+superstate_allowlist::ID == freeze_authority
+    && *mint_account_info.owner == spl_token_2022::ID
+    && default_account_state_freeze
+    && maybe_permanent_delegate
+```
+
+— [`raydium-clmm/programs/amm/src/util/token.rs:485`](https://github.com/raydium-io/raydium-clmm)
+
+如果**所有四個**都成立，代幣會通過此分支：
+
+- 其擁有程式是 Token-2022 程式。
+- 其凍結權限等於 `superstate_allowlist::ID`。主網：`2Yq4T3mPNfjtEyTxSbRjRKqLf1pwbTasuCQrWe6QpM7x`。開發網：`3TRuL3MFvzHaUfQAb6EsSAbQhWdhmYrKxEiViVkdQfXu`。
+- 其 `DefaultAccountState` 擴展設定為 `Frozen`。
+- 其永久代理人也是 `superstate_allowlist::ID`。
+
+這是啟發式而不是登記表 — Superstate 發行的任何未來具有相同權限形狀的代幣都將自動被認可。
+
+## 繞過不豁免的內容
+
+繞過會跳過擴展許可清單，但程式仍然執行：
+
+- 代幣由 `Token` 或 `Token-2022` 擁有。自訂代幣程式會在上游被拒絕。
+- 池保管庫使用 Token-2022 池的正確 ATA 擴展建立（`ImmutableOwner` 等）。
+- 所有轉帳都通過 `transfer_checked` — 費用承載代幣在保管庫中登陸正確的數額。
+
+白名單或 PDA 登記的代幣，例如稍後添加 `TransferHook` 的代幣，不會獲得交換時間檢查；掛鉤會在每次轉帳時執行，可能導致交換失敗。因此，白名單是高信任操作。
+
+## 「被阻止」語義
+
+當 `is_supported_mint` 返回 `false` 時，池建立會還原為 `ErrorCode::NotSupportMint`（CPMM）/ `ErrorCode::NotSupportMint`（CLMM）。有關數字代碼，見 [`reference/error-codes`](/zh-Hant/reference/error-codes)。
+
+現有池無法回溯性地失敗此檢查 — 門控僅在建立時執行。代幣擴展對於 Raydium 拒絕的類別是不可變的（轉帳掛鉤、不可轉帳、機密轉帳無法在建立後添加），所以靜態檢查是充分的。
+
+## 為什麼排除每個擴展
+
+- **TransferHook** — 在每次轉帳時呼叫自訂程式，具有任意 CU 消耗、任意失敗條件，以及重新進入呼叫程式的能力。不存在安全沙箱。一些 DEX 維護掛鉤許可清單；Raydium 沒有。
+- **NonTransferable** — `Transfer` 總是失敗。池無法接管保管權。
+- **ConfidentialTransfer** — 轉帳數額是加密的；曲線無法為交換定價。
+- **PermanentDelegate** — 代理人的持有者可以掃除任何代幣帳戶，包括池保管庫。僅允許透過靜態白名單用於信任的發行者（例如，受監管的穩定幣）。
+- **MintCloseAuthority** — 代幣可以關閉；現有池變為不可用。預設不允許。
+- **DefaultAccountState (Frozen)** — 池 ATA 會登陸在 `Frozen` 狀態中，需要按帳戶解凍。僅允許透過 Superstate 偵測，假設發行者在登記時解凍機構帳戶。
+- **Group/Member pointers** — 不是主動有害，但未經審查。預設不允許以保持表面狹窄。
+
+## 轉帳費用會計
+
+對於帶有 `TransferFeeConfig` 的代幣，每次交換、存款和提款移動少於名義數額。SDK 會顯示計算的兩個部分：
+
+```ts
+const { amountIn, amountOut, feeAmount, token2022FeeIn, token2022FeeOut } =
+  await raydium.cpmm.computeSwapAmount({ ... });
+```
+
+正確的 UI 會顯示：
+
+- `amountIn + token2022FeeIn` 作為「你發送」
+- `amountOut - token2022FeeOut` 作為「你接收」
+- `feeAmount` 作為池費用（LP + 協議），與 Token-2022 轉帳費用分開
+
+只顯示 `amountIn → amountOut` 的天真 UI 會低估成本。
+
+### `maximumFee` 上限
+
+Token-2022 轉帳費用按轉帳上限。對於 1% 的代幣，上限為 10,000 個代幣，100,000,000 個代幣的轉帳只支付 10,000 費用。SDK 的 `computeSwapAmount` 會應用上限；直接程式呼叫者必須複製它。
+
+### 期限過渡
+
+代幣權限可以計劃在下一個期限激活的費率變化。在過渡窗口期間，兩個配置（`older`、`newer`）同時存在於代幣上，`TransferChecked` 按當前期限選擇。CPMM `SwapV2` 和 CLMM `SwapV2` 都在 `accounts` 中傳遞完整的代幣帳戶，所以程式讀取正確的配置而無需額外查詢。
+
+如果您透過 Trade API 或 SDK 提前一個以上期限報價，執行費用可能與報價費用不同 — 受舊配置的 `maximum_fee_basis_points` 限制。
+
+## 計息和 ScaledUiAmount
+
+池持有本金數額；「UI 數額」是本金乘以時間相關或管理員設定的比例因數。交換數學在本金上運行：
+
+```
+principal_in = ui_amount_in / ui_multiplier(now)
+```
+
+SDK 自動轉換。直接 RPC 讀者應將 `pool.token0Vault.amount` 視為本金。
+
+## 「Token-2022 池」定義
+
+如果**任一**代幣的 `programId == TokenzQdB...`，池就是 Token-2022 池。API 會顯示這一點：
+
+```
+GET /pools/info/ids?ids=<POOL_ID>
+```
+
+```json
+{
+  "data": [{
+    "mintA": { "programId": "TokenzQdB...", "hasTransferFee": true, ... },
+    "mintB": { "programId": "Tokenkeg...", ... }
+  }]
+}
+```
+
+使用 `programId` 進行分派，使用 `hasTransferFee` 來顯示 UI 警告。
+
+## SDK 輔助工具
+
+```ts
+import { Raydium, TOKEN_2022_PROGRAM_ID } from "@raydium-io/raydium-sdk-v2";
+import { ExtensionType, getExtensionTypes, unpackMint } from "@solana/spl-token";
+
+const raydium = await Raydium.load({ owner, connection });
+
+const acct = await connection.getAccountInfo(mintPubkey);
+if (!acct) throw new Error("mint not found");
+const mint = unpackMint(mintPubkey, acct, acct.owner);
+
+if (acct.owner.equals(TOKEN_2022_PROGRAM_ID)) {
+  const extensions = getExtensionTypes(mint.tlvData);
+  const accepted = new Set([
+    ExtensionType.TransferFeeConfig,
+    ExtensionType.MetadataPointer,
+    ExtensionType.TokenMetadata,
+    ExtensionType.InterestBearingConfig,
+    ExtensionType.ScaledUiAmount,
+  ]);
+  const rejecting = extensions.filter(e => !accepted.has(e));
+  if (rejecting.length) {
+    console.warn("Pool creation will revert unless this mint is whitelisted:", rejecting);
+  }
+}
+```
+
+## 常見整合錯誤
+
+- **只預先檢查程式 ID。** 代幣可以是 Token-2022*且*不受支援。在允許池建立前，針對許可清單（和靜態白名單）檢查擴展清單。
+- **當代幣根本不被接受時信任 SDK 的報價。** 報價 API 不拒絕報價 — 池建立是還原的。在 UI 中公開池建立前，確認 `is_supported_mint` 語義離線。
+- **報價時不考慮轉帳費用扣款。** 兩側都有 1% 轉帳費用代幣的 0.25% CPMM 池的有效費用約為 2.25%，而不是 0.25%。使用 SDK 報價或 Trade API 報價 — 永遠不要從池的費用層級單獨手動計算費用。
+- **在 Token-2022 池上呼叫舊版 `Swap` 指令。** `Swap` 發佈於 Token-2022 之前。每當任一代幣是 Token-2022 時，都使用 `SwapV2`。
+- **自動列出新的 Token-2022 代幣。** 錢包和聚合器應在向使用者顯示代幣前檢查 `TransferHook` 和 `NonTransferable`；兩者都是 Raydium 不相容的。
+
+## 未來工作
+
+Solana 生態系統和協議路線圖項目，會改變此矩陣：
+
+- 在 Solana 級別允許列出的轉帳掛鉤程式（生態系統慣例進化）。
+- 機密轉帳相容的 AMM（研究階段）。
+- 更廣泛的 CPMM 每個代幣登記表（與 CLMM 的對等）。
+- 依賴升級，使 CLMM 的 `ScaledUiConfig` 解碼在沒有 Superstate 啟發式的情況下工作。
+
+此頁面將在任何上線時更新。
+
+## 指標
+
+- [`algorithms/token-2022-transfer-fees`](/zh-Hant/algorithms/token-2022-transfer-fees) — 交換中的費用數學。
+- [`products/cpmm/instructions`](/zh-Hant/products/cpmm/instructions) — `SwapV2`、`Initialize`。
+- [`products/clmm/instructions`](/zh-Hant/products/clmm/instructions) — `SwapV2`、`CreatePool`、`CreateSupportMintAssociated`。
+- [`reference/error-codes`](/zh-Hant/reference/error-codes) — 每個程式的 `NotSupportMint` 數字代碼。
+
+來源：
+
+- `raydium-cp-swap/programs/cp-swap/src/utils/token.rs` — `MINT_WHITELIST`、`is_supported_mint`。
+- `raydium-clmm/programs/amm/src/util/token.rs` — `MINT_WHITELIST`、`superstate_allowlist`、`is_superstate_token`、`is_supported_mint`。
+- `raydium-clmm/programs/amm/src/instructions/admin/create_support_mint_associated.rs` — 每個代幣登記表指令。
+- `raydium-launchpad/programs/launchpad/src/instructions/initialize_with_token_2022.rs` — LaunchLab Token-2022 基礎代幣建立。

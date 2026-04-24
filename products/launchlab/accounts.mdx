@@ -1,0 +1,213 @@
+---
+title: "LaunchLab accounts"
+description: "PoolState (per-launch root), the base and quote vaults, the authority PDA, and the small graph of per-launch accounts. Protocol-level GlobalConfig and platform-level PlatformConfig live on their own pages."
+---
+
+<Info>
+  This page documents the **per-launch** account graph: the `PoolState` (the root state account for one launch), its two vaults, the authority PDA, and the post-graduation references it gains when the launch settles.
+
+  For the protocol-level config that bounds every launch, see [`products/launchlab/global-config`](/products/launchlab/global-config). For the per-platform overlay, see [`products/launchlab/platform-config`](/products/launchlab/platform-config). For vesting accounts (`VestingSchedule` on `PoolState`, `VestingRecord` per beneficiary), see [`products/launchlab/vesting`](/products/launchlab/vesting).
+</Info>
+
+## Account inventory
+
+| Account | Owner | Purpose |
+|---------|-------|---------|
+| [`GlobalConfig`](/products/launchlab/global-config) | LaunchLab program | Protocol-level rules: fees, supply floors, migration wallets. One per `(curve_type, index)`. |
+| [`PlatformConfig`](/products/launchlab/platform-config) | LaunchLab program | Per-platform overlay: branding, platform fee, NFT split at graduation, curve-shape whitelist. |
+| `PoolState` | LaunchLab program | Per-launch root state: mints, vaults, curve params, sold counters, fee counters, vesting schedule, graduation status. |
+| `authority` | LaunchLab program | Single PDA at seed `[b"vault_auth_seed"]` that owns vaults across all launches and signs the post-graduation CPI. |
+| `base_vault` | SPL Token / Token-2022 | Per-launch vault holding the unsold base tokens. |
+| `quote_vault` | SPL Token | Per-launch vault holding accumulated quote tokens. |
+| [`VestingRecord`](/products/launchlab/vesting) | LaunchLab program | Per-beneficiary cliff + linear-unlock record. Optional. |
+| `creator_fee_vault` | SPL Token | Per-creator + per-quote-mint vault holding accrued creator fees, swept by `ClaimCreatorFee`. |
+| `platform_fee_vault` | SPL Token | Per-platform + per-quote-mint vault holding accrued platform fees, swept by `ClaimPlatformFeeFromVault`. |
+| (post-graduation) `cpmm_pool_state` *or* `amm_pool_state` | CPMM / AMM v4 program | The pool created by `MigrateToCpswap` / `MigrateToAmm`. |
+| (post-graduation) Fee Key NFT | LP-Lock program | Wraps the creator's slice of LP at CPMM graduation; entitles the holder to `ClaimCreatorFee` on the CPMM pool. |
+
+The SDK's `raydium.launchpad.getLaunchById` returns `PoolState` plus a flag indicating whether the launch has graduated; if it has, the post-migration pool ID is included.
+
+## `PoolState`
+
+The per-launch root state. Field names below match the on-chain Rust struct (`states/pool.rs`); some values are simplified for readability — consult the source for the exact memory layout.
+
+```rust
+// states/pool.rs (abridged)
+pub struct PoolState {
+    pub epoch:                     u64,        // recent_epoch tracker
+    pub auth_bump:                 u8,
+    pub status:                    u8,         // PoolStatus enum
+    pub base_decimals:             u8,
+    pub quote_decimals:            u8,
+    pub migrate_type:              u8,         // 0 = AMM v4, 1 = CPMM
+    pub supply:                    u64,        // total base tokens (no decimals)
+    pub total_base_sell:           u64,        // base supply allocated to the curve
+    pub virtual_base:              u64,        // virtual-reserve seed
+    pub virtual_quote:             u64,        // virtual-reserve seed
+    pub real_base:                 u64,        // base sold so far
+    pub real_quote:                u64,        // quote raised so far (excl. fees)
+    pub total_quote_fund_raising:  u64,        // graduation threshold in quote
+
+    pub quote_protocol_fee:        u64,        // accrued, pending CollectFee
+    pub platform_fee:              u64,        // accrued, pending ClaimPlatformFee
+    pub migrate_fee:               u64,        // accrued, pending CollectMigrateFee
+    pub vesting_schedule:          VestingSchedule,
+
+    pub global_config:             Pubkey,
+    pub platform_config:           Pubkey,
+    pub creator:                   Pubkey,
+    pub base_mint:                 Pubkey,
+    pub quote_mint:                Pubkey,
+    pub base_vault:                Pubkey,
+    pub quote_vault:               Pubkey,
+
+    pub amm_creator_fee_on:        u8,         // 0 = QuoteToken, 1 = BothToken (CPMM-only)
+    pub token_program_flag:        u8,         // bit flags for SPL Token vs Token-2022
+    pub padding:                   [u8; 54],
+}
+
+#[derive(Default, Debug, Clone)]
+pub struct VestingSchedule {
+    pub total_locked_amount:    u64,
+    pub cliff_period:           u64,
+    pub unlock_period:          u64,
+    pub start_time:             u64,           // set at graduation
+    pub allocated_share_amount: u64,           // running sum across VestingRecords
+}
+```
+
+`PoolStatus` values (from the Anchor IDL):
+
+```
+0 = Funding         — accepting buys / sells; below quote_reserve_target
+1 = Migrate         — quote_reserve_target reached; awaiting MigrateTo*
+2 = Migrated        — MigrateTo* already executed; vesting clock running
+```
+
+Integrator-facing fields:
+
+- **`status`** — three values, monotone (Funding → Migrate → Migrated). Reads always safe; writes gated.
+- **`real_base`**, **`real_quote`** — current curve state. Combined with `virtual_base` / `virtual_quote` they are sufficient to compute spot price without touching the vaults. See [`bonding-curve`](/products/launchlab/bonding-curve).
+- **`total_base_sell`** vs `real_base` — "progress toward graduation" ratio for UIs.
+- **`migrate_type`** — selects whether `MigrateToAmm` or `MigrateToCpswap` is the valid graduation path. Token-2022 launches must use CPMM.
+- **`amm_creator_fee_on`** — only meaningful when graduating to CPMM. Picks `creator_fee_on = OnlyQuoteToken` (`0`) or `BothToken` (`1`) on the post-graduation CPMM pool. *Despite the name, this enum effectively also drives the migration target — `BothToken` is paired with `MigrateToAmm` in current operational practice; `QuoteToken` with `MigrateToCpswap`.* See [`creator-fees`](/products/launchlab/creator-fees).
+- **`quote_protocol_fee` / `platform_fee` / `migrate_fee`** — three independent fee counters. Each has its own claim instruction; see [`instructions`](/products/launchlab/instructions).
+- **`vesting_schedule`** — present on every `PoolState` but inactive when `total_locked_amount == 0`. See [`vesting`](/products/launchlab/vesting) for the full lifecycle.
+
+## The authority PDA
+
+LaunchLab uses a **single** authority PDA across all launches, derived with no per-launch seed:
+
+```ts
+const LAUNCHLAB_PROGRAM_ID = new PublicKey("<LAUNCHLAB_ID>"); // see reference/program-addresses
+
+const [authority, bump] = PublicKey.findProgramAddressSync(
+  [Buffer.from("vault_auth_seed")],
+  LAUNCHLAB_PROGRAM_ID,
+);
+```
+
+That single PDA is:
+
+- The authority on every launch's `base_vault` and `quote_vault`.
+- The `mint_authority` on each launch's `base_mint` (pre-graduation).
+- The signer on the post-graduation CPI to AMM v4 / CPMM (`MigrateTo*`).
+- The signer on `ClaimVestedToken` transfers out of the base vault.
+
+The `mint_authority` is revoked immediately after `MigrateToAmm` / `MigrateToCpswap` so the supply is permanently fixed.
+
+Two additional PDAs gate the fee vaults:
+
+```ts
+const [creatorFeeVaultAuthority] = PublicKey.findProgramAddressSync(
+  [Buffer.from("creator_fee_vault_auth_seed")],
+  LAUNCHLAB_PROGRAM_ID,
+);
+
+const [platformFeeVaultAuthority] = PublicKey.findProgramAddressSync(
+  [Buffer.from("platform_fee_vault_auth_seed")],
+  LAUNCHLAB_PROGRAM_ID,
+);
+```
+
+These sign the transfer out of the corresponding fee vaults during `ClaimCreatorFee` and `ClaimPlatformFeeFromVault`.
+
+## Base mint
+
+Created inline by `Initialize` with:
+
+- `mint_authority = authority` (revoked at graduation).
+- `freeze_authority = None`.
+- `supply = supply`, entirely minted into `base_vault`.
+- `decimals` chosen by the creator at `Initialize` (commonly 6).
+
+Because the full supply is pre-minted, `base_mint.supply` is constant for the life of the launch. Curve buys move tokens from `base_vault` to the buyer, but do not call `mint_to`.
+
+`Initialize` / `InitializeV2` create SPL Token launches. The dedicated `InitializeWithToken2022` instruction lets the base mint be a Token-2022 mint (with optional `TransferFeeConfig`); the quote mint is still SPL Token. Token-2022 launches must graduate to a CPMM pool because AMM v4 only supports SPL Token vaults.
+
+## Vaults
+
+Both `base_vault` and `quote_vault` are standard SPL Token accounts owned by the LaunchLab `authority` PDA. Addresses are stored on `PoolState` and can also be derived:
+
+```ts
+const [baseVault] = PublicKey.findProgramAddressSync(
+  [Buffer.from("pool_vault"), poolState.toBuffer(), baseMint.toBuffer()],
+  LAUNCHLAB_PROGRAM_ID,
+);
+const [quoteVault] = PublicKey.findProgramAddressSync(
+  [Buffer.from("pool_vault"), poolState.toBuffer(), quoteMint.toBuffer()],
+  LAUNCHLAB_PROGRAM_ID,
+);
+```
+
+(Verify the exact seed prefixes from the source's `Initialize` accounts struct before relying on a derivation in production.)
+
+## Fee vaults
+
+Two PDAs aggregate fees across launches:
+
+- **Creator fee vault** — PDA at seeds `[creator, quote_mint]`. Every launch that earns the same creator fees on the same quote mint pours into the same vault. The creator sweeps it via `ClaimCreatorFee`.
+- **Platform fee vault** — PDA at seeds `[platform_config, quote_mint]`. Every launch routed through the same platform that uses the same quote mint pours into the same vault. The platform's `platform_fee_wallet` sweeps it via `ClaimPlatformFeeFromVault`. There is also a per-launch sweep variant (`ClaimPlatformFee`) that pulls from the launch's `quote_vault` directly without going through the aggregated vault.
+
+The aggregated-vault pattern is what lets a high-volume creator or platform amortize the rent cost of fee accumulation across many launches.
+
+## Quote vault ↔ `real_quote`
+
+`quote_vault.balance` and `PoolState.real_quote` should stay in sync. They can drift by at most the sum of the three pending fee counters (`quote_protocol_fee`, `platform_fee`, `migrate_fee`), which sit in the vault but belong to the fee counters and not the curve reserve. The curve math always uses `real_quote`, never the raw vault balance.
+
+Pre-graduation invariant:
+
+```
+quote_vault.balance ==
+   real_quote
+ + quote_protocol_fee
+ + platform_fee
+ + migrate_fee
+```
+
+## Lifecycle account transitions
+
+| Event | Status | `real_base` | `real_quote` | Post-graduation pool |
+|-------|--------|-------------|--------------|----------------------|
+| `Initialize` | Funding | 0 | 0 | — |
+| `BuyExactIn` / `BuyExactOut` | Funding | `+base_out` | `+quote_in_after_fee` | — |
+| `SellExactIn` / `SellExactOut` | Funding | `−base_in` | `−quote_out_before_fee` | — |
+| `MigrateToAmm` / `MigrateToCpswap` | Funding → Migrate → Migrated | (frozen) | (frozen) | created, LP split per `PlatformConfig` |
+| `ClaimCreatorFee` / `ClaimPlatformFee*` | any | — | — | drains a fee vault |
+| `CreateVestingAccount` | Funding | — | — | bumps `vesting_schedule.allocated_share_amount` |
+| `ClaimVestedToken` | Migrated only | — | — | drains `base_vault` |
+
+## Where to go next
+
+- [`products/launchlab/bonding-curve`](/products/launchlab/bonding-curve) — the math behind `real_base` ↔ `real_quote`.
+- [`products/launchlab/instructions`](/products/launchlab/instructions) — per-instruction account lists.
+- [`products/launchlab/global-config`](/products/launchlab/global-config) — protocol-level binding.
+- [`products/launchlab/platform-config`](/products/launchlab/platform-config) — platform overlay.
+- [`products/launchlab/vesting`](/products/launchlab/vesting) — locked supply mechanics.
+- [`products/cpmm/accounts`](/products/cpmm/accounts) — what the post-graduation `cpmm_pool_state` looks like.
+
+Sources:
+
+- `raydium-launch/programs/launchpad/src/states/pool.rs` — `PoolState`, `PoolStatus`, `VestingSchedule`, `AmmCreatorFeeOn`.
+- `raydium-launch/programs/launchpad/src/lib.rs` — PDA seed constants (`AUTH_SEED`, `CREATOR_FEE_VAULT_AUTH_SEED`, `PLATFORM_FEE_VAULT_AUTH_SEED`).
+- [Raydium SDK v2 `launchpad` module](https://github.com/raydium-io/raydium-sdk-V2).

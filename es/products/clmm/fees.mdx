@@ -1,0 +1,266 @@
+---
+title: "Comisiones y recompensas de CLMM"
+description: "Cómo distribuye CLMM la comisión de cada operación entre LPs, protocolo y fondo; cómo el sistema de tres ranuras de recompensas emite a posiciones en rango; y cómo ambos se liquidan en saldos por posición."
+---
+
+<Info>
+  **Esta página fue traducida automáticamente por IA. La versión en inglés es la fuente autorizada.**
+
+  [Ver versión en inglés →](/products/clmm/fees)
+</Info>
+
+## Niveles de comisión
+
+Los pools de CLMM se vinculan a un `AmmConfig` en el momento de su creación; la configuración determina la tasa de comisión de la operación, las participaciones del protocolo y del fondo, y el **espaciado de ticks** (ver [`products/clmm/ticks-and-positions`](/es/products/clmm/ticks-and-positions)). Niveles publicados típicos (verifica los valores actuales en `GET https://api-v3.raydium.io/main/clmm-config`):
+
+| Índice `AmmConfig` | `trade_fee_rate` | Espaciado de ticks | Uso típico |
+|---|---|---|---|
+| 0 | `100` (0.01%) | 1 | Pares estables |
+| 1 | `500` (0.05%) | 10 | Blue-chips correlacionados |
+| 2 | `2_500` (0.25%) | 60 | Pares estándar |
+| 3 | `10_000` (1.00%) | 120 | Volátiles o de cola larga |
+
+La tasa de comisión de la operación se expresa en unidades de `1/FEE_RATE_DENOMINATOR = 1/1_000_000` del volumen. Las tasas del protocolo y del fondo usan el mismo denominador, pero se aplican sobre la **comisión de la operación**, no sobre el volumen — la misma convención que en CPMM.
+
+## Distribución de la comisión por *swap*
+
+En cada paso de un *swap* (ver [`products/clmm/math`](/es/products/clmm/math)):
+
+```
+step_trade_fee   = ceil(step_input * trade_fee_rate / 1_000_000)
+step_protocol    = floor(step_trade_fee * protocol_fee_rate / 1_000_000)
+step_fund        = floor(step_trade_fee * fund_fee_rate     / 1_000_000)
+step_lp          = step_trade_fee - step_protocol - step_fund
+```
+
+- `step_lp` fluye hacia `fee_growth_global_{input_side}_x64`, escalado por la liquidez activa actual: `fee_growth_global += step_lp × 2^64 / pool.liquidity`.
+- `step_protocol` se acumula en `PoolState.protocol_fees_token_{input_side}` — se extrae con `CollectProtocolFee`.
+- `step_fund` se acumula en `PoolState.fund_fees_token_{input_side}` — se extrae con `CollectFundFee`.
+
+Al igual que en CPMM, las porciones del protocolo y del fondo se encuentran en las bóvedas pero están **excluidas de la vista de liquidez de la curva**: la matemática del *swap* lee `pool.liquidity`, que no está inflada por comisiones pendientes de extracción.
+
+## Por qué las comisiones son por lado
+
+A diferencia de CPMM (donde la comisión de un *swap* siempre se cobra en el token de entrada y el otro lado del pool nunca ve la acumulación de protocolo/fondo de ese *swap*), en CLMM la misma regla se aplica en cada paso: **las comisiones se acumulan en el token que sea la entrada en ese paso**. Como un *swap* multi-tick tiene una dirección constante, todos los pasos cobran comisiones en el mismo token — así que, en la práctica, las comisiones de cualquier *swap* van a *un solo* lado.
+
+Si un usuario intercambia token0 → token1, `fee_growth_global_0_x64` sube; `fee_growth_global_1_x64` no lo hace. Las posiciones acumulan comisiones en token0 en ese *swap*. El siguiente *swap* puede ir en la dirección contraria y acreditar `fee_growth_global_1_x64`. Con el tiempo, un pool equilibrado acumula en ambos lados.
+
+## Comisión de un solo lado (`CollectFeeOn`)
+
+Los pools creados mediante [`CreateCustomizablePool`](/es/products/clmm/instructions) pueden optar por un modo de recaudación de comisiones distinto al predeterminado. El modo se fija en el momento de creación del pool y se almacena en `PoolState.fee_on`.
+
+| Valor de `CollectFeeOn` | Byte `fee_on` | Comportamiento |
+|---|---|---|
+| `FromInput` (predeterminado) | `0` | Clásico Uniswap-V3 — la comisión siempre se deduce del token de entrada de cada paso del *swap*. El token de entrada alterna con la dirección del *swap*. |
+| `Token0Only` | `1` | La comisión siempre se denomina en token0. Para *swaps* 0→1, la comisión es el token de entrada (igual que `FromInput`). Para *swaps* 1→0, la comisión se toma de la salida del *swap* (token0). |
+| `Token1Only` | `2` | Simétrico a `Token0Only` — la comisión siempre en token1. |
+
+**Por qué un pool elegiría `Token0Only` o `Token1Only`** — para dar a los LPs una moneda de acumulación única y predecible. Los pares como `MEMECOIN / USDC`, donde los LPs están denominados en dólares, se benefician de `Token1Only` (las comisiones siempre se liquidan en USDC); el P&L del LP queda así libre de la influencia de qué lado domina el volumen. La contrapartida es que, en las direcciones donde la comisión sale de la salida del *swap*, el usuario recibe `out − fee` en lugar de `out − ε` desde la entrada, por lo que la lógica de cotización debe restar la comisión del lado de salida. El método `computeAmountOut` del SDK gestiona esta bifurcación a partir de `fee_on`; el código cliente que lee `pool.fee_on` directamente debe replicar las funciones auxiliares de `PoolState`:
+
+```rust
+pool.is_fee_on_input(zero_for_one: bool) -> bool   // true → fee is deducted from input
+pool.is_fee_on_token0(zero_for_one: bool) -> bool  // for telemetry / accounting
+```
+
+**Efecto a nivel de posición LP** — la comisión sigue enrutándose a través de los acumuladores estándar `fee_growth_global_{0,1}_x64` por paso de *swap*, por lo que las posiciones siguen liquidando comisiones con la misma fórmula `fee_growth_inside`. La asimetría solo afecta a la *dirección* de la acumulación por lado, no a la matemática.
+
+`fee_on` **no** es mutable tras la creación. Los pools creados mediante la instrucción legacy `CreatePool` son permanentemente `FromInput`.
+
+## Comisión dinámica
+
+Los pools creados con `enable_dynamic_fee = true` aplican un recargo impulsado por la volatilidad por encima de `AmmConfig.trade_fee_rate`. El mecanismo es una adaptación simplificada del diseño de comisión dinámica de Trader Joe / Meteora.
+
+### Estado
+
+`PoolState.dynamic_fee_info` contiene cinco parámetros de calibración (instantánea de `DynamicFeeConfig` en el momento de creación del pool) más cuatro campos de estado que se actualizan con cada *swap*. Consulta [`products/clmm/accounts`](/es/products/clmm/accounts#dynamicfeeconfig-and-dynamicfeeinfo) para ver el diseño de bytes.
+
+### Actualización por *swap*
+
+En cada paso del *swap*, el programa ejecuta tres subpasos:
+
+1. **Decaimiento de referencia**. Si `now - last_update_timestamp > filter_period`, la referencia de volatilidad decae:
+
+    ```
+    if elapsed > decay_period:
+        volatility_reference = 0
+    elif elapsed > filter_period:
+        volatility_reference = volatility_accumulator * reduction_factor / 10_000
+    # else: hold the previous reference
+    ```
+
+2. **Actualización del acumulador**. El nuevo acumulador es la referencia más la distancia absoluta recorrida (en unidades de `tick_spacing`), multiplicada por una escala de granularidad, con un tope en el máximo configurado:
+
+    ```
+    delta_idx     = abs(tick_spacing_index_reference - current_tick_spacing_index)
+    accumulator   = volatility_reference + delta_idx * 10_000   // VOLATILITY_ACCUMULATOR_SCALE
+    accumulator   = min(accumulator, max_volatility_accumulator)
+    ```
+
+3. **Cálculo del recargo**. El recargo es parabólico en el acumulador (ya que la "distancia en ticks" del *swap* se eleva al cuadrado en la fórmula canónica), escalado en ganancia por `dynamic_fee_control`:
+
+    ```
+    fee_increment_rate = dynamic_fee_control * (accumulator * tick_spacing)^2
+                       / (100_000 * 10_000^2)
+    fee_rate           = AmmConfig.trade_fee_rate + fee_increment_rate
+    fee_rate           = min(fee_rate, 100_000)              // 10% cap
+    ```
+
+El tope del 10% (`MAX_FEE_RATE_NUMERATOR = 100_000` en unidades de `1e6`) está fijado en el código como medida de seguridad; en la práctica, configuraciones bien calibradas se mantienen muy por debajo.
+
+### Elección de parámetros
+
+Rangos predeterminados que han funcionado en pools piloto:
+
+| Parámetro | Rango típico | Notas |
+|---|---|---|
+| `filter_period` | 30 – 60 s | Mantiene la referencia ante micro-volatilidad; menor = más reactivo |
+| `decay_period` | 300 – 1800 s | Tras esta ventana de calma, la comisión vuelve a la base |
+| `reduction_factor` | 4_000 – 8_000 | De `10_000`. Mayor = comisión elevada más persistente |
+| `dynamic_fee_control` | 1_000 – 50_000 | De `100_000`. Ganancia sobre la curva |
+| `max_volatility_accumulator` | 100_000 – 10_000_000 | Satura el nivel máximo que puede alcanzar el recargo |
+
+Calibra reproduciendo *swaps* históricos fuera de cadena con la fórmula, y ajusta `dynamic_fee_control` para que la comisión promedio resultante se ajuste a un objetivo (por ejemplo, 1.5× la base en días de 1σ, 5× en días de 3σ).
+
+### Lo que ven los LPs
+
+Los ingresos por comisión dinámica fluyen a través de los mismos acumuladores que la comisión base — `fee_growth_global_{0,1}_x64`. No existe un campo separado de "crecimiento de comisión dinámica". Los LPs en pools volátiles simplemente ganan comisiones más altas durante los períodos de volatilidad, sin necesidad de ninguna reclamación adicional ni instrucción de liquidación.
+
+### Lo que los integradores deben saber
+
+- La comisión que devuelve una cotización puede cambiar entre el bloque N y el bloque N+1 aunque las reservas del pool no se hayan movido — cada *swap* desplaza el acumulador de volatilidad. Las cotizaciones de la Trade API son válidas en el bloque de la cotización y pueden diferir por algunos bps si el pool reactivo recibe un *swap* entre la cotización y la ejecución.
+- `volatility_accumulator` y `last_update_timestamp` son públicos en cadena — los clientes pueden replicar la fórmula del lado del cliente para simulaciones fuera de línea.
+
+## Contabilidad de comisiones por posición
+
+Cada posición almacena, en el momento de su último toque:
+
+- `fee_growth_inside_0_last_x64` y `fee_growth_inside_1_last_x64` — el crecimiento de comisión específico del rango en esa instantánea.
+
+En cada toque posterior (`IncreaseLiquidity`, `DecreaseLiquidity`, y de forma implícita cualquier transición de estado que actualice el crecimiento de comisión del tick límite):
+
+1. El programa recalcula `fee_growth_inside_{0,1}_x64` a partir del crecimiento de comisión **global** y los `fee_growth_outside_*` de los dos ticks extremos.
+2. El delta se añade a `tokens_fees_owed_{0,1}` ponderado por la liquidez de la posición:
+
+   ```
+   Δ_fee_growth_inside_0 = fee_growth_inside_now_0 - fee_growth_inside_last_0
+   tokens_fees_owed_0  += Δ_fee_growth_inside_0 * position.liquidity / 2^64
+   ```
+
+3. `fee_growth_inside_{0,1}_last_x64` se actualiza.
+
+Los tokens se mueven físicamente solo en `DecreaseLiquidity` o mediante la ruta dedicada `CollectFees` (en el conjunto de instrucciones actual de Raydium, las comisiones se extraen como parte de `DecreaseLiquidity`). Establecer `liquidity = 0` en una llamada a `DecreaseLiquidity` es el modismo canónico de "solo recolectar".
+
+### Las posiciones fuera de rango no generan comisiones
+
+Si el rango de una posición no contiene `tick_current`, el `fee_growth_inside` calculado para ella está **acotado superiormente** y no se mueve mientras el precio esté fuera del rango. La posición deja de acumular comisiones hasta que el precio regrese a su rango. Esto es una característica del diseño, no un error — así es como la liquidez concentrada concentra también el *rendimiento de comisiones*, además del capital.
+
+## Flujos de recompensas
+
+Un pool de CLMM puede tener hasta **tres** flujos de recompensas activos simultáneamente. Cada flujo es una tupla (mint de recompensa, tasa de emisión, hora de inicio, hora de fin) almacenada en `PoolState.reward_infos[i]`.
+
+```rust
+pub struct RewardInfo {
+    pub reward_state: u8,               // Uninitialized | Initialized | Open | Ended
+    pub open_time: u64,
+    pub end_time: u64,
+    pub last_update_time: u64,
+    pub emissions_per_second_x64: u128, // Q64.64 reward tokens per second
+    pub reward_total_emissioned: u64,
+    pub reward_claimed: u64,
+    pub token_mint:    Pubkey,
+    pub token_vault:   Pubkey,
+    pub authority:     Pubkey,           // who can SetRewardParams / fund
+    pub reward_growth_global_x64: u128,  // accumulator, Q64.64
+}
+```
+
+### Bucle de liquidación
+
+Cada instrucción que toca liquidez (y `UpdateRewardInfos` como instrucción independiente) avanza todos los flujos activos hasta `now`:
+
+```
+for each reward_info with state in {Open, Ended within grace}:
+    elapsed         = min(now, end_time) − last_update_time
+    if elapsed > 0 && pool.liquidity > 0:
+        reward_growth_global_x64 += emissions_per_second_x64 × elapsed × 2^64 / pool.liquidity
+        reward_total_emissioned  += emissions_per_second × elapsed
+    last_update_time = min(now, end_time)
+```
+
+Si `pool.liquidity == 0` durante algún intervalo, las emisiones de ese intervalo **no** se distribuyen (no es posible; no hay liquidez en rango a la que pagar). El presupuesto restante permanece en la bóveda de recompensas. Los protocolos que inicializan el flujo y lo abandonan pueden reponerlo o finalizarlo mediante `SetRewardParams`.
+
+### Acumulación de recompensas por posición
+
+Exactamente igual que con las comisiones, con una dimensión adicional por flujo:
+
+```
+for each stream i:
+    reward_growth_inside_now_i   = compute_inside_i(pool, tick_lower, tick_upper)
+    Δ_i = reward_growth_inside_now_i - personal_position.reward_infos[i].growth_inside_last_x64
+    personal_position.reward_infos[i].reward_amount_owed += Δ_i * personal_position.liquidity / 2^64
+    personal_position.reward_infos[i].growth_inside_last_x64 = reward_growth_inside_now_i
+```
+
+Los usuarios reclaman mediante `CollectReward`, que transfiere `reward_amount_owed` desde la bóveda del flujo al usuario y pone el contador a cero.
+
+### Solo las posiciones en rango acumulan recompensas
+
+`reward_growth_inside` usa la misma fórmula que `fee_growth_inside` — a través de los acumuladores tick-outside — por lo que las posiciones fuera del rango de precio actual no acumulan recompensas. Esto refleja la decisión de diseño de Uniswap v3 de "los incentivos van a la liquidez activa" y alinea el interés del LP con la cobertura del precio actual.
+
+### Financiación y cierre de flujos
+
+Un flujo se crea mediante `InitializeReward`, que deposita el presupuesto total (`emissions_per_second × (end_time − open_time)`) en la bóveda de recompensas del flujo por adelantado. El programa rechaza `InitializeReward` si el saldo del financiador es insuficiente. `SetRewardParams` puede extender `end_time` o aumentar la tasa de emisión; reducir cualquiera de los dos está bloqueado para evitar un *rug pull* sobre emisiones ya prometidas a los LPs.
+
+Cuando `now > end_time`, el flujo pasa al estado `Ended`, pero su `reward_growth_global_x64` sigue siendo legible — los LPs pueden seguir usando `CollectReward` para reclamar importes ganados históricamente mucho después de que cesen las emisiones.
+
+## Recaudación administrativa
+
+| Firmante | Instrucción | Efecto |
+|--------|-------------|--------|
+| `amm_config.owner` | `CollectProtocolFee` | Extrae `protocol_fees_token_{0,1}` hacia un destinatario. |
+| `amm_config.fund_owner` | `CollectFundFee` | Extrae `fund_fees_token_{0,1}` hacia un destinatario. |
+
+Ninguna de las dos mueve la curva — los importes acumulados ya están fuera de `pool.liquidity`. Consulta [`security/admin-and-multisig`](/es/security/admin-and-multisig) para saber quién tiene estos firmantes en mainnet.
+
+## Interacciones con Token-2022
+
+Las comisiones y recompensas se denominan en uno de los tokens del pool o del flujo. Las extensiones de Token-2022 se comportan igual que en CPMM:
+
+- **Comisión de transferencia en el mint de entrada de un *swap*.** El pool recibe `amount_in − mint_transfer_fee`. El paso del programa CLMM se calcula sobre el importe neto, por lo que los acumuladores de comisión del pool reflejan tokens reales en la bóveda.
+- **Comisión de transferencia en el mint de salida.** El pool envía `amount_out`; el usuario recibe `amount_out − mint_transfer_fee`. Las comprobaciones de *slippage* deben hacerse sobre el importe que recibe el usuario.
+- **Comisión de transferencia en un mint de recompensa.** Las emisiones se denominan en unidades "ingresadas en la bóveda" en el momento de `InitializeReward` (el financiador paga la comisión de transferencia del mint hacia la bóveda). Las retiradas en `CollectReward` incurren en otra comisión de transferencia del mint; los LPs deben esperar un pequeño descuento en tokens de recompensa con comisión de transferencia.
+- **Mints no transferibles, confidenciales o miembros de grupo.** Rechazados en `CreatePool` / `InitializeReward`.
+
+El efecto combinado en un *swap* multi-hop con comisión de transferencia puede ser significativo. Los cotizadores que lo ignoran prometerán de más; consulta [`algorithms/token-2022-transfer-fees`](/es/algorithms/token-2022-transfer-fees) para el cálculo de referencia.
+
+## Lectura de comisiones y recompensas fuera de cadena
+
+```ts
+const pool = await raydium.clmm.getPoolInfoFromRpc(poolId);
+const position = await raydium.clmm.getOwnerPositionInfo({
+  wallet: owner.publicKey,
+});
+
+for (const p of position) {
+  console.log("Position", p.nftMint.toBase58(),
+              "range", p.tickLower, "→", p.tickUpper,
+              "L", p.liquidity.toString(),
+              "fees owed:", p.tokenFeesOwed0.toString(),
+              p.tokenFeesOwed1.toString(),
+              "rewards owed:", p.rewardInfos.map(r => r.rewardAmountOwed.toString()));
+}
+```
+
+`tokenFeesOwed*` y `rewardAmountOwed` son instantáneas del último momento en que se tocó la posición. Para ver los valores **actuales** (que reflejan el crecimiento desde entonces), llama a `IncreaseLiquidity` con liquidez cero en una simulación, o simplemente recalcula usando el `fee_growth_*` global y las dos instantáneas tick-outside.
+
+## Próximos pasos
+
+- [`products/clmm/math`](/es/products/clmm/math) — derivación completa de `fee_growth_inside`.
+- [`products/clmm/instructions`](/es/products/clmm/instructions) — listas de cuentas para `CollectReward`, `InitializeReward`, `SetRewardParams`.
+- [`algorithms/token-2022-transfer-fees`](/es/algorithms/token-2022-transfer-fees) — cotización con mints de comisión de transferencia.
+- [`reference/fee-comparison`](/es/reference/fee-comparison) — matriz comparativa de comisiones CLMM/CPMM/AMM-v4.
+
+Fuentes:
+
+- [`raydium-io/raydium-clmm` — `states/pool.rs`, `libraries/fixed_point_64.rs`](https://github.com/raydium-io/raydium-clmm)
+- Libro blanco "Uniswap v3 Core", §7 (crecimiento de comisiones)

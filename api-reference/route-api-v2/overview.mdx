@@ -1,0 +1,235 @@
+---
+title: Transaction API Overview
+description: Server-side swap transaction builder for Solana.
+---
+
+## What is the Transaction API?
+
+The Raydium Transaction API (Route V2) is a server-side service that builds serialized Solana swap transactions without requiring clients to maintain an RPC connection or bundle the entire Raydium SDK. This dramatically simplifies integration for:
+
+- Web frontends that cannot run a local RPC client
+- Mobile applications with limited resources
+- Headless trading bots
+- Aggregators and wallet providers
+
+Instead of performing complex pool routing and transaction construction on the client, you request swap quotes and transaction building from our API, then sign and broadcast the result using any Solana RPC.
+
+## Workflow Overview
+
+The Transaction API separates concerns into two phases:
+
+### 1. Compute Phase: Get a Quote
+Call `/compute/swap-base-in` or `/compute/swap-base-out` to receive the expected swap output (or required input) based on current pool states. This endpoint is **read-only** and does not require any signing:
+
+```bash
+GET /compute/swap-base-in?inputMint=EPjF...&outputMint=So111...&amount=1000000&slippageBps=50&txVersion=V0
+```
+
+Response includes:
+- Expected output amount
+- Route breakdown (which pools and liquidity sources are used)
+- Price impact
+
+### 2. Transaction Phase: Build and Sign
+Once you have the compute response, pass it (along with wallet and configuration) to `/transaction/swap-base-in` or `/transaction/swap-base-out`:
+
+```bash
+POST /transaction/swap-base-in
+Content-Type: application/json
+
+{
+  "wallet": "YourWalletAddress",
+  "swapResponse": { ...response from /compute/swap-base-in },
+  "txVersion": "V0",
+  "computeUnitPriceMicroLamports": "1000",
+  "wrapSol": false,
+  "unwrapSol": false,
+  "inputAccount": "TokenAccount1...",
+  "outputAccount": "TokenAccount2..."
+}
+```
+
+Response contains:
+- A base64-encoded versioned transaction ready to sign
+- Address lookup table addresses (if txVersion=V0)
+
+Your client then:
+1. Decodes the transaction
+2. Signs it with the user's keypair
+3. Broadcasts it via any Solana RPC
+4. Awaits confirmation
+
+## Compute Endpoints
+
+### `GET /compute/swap-base-in`
+**Use case**: User specifies input amount, we compute the output.
+
+**Required query parameters**:
+- `inputMint` – Mint address of the token you're sending
+- `outputMint` – Mint address of the token you want
+- `amount` – Input amount in lamports (smallest unit)
+- `slippageBps` – Maximum acceptable slippage in basis points (0–10000)
+- `txVersion` – `V0` or `LEGACY`
+
+**Optional**:
+- `referrerBps` – If you have a referrer authority, basis points of the output to collect as referrer fee
+
+### `GET /compute/swap-base-out`
+**Use case**: User specifies desired output, we compute the required input.
+
+**Required query parameters**:
+- `inputMint`, `outputMint`, `amount` (desired output), `slippageBps`, `txVersion`
+
+**Note**: No referrer basis points for base-out (not yet implemented).
+
+## Transaction Endpoints
+
+### `POST /transaction/swap-base-in`
+Builds a transaction for a fixed input amount.
+
+**Required body**:
+- `wallet` – Your signing wallet address
+- `swapResponse` – The entire compute response object
+- `txVersion` – Transaction version
+- `computeUnitPriceMicroLamports` – Priority fee in micro-lamports
+
+**Optional**:
+- `wrapSol` – If true, wrap native SOL for input
+- `unwrapSol` – If true, unwrap WSOL to SOL in output
+- `inputAccount` – Token account for input (required if not wrapping SOL)
+- `outputAccount` – Token account for output
+- `nonceInfo` – Durable nonce for offline signing
+- `jitoInfo` – Jito MEV protection bundle params
+- `referrerWallet` – Referrer wallet for fee collection
+
+### `POST /transaction/swap-base-out`
+Builds a transaction for a fixed output amount.
+
+**Same parameters as base-in**, except:
+- `referrerInfo` field is currently commented out (not yet implemented)
+
+## Response Envelope
+
+All endpoints return a standard envelope:
+
+```json
+{
+  "id": "550e8400-e29b-41d4-a716-446655440000",
+  "success": true,
+  "version": "V1",
+  "data": { ... }
+}
+```
+
+On error, `success` is `false` and `msg` contains the error code (e.g., `REQ_WALLET_ERROR`, `REQ_SLIPPAGE_BPS_ERROR`).
+
+## Transaction Response Shape
+
+A successful transaction response looks like:
+
+```json
+{
+  "id": "...",
+  "success": true,
+  "version": "V1",
+  "data": {
+    "transaction": "AgABB...",  // Base64-encoded transaction
+    "addressLookupTableAddresses": ["Address1...", "Address2..."]  // For V0 only
+  }
+}
+```
+
+## Integration Example
+
+Here's a typical flow in pseudocode:
+
+```typescript
+// 1. Get quote
+const quote = await fetch(
+  'https://transaction-v1.raydium.io/compute/swap-base-in?' +
+  'inputMint=EPjF...&outputMint=So111...&amount=1000000&slippageBps=50&txVersion=V0'
+).then(r => r.json());
+
+// 2. Validate quote
+if (!quote.success) {
+  throw new Error(quote.msg);
+}
+
+// 3. Build transaction
+const tx = await fetch(
+  'https://transaction-v1.raydium.io/transaction/swap-base-in',
+  {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      wallet: userWalletAddress,
+      swapResponse: quote,
+      txVersion: 'V0',
+      computeUnitPriceMicroLamports: '1000',
+      inputAccount: userInputTokenAccount,
+      outputAccount: userOutputTokenAccount,
+    }),
+  }
+).then(r => r.json());
+
+// 4. Decode and sign
+const transaction = VersionedTransaction.deserialize(
+  Buffer.from(tx.data.transaction, 'base64')
+);
+transaction.sign([userKeypair]);
+
+// 5. Send via RPC
+const rpc = new Connection('https://api.mainnet-beta.solana.com');
+const sig = await rpc.sendTransaction(transaction);
+await rpc.confirmTransaction(sig);
+```
+
+## Key Parameters Explained
+
+### `txVersion`
+- **V0**: Modern Solana transaction with Address Lookup Tables (ALTs). Smaller serialization size, lower fees.
+- **LEGACY**: Pre-ALT transaction format. Larger, but works with all RPC endpoints.
+
+Choose **V0** when possible; fall back to **LEGACY** if your RPC or wallet does not support ALTs.
+
+### `computeUnitPriceMicroLamports`
+Priority fee for faster block inclusion. Set to `0` for no priority fee, or higher values (e.g., `1000`) to compete in congested networks. Units are micro-lamports per compute unit.
+
+### `slippageBps`
+Maximum slippage tolerance in basis points. `100` = 1%, `50` = 0.5%.
+- Use lower values (e.g., 25–50 bps) for most stable swaps
+- Increase for volatile or low-liquidity pairs
+
+### `wrapSol` and `unwrapSol`
+- **wrapSol**: If `true`, the API wraps your native SOL into WSOL. No `inputAccount` needed.
+- **unwrapSol**: If `true`, the API unwraps the output WSOL back to native SOL. No `outputAccount` needed.
+
+If both are `false`, you must provide explicit token accounts.
+
+## Network Endpoints
+
+| Network | Mainnet | Devnet |
+|---------|---------|--------|
+| Host    | `transaction-v1.raydium.io` | `transaction-v1-devnet.raydium.io` |
+| Protocol | HTTPS | HTTPS |
+
+## Error Codes
+
+Common error messages:
+
+| Code | Meaning |
+|------|---------|
+| `REQ_SLIPPAGE_BPS_ERROR` | Slippage is invalid or out of range |
+| `REQ_INPUT_MINT_ERROR` | Input mint address is invalid |
+| `REQ_OUTPUT_MINT_ERROR` | Output mint address is invalid |
+| `REQ_AMOUNT_ERROR` | Amount is not a valid number |
+| `REQ_TX_VERSION_ERROR` | txVersion must be V0 or LEGACY |
+| `REQ_WALLET_ERROR` | Wallet address is invalid |
+| `REQ_INPUT_ACCOUT_ERROR` | Input token account missing or invalid |
+| `REQ_OUTPUT_ACCOUT_ERROR` | Output token account missing or invalid |
+| `UNKNOWN_ERROR` | Server-side error; check your request parameters |
+
+## See Also
+
+- [OpenAPI Specification](/api-reference/openapi/route-api-v2.yaml)
+- [Aggregator Integration Guide](/integration-guides/aggregator)

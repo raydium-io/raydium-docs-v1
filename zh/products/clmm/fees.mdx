@@ -1,0 +1,266 @@
+---
+title: "CLMM 手续费与奖励"
+description: "CLMM 如何将交易手续费拆分给 LP、协议和基金；三槽位奖励系统如何向区间内头寸发放奖励；以及两者如何结算为每个头寸的余额。"
+---
+
+<Info>
+  **本页内容由 AI 自动翻译，所有内容以英文版本为准。**
+
+  [查看英文版 →](/products/clmm/fees)
+</Info>
+
+## 手续费档位
+
+CLMM 池在创建时会绑定一个 `AmmConfig`，该配置决定交易手续费率、协议份额和基金份额，以及**价格刻度间距**（参见 [`products/clmm/ticks-and-positions`](/zh/products/clmm/ticks-and-positions)）。以下是常见的公开档位（以实时 `GET https://api-v3.raydium.io/main/clmm-config` 为准）：
+
+| `AmmConfig` 索引 | `trade_fee_rate` | 刻度间距 | 典型用途 |
+|---|---|---|---|
+| 0 | `100`（0.01%） | 1 | 稳定币对 |
+| 1 | `500`（0.05%） | 10 | 相关性强的蓝筹币对 |
+| 2 | `2_500`（0.25%） | 60 | 标准币对 |
+| 3 | `10_000`（1.00%） | 120 | 高波动或长尾币对 |
+
+交易手续费率的单位是 `1/FEE_RATE_DENOMINATOR = 1/1_000_000` 的交易量。协议费率和基金费率使用相同的分母，但作用于**交易手续费**而非交易量——这与 CPMM 的约定一致。
+
+## 每笔 swap 的手续费拆分
+
+在 swap 的每个步骤中（参见 [`products/clmm/math`](/zh/products/clmm/math)）：
+
+```
+step_trade_fee   = ceil(step_input * trade_fee_rate / 1_000_000)
+step_protocol    = floor(step_trade_fee * protocol_fee_rate / 1_000_000)
+step_fund        = floor(step_trade_fee * fund_fee_rate     / 1_000_000)
+step_lp          = step_trade_fee - step_protocol - step_fund
+```
+
+- `step_lp` 流入 `fee_growth_global_{input_side}_x64`，并按当前活跃流动性缩放：`fee_growth_global += step_lp × 2^64 / pool.liquidity`。
+- `step_protocol` 计入 `PoolState.protocol_fees_token_{input_side}`，通过 `CollectProtocolFee` 提取。
+- `step_fund` 计入 `PoolState.fund_fees_token_{input_side}`，通过 `CollectFundFee` 提取。
+
+与 CPMM 相同，协议费和基金费虽存放在金库中，但**不计入曲线的流动性视图**：swap 数学计算读取的是 `pool.liquidity`，该值不受待提取手续费的影响。
+
+## 手续费按代币方向分配的原因
+
+在 CPMM 中，swap 手续费始终从输入代币扣除，另一侧不会产生协议/基金应计费。CLMM 在每个步骤中遵循相同规则：**手续费计入该步骤的输入代币**。由于多个刻度的 swap 方向一致，所有步骤均从同一代币扣费——因此实际上，任意一笔 swap 的手续费只流向*某一侧*。
+
+若用户将 token0 换成 token1，则 `fee_growth_global_0_x64` 上升，`fee_growth_global_1_x64` 不变。本次 swap 中头寸以 token0 获得手续费。下一笔 swap 可能方向相反，转而增加 `fee_growth_global_1_x64`。随着时间推移，均衡的池子两侧都会积累手续费。
+
+## 单侧手续费（`CollectFeeOn`）
+
+通过 [`CreateCustomizablePool`](/zh/products/clmm/instructions) 创建的池子可选择非默认的手续费收取模式。该模式在池子创建时固定，存储在 `PoolState.fee_on` 中。
+
+| `CollectFeeOn` 值 | `fee_on` 字节 | 行为 |
+|---|---|---|
+| `FromInput`（默认） | `0` | 经典 Uniswap-V3 模式——手续费始终从每个 swap 步骤的输入代币扣除，输入代币随 swap 方向交替。 |
+| `Token0Only` | `1` | 手续费始终以 token0 计价。对于 0→1 的 swap，手续费来自输入代币（与 `FromInput` 相同）；对于 1→0 的 swap，手续费从 swap 输出（token0）扣除。 |
+| `Token1Only` | `2` | 与 `Token0Only` 对称——手续费始终以 token1 计价。 |
+
+**为什么池子会选择 `Token0Only` 或 `Token1Only`**——目的是让 LP 获得单一、可预期的计价货币。对于 `MEMECOIN / USDC` 这类以美元计价的 LP，选择 `Token1Only`（手续费始终结算为 USDC）后，LP 的盈亏不再受交易方向占比的影响。代价是：当手续费从 swap 输出扣除时，用户收到的是 `out − fee` 而非从输入端扣除的近似原值，因此报价逻辑须从输出端减去手续费。SDK 的 `computeAmountOut` 已根据 `fee_on` 处理这一分支；直接读取 `pool.fee_on` 的客户端代码应参照 `PoolState` 上的辅助函数：
+
+```rust
+pool.is_fee_on_input(zero_for_one: bool) -> bool   // true → fee is deducted from input
+pool.is_fee_on_token0(zero_for_one: bool) -> bool  // for telemetry / accounting
+```
+
+**LP 层面的影响**——手续费仍通过标准的 `fee_growth_global_{0,1}_x64` 累加器按 swap 步骤路由，因此头寸仍使用相同的 `fee_growth_inside` 公式结算手续费。不对称性仅体现在*侧面应计方向*，而非数学计算本身。
+
+`fee_on` 在创建后**不可修改**。通过旧版 `CreatePool` 创建的池子永久为 `FromInput` 模式。
+
+## 动态手续费
+
+以 `enable_dynamic_fee = true` 创建的池子会在 `AmmConfig.trade_fee_rate` 基础上叠加一个基于波动率的附加费率。该机制是对 Trader Joe / Meteora 动态手续费设计的简化移植。
+
+### 状态
+
+`PoolState.dynamic_fee_info` 包含五个校准参数（池子创建时 `DynamicFeeConfig` 的快照）以及每次 swap 更新的四个状态字段。字节布局参见 [`products/clmm/accounts`](/zh/products/clmm/accounts#dynamicfeeconfig-and-dynamicfeeinfo)。
+
+### 每笔 swap 的更新
+
+每个 swap 步骤程序依次执行三个子步骤：
+
+1. **衰减参考值**。若 `now - last_update_timestamp > filter_period`，波动率参考值衰减：
+
+    ```
+    if elapsed > decay_period:
+        volatility_reference = 0
+    elif elapsed > filter_period:
+        volatility_reference = volatility_accumulator * reduction_factor / 10_000
+    # else: hold the previous reference
+    ```
+
+2. **更新累加器**。新的累加器等于参考值加上已遍历的绝对距离（以 `tick_spacing` 为单位）乘以粒度缩放系数，并不超过配置的最大值：
+
+    ```
+    delta_idx     = abs(tick_spacing_index_reference - current_tick_spacing_index)
+    accumulator   = volatility_reference + delta_idx * 10_000   // VOLATILITY_ACCUMULATOR_SCALE
+    accumulator   = min(accumulator, max_volatility_accumulator)
+    ```
+
+3. **计算附加费率**。附加费率关于累加器呈抛物线形（因为 swap 的"刻度距离"在标准公式中被平方），并通过 `dynamic_fee_control` 进行增益缩放：
+
+    ```
+    fee_increment_rate = dynamic_fee_control * (accumulator * tick_spacing)^2
+                       / (100_000 * 10_000^2)
+    fee_rate           = AmmConfig.trade_fee_rate + fee_increment_rate
+    fee_rate           = min(fee_rate, 100_000)              // 10% cap
+    ```
+
+10% 上限（`1e6` 单位下 `MAX_FEE_RATE_NUMERATOR = 100_000`）为硬编码安全限制；在实践中，调优后的配置通常远低于此上限。
+
+### 参数选择
+
+以下是在试点池中有效的默认范围：
+
+| 参数 | 典型范围 | 说明 |
+|---|---|---|
+| `filter_period` | 30 – 60 秒 | 在微波动期间保持参考值；值越小响应越灵敏 |
+| `decay_period` | 300 – 1800 秒 | 平静窗口结束后，手续费回归基准 |
+| `reduction_factor` | 4_000 – 8_000 | 基于 `10_000`，值越高则高位手续费越难回落 |
+| `dynamic_fee_control` | 1_000 – 50_000 | 基于 `100_000`，曲线增益系数 |
+| `max_volatility_accumulator` | 100_000 – 10_000_000 | 附加费率的饱和上限 |
+
+建议将历史 swap 数据代入公式进行离线回放，再调整 `dynamic_fee_control`，使平均手续费符合目标（例如，1σ 行情日为基准的 1.5 倍，3σ 行情日为 5 倍）。
+
+### LP 所见
+
+动态手续费收入与基础手续费流经相同的累加器——`fee_growth_global_{0,1}_x64`，不存在单独的"动态手续费增长"字段。高波动池中的 LP 在波动期间自然获得更高手续费，无需额外的领取或结算指令。
+
+### 集成方须知
+
+- 即使池子储备未发生变化，某笔报价在区块 N 与区块 N+1 之间也可能发生变化——每笔 swap 都会改变波动率累加器。Trade API 的报价在报价区块时有效；若在报价与执行之间有响应型池子被触发，实际费率可能偏差数个 bps。
+- `volatility_accumulator` 和 `last_update_timestamp` 是链上公开数据，客户端可在离线模拟中直接复现该公式。
+
+## 每个头寸的手续费记账
+
+每个头寸在最后一次被触碰时存储：
+
+- `fee_growth_inside_0_last_x64` 和 `fee_growth_inside_1_last_x64`——该快照时刻的区间特定手续费增长值。
+
+此后每次被触碰（`IncreaseLiquidity`、`DecreaseLiquidity`，以及任何更新刻度边界手续费增长的状态转换）时：
+
+1. 程序从**全局**手续费增长和两个端点刻度的 `fee_growth_outside_*` 重新计算 `fee_growth_inside_{0,1}_x64`。
+2. Δ 按头寸流动性权重累加至 `tokens_fees_owed_{0,1}`：
+
+   ```
+   Δ_fee_growth_inside_0 = fee_growth_inside_now_0 - fee_growth_inside_last_0
+   tokens_fees_owed_0  += Δ_fee_growth_inside_0 * position.liquidity / 2^64
+   ```
+
+3. `fee_growth_inside_{0,1}_last_x64` 更新。
+
+代币实际转移仅发生在 `DecreaseLiquidity` 或专用的 `CollectFees` 路径（在 Raydium 当前的指令集中，手续费作为 `DecreaseLiquidity` 的一部分被提取）。在 `DecreaseLiquidity` 调用中将 `liquidity = 0` 是"仅收集手续费"的标准写法。
+
+### 区间外头寸不获得手续费
+
+若头寸区间不包含 `tick_current`，则为其计算的 `fee_growth_inside` 受到**上界约束**，价格在区间外时不会增长。该头寸停止累积手续费，直到价格重新回到其区间。这是设计特性而非缺陷——正是集中流动性将*手续费收益*与资本同步集中的方式。
+
+## 奖励流
+
+一个 CLMM 池最多可同时运行**三个**奖励流。每个奖励流是一个（奖励 mint、发放速率、开始时间、结束时间）的元组，存储在 `PoolState.reward_infos[i]` 中。
+
+```rust
+pub struct RewardInfo {
+    pub reward_state: u8,               // Uninitialized | Initialized | Open | Ended
+    pub open_time: u64,
+    pub end_time: u64,
+    pub last_update_time: u64,
+    pub emissions_per_second_x64: u128, // Q64.64 reward tokens per second
+    pub reward_total_emissioned: u64,
+    pub reward_claimed: u64,
+    pub token_mint:    Pubkey,
+    pub token_vault:   Pubkey,
+    pub authority:     Pubkey,           // who can SetRewardParams / fund
+    pub reward_growth_global_x64: u128,  // accumulator, Q64.64
+}
+```
+
+### 结算循环
+
+每条涉及流动性的指令（以及作为独立指令的 `UpdateRewardInfos`）都会将所有活跃奖励流推进到 `now`：
+
+```
+for each reward_info with state in {Open, Ended within grace}:
+    elapsed         = min(now, end_time) − last_update_time
+    if elapsed > 0 && pool.liquidity > 0:
+        reward_growth_global_x64 += emissions_per_second_x64 × elapsed × 2^64 / pool.liquidity
+        reward_total_emissioned  += emissions_per_second × elapsed
+    last_update_time = min(now, end_time)
+```
+
+若某段时间内 `pool.liquidity == 0`，该区间内的奖励发放将被**跳过**（无区间内流动性可分配）。剩余预算留在奖励金库中。协议方可通过 `SetRewardParams` 追加资金或结束奖励流。
+
+### 每个头寸的奖励应计
+
+与手续费完全一致，额外增加每个奖励流的维度：
+
+```
+for each stream i:
+    reward_growth_inside_now_i   = compute_inside_i(pool, tick_lower, tick_upper)
+    Δ_i = reward_growth_inside_now_i - personal_position.reward_infos[i].growth_inside_last_x64
+    personal_position.reward_infos[i].reward_amount_owed += Δ_i * personal_position.liquidity / 2^64
+    personal_position.reward_infos[i].growth_inside_last_x64 = reward_growth_inside_now_i
+```
+
+用户通过 `CollectReward` 领取奖励，该指令将 `reward_amount_owed` 从奖励流金库转至用户账户并将计数器清零。
+
+### 只有区间内头寸获得奖励
+
+`reward_growth_inside` 与 `fee_growth_inside` 使用相同的公式——通过刻度外部累加器计算——因此当前价格区间外的头寸不会累积奖励。这与 Uniswap v3"激励归于活跃流动性"的设计理念一致，也将 LP 利益与现货价格覆盖范围对齐。
+
+### 资金注入与结束奖励流
+
+奖励流通过 `InitializeReward` 创建，该指令会预先将总预算（`emissions_per_second × (end_time − open_time)`）存入奖励金库。若资金方余额不足，程序会拒绝执行 `InitializeReward`。`SetRewardParams` 可延长 `end_time` 或提高发放速率；缩减上述任一参数的操作会被阻止，以防止对已承诺给 LP 的奖励进行撤销。
+
+当 `now > end_time` 时，奖励流进入 `Ended` 状态，但其 `reward_growth_global_x64` 仍可被读取——LP 在发放结束很久后仍可通过 `CollectReward` 提取历史已赚取的奖励。
+
+## 管理员收取手续费
+
+| 签名方 | 指令 | 效果 |
+|--------|-------------|--------|
+| `amm_config.owner` | `CollectProtocolFee` | 将 `protocol_fees_token_{0,1}` 转至指定接收方。 |
+| `amm_config.fund_owner` | `CollectFundFee` | 将 `fund_fees_token_{0,1}` 转至指定接收方。 |
+
+两者均不影响曲线——已应计金额本就在 `pool.liquidity` 之外。关于主网上这些签名方的持有者，参见 [`security/admin-and-multisig`](/zh/security/admin-and-multisig)。
+
+## Token-2022 交互
+
+手续费和奖励均以池子或奖励流中某一代币计价。Token-2022 扩展的行为与 CPMM 中相同：
+
+- **swap 输入 mint 的转账费。** 池子收到 `amount_in − mint_transfer_fee`。CLMM 程序的步骤输入按净额计算，因此池子的手续费累加器反映的是实际入库代币。
+- **swap 输出 mint 的转账费。** 池子发出 `amount_out`，用户收到 `amount_out − mint_transfer_fee`。滑点检查应基于用户实际收到的金额。
+- **奖励 mint 的转账费。** 在 `InitializeReward` 时，奖励以"入库"单位计价（资金方支付 mint 转账费存入金库）。在 `CollectReward` 时还会再次产生 mint 转账费；LP 应预计转账费奖励代币会有一定折扣。
+- **不可转让 / 机密 / 群组成员 mint。** 在 `CreatePool` / `InitializeReward` 时会被拒绝。
+
+对于多跳含转账费的 swap，综合影响可能相当显著。忽略此影响的报价器会高估输出；参见 [`algorithms/token-2022-transfer-fees`](/zh/algorithms/token-2022-transfer-fees) 了解参考计算方法。
+
+## 链下读取手续费与奖励
+
+```ts
+const pool = await raydium.clmm.getPoolInfoFromRpc(poolId);
+const position = await raydium.clmm.getOwnerPositionInfo({
+  wallet: owner.publicKey,
+});
+
+for (const p of position) {
+  console.log("Position", p.nftMint.toBase58(),
+              "range", p.tickLower, "→", p.tickUpper,
+              "L", p.liquidity.toString(),
+              "fees owed:", p.tokenFeesOwed0.toString(),
+              p.tokenFeesOwed1.toString(),
+              "rewards owed:", p.rewardInfos.map(r => r.rewardAmountOwed.toString()));
+}
+```
+
+`tokenFeesOwed*` 和 `rewardAmountOwed` 是头寸最后一次被触碰时的快照。若要查看**当前**值（包含此后的增长），可以在模拟中以零流动性调用 `IncreaseLiquidity`，或直接使用全局 `fee_growth_*` 及两个刻度外部快照重新计算。
+
+## 延伸阅读
+
+- [`products/clmm/math`](/zh/products/clmm/math) — `fee_growth_inside` 的完整推导。
+- [`products/clmm/instructions`](/zh/products/clmm/instructions) — `CollectReward`、`InitializeReward`、`SetRewardParams` 的账户列表。
+- [`algorithms/token-2022-transfer-fees`](/zh/algorithms/token-2022-transfer-fees) — 含转账费 mint 的报价方法。
+- [`reference/fee-comparison`](/zh/reference/fee-comparison) — CLMM/CPMM/AMM-v4 手续费矩阵对比。
+
+参考资料：
+
+- [`raydium-io/raydium-clmm` — `states/pool.rs`, `libraries/fixed_point_64.rs`](https://github.com/raydium-io/raydium-clmm)
+- "Uniswap v3 Core" 白皮书，§7（手续费增长）

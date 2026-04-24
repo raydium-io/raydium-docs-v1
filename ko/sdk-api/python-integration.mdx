@@ -1,0 +1,268 @@
+---
+title: "Python 통합"
+description: "solders, solana-py, anchorpy를 통한 Raydium 연동 봇 및 백엔드 구축 — 환경 설정, 풀 상태 읽기, 스왑 전송, 전형적인 봇 아키텍처."
+---
+
+<Info>
+  **이 페이지는 AI 자동 번역입니다. 모든 내용은 영문판을 기준으로 합니다.**
+
+  [영문판 보기 →](/sdk-api/python-integration)
+</Info>
+
+<Info>
+  Raydium은 공식 Python SDK를 발행하지 않습니다. 여기서 제시하는 패턴은 세 가지 잘 관리되는 커뮤니티 라이브러리를 조합합니다: **`solders`** (Rust 바인딩 Solana 기초), **`solana-py`** (RPC 클라이언트), **`anchorpy`** (IDL로부터 생성된 Anchor 스타일 명령 빌더). 이 조합은 TS SDK가 제공하는 모든 기능을 커버하지만, 다듬어지지는 않았습니다.
+</Info>
+
+## 환경
+
+```bash
+python -m venv .venv
+source .venv/bin/activate
+
+pip install solders solana anchorpy construct base58
+```
+
+현재 기준으로 호환되는 버전:
+
+```
+solders == 0.21.*
+solana  == 0.34.*
+anchorpy == 0.20.*
+```
+
+`anchorpy`는 주기적으로 `anchor-lang` 버전을 따라갑니다. 최근 배포된 Raydium 프로그램의 경우, 고정한 `anchorpy` 버전에서 IDL이 컴파일되는지 확인하고 커밋하세요.
+
+## 연결 및 키페어
+
+```python
+from solana.rpc.async_api import AsyncClient
+from solders.keypair import Keypair
+
+client = AsyncClient("https://api.mainnet-beta.solana.com", commitment="confirmed")
+owner  = Keypair.from_bytes(bytes(open("keypair.json", "rb").read()))
+```
+
+`AsyncClient`는 `async` 변형이고, 동기식 `Client`도 빠른 스크립트에 사용할 수 있지만 여러 요청을 보내는 경우 async가 선호됩니다.
+
+## 풀 상태 읽기
+
+대부분의 프로덕션 사용은 온체인 데이터를 수동으로 디코딩하는 대신 Raydium의 REST API에서 디코딩된 풀 상태를 읽습니다 ([`sdk-api/rest-api`](/ko/sdk-api/rest-api) 참조) — 더 간단하고 대부분의 사용 사례에서 레이턴시가 허용됩니다.
+
+```python
+import httpx
+
+async def get_pool(pool_id: str) -> dict:
+    async with httpx.AsyncClient() as http:
+        r = await http.get(
+            "https://api-v3.raydium.io/pools/info/ids",
+            params={"ids": pool_id},
+        )
+        r.raise_for_status()
+        data = r.json()
+        if not data["success"]:
+            raise RuntimeError(data["error"]["message"])
+        return data["data"][0]
+
+pool = await get_pool("58oQChx4yWmvKdwLLZzBi4ChoCc2fqCUWBkwMihLYQo2")
+print(pool["price"], pool["day"]["volume"])
+```
+
+가장 낮은 레이턴시가 필요한 봇의 경우 온체인 바이트를 직접 디코딩하세요:
+
+```python
+from construct import Struct, Int64ul, Int128ul, Bytes, this
+
+# 부분 CPMM PoolState 레이아웃 (처음 몇 필드)
+POOL_STATE_LAYOUT = Struct(
+    "discriminator"     / Bytes(8),
+    "amm_config"        / Bytes(32),
+    "pool_creator"      / Bytes(32),
+    "token_0_vault"     / Bytes(32),
+    "token_1_vault"     / Bytes(32),
+    "lp_mint"           / Bytes(32),
+    "token_0_mint"      / Bytes(32),
+    "token_1_mint"      / Bytes(32),
+    # ...
+)
+
+from solders.pubkey import Pubkey
+
+async def decode_pool(pool_id: Pubkey) -> dict:
+    resp = await client.get_account_info(pool_id)
+    data = resp.value.data
+    return POOL_STATE_LAYOUT.parse(data)
+```
+
+전체 레이아웃은 `src/raydium/cpmm/layout.ts` (TS 소스)에 있으며, 필요에 따라 `construct`로 포팅하세요. `anchorpy`는 IDL이 주어졌을 때 이를 자동으로 수행할 수 있습니다 — 아래를 참조하세요.
+
+## 스왑 빌드 및 전송
+
+간단함을 위해 Raydium의 **server-built-transaction** 엔드포인트를 사용하세요. 서버가 서명 가능한 트랜잭션을 반환하므로 서명만 추가하면 됩니다:
+
+```python
+import httpx
+import base64
+from solders.transaction import VersionedTransaction
+from solana.rpc.types import TxOpts
+
+async def swap(pool_id: str, amount_in: int, slippage_bps: int):
+    async with httpx.AsyncClient() as http:
+        r = await http.get(
+            "https://api-v3.raydium.io/transaction/swap-base-in",
+            params={
+                "poolId":       pool_id,
+                "amount":       amount_in,
+                "inputMint":    "So11111111111111111111111111111111111111112",  # WSOL
+                "outputMint":   "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",  # USDC
+                "slippageBps":  slippage_bps,
+                "wallet":       str(owner.pubkey()),
+                "txVersion":    "V0",
+                "computeUnitPriceMicroLamports": 50_000,
+            },
+        )
+        r.raise_for_status()
+        data = r.json()["data"]
+
+    # 미리 빌드된 tx를 디코딩하고, 우리 키페어로 서명하고, 전송합니다.
+    raw  = base64.b64decode(data["tx"]["transaction"])
+    tx   = VersionedTransaction.from_bytes(raw)
+    tx.sign([owner])
+
+    sig = await client.send_transaction(tx, opts=TxOpts(skip_preflight=False))
+    await client.confirm_transaction(sig.value, commitment="confirmed")
+    return sig.value, data["swapResponse"]
+```
+
+이것이 작동하는 봇에 도달하는 가장 빠른 경로입니다. 서버 견적은 빠르게 만료되므로 (≈30초), 캐시하지 마세요.
+
+## 클라이언트 측 스왑 빌드 (via `anchorpy`)
+
+더 낮은 레이턴시 또는 Raydium API에 도달할 수 없는 경우 (제재 지역, 폐쇄 네트워크):
+
+```python
+from anchorpy import Program, Provider, Wallet, Context
+from solana.rpc.async_api import AsyncClient
+from solders.pubkey import Pubkey
+import json
+
+idl = json.load(open("cpmm.json"))  # raydium-sdk-v2에서
+provider = Provider(client, Wallet(owner))
+program  = Program(idl, Pubkey.from_string(CPMM_PROGRAM_ID), provider)
+
+# swap_base_input 호출:
+tx_sig = await program.rpc["swap_base_input"](
+    amount_in,
+    minimum_amount_out,
+    ctx=Context(
+        accounts={
+            "payer":                owner.pubkey(),
+            "authority":            owner.pubkey(),
+            "amm_config":           amm_config_pk,
+            "pool_state":           pool_state_pk,
+            "input_token_account":  user_input_ata,
+            "output_token_account": user_output_ata,
+            "input_vault":          input_vault_pk,
+            "output_vault":         output_vault_pk,
+            "input_token_program":  TOKEN_PROGRAM_ID,
+            "output_token_program": TOKEN_PROGRAM_ID,
+            "input_token_mint":     input_mint,
+            "output_token_mint":    output_mint,
+            "observation_state":    observation_state_pk,
+        },
+    ),
+)
+```
+
+PDA 유도 (observation state, pool authority)는 CPMM 장에서와 동일한 공식을 따릅니다. `anchorpy`는 자동 유도를 하지 않습니다.
+
+## 전형적인 봇 아키텍처
+
+일반적인 Python Raydium 봇 구조:
+
+```
+┌──────────────────┐
+│ Scheduler        │  cron / asyncio / redis queue
+└──────────┬───────┘
+           │
+           ▼
+┌──────────────────┐
+│ Price poller     │  httpx + Raydium REST API
+│  (per pool)      │  또는 WebSocket RPC sub
+└──────────┬───────┘
+           │ 이벤트
+           ▼
+┌──────────────────┐
+│ Strategy engine  │  신호 계산, 거래 파라미터 결정
+└──────────┬───────┘
+           │ 거래 파라미터
+           ▼
+┌──────────────────┐
+│ TX builder       │  Raydium REST server-built-tx 또는 anchorpy
+│ + signer         │  solders.Keypair
+└──────────┬───────┘
+           │ VersionedTransaction
+           ▼
+┌──────────────────┐
+│ RPC sender       │  solana-py AsyncClient + Jito RPC
+│ (retry + monitor)│  priority-fee 로직
+└──────────┬───────┘
+           │ sig
+           ▼
+┌──────────────────┐
+│ Ledger store     │  위치, 대기 중인 tx, PnL을 위한 Postgres
+└──────────────────┘
+```
+
+프로덕션을 위한 주요 결정:
+
+- **RPC 제공자.** 공개 mainnet RPC는 적극적으로 요청 제한을 합니다. 지속적인 트래픽을 위해 전담 제공자 (Helius, QuickNode, Triton)를 사용하세요.
+- **풀 상태를 위한 WebSocket.** `client.account_subscribe(pool_id)`는 모든 상태 변화에서 업데이트를 푸시합니다. 폴링보다 훨씬 더 타이트합니다.
+- **Priority fee 제공자.** Helius는 `getPriorityFeeEstimate` 엔드포인트를 가지고 있고, Triton은 자신의 것을 가지고 있습니다. 대상 프로그램의 최근 수수료의 75번째 백분위수를 기반으로 수수료 크기를 조정하세요.
+- **MEV 민감 거래를 위한 번들.** 샌드위치 위험을 견딜 수 없다면 Jito의 블록 엔진을 통해 라우팅하세요. Python 라이브러리: `jito-sdk-python` (서드파티, 품질은 다양).
+
+## 팜 상태 읽기
+
+```python
+FARM_V6_ID = Pubkey.from_string("...")
+
+async def get_farm_v6(farm_id: Pubkey):
+    resp = await client.get_account_info(farm_id)
+    return farm_v6_idl_program.account["FarmState"].decode(resp.value.data)
+
+farm = await get_farm_v6(farm_id)
+print(farm.total_staked, farm.reward_info_count)
+for r in farm.reward_infos[:farm.reward_info_count]:
+    print(r.reward_mint, r.emission_per_second_x64)
+```
+
+`anchorpy`의 `.account["X"].decode(bytes)`는 IDL 구조체와 일치하는 네이티브 Python 객체를 제공합니다.
+
+## 함정
+
+### 1. 소수점 처리
+
+Python의 기본 `float`은 IEEE-754 배정도이며, 9진법 민트의 금액 (1 SOL = 1e9 단위)은 정확하게 유지되지만 비율과 곱은 정밀도를 잃습니다. 모든 금액 필드에 `int` (`solders`는 `int`를 반환)를 사용하고 가격 산술을 위해 `decimal.Decimal`을 통해 라우팅하세요.
+
+### 2. 슬롯 기반 대 타임스탬프 기반 추론
+
+일부 팜 버전은 슬롯 카운터를 사용하고, LaunchLab은 타임스탬프를 사용합니다. `solana-py`는 RPC 응답에서 `slot`을 반환하지만, 슬롯 → 타임스탐프 변환은 손실적입니다 (리더 스케줄에 따라 다름). 벽시계 시간이 필요하면 `get_block_time(slot)`을 명시적으로 호출하세요.
+
+### 3. 연결 풀 고갈
+
+`AsyncClient`는 기본적으로 요청당 하나의 HTTP 연결을 엽니다. 높은 부하에서는 `httpx.AsyncClient` 세션을 재사용하고 적절한 `limits=httpx.Limits(max_connections=100)`을 설정하세요.
+
+### 4. 트랜잭션 크기 제한
+
+Python으로 빌드된 트랜잭션은 TS로 빌드된 것보다 작지 않습니다 — 1232바이트 제한이 동등하게 적용됩니다. 약 2개 이상의 풀을 통해 라우팅되는 것에는 V0 트랜잭션 (주소 조회 테이블)을 사용하세요.
+
+## 포인터
+
+- [`sdk-api/rest-api`](/ko/sdk-api/rest-api) — 위에서 사용한 HTTP 엔드포인트.
+- [`sdk-api/anchor-idl`](/ko/sdk-api/anchor-idl) — `anchorpy`를 위한 IDL을 얻을 수 있는 곳.
+- [`integration-guides/routing-and-mev`](/ko/integration-guides/routing-and-mev) — Jito 번들 패턴.
+
+출처:
+
+- [solders](https://github.com/kevinheavey/solders)
+- [solana-py](https://github.com/michaelhly/solana-py)
+- [anchorpy](https://github.com/kevinheavey/anchorpy)

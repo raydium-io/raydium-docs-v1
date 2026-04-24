@@ -1,0 +1,150 @@
+---
+title: "LaunchLab 概覽"
+description: "Raydium 的聯合曲線啟動場地如何端到端運作：針對確定性曲線的前畢業交易、觸發畢業的融資門檻，以及自動遷移到標準 CPMM 池。"
+---
+
+<Info>
+  **本頁內容由 AI 自動翻譯，所有內容以英文版本為準。**
+
+  [查看英文版 →](/products/launchlab/overview)
+</Info>
+
+## LaunchLab 解決的問題
+
+在 LaunchLab 推出之前，在 Raydium 上啟動新代幣需要創建者預先向 AMM 池注入配對的雙方流動性，這意味著團隊必須自掏腰包提供報價方流動性（SOL 或 USDC）。這類做法偏向資金充裕的項目，並將啟動板機制的准入門檻設在初始資本上。
+
+LaunchLab 用**聯合曲線**取代了這個開場步驟：代幣部署時綁定一條以報價幣種（通常是 SOL 或 USDC）定價的曲線。買家向曲線發送報價幣，程序根據曲線公式與當前供應量確定的價格，自動鑄造或釋放基礎代幣單位。不需要預先注入流動性。
+
+一旦曲線累積足夠的報價幣來匹配真實 AMM 池的流動性公式，它就**畢業**：程序在主網上使用曲線的基礎儲備和報價儲備創建一個 CPMM 池，從那時起交易轉移到 AMM。
+
+## 生命週期
+
+```
+             ┌───────────────────────┐
+creator  ──▶ │  Initialize (Launch)  │   ▸ mints the base token, funds the curve vaults,
+             │                        │     sets curve params and graduation threshold
+             └───────────┬────────────┘
+                         │
+                         ▼
+             ┌───────────────────────┐       repeated N times
+             │   Buy  /  Sell        │ ◀─── traders interact with the curve
+             └───────────┬────────────┘
+                         │ curve quote_reserve
+                         │ crosses threshold
+                         ▼
+             ┌───────────────────────┐   ▸ snapshots curve state
+             │      Graduate         │   ▸ deploys CPMM pool seeded with curve reserves
+             │                        │   ▸ locks / burns remaining base supply per policy
+             └───────────┬────────────┘
+                         │
+                         ▼
+             ┌───────────────────────┐
+             │   CPMM pool live      │   ▸ standard CPMM behavior going forward
+             └───────────────────────┘
+```
+
+每次啟動都恰好按照這個序列進行一遍。`Buy` 和 `Sell` 是中間階段唯一可由用戶調用的指令；`Graduate` 是無須權限的（任何人都可在閾值被突破後調用），但實際上 SDK 會在跨越閾值的交易內自動調用它。
+
+## 兩個固定角色
+
+LaunchLab 狀態有兩個特殊賬戶：
+
+- **基礎幣種** — 正在啟動的代幣。其鑄造權由 LaunchLab 程序持有，直到畢業；畢業後被撤銷。
+- **報價幣種** — 抵押物。始終是主流幣種（SOL / USDC / RAY）。啟動配置在 `Initialize` 時選擇一個；之後無法更改。
+
+以及兩個金庫：
+
+- **`base_vault`** — 存放已預先鑄造到曲線但尚未售出的基礎代幣供應量。隨著用戶購買而減少。
+- **`quote_vault`** — 積累買家支付的報價幣。隨著用戶購買而增加。這個餘額用來對比畢業閾值。
+
+## 定價模型
+
+LaunchLab 支持多種曲線公式（見 [`bonding-curve`](/zh-Hant/products/launchlab/bonding-curve)）。最常見的是**二次**聯合曲線，類似於 Pump.fun / Curve.fi / Bancor 系統：
+
+```
+price(s) = k × (s / S_max)²     (or similar — exact formula is curve-config dependent)
+```
+
+其中 `s` 是已售予用戶的基礎代幣數量，`S_max` 是曲線的最大供應量。每次買入時價格單調上升，每次賣出時下降。因為程序精確計算 AMM 綜合成本，任何大小的買入都返回正確的綜合數量；除了曲線固有的凸性外，沒有逐筆交易的滑點。
+
+## 畢業
+
+當 `quote_vault.balance ≥ graduation_threshold` 時，啟動畢業。閾值在 `Initialize` 時設置，通常選擇使畢業時曲線的隱含價格與 AMM 池以收集的儲備開盤的價格相符。具體來說：
+
+```
+threshold ≈ S_graduate × price(S_graduate) × f
+```
+
+其中 `S_graduate` 是已售出的基礎代幣數量，`price(S_graduate)` 是曲線在該點的邊際價格，`f` 是用來說明費用線的小係數（1–2%）。
+
+在畢業時：
+
+1. 程序對 `(base_vault_remaining, quote_vault)` 進行快照。
+2. 它使用這兩個儲備調用 CPMM `CreatePool` CPI，將初始 LP 鑄造給程序持有的權限（通常根據政策被燒毀/鎖定）。
+3. 它撤銷基礎幣種的鑄造權（以防止任何人再鑄造基礎代幣）。
+4. `LaunchState.status` 翻轉為 `Graduated`。
+
+畢業後，`Buy` 和 `Sell` 被拒絕。交易繼續在生成的 CPMM 池上進行，該池與任何其他 Raydium CPMM 池沒有區別。
+
+## 費用
+
+在曲線階段，每次 `Buy` 和 `Sell` 都會產生費用，分配給：
+
+- **曲線 LP 方** — 增加曲線的隱含 `k`，這對後來的買家有利（更低價格）。
+- **協議** — 計入 LaunchLab 管理員，通過 `CollectFees` 收集。
+- **創建者** — 可選，在 `Initialize` 時可配置。某些啟動將一部分分配給創建者作為持續的收入流。
+
+默認費率記錄在 [`bonding-curve`](/zh-Hant/products/launchlab/bonding-curve)。確切的分配存儲在 `LaunchState.fees` 上，每次啟動可能不同。
+
+畢業後的費用遵循池創建時使用的 CPMM 配置（通常是 `AmmConfig[0]`，0.25% 級別）。
+
+## 畢業後誰持有 LP？
+
+LaunchLab 支持多種畢業後 LP 政策：
+
+- **燒毀** — LP 鑄造到死地址。池變為永久性；任何人都無法移除流動性。
+- **鎖定** — LP 鑄造到時間鎖定的託管，在歸屬期後釋放給創建者。
+- **創建者立即接收** — 僅用於許可啟動。
+
+政策在 `Initialize` 時設置，之後無法更改。大多數開放式啟動使用**燒毀** — 一旦池存在，其流動性就永遠存在。
+
+## 重要的不變量
+
+- **基礎幣種在畢業後沒有通脹。** 其 `mint_authority` 被撤銷；`freeze_authority` 從未設置。
+- **通過 `initialize_with_token_2022` 支持 Token-2022。** 標準的 `Initialize` / `InitializeV2` 創建 SPL Token 啟動；專用的 `InitializeWithToken2022` 指令創建基礎幣種是 Token-2022 的啟動（可選 `TransferFeeConfig`）。Token-2022 啟動必須畢業到 CPMM 池 — 它們不能畢業到 AMM v4，後者僅支持 SPL Token。
+- **曲線狀態在一個方向上單調。** `base_sold` 在 Buy 時僅上升，`quote_vault` 在 Buy 時僅上升（在 Sell 時下降 — 對稱地降低 `base_sold`）。程序永遠不會讓曲線進入負數。
+- **畢業是單向門。** 即使畢業後的交易將 AMM 池價格推回到畢業價格以下，啟動也不會恢復到曲線。
+
+## 何時使用 LaunchLab
+
+<Note>
+  本頁僅描述協議機制。本頁內容不構成財務、法律或投資建議。代幣啟動具有重大財務風險。在啟動涉及公開融資的代幣之前，請咨詢相應的專業人士。
+</Note>
+
+- 你正在啟動一個沒有現有市場的新代幣。
+- 你希望市場確定開盤 CPMM 價格，而不是預先聲明它。
+- 你想允許任何人（包括團隊本身）以相同的曲線確定的價格買入，而不是以折扣價預分配給內部人士。
+
+**不要**在以下情況使用 LaunchLab：
+
+- 現有的、市場已確立的代幣（直接在 CPMM 上使用 `CreatePool`）。
+- 你需要對開盤 AMM 價格有精確控制的啟動（你可以通過謹慎的曲線配置來逼近它，但該機制仍是曲線驅動的）。
+- 需要 LaunchLab 不允許列表的 Token-2022 擴展的代幣（啟動程序即使在 Token-2022 路徑上也拒絕 `TransferHook` 和 `PermanentDelegate` 等擴展）。
+
+## 章節內容
+
+- [`bonding-curve`](/zh-Hant/products/launchlab/bonding-curve) — 曲線公式、成本和收益數學、畢業閾值推導。
+- [`accounts`](/zh-Hant/products/launchlab/accounts) — `LaunchConfig`、`LaunchState`、金庫、權限 PDA。
+- [`instructions`](/zh-Hant/products/launchlab/instructions) — `Initialize`、`Buy`、`Sell`、`Graduate`、`CollectFees`、`SetParams`。
+- [`code-demos`](/zh-Hant/products/launchlab/code-demos) — 端到端 TypeScript 示例。
+
+## 後續步驟
+
+- [`products/cpmm/overview`](/zh-Hant/products/cpmm/overview) — 啟動畢業後的情況。
+- [`user-flows/create-cpmm-pool`](/zh-Hant/user-flows/create-cpmm-pool) — 不需要曲線的代幣的替代路徑。
+- [`reference/program-addresses`](/zh-Hant/reference/program-addresses) — LaunchLab 程序 ID。
+
+來源：
+
+- [Raydium SDK v2 `LaunchLab` 模塊](https://github.com/raydium-io/raydium-sdk-V2)（IDL 位於 `src/raydium/launchpad/`）。
+- LaunchLab 程序源代碼目前不作為獨立倉庫發布。上述 SDK 中包含的 IDL 是規範接口。

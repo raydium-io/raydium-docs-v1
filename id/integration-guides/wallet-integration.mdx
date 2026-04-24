@@ -1,0 +1,213 @@
+---
+title: "Integrasi dompet"
+description: "Menampilkan posisi Raydium, saham pool, taruhan farm, dan reward tertunda di UI dompet — pola deteksi, simulasi untuk pratinjau transaksi, dan spesifik tampilan Token-2022."
+---
+
+<Info>
+  **Halaman ini diterjemahkan secara otomatis oleh AI. Versi bahasa Inggris adalah acuan resmi.**
+
+  [Lihat versi bahasa Inggris →](/integration-guides/wallet-integration)
+</Info>
+
+<Info>
+  Dompet yang mengintegrasikan Raydium biasanya perlu menjawab empat pertanyaan per pengguna: pool mana yang memiliki LP pengguna ini? posisi apa (NFT CLMM) yang mereka pegang? farm mana yang mereka stake? berapa nilai semuanya? Halaman ini mendokumentasikan semuanya.
+</Info>
+
+## Mendeteksi posisi Raydium
+
+### LP token klasik (CPMM, AMM v4)
+
+Token ini terlihat seperti SPL Token lainnya: ATA pengguna memiliki saldo. Dompet menampilkan ini sebagai token biasa secara default. Untuk mengungkapnya sebagai posisi Raydium:
+
+1. Enumerasi akun token pengguna: `connection.getParsedTokenAccountsByOwner(user, { programId: TOKEN_PROGRAM_ID })`.
+2. Untuk setiap mint, periksa daftar mint Raydium: `GET https://api-v3.raydium.io/pools/info/lps?lps=<LP_MINT>,...` (batch hingga ~50 LP mint per panggilan).
+3. Untuk mint yang cocok, API mengembalikan referensi pool. Gunakan untuk menghitung nilai posisi yang denomin dalam token:
+
+```
+token_a_owned = user_lp_balance * poolReserves.A / lpMint.supply
+token_b_owned = user_lp_balance * poolReserves.B / lpMint.supply
+usd_value     = token_a_owned * priceA_usd + token_b_owned * priceB_usd
+```
+
+Tampilkan baik saldo LP maupun jumlah yang dibuka — pengguna berpikir dalam token dasar, bukan unit LP.
+
+### NFT posisi CLMM
+
+Posisi CLMM adalah NFT. `PersonalPositionState` PDA setiap posisi diturunkan dari mint NFT. Untuk mendeteksi:
+
+1. Enumerasi NFT pengguna. Untuk NFT Metaplex warisan: filter akun token ke yang memiliki supply 1 dan desimal 0.
+2. Untuk setiap mint NFT, coba turunkan PDA PersonalPositionState:
+
+```ts
+import { CLMM_PROGRAM_ID } from "@raydium-io/raydium-sdk-v2";
+
+const [positionPda] = PublicKey.findProgramAddressSync(
+  [Buffer.from("position"), nftMint.toBuffer()],
+  CLMM_PROGRAM_ID,
+);
+
+const accountInfo = await connection.getAccountInfo(positionPda);
+if (!accountInfo || !accountInfo.owner.equals(CLMM_PROGRAM_ID)) return null;
+// Ini adalah posisi CLMM Raydium — dekode.
+```
+
+3. Dekode via `raydium.clmm.getPositionInfo({ positionPda })` untuk mendapatkan:
+   - `poolId` → ambil pool untuk menyelesaikan mint
+   - `tickLower`, `tickUpper` → tampilkan range
+   - `liquidity`, `tokensOwedA/B` → hitung nilai posisi + fee tertunda
+   - `rewardInfos` → reward tertunda per stream
+
+4. Untuk posisi-NFT yang dikeluarkan di bawah Token-2022 (`OpenPositionWithToken22Nft`), program mint NFT adalah Token-2022 bukan SPL Token. Enumerasi keduanya saat memindai.
+
+### Farm stakes
+
+Farm v3 / v5 / v6 masing-masing memiliki per-user ledger PDA. Penurunan:
+
+```ts
+// Coba ketiga versi farm untuk setiap potensi interaksi farm pengguna.
+// Pendekatan termurah: tanya API terlebih dahulu, yang telah mengindeks semua posisi pengguna.
+
+const r = await fetch(
+  `https://api-v3.raydium.io/positions/staking?wallet=${user.toBase58()}`
+).then(r => r.json());
+
+for (const s of r.data.stakings) {
+  // s.farmId, s.stakedAmount, s.pendingRewards[], s.poolApr, ...
+}
+```
+
+Untuk dompet yang lebih suka deteksi fully on-chain: iterasi kemungkinan `UserLedger` PDA dengan menghashing pengguna dengan daftar kurator "kemungkinan" farm ID. Enumerasi semua farm ID secara exhaustif tidak praktis (ribuan ada); gunakan API.
+
+## Menghitung nilai posisi
+
+### CPMM / AMM v4 LP
+
+```ts
+const poolInfo = await raydium.<type>.getPoolInfoFromRpc({ poolId });
+const myShare  = userLpBalance / poolInfo.lpMint.supply;
+const tokensA  = BigInt(poolInfo.mintAmountA) * BigInt(userLpBalance)
+                / BigInt(poolInfo.lpMint.supply);
+const tokensB  = BigInt(poolInfo.mintAmountB) * BigInt(userLpBalance)
+                / BigInt(poolInfo.lpMint.supply);
+```
+
+Kemudian kalikan masing-masing dengan harga USD mint (dari `raydium.token` atau oracle harga).
+
+### Posisi CLMM
+
+```ts
+const position = await raydium.clmm.getPositionInfo({ positionPda });
+const pool     = await raydium.clmm.getPoolInfoFromRpc({ poolId: position.poolId });
+
+const { amountA, amountB } = PoolUtils.getAmountsFromLiquidity({
+  sqrtPriceX64:  pool.sqrtPriceX64,
+  tickLower:     position.tickLower,
+  tickUpper:     position.tickUpper,
+  liquidity:     position.liquidity,
+  slippage:      0,  // untuk tampilan, tanpa slippage
+});
+
+// Fee tertunda — tampilkan secara terpisah sebagai "tidak dikumpulkan"
+const fees = {
+  A: position.tokenFeesOwedA,
+  B: position.tokenFeesOwedB,
+};
+
+// Reward tertunda — pool CLMM memiliki 0–3 stream reward.
+const rewards = position.rewardInfos.map(r => ({
+  mint:          r.rewardMint,
+  rewardAmount:  r.rewardAmountOwed,
+}));
+```
+
+Render sebagai:
+
+- Nilai likuiditas (harga saat ini)
+- Fee yang tidak dikumpulkan
+- Reward tertunda per stream
+- Range: `[tickLower_price, tickUpper_price]` dengan batang visual yang menunjukkan apakah harga saat ini dalam range
+
+### Farm stake
+
+```ts
+// Respons API sudah termasuk reward tertunda; gunakan langsung.
+const apr       = stakingFarm.apr;               // %, annualisasi
+const staked    = stakingFarm.stakedAmount;      // unit terkecil dari mint staking
+const rewards   = stakingFarm.pendingRewards;    // array dari { mint, amount }
+```
+
+Untuk komputasi on-chain, cerminkan akuntansi farm:
+
+```
+pending_reward_i = user.deposited
+                 * farm.reward_per_share_x64[i] / 2^64
+                 - user.reward_debts[i]
+```
+
+Pastikan untuk menyegarkan `reward_per_share_x64` dengan formula lazy-update sebelum menghitung (waktu yang telah berlalu × tingkat emisi ÷ total_staked).
+
+## Simulasi transaksi untuk pratinjau
+
+Sebelum pengguna menandatangani, dompet biasanya menampilkan pratinjau perubahan saldo. Gunakan `simulateTransaction`:
+
+```ts
+const sim = await connection.simulateTransaction(tx, {
+  sigVerify: false,
+  commitment: "confirmed",
+  accounts: {
+    encoding: "base64",
+    addresses: [userTokenAtaA, userTokenAtaB, userLpAta].map(a => a.toBase58()),
+  },
+});
+
+// Dekode saldo setiap akun yang dikembalikan dan diff terhadap saldo pra-tx.
+for (const [i, acctData] of sim.value.accounts!.entries()) {
+  const newBalance = decodeTokenAccount(acctData!.data[0]).amount;
+  // bandingkan dengan saldo pra-tx, tampilkan Δ
+}
+```
+
+Parameter `accounts` meminta validator mengembalikan status akun setelah simulasi untuk alamat yang terdaftar. Jauh lebih akurat daripada mencoba memprediksi perubahan saldo dari bentuk instruksi saja.
+
+### Jebakan simulasi
+
+- **Swap CLMM membutuhkan tick array yang valid.** Jika ukuran input pengguna akan melintasi tick array yang tidak diinisialisasi, simulasi dibatalkan (sama seperti eksekusi). Tampilkan ini dengan jelas di UI.
+- **Biaya prioritas.** Simulasi berjalan tanpa instruksi budget-komputasi diterapkan. Untuk transaksi besar yang akan melebihi 200k CU default, simulasi gagal tetapi eksekusi aktual dengan limit CU eksplisit berhasil. Selalu atur limit CU pada tx simulasi juga.
+- **Blockhash segar.** Simulasi menggunakan blockhash saat ini; jika penandatanganan memakan waktu >60s tx menjadi tidak valid. Simulasi ulang jika pengguna ragu-ragu.
+
+## Tampilan Token-2022
+
+Token di bawah program Token-2022 harus diberi label sebagai demikian dalam daftar token dompet, karena mereka memiliki permukaan risiko yang berbeda:
+
+- **Mint transfer-fee**: tampilkan `transferFeeBasisPoints` saat ini sebagai "Biaya transfer: X%" di samping saldo. Peringatkan saat menerima — pengguna mungkin tidak menyadari mereka akan menerima lebih sedikit daripada yang dikirim pengirim.
+- **Mint transfer-hook**: tampilkan ID program hook. Hook berbahaya dapat memblokir transfer keluar; pengguna harus memverifikasi hook adalah yang mereka harapkan.
+- **Mint non-transferable**: tampilkan "Non-transferable" dan nonaktifkan swap/kirim. Ini biasanya token terikat jiwa atau kredensial.
+- **Mint interest-bearing**: saldo UI yang diturunkan dari `TokenAccount.amount` **tidak** mencerminkan bunga yang akumulasi. Gunakan `amountToUiAmount` dari `@solana/spl-token` (yang menerapkan faktor scaling) untuk nilai yang ditampilkan.
+
+## Tampilan APR Farm
+
+APR yang ditampilkan kepada pengguna harus menggabungkan semua stream reward yang hidup, dikonversi ke USD, dan diannualisasi:
+
+```ts
+let apr = 0;
+for (const r of farm.rewardInfos) {
+  if (r.rewardState !== 1) continue;   // lewati yang tidak berjalan
+  const annualRewardTokens = Number(r.emissionPerSecond) * 86400 * 365 / 1e<decimals>;
+  const annualRewardValue  = annualRewardTokens * priceUsd(r.rewardMint);
+  const tvlValue           = Number(farm.totalStaked) * priceUsd(farm.stakingMint) / 1e<decimals>;
+  apr += annualRewardValue / tvlValue;
+}
+```
+
+Tampilkan sebagai `APR: X.Y%`. Jika mint staking adalah token LP, juga hitung APR biaya dasar LP yang mendasar dan beri label jumlahnya sebagai "Total APR" atau "APR + biaya".
+
+## Pointer
+
+- [`/id/products/clmm/ticks-and-positions`](/id/products/clmm/ticks-and-positions) — penurunan nilai posisi.
+- [`/id/products/farm-staking/accounts`](/id/products/farm-staking/accounts) — field status farm.
+- [`/id/algorithms/token-2022-transfer-fees`](/id/algorithms/token-2022-transfer-fees) — semantik tampilan untuk token transfer-fee.
+
+Sumber:
+
+- Raydium SDK v2 — pembantu posisi/farm.
+- Endpoint user-position di `api-v3.raydium.io`.

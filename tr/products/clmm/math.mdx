@@ -1,0 +1,373 @@
+---
+title: "CLMM Matematiği"
+description: "Kare kök fiyat gösterimi, likidite ↔ token tutarları, tek-tick swap adımı, çok-tick yineleme ve ücret-artış muhasebesi."
+---
+
+<Info>
+  **Bu sayfa yapay zekâ tarafından otomatik olarak çevrilmiştir. İngilizce sürüm esas alınır.**
+
+  [İngilizce sürümü görüntüle →](/products/clmm/math)
+</Info>
+
+<Info>
+  Bu sayfa operasyonel: CLMM programı tarafından kullanılan formülleri, sabit-nokta kurallarını ve adım-adım prosedürü sunmaktadır. Konsantre likidite eğrisinin kendisinin arkasındaki mantık — neden `L = sqrt(x · y)` önemli — için bkz. [`algorithms/clmm-math`](/tr/algorithms/clmm-math). Bu sayfayı okumadan önce o sayfayı okumuş olduğunuzu varsayıyoruz.
+</Info>
+
+## Kare kök fiyat gösterimi
+
+CLMM fiyatı `sqrt_price_x64` olarak saklar — token1-başına-token0 fiyatının kare kökü, Q64.64 sabit-nokta sayısı olarak:
+
+$$
+\text{sqrt\_price\_x64} = \lfloor \sqrt{p} \cdot 2^{64} \rfloor
+$$
+
+burada `p = token1_amount / token0_amount`. Kare kök cinsinden çalışmak swap matematiğini doğrusallaştırır (token-tutarı deltalar `Δsqrt_price`'te doğrusal hale gelir) ve `x64` sabit-nokta çok-tick swaplarda kesinliği korur.
+
+Tick ↔ kare kök fiyat dönüşümü `bit-by-bit` logaritma yaklaşımıyla önceden hesaplanır:
+
+$$
+\text{sqrt\_price\_x64}(t) \approx 2^{64} \cdot (1.0001)^{t/2}
+$$
+
+`tick_math::get_sqrt_price_at_tick`'te arama tablosu tabanlı üs alma olarak uygulanır.
+
+## Likidite kanonik birim olarak
+
+`[sqrt_a, sqrt_b]` aralığında (`sqrt_a < sqrt_b`), **likidite `L`** konumlandırması token tutarlarına aşağıdaki gibi eşlenir. `sqrt_c = sqrt_price_x64` havuzun mevcut fiyatı olsun.
+
+| Durum | `amount0` | `amount1` |
+|------|-----------|-----------|
+| `sqrt_c <= sqrt_a` (havuz fiyatı aralığın altında) | `L · (sqrt_b - sqrt_a) / (sqrt_a · sqrt_b)` | `0` |
+| `sqrt_a < sqrt_c < sqrt_b` (aralık içinde) | `L · (sqrt_b - sqrt_c) / (sqrt_c · sqrt_b)` | `L · (sqrt_c - sqrt_a)` |
+| `sqrt_c >= sqrt_b` (havuz fiyatı aralığın üstünde) | `0` | `L · (sqrt_b - sqrt_a)` |
+
+Üç kimlik de konsantre likiditenin bir aralık içinde karşıladığı `x = L / sqrt_p`, `y = L · sqrt_p` değişmezinden gelir.
+
+Entegratörler tipik olarak tersi isteyebilir: `amount0` / `amount1` mevduatı verilen, aralığa sığan maksimum `L` hesaplansın. SDK'nın `LiquidityMath.getLiquidityFromTokenAmounts` bunu yapar. Aralık içi durum için formül:
+
+$$
+L_0 = \text{amount0} \cdot \frac{\text{sqrt\_c} \cdot \text{sqrt\_b}}{\text{sqrt\_b} - \text{sqrt\_c}},
+\qquad
+L_1 = \frac{\text{amount1}}{\text{sqrt\_c} - \text{sqrt\_a}},
+\qquad
+L = \min(L_0, L_1)
+$$
+
+Hangisi sınırlayıcı ise gerçekte tüketilen oranı belirler; diğer taraf kalan kalabilir.
+
+## Tek-tick swap adımı
+
+Swap **adımlar** halinde ilerler. Her adım ya (a) mevcut tick aralığındaki tüm mevcut girdisi tick geçmeden tüketir ya da (b) fiyatı tam olarak sonraki başlatılmış tick'e hareket ettirir.
+
+Mevcut durum `(sqrt_c, L)` ve **yukarı** swap (token0 giriş, token1 çıkış, `sqrt_price` artar) verilen, sonraki başlatılmış tick'e kadar mesafe `sqrt_t`'dir. Bu mikro-aralık içinde giriş ve fiyat arasındaki ilişki:
+
+$$
+\Delta\text{amount0} = L \cdot \left( \frac{1}{\text{sqrt\_c}} - \frac{1}{\text{sqrt\_t}} \right)
+= \frac{L \cdot (\text{sqrt\_t} - \text{sqrt\_c})}{\text{sqrt\_c} \cdot \text{sqrt\_t}}
+$$
+
+ve
+
+$$
+\Delta\text{amount1} = L \cdot (\text{sqrt\_t} - \text{sqrt\_c})
+$$
+
+Program iki şeyden birini yapar:
+
+- **Tüm giriş uyuyor mu?** Kalan giriş (ücret sonrası) `sqrt_t`'ye ulaşmak için `Δamount0`'dan azsa, yeni `sqrt_c'`'yi tam olarak çözün:
+
+  $$
+  \text{sqrt\_c}' = \frac{L \cdot \text{sqrt\_c}}{L + \Delta\text{input} \cdot \text{sqrt\_c}}
+  $$
+
+  (tam-giriş `token0 → token1` swap için). Swap bu adımda tick geçmeden tamamlanır.
+
+- **Giriş `Δamount0`'ı aşıyor mu?** `sqrt_c' = sqrt_t` ayarlayın, tick geçin (`liquidity_net` uygulayın), kalan girdiye `Δamount0` çıkartın, çıktıya `Δamount1` ekleyin ve tekrarlayın.
+
+Ters yön için (`token1 → token0`, fiyat düşer), formüllerde `sqrt_c` ve `sqrt_t` değiştirilir ve ters başka slotta yapılır.
+
+Tam Rust uygulaması `raydium-clmm/programs/amm/src/libraries/swap_math.rs`'de bulunur. Oradaki mantık Uniswap v3'ün `SwapMath.computeSwapStep` ile bire bir eşleşir.
+
+## Her adımda ücretler
+
+İşlem ücretleri her adımda **giriş** tutarından alınır, CPMM ile aynı kural:
+
+```
+step_fee_amount  = ceil(step_input * trade_fee_rate / 1_000_000)
+step_net_input   = step_input - step_fee_amount
+protocol_portion = floor(step_fee_amount * protocol_fee_rate / 1_000_000)
+fund_portion     = floor(step_fee_amount * fund_fee_rate     / 1_000_000)
+lp_portion       = step_fee_amount - protocol_portion - fund_portion
+```
+
+LP kısmı küresel ücret-artış akümülatörü güncellenirken şu anda aralık içindeki likiditeye bölünür:
+
+$$
+\text{fee\_growth\_global}_{\text{in}} \mathrel{+}= \text{lp\_portion} \cdot \frac{2^{64}}{L}
+$$
+
+— yani likidite *başına ücret*, Q64.64 cinsinden ifade edilir, böylece bu swap boyunca aralık içinde kalan `L_i` likiditelik bir pozisyon daha sonra `L_i · Δfee_growth_global / 2^{64}` ödenmesi gereken token'ları geri okur.
+
+Protocol ve fund kısımları sırasıyla `PoolState.protocol_fees_token_{0,1}` ve `PoolState.fund_fees_token_{0,1}`'e birikir, CPMM ile aynı. Bunlar `CollectProtocolFee` / `CollectFundFee` tarafından taranır.
+
+## Dışarıda ve içeride ücret-artış
+
+CLMM ücret muhasebesi zor kısım: bir pozisyon ücret kazanır sadece havuz fiyatı aralığı **içinde** iken. Havuz küresel birikmiş ücretleri izler; pozisyon kendi spesifik aralığı *içinde* birikmiş ücretleri bilmesi gerekir.
+
+Çözüm bir **tick tabanlı** akümülatördür. Her tick şunları saklar:
+
+```
+fee_growth_outside_0_x64
+fee_growth_outside_1_x64
+```
+
+Tick başlatma sırasında:
+
+- Havuz fiyatı **bu tick'in üstündeyse** (`tick_current >= this_tick`), `fee_growth_outside = fee_growth_global`. (Şimdiye kadarki tüm kazanç bu tick'e göre "dışarıda" — yani aşağıda.)
+- Aksi takdirde `fee_growth_outside = 0`.
+
+Fiyat tick'i geçtiğinde, program o tick'in `fee_growth_outside`'ını **çevirir**:
+
+$$
+\text{fee\_growth\_outside} \gets \text{fee\_growth\_global} - \text{fee\_growth\_outside}
+$$
+
+Bu korunan değişmez: herhangi bir tick `t` için, `fee_growth_outside(t)` `tick_current` `t`'nin karşı tarafında iken birikmiş ücretlere eşittir.
+
+**Aralık `[tick_lower, tick_upper]`'da ücret-artış içerde** türetilir:
+
+```
+if tick_current >= tick_upper:
+    fee_growth_below = fee_growth_outside(tick_lower)
+    fee_growth_above = fee_growth_global - fee_growth_outside(tick_upper)
+elif tick_current >= tick_lower:
+    fee_growth_below = fee_growth_outside(tick_lower)
+    fee_growth_above = fee_growth_outside(tick_upper)
+else:
+    fee_growth_below = fee_growth_global - fee_growth_outside(tick_lower)
+    fee_growth_above = fee_growth_outside(tick_upper)
+
+fee_growth_inside = fee_growth_global - fee_growth_below - fee_growth_above
+```
+
+Bu Uniswap-v3 ücret-artış formülüdür, değiştirilmemiş.
+
+## Bir pozisyon neyi saklar ve neyi okur
+
+Bir `PersonalPositionState` `fee_growth_inside_0_last_x64` ve `fee_growth_inside_1_last_x64` saklar: pozisyon son dokunuşta `fee_growth_inside` değerleri.
+
+Herhangi bir sonraki dokunuş (arttırma, azaltma, toplama), program:
+
+1. Yukarıdaki formülü kullanarak şu anki `fee_growth_inside_{0,1}_x64`'yi hesaplar.
+2. `Δ = fee_growth_inside_now − fee_growth_inside_last` hesaplar (u128'de modüler çıkartma).
+3. `Δ × position.liquidity / 2^{64}`'ü `tokens_fees_owed_{0,1}`'ye ekler.
+4. `fee_growth_inside_last`'ı yeni değere günceller.
+
+Token'lar kasalardan gerçekte hareket etmez ancak `CollectFees` / `DecreaseLiquidity`'de, `tokens_fees_owed`'a karşı.
+
+## Ödüller
+
+Havuzun üç ödül akışından her biri aynı artış-içinde mekanizmasını kullanır, kendi `reward_growth_global_x64` akümülatöründe. Emisyon sırasında:
+
+$$
+\text{reward\_growth\_global} \mathrel{+}= \text{emission\_per\_second} \cdot \Delta t \cdot \frac{2^{64}}{L}
+$$
+
+— emisyonlar aktif likiditeyle ters yönde ölçeklenir, böylece daha yoğun bir havuz her pozisyona saniye başına orantısal olarak daha az öder, ama toplamda daha çok pozisyon üstünde. Pozisyon başına ödenen ödül
+
+$$
+\text{reward\_owed} = (\text{reward\_growth\_inside}_{\text{now}} - \text{reward\_growth\_inside}_{\text{last}}) \cdot L / 2^{64}
+$$
+
+ve `CollectReward` yoluyla talep edilir. Bkz. [`products/clmm/fees`](/tr/products/clmm/fees).
+
+## Çalışılmış örnek: tam-giriş swap
+
+Diyelim ki:
+
+- `tick_spacing = 60`
+- `sqrt_price_x64 = 1 × 2^{64}` — fiyat = 1.0, yani `tick_current = 0`.
+- Aktif likidite `L = 1_000_000 × 2^{64}`.
+- Üstte sonraki başlatılmış tick: `t = 60` (sqrt_price_b ≈ `1.003004 × 2^{64}`).
+- İşlem ücreti oranı: 500 (0.05%).
+
+Kullanıcı: `SwapBaseInput` tam-giriş 1,000 token0.
+
+Adım 1 — ücretler:
+
+```
+trade_fee       = ceil(1000 * 500 / 1_000_000)  = 1
+step_net_input  = 999
+```
+
+Adım 2 — 999 mevcut tick aralığına uyuyor mu?
+
+```
+Sonraki tick'e kadar (amount0):
+  L · (sqrt_t - sqrt_c) / (sqrt_c * sqrt_t)
+  ≈ 1_000_000 · (1.003004 − 1) / (1 · 1.003004)
+  ≈ 2995.5 token0
+```
+
+`999 < 2995.5`, yani tüm giriş tick geçmeden uyuyor.
+
+Adım 3 — yeni fiyat:
+
+```
+sqrt_c' = L · sqrt_c / (L + Δin · sqrt_c)
+        = 1_000_000 · 1 / (1_000_000 + 999 · 1)
+        ≈ 0.999001
+```
+
+yani `sqrt_c'` `sqrt_c`'nin biraz altında. Yukarıdaki formülün `token1 → token0` swap için olduğunu dikkate alın. Buradaki örnek `token0 → token1`, fiyatı **yukarı** çeker, aşağı değil — bu yüzden `token0` giriş için karşılık gelen formu kullanırız:
+
+```
+sqrt_c' = sqrt_c + Δin / L
+        = 1 + 999 / 1_000_000
+        = 1.000999
+```
+
+(bu `token0 → token1` için beklenen swap yönüyle eşleşir: `sqrt_c` fiyat ile birlikte yükselir.)
+
+Adım 4 — çıktı tutarı:
+
+```
+Δout token1 = L · (sqrt_c' − sqrt_c)
+            = 1_000_000 · 0.000999
+            = 999.00
+```
+
+Yuvarlama için muhasebe yapıldıktan sonra, kullanıcı ≈ 999 token1 alır. Ücret (1 token0) `trade_fee_rate × protocol_fee_rate / 1e6` tarafından LP, protocol ve fund arasında bölünür (ve fund için benzer); LP kısmı `fee_growth_global_0_x64` içine akar.
+
+## Swap sırasında limit emri eşleştirme
+
+Swap adımı açık limit emirleri tutan bir tick'i geçtiğinde, bu emirler swap girdisini **önce** LP eğrisi olmadan, tick'in tam fiyatında tüketir. Eşleştirme tick içinde `order_phase` kohortuna göre FIFO'dur.
+
+### `TickState`'de kohort başına durum
+
+```
+order_phase                  : u64    monoton kohort id
+orders_amount                : u64    mevcut (en yeni) kohortta giriş-token toplamı
+part_filled_orders_remaining : u64    swap şu anda doldurduğu kohorta kalan giriş
+unfilled_ratio_x64           : u128   kısmen dolu kohorta için Q64.64 doldurma oranı
+```
+
+İki kohort düzeni var çünkü yeni emirler tick'te *açılabilir* daha eski bir kohort hala doldurulurken. Yeni açılan emirler `orders_amount`'a katılır ve sonraki `order_phase`'i miras alır; önceki kohort tamamen tüketilinceye kadar dolduramazlar.
+
+### Eşleştirme adımı
+
+Swap sırasında her tick geçişinde gerçekleşen eşleştirme için sözde kod:
+
+```
+fn match_limit_orders_at_tick(tick, swap_input_remaining, sqrt_p):
+    # 1. Kısmen dolu kohortu ilk olarak doldurmeye çalışın.
+    if tick.part_filled_orders_remaining > 0:
+        consume = min(tick.part_filled_orders_remaining, swap_input_remaining)
+        # O kohortun doldurulmamış oranını güncelleyin.
+        tick.unfilled_ratio_x64 *= (1 - consume / tick.part_filled_orders_remaining)
+        tick.part_filled_orders_remaining -= consume
+        swap_input_remaining -= consume
+        if tick.part_filled_orders_remaining == 0:
+            tick.unfilled_ratio_x64 = 0
+        if swap_input_remaining == 0: return
+
+    # 2. Aktif kohortu yükseltin.
+    if tick.orders_amount > 0:
+        tick.part_filled_orders_remaining = tick.orders_amount
+        tick.orders_amount = 0
+        tick.order_phase += 1
+        tick.unfilled_ratio_x64 = ONE_X64
+        # Taze yükseltilmiş kohortla recurse edin.
+        return match_limit_orders_at_tick(tick, swap_input_remaining, sqrt_p)
+
+    return  # tick'in daha limit emri yok
+```
+
+Limit emri sahiplerine giden çıktı token'ları swap başına aktarılmaz. Havuzun çıktı kasasında emit olarak otururlar emri sahibi `SettleLimitOrder` (veya `DecreaseLimitOrder`) çağırana kadar. Havuz basitçe kohortan ne kadarının dolu olduğunu `unfilled_ratio_x64` yoluyla izler. Her `LimitOrderState` açılış sırasında kendi `(order_phase, unfilled_ratio_x64)` anlık görüntüsünü saklar, yani settlement'e indirgenir:
+
+```
+filled_amount  = total_amount × (1 − tick_now.unfilled_ratio_x64 / order.unfilled_ratio_x64)
+                if tick_now.order_phase > order.order_phase
+                else 0
+output_amount  = price_at(tick_index) × filled_amount   # yöne göre ayarlanmış
+```
+
+Bu O(1) settlement kohort tasarımının tüm noktası — tick'e yüklü sayıda emirler doldurabilir işlem başına gaz olmadan.
+
+### LP eğrisiyle etkileşim
+
+Bir swap adımında, limit emri eşleştirme tick'te *oluşur* (sıfır `Δsqrt_price`); LP eğrisi tüketimi tick'ler *arasında* oluşur. Sıra bu nedenle:
+
+1. Tick `t_cross` geçin (LP `liquidity_net` değişimini ilk uygulayın, çünkü Uniswap-V3 böyle yapar).
+2. `t_cross`'da oturan herhangi bir limit emri doldurun.
+3. LP eğrisi boyunca sonraki başlatılmış tick'e veya `swap_input` tükenişine devam edin.
+
+Limit emirleri böylece tüccarlar verir *daha* etkili likidite tam emrin tick fiyatında (bir fiyat-iyileştirme efekti), maliyeti ile LP'ler o swap haciminin kısmı üzerine ücret kazanmaz — limit emri swap kısmı tüccar için ücretsizdir, çünkü limit emri açan maker olarak hareket eder. Dinamik-ücret ek (etkinse) hala aynı swap'ın LP kısmına uygulanır.
+
+## Dinamik ücret türetimi
+
+`PoolState.dynamic_fee_info` volatilite durumunu taşır. Her swap adımı per-adım ücret oranını hesaplar:
+
+$$
+\text{fee\_rate}_{\text{total}} = \text{trade\_fee\_rate}_{\text{config}} +
+\underbrace{\frac{\text{dynamic\_fee\_control} \cdot (\text{vol\_acc} \cdot \text{tick\_spacing})^2}
+{D_{\text{ctrl}} \cdot S_{\text{vol}}^2}}_{\text{dinamik ek}}
+$$
+
+nerede:
+
+- $D_{\text{ctrl}} = 100{,}000$ — `DYNAMIC_FEE_CONTROL_DENOMINATOR`
+- $S_{\text{vol}} = 10{,}000$ — `VOLATILITY_ACCUMULATOR_SCALE`
+- `vol_acc` aşağıdaki güncelleme kuralından sonra per-swap akümülatördür
+- `tick_spacing` `PoolState.tick_spacing`'den
+
+Sonuç $100{,}000 / 10^6 = 10\%$ da sıkıştırılır.
+
+### Akümülatör güncelleme
+
+İki kural her swap'ta sırada uygulanır:
+
+**Azalma.** Referans taban son güncelleme itibaren zamana göre azalır:
+
+$$
+\text{vol\_ref} = \begin{cases}
+0 & \text{eğer } \Delta t > \text{decay\_period} \\
+\text{vol\_acc}_{\text{prev}} \cdot \dfrac{\text{reduction\_factor}}{10{,}000} & \text{eğer } \text{filter\_period} < \Delta t \le \text{decay\_period} \\
+\text{vol\_ref}_{\text{prev}} & \text{eğer } \Delta t \le \text{filter\_period}
+\end{cases}
+$$
+
+**Birikme.** Yeni akümülatör referans artı önceki referans indeksinden beri kat edilen tick-mesafesidir:
+
+$$
+\text{vol\_acc} = \min\left(
+    \text{vol\_ref} + \left| t_{\text{ref}} - t_{\text{now}} \right| \cdot S_{\text{vol}},
+    \text{max\_vol\_acc}
+\right)
+$$
+
+`tick_spacing_index_reference` ($t_{\text{ref}}$) ham tick'te değil, tick-boşluk birimindedir: $t_{\text{ref}} = \lfloor \text{tick\_current} / \text{tick\_spacing} \rfloor$.
+
+### Neden parabol tick mesafede
+
+Akümülatörü karelemek ücretin fiyat *karesinin* olarak yürüdüğü kadar yükseldiği anlamına gelir. Ampirik olarak bu rastgele-yürüyüş basıncı altında fiyatın varyans ölçeklemesi eşleşir: 2× tick sapması 4× örtülü volatilite anlamına gelir, yani 4× ek ücret alır. `dynamic_fee_control` parametresi mutlak seviyeyi ayarlar.
+
+`filter_period` penceresi küçük alt-saniye salınımları (örn. MEV botlar sandviç) akümülatörü şişirmesinden önler. `decay_period` penceresi tek bir geçmiş spike'ın pazar sakinleştikten sonra ücret almaya devam etmesini önler.
+
+## Sayısal sağlamlık
+
+- Tüm ara çarpımlar `u128` veya `u256` şeklinde aritmetiğe gider. CLMM `U128Sqrt` yardımcılarını ve `FullMath::mulDiv` modellerini Uniswap v3'ten doğrudan taşıyanları kullanır.
+- Bölme yuvarlama değişmez `k' ≥ k` yerel olarak uygulamak için per-adım seçilir. `SwapBaseInput` çıktıyı **aşağı** yuvarlar; `SwapBaseOutput` girdiye **yukarı** yuvarlar.
+- Tick geçişleri `PoolState.liquidity` sıfıra düşürenler izin verilir (fiyat "likidite deliği" içinde gidebilir) ama swap basitçe sonraki başlatılmış tick'e giriş tüketin olmadan, ücret almadan ilerler.
+- Taşma koruması: `sqrt_price_x64` `[MIN_TICK, MAX_TICK]`'e karşılık gelen `[MIN_SQRT_PRICE_X64, MAX_SQRT_PRICE_X64]` aralığında tutulur. Herhangi bir bağı geçecek bir swap `SqrtPriceLimitOverflow` ile geri döner.
+
+## Sonra nereye gidilir
+
+- [`products/clmm/ticks-and-positions`](/tr/products/clmm/ticks-and-positions) tick haritasının yürüyüşe nasıl katıldığı için.
+- [`products/clmm/fees`](/tr/products/clmm/fees) ücret/ödül matematiği detaylı için.
+- [`algorithms/clmm-math`](/tr/algorithms/clmm-math) `L = sqrt(x · y)` ve aralık-vs-likidite formüllerinin arkasındaki türetimler için.
+
+Kaynaklar:
+
+- [`raydium-io/raydium-clmm` — `libraries/swap_math.rs`, `libraries/tick_math.rs`](https://github.com/raydium-io/raydium-clmm)
+- "Uniswap v3 Core" whitepaper, §6–7

@@ -1,0 +1,305 @@
+---
+title: "Desplegar un pool CLMM"
+description: "Script de Node.js listo para copiar y pegar que crea un nuevo pool CLMM, luego abre una posición concentrada inicial. Espeja el flujo oficial de raydium-sdk-V2-demo."
+---
+
+<Info>
+  **Esta página fue traducida automáticamente por IA. La versión en inglés es la fuente autorizada.**
+
+  [Ver versión en inglés →](/quick-start/deploy-clmm-pool)
+</Info>
+
+<Info>
+  **Qué hace esto.** Crea un nuevo pool CLMM en el nivel de comisión que elijas, luego abre una posición concentrada inicial. Dos transacciones, un script. El código está adaptado de los demos oficiales en [`raydium-sdk-V2-demo/src/clmm`](https://github.com/raydium-io/raydium-sdk-V2-demo/tree/master/src/clmm) en un único archivo ejecutable en Node.
+</Info>
+
+## Configuración
+
+Asegúrate de haber leído los [requisitos previos de Inicio rápido](/es/quick-start) y tengas `RPC_URL`, `KEYPAIR` e instaladas las dependencias.
+
+La creación de un pool CLMM tiene una comisión única más renta por array de ticks para la posición inicial. También necesitarás ambas mints de semilla en tu billetera — abrir una posición cuando el precio está dentro del rango elegido requiere liquidez en ambos lados.
+
+## Paso 1 — `config.ts`
+
+Guarda como `config.ts`. Tiene la misma estructura que el [`src/config.ts.template`](https://github.com/raydium-io/raydium-sdk-V2-demo/blob/master/src/config.ts.template) del repo demo — `disableFeatureCheck` se fuerza a `true` (recomendado para cualquier integración no trivial para que el SDK no se bloquee en su llamada de detección de características al inicio):
+
+```ts
+// config.ts
+import { Raydium, TxVersion, parseTokenAccountResp } from "@raydium-io/raydium-sdk-v2";
+import { Connection, Keypair, clusterApiUrl } from "@solana/web3.js";
+import { TOKEN_PROGRAM_ID, TOKEN_2022_PROGRAM_ID } from "@solana/spl-token";
+import bs58 from "bs58";
+import fs from "node:fs";
+
+export const owner: Keypair = Keypair.fromSecretKey(
+  // accept either a JSON-array keypair file (same shape Solana CLI writes) or a bs58 secret in env
+  process.env.KEYPAIR_BS58
+    ? bs58.decode(process.env.KEYPAIR_BS58)
+    : new Uint8Array(JSON.parse(fs.readFileSync(process.env.KEYPAIR!, "utf8"))),
+);
+
+export const connection = new Connection(
+  process.env.RPC_URL ?? clusterApiUrl("mainnet-beta"),
+  "confirmed",
+);
+export const txVersion = TxVersion.V0;
+const cluster = "mainnet" as "mainnet" | "devnet";
+
+let raydium: Raydium | undefined;
+export const initSdk = async (params?: { loadToken?: boolean }) => {
+  if (raydium) return raydium;
+  raydium = await Raydium.load({
+    owner,
+    connection,
+    cluster,
+    disableFeatureCheck: true,
+    disableLoadToken: !params?.loadToken,
+    blockhashCommitment: "finalized",
+  });
+  return raydium;
+};
+
+export const fetchTokenAccountData = async () => {
+  const solAccountResp = await connection.getAccountInfo(owner.publicKey);
+  const tokenAccountResp = await connection.getTokenAccountsByOwner(owner.publicKey, {
+    programId: TOKEN_PROGRAM_ID,
+  });
+  const token2022Req = await connection.getTokenAccountsByOwner(owner.publicKey, {
+    programId: TOKEN_2022_PROGRAM_ID,
+  });
+  return parseTokenAccountResp({
+    owner: owner.publicKey,
+    solAccountResp,
+    tokenAccountResp: {
+      context: tokenAccountResp.context,
+      value: [...tokenAccountResp.value, ...token2022Req.value],
+    },
+  });
+};
+```
+
+## Paso 2 — `createPool.ts`
+
+Guarda junto a `config.ts`. Fuente: [`src/clmm/createPool.ts`](https://github.com/raydium-io/raydium-sdk-V2-demo/blob/master/src/clmm/createPool.ts).
+
+```ts
+// createPool.ts
+import { CLMM_PROGRAM_ID, DEVNET_PROGRAM_ID } from "@raydium-io/raydium-sdk-v2";
+import { PublicKey } from "@solana/web3.js";
+import Decimal from "decimal.js";
+import { initSdk, txVersion } from "./config";
+
+export const createPool = async () => {
+  const raydium = await initSdk({ loadToken: true });
+
+  // RAY
+  const mint1 = await raydium.token.getTokenInfo("4k3Dyjzvzp8eMZWUXbBCjEvwSkkk59S5iCNLY3QrkX6R");
+  // USDT
+  const mint2 = await raydium.token.getTokenInfo("Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB");
+
+  // Fee tiers come from the live API. On devnet the published `id` field is wrong;
+  // re-derive the PDA before passing it to the SDK.
+  const clmmConfigs = await raydium.api.getClmmConfigs();
+
+  const { execute } = await raydium.clmm.createPool({
+    programId: CLMM_PROGRAM_ID,
+    // programId: DEVNET_PROGRAM_ID.CLMM_PROGRAM_ID,
+    mint1,
+    mint2,
+    ammConfig: {
+      ...clmmConfigs[0],
+      id: new PublicKey(clmmConfigs[0].id),
+      fundOwner: "",
+      description: "",
+    },
+    initialPrice: new Decimal(1),
+    txVersion,
+    // optional: set up priority fee here
+    // computeBudgetConfig: { units: 600000, microLamports: 46591500 },
+  });
+
+  const { txId } = await execute({ sendAndConfirm: true });
+  console.log("clmm pool created:", { txId: `https://explorer.solana.com/tx/${txId}` });
+  process.exit();
+};
+
+createPool();
+```
+
+## Paso 3 — `createPosition.ts`
+
+Fuente: [`src/clmm/createPosition.ts`](https://github.com/raydium-io/raydium-sdk-V2-demo/blob/master/src/clmm/createPosition.ts).
+
+```ts
+// createPosition.ts
+import {
+  ApiV3PoolInfoConcentratedItem,
+  TickUtils,
+  PoolUtils,
+  ClmmKeys,
+} from "@raydium-io/raydium-sdk-v2";
+import BN from "bn.js";
+import Decimal from "decimal.js";
+import { initSdk, txVersion } from "./config";
+import { isValidClmm } from "./utils";
+
+export const createPosition = async () => {
+  const raydium = await initSdk();
+
+  let poolInfo: ApiV3PoolInfoConcentratedItem;
+  // RAY-USDC pool
+  const poolId = "61R1ndXxvsWXXkWSyNkCxnzwd3zUNB8Q2ibmkiLPC8ht";
+  let poolKeys: ClmmKeys | undefined;
+
+  if (raydium.cluster === "mainnet") {
+    const data = await raydium.api.fetchPoolById({ ids: poolId });
+    poolInfo = data[0] as ApiV3PoolInfoConcentratedItem;
+    if (!isValidClmm(poolInfo.programId)) throw new Error("target pool is not CLMM pool");
+  } else {
+    const data = await raydium.clmm.getPoolInfoFromRpc(poolId);
+    poolInfo = data.poolInfo;
+    poolKeys = data.poolKeys;
+  }
+
+  // Optional: pull on-chain real-time price to avoid slippage errors from a stale API quote.
+  // const rpcData = await raydium.clmm.getRpcClmmPoolInfo({ poolId: poolInfo.id });
+  // poolInfo.price = rpcData.currentPrice;
+
+  const inputAmount = 0.000001; // RAY amount
+  const [startPrice, endPrice] = [0.000001, 100000];
+
+  const { tick: lowerTick } = TickUtils.getPriceAndTick({
+    poolInfo,
+    price: new Decimal(startPrice),
+    baseIn: true,
+  });
+  const { tick: upperTick } = TickUtils.getPriceAndTick({
+    poolInfo,
+    price: new Decimal(endPrice),
+    baseIn: true,
+  });
+
+  const epochInfo = await raydium.fetchEpochInfo();
+  const res = await PoolUtils.getLiquidityAmountOutFromAmountIn({
+    poolInfo,
+    slippage: 0,
+    inputA: true,
+    tickUpper: Math.max(lowerTick, upperTick),
+    tickLower: Math.min(lowerTick, upperTick),
+    amount: new BN(new Decimal(inputAmount || "0").mul(10 ** poolInfo.mintA.decimals).toFixed(0)),
+    add: true,
+    amountHasFee: true,
+    epochInfo,
+  });
+
+  const { execute, extInfo } = await raydium.clmm.openPositionFromBase({
+    poolInfo,
+    poolKeys,
+    tickUpper: Math.max(lowerTick, upperTick),
+    tickLower: Math.min(lowerTick, upperTick),
+    base: "MintA",
+    ownerInfo: { useSOLBalance: true },
+    baseAmount: new BN(new Decimal(inputAmount || "0").mul(10 ** poolInfo.mintA.decimals).toFixed(0)),
+    otherAmountMax: res.amountSlippageB.amount,
+    txVersion,
+    computeBudgetConfig: { units: 600000, microLamports: 100000 },
+  });
+
+  const { txId } = await execute({ sendAndConfirm: true });
+  console.log("clmm position opened:", { txId, nft: extInfo.nftMint.toBase58() });
+  process.exit();
+};
+
+createPosition();
+```
+
+## Paso 4 — `utils.ts`
+
+Fuente: [`src/clmm/utils.ts`](https://github.com/raydium-io/raydium-sdk-V2-demo/blob/master/src/clmm/utils.ts).
+
+```ts
+// utils.ts
+import { CLMM_PROGRAM_ID, DEVNET_PROGRAM_ID } from "@raydium-io/raydium-sdk-v2";
+
+const VALID_PROGRAM_IDS = new Set<string>([
+  CLMM_PROGRAM_ID.toBase58(),
+  DEVNET_PROGRAM_ID.CLMM_PROGRAM_ID.toBase58(),
+]);
+
+export const isValidClmm = (programId: string) => VALID_PROGRAM_IDS.has(programId);
+```
+
+## Ejecutar
+
+```bash
+# create the pool first
+RPC_URL="https://api.mainnet-beta.solana.com" \
+KEYPAIR="$HOME/.config/solana/id.json" \
+npx tsx createPool.ts
+
+# then open an initial position against the new pool id
+# (edit poolId at the top of createPosition.ts to point at your new pool)
+RPC_URL="https://api.mainnet-beta.solana.com" \
+KEYPAIR="$HOME/.config/solana/id.json" \
+npx tsx createPosition.ts
+```
+
+## Qué acaba de suceder
+
+**Transacción 1 — `raydium.clmm.createPool`** inicializó:
+
+- el estado del pool en la PDA canónica para `(mint1, mint2, ammConfig)`,
+- `token_0_vault` y `token_1_vault` (ordenados por byte de mint),
+- el búfer ring de `observation`,
+- el bitmap de array de ticks inline,
+
+y estableció el `sqrt_price_x64` inicial desde tu `initialPrice`.
+
+**Transacción 2 — `raydium.clmm.openPositionFromBase`** abrió una posición concentrada:
+
+- acuñó un NFT de posición en tu billetera (el NFT *es* la posición; transferirlo transfiere la posición),
+- asignó arrays de ticks en los límites inferior y superior (renta única si es la primera posición en esos rangos; los arrays de ticks nunca se cierran por el programa, por lo que las posiciones posteriores en los mismos arrays no pagan renta adicional),
+- depositó `inputAmount` de `mint1` y el monto de par coincidente de `mint2` (calculado por `PoolUtils.getLiquidityAmountOutFromAmountIn`),
+- acreditó la posición con liquidez proporcional al ancho del rango.
+
+Cuanto más estrecho sea el rango, mayor será la eficiencia de capital por dólar de TVL — y más dolorosa será la pérdida impermanente cuando el precio se desvíe fuera de rango. El rango usado arriba (`[0.000001, 100000]`) es efectivamente rango completo; estréchalo para concentrar comisiones cerca del spot actual.
+
+## Elegir un nivel de comisión
+
+`clmmConfigs[0]` es el nivel de comisión más bajo. El conjunto completo se publica en `GET https://api-v3.raydium.io/main/clmm-config`:
+
+| Índice | `tradeFeeRate` | Espaciado de ticks | Usar cuando |
+|---|---|---|---|
+| 0 | `100` (1bp) | 1 | Estable / estable, pérdida impermanente muy baja esperada |
+| 1 | `500` (5bp) | 10 | Activos altamente correlacionados (p. ej. staked-liquid vs subyacente) |
+| 2 | `2_500` (25bp) | 60 | Par de token estándar, blue-chip + estable |
+| 3 | `10_000` (1,00%) | 120 | Par volátil o delgado donde el riesgo de IL es alto |
+
+Consulta [`user-flows/choosing-a-pool-type`](/es/user-flows/choosing-a-pool-type) para una matriz de decisión completa.
+
+## Errores comunes
+
+- **`Pool already exists for this config`** — Ya existe un pool CLMM para este triple `(mint1, mint2, ammConfig)`. Busca el ID del pool existente y salta el Paso 2.
+- **`Insufficient funds for amount B`** — Tu billetera tiene el monto solicitado de `mintA` pero no el `mintB` coincidente. Abrir una posición cuando el precio está dentro del rango requiere liquidez en ambos lados.
+- **`Tick out of range`** — Tu `lowerPrice` o `upperPrice` cae fuera del rango de precio representable. Usa un rango más razonable en relación al precio actual.
+- **Precio obsoleto** — Una cotización de la API puede estar 5–60 segundos obsoleta. Si `executePosition` falla por slippage, descomenta el bloque `getRpcClmmPoolInfo` en `createPosition.ts` para obtener el precio en vivo justo antes de firmar.
+
+## Advertencias
+
+- **El NFT de posición es tu único acceso.** Pierde el NFT o transfierelo, pierde acceso a la posición. Trátalo como una llave.
+- **Las posiciones fuera de rango no ganan comisiones.** Si el precio se mueve fuera de `[lowerPrice, upperPrice]`, tu posición está estacionada completamente en un activo y no gana nada hasta que reequilibres.
+- **La renta de array de ticks es unidireccional.** La primera posición que toca un array de ticks nunca inicializado paga su renta; el programa no expone una ruta para cerrar arrays de ticks, por lo que esa renta es permanente. Las posiciones posteriores en el mismo array son gratuitas.
+
+## Siguiente
+
+- [`products/clmm/overview`](/es/products/clmm/overview) — mecánica completa de CLMM.
+- [`products/clmm/ticks-and-positions`](/es/products/clmm/ticks-and-positions) — las matemáticas detrás de los ticks.
+- [`algorithms/impermanent-loss`](/es/algorithms/impermanent-loss) — cuantificando la amplificación de IL en CLMM.
+- [`user-flows/create-clmm-pool`](/es/user-flows/create-clmm-pool) — el mismo flujo a través de la interfaz de usuario de Raydium.
+
+Fuentes:
+
+- [`raydium-sdk-V2-demo/src/clmm/createPool.ts`](https://github.com/raydium-io/raydium-sdk-V2-demo/blob/master/src/clmm/createPool.ts)
+- [`raydium-sdk-V2-demo/src/clmm/createPosition.ts`](https://github.com/raydium-io/raydium-sdk-V2-demo/blob/master/src/clmm/createPosition.ts)
+- [`raydium-sdk-V2-demo/src/clmm/utils.ts`](https://github.com/raydium-io/raydium-sdk-V2-demo/blob/master/src/clmm/utils.ts)
+- [`raydium-sdk-V2-demo/src/config.ts.template`](https://github.com/raydium-io/raydium-sdk-V2-demo/blob/master/src/config.ts.template)

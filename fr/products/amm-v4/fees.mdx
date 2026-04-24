@@ -1,0 +1,112 @@
+---
+title: "Frais d'AMM v4"
+description: "Les frais de swap de 0,25%, leur répartition LP / protocole, la génération de PnL à partir des remplissages OpenBook, et comment l'admin récupère les frais de protocole accumulés."
+---
+
+<Info>
+  **Cette page est traduite automatiquement par IA. La version anglaise fait foi.**
+
+  [Voir la version anglaise →](/products/amm-v4/fees)
+</Info>
+
+## L'unique palier publié
+
+Contrairement à CPMM et CLMM, AMM v4 n'a **pas de compte `AmmConfig`**. Les frais sont stockés directement dans la structure `AmmInfo.fees` de chaque pool et sont fixés lors de la création du pool. Les paramètres par défaut couvrent essentiellement tous les pools AMM v4 en production :
+
+| Champ on-chain | Défaut | Signification |
+|---|---|---|
+| `swap_fee_numerator / swap_fee_denominator` | `25 / 10_000` | **Frais de swap bruts sur les swaps par AMM : 0,25% du volume d'entrée.** |
+| `trade_fee_numerator / trade_fee_denominator` | `25 / 10_000` | Utilisé par l'intégration OpenBook pour calculer le prix des ordres limites incluant les frais. Par défaut, le même `0,25%` que `swap_fee`. |
+| `pnl_numerator / pnl_denominator` | `12 / 100` | **Part du protocole dans les frais de swap : 12%** — c'est-à-dire `0,25% × 12% = 0,03%` du volume. S'accumule dans les compteurs `need_take_pnl_*`. |
+| `min_separate_numerator / min_separate_denominator` | `5 / 10_000` | Seuil de précision interne utilisé par la logique d'arrondi de la répartition des frais. |
+
+Notez que `pnl_numerator / pnl_denominator` est une fraction **des frais de swap**, et non du volume de trade — c'est une erreur de lecture courante. La part LP est le complément (`88%` des frais = `0,22%` du volume) et est implicite ; il n'y a pas de numérateur séparé « part LP ».
+
+Un petit nombre de pools créés tôt l'ont été avec des numérateurs différents ; lisez toujours `AmmInfo.fees` avant de citer.
+
+Il n'y a **pas de frais de fonds** et **pas de frais de créateur** : ce sont des inventions de CPMM/CLMM qui n'existaient pas dans le modèle de frais original d'AMM v4.
+
+## Comment la répartition est calculée
+
+À chaque swap, le pool prélève les frais bruts du montant d'entrée, puis répartit :
+
+```
+gross_fee   = ceil(amount_in * swap_fee_numerator / swap_fee_denominator)        // 0.25% of amount_in
+pnl_portion = gross_fee * pnl_numerator / pnl_denominator                        // 12% of gross_fee
+lp_portion  = gross_fee − pnl_portion                                            // 88% of gross_fee
+```
+
+- `lp_portion` reste dans le coffre et contribue au prochain `k`. Les LP le capturent en échangeant leurs jetons LP plus tard.
+- `pnl_portion` incrémente `AmmInfo.state_data.need_take_pnl_coin` ou `need_take_pnl_pc` selon le côté d'entrée du swap.
+
+Même astuce préservant l'invariant que CPMM : le montant PnL se situe physiquement dans le coffre mais est soustrait des réserves utilisées dans la courbe, donc `TakePnl` déplace les tokens sans changer le prix.
+
+## PnL depuis OpenBook (historique)
+
+<Note>
+  **N'accumule plus.** L'intégration OpenBook est désactivée, donc le *deuxième* flux de PnL décrit dans cette section n'est plus généré. Les compteurs `total_pnl_{coin,pc}` sur les pools existants peuvent contenir des valeurs historiques, mais aucun nouveau montant n'est ajouté. Le chemin de frais de protocole de 0,03% (ci-dessus) n'est pas affecté et reste actif.
+</Note>
+
+Historiquement, AMM v4 avait un *deuxième* flux de revenus de type frais : lorsque ses ordres limites sur OpenBook étaient remplis, le pool pouvait être du côté preneur du remplissage et gagner ou payer l'écart acheteur/vendeur du marché. Ces événements PnL se réglaient dans les coffres du pool pendant `MonitorStep` et le programme les créditait aux compteurs informatifs `state_data.total_pnl_{coin,pc}`.
+
+- Lorsque la grille affichée du pool était correctement calibrée autour du prix de la courbe, les remplissages OpenBook tendaient à être **positifs en frais** pour le pool — l'AMM faisait effectivement du market-making sur OpenBook et gagnait des rabais de teneur de marché.
+- Lorsque OpenBook s'arrêtait ou que la file d'attente d'événements se remplissait, le pool pouvait avoir des ordres périmés qui se remplissaient à des prix désavantageux, produisant un PnL négatif. Ce couplage opérationnel était l'une des motivations pour s'éloigner de la conception hybride.
+
+Ce PnL OpenBook **n'était pas** identique aux frais de protocole de 0,03%. OpenBook PnL gonflait directement les réserves du pool (bénéficiant aux LP + protocole proportionnellement à la répartition des frais), tandis que les frais de protocole de 0,03% étaient marqués spécifiquement pour la récupération par l'admin. Avec le côté OpenBook désactivé, le seul taux de frais aujourd'hui provient des 0,25% sur les swaps AMM et sa répartition 22/3.
+
+## Collecte
+
+L'admin (le multisig Raydium) appelle `WithdrawPnl` / `TakePnl` pour récupérer `need_take_pnl_*` dans les comptes « propriétaire PnL » au niveau du pool configurés sur l'`AmmConfig` du programme (une config différente, scoped au programme — pas l'AmmConfig par-pool de style CPMM). La récupération :
+
+1. Règle d'abord les remplissages OpenBook en attente. *(Aucune opération maintenant qu'OpenBook est inactif.)*
+2. Transfère `need_take_pnl_coin` / `need_take_pnl_pc` des coffres du pool vers la destination PnL.
+3. Réinitialise les compteurs.
+
+L'opération ne déplace pas la courbe. Les LP ne devraient voir aucune variation de prix après un appel `TakePnl`.
+
+## Rachat des frais LP
+
+Il n'y a pas d'instruction dédiée « collecter les frais LP ». Les frais LP s'accumulent dans les coffres et gonflent `k` au fil du temps ; les LP les réalisent en échangeant des jetons LP via `Withdraw`. La valeur d'un jeton LP croît de manière monotone avec la croissance de `(coin_reserve_effective, pc_reserve_effective)`.
+
+## Visualisation : où vont 1 000 USDC de volume
+
+Sur un swap lourd en USDC de 1 000 \$ contre un pool avec paramètres par défaut :
+
+```
+Frais de swap bruts (0,25%) :   2,50 $
+  Part LP   (0,22%) :           2,20 $   → reste dans le pool, augmente k
+  Part PnL  (0,03%) :           0,30 $   → need_take_pnl_pc, récupérée par TakePnl
+Reste envoyé à l'utilisateur : 997,50 $ (moins l'impact de prix de la courbe)
+```
+
+Comparez à CPMM `AmmConfig[0]` (palier 0,25%, pas de frais de créateur) : LP obtient 2,10 \$, protocole 0,30 \$, fonds 0,10 \$. CPMM introduit la ligne de fonds en la prélevant sur ce qui aurait été la part LP dans le palier équivalent d'AMM v4.
+
+## Tableau comparatif
+
+| | AMM v4 | CPMM `index=0` | CLMM `index=2` |
+|---|---|---|---|
+| Frais de swap | 0,25% | 0,25% | 0,25% |
+| LP | 0,22% | 0,21% | Varie selon les émissions |
+| Protocole | 0,03% | 0,03% | Par palier |
+| Fonds | N/A | 0,01% | Par palier |
+| Créateur (optionnel) | N/A | 0 par défaut | N/A |
+| Où les frais sont situés | Coffre du pool + need_take_pnl_* | Coffre du pool + protocol_fees_* + fund_fees_* | Global + par-tick + par-position |
+
+Matrice complète dans [`reference/fee-comparison`](/fr/reference/fee-comparison).
+
+## Notes pour les intégrateurs
+
+- **Citation.** Récupérez `AmmInfo` via le SDK ou `api-v3.raydium.io/pools/info/ids`. **Ne pas** calculer votre propre citation contre les soldes bruts des coffres — les montants en séquestre OpenBook et l'exclusion PnL éloignent les réserves effectives de ce que `getTokenAccountBalance` affiche.
+- **Paramètres de frais périmés.** En principe, `SetParams` pourrait changer `swap_fee_numerator`, mais en pratique, le multisig Raydium n'a pas changé les paramètres par défaut pour aucun pool en production. Néanmoins, lisez toujours l'état on-chain plutôt que de coder en dur.
+- **Pas de récompenses.** AMM v4 ne supporte pas les émissions de récompenses au niveau du pool. Les fermes écosystème héritées (Farm v3 / v5 / v6) en sont l'équivalent au niveau du staking — voir [`products/farm-staking`](/fr/products/farm-staking).
+
+## Où aller ensuite
+
+- [`products/amm-v4/math`](/fr/products/amm-v4/math) — la dérivation des frais de swap dans la courbe.
+- [`products/amm-v4/instructions`](/fr/products/amm-v4/instructions) — listes de comptes pour `WithdrawPnl` / `SetParams`.
+- [`reference/fee-comparison`](/fr/reference/fee-comparison) — matrice côte à côte.
+
+Sources :
+
+- [Programme Raydium AMM — `raydium-io/raydium-amm`](https://github.com/raydium-io/raydium-amm)
+- Champs de numérateur/dénominateur des frais AMM v4 on-chain (vérifiés contre les comptes `AmmInfo` sur mainnet).

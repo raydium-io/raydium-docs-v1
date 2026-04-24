@@ -1,0 +1,256 @@
+---
+title: "集中流动性数学"
+description: "sqrt-price 表示、流动性-金额公式、单跳和多跳交换步骤、费用增长会计——Raydium CLMM 背后的数学。"
+---
+
+<Info>
+  **本页内容由 AI 自动翻译，所有内容以英文版本为准。**
+
+  [查看英文版 →](/algorithms/clmm-math)
+</Info>
+
+<Info>
+  本页整合了 CLMM 背后的推导过程。如需了解链上实现，请查看 [`products/clmm/math`](/zh/products/clmm/math)（引用本页）和 [`products/clmm/ticks-and-positions`](/zh/products/clmm/ticks-and-positions)（说明跳价格子的设计）。
+</Info>
+
+## 为什么是 sqrt-price，而不是 price
+
+Uniswap v3 系列的 CLMM 将价格表示为其平方根，以定点 `Q64.64` 形式存储：
+
+```
+sqrt_price_x64 = floor(sqrt(price) · 2^64)
+```
+
+有三个原因：
+
+1. **线性流动性数学。** 价格范围内 token0 或 token1 的金额恰好是 `sqrt_price` 的线性函数，而不是 `price` 的线性函数。存储 `sqrt_price` 让交换步骤可以直接计算这些线性公式，无需计算平方根。
+2. **溢出控制。** `sqrt_price · L` 在所有合理参数下都适应 `u256`；`price · L` 可能更早溢出。
+3. **跳价格数学统一。** 由于跳价格定义为 `1.0001^i`，所以 `sqrt(price) = 1.00005^i` 也是 1.00005 梯级的精确幂。每次跳价格穿越在 `sqrt_price_x64` 空间中转化为一个小的乘法。
+
+价格和 sqrt-price 是一一对应的；转换公式为 `price = (sqrt_price_x64 / 2^64)^2`。
+
+## 跳价格格子
+
+价格被离散化到一个网格上：
+
+```
+price(tick_i) = 1.0001^i
+```
+
+`tick_i` 是一个 `i32`。活跃范围是 `[MIN_TICK, MAX_TICK] = [−443636, 443636]`，对应的价格范围约为 `[2^−128, 2^128]`。每个池的 `tick_spacing` 由其费用等级设定：紧密交易对使用较小间距（例如稳定币 0.01% 等级使用间距 1），波动性交易对使用较大间距（0.25% 等级使用 60，1% 等级使用 120）。
+
+头寸必须使其 `tick_lower` 和 `tick_upper` 与 `tick_spacing` 对齐。池中的活跃跳价格（那些在该处开始或结束流动性的跳价格）是交换步骤关心的唯一跳价格。
+
+## 流动性到金额的转换
+
+对于流动性为 `L` 且价格范围为 `[sqrt_lo, sqrt_hi]` 的头寸（均为 `sqrt_price` 值）：
+
+| 池状态 | token0 金额 | token1 金额 |
+|------------|-------------------|-------------------|
+| 价格在范围上方（`sqrt_p ≥ sqrt_hi`） | 0 | `L · (sqrt_hi − sqrt_lo)` |
+| 价格在范围内 | `L · (sqrt_hi − sqrt_p) / (sqrt_p · sqrt_hi)` | `L · (sqrt_p − sqrt_lo)` |
+| 价格在范围下方（`sqrt_p ≤ sqrt_lo`） | `L · (sqrt_hi − sqrt_lo) / (sqrt_lo · sqrt_hi)` | 0 |
+
+推导：对 CPMM 不变式进行局部求导。在任何单个跳价格范围内，头寸的行为如同一个 CPMM，其虚拟准备金 `(x_v, y_v)` 被选择使得池当前的 `(sqrt_p, L)` 符合 `L = sqrt(x_v · y_v)`。从 `sqrt_p` 积分到范围边界得出上述金额。
+
+**逆向公式**（用于为给定的 `amount0` 或 `amount1` 创建头寸时）：
+
+```
+L_from_amount0(amount0, sqrt_lo, sqrt_hi, sqrt_p) =
+    amount0 · sqrt_p · sqrt_hi / (sqrt_hi − sqrt_p)
+
+L_from_amount1(amount1, sqrt_lo, sqrt_hi, sqrt_p) =
+    amount1 / (sqrt_p − sqrt_lo)
+
+// 对于对范围内头寸的对称存入，取最小值。
+L = min(L_from_amount0, L_from_amount1)
+```
+
+## 单跳价格交换步骤
+
+在单个跳价格范围内，池的行为类似 CPMM。给定当前 `sqrt_p` 和目标 `sqrt_target`：
+
+```
+Δamount0_step = L · (sqrt_target − sqrt_p) / (sqrt_p · sqrt_target)     // 交换获得 token0 时
+Δamount1_step = L · (sqrt_target − sqrt_p)                              // 交换获得 token1 时
+```
+
+### 精确输入步骤
+
+给定 `Δin_remaining`：
+
+```
+// 如果填满到跳价格边界，候选新 sqrt_p：
+sqrt_after_full = sqrt_target
+amount_to_full  = Δamount_in_to_reach(sqrt_p → sqrt_target)
+
+if Δin_remaining ≥ amount_to_full:
+    // 消耗桶的剩余部分
+    sqrt_p'         = sqrt_target
+    Δin_consumed    = amount_to_full
+    Δout            = amount_out_at_boundary
+else:
+    // 我们不会穿越；求解终端 sqrt_p
+    sqrt_p'         = L · sqrt_p / (L + Δin_remaining · sqrt_p)      // 用于 0→1 交换
+    Δin_consumed    = Δin_remaining
+    Δout            = L · (sqrt_p − sqrt_p')                          // 与 Δsqrt 成比例
+```
+
+`0→1` 交换会降低 `sqrt_p`（当我们出售 token0 时价格下跌）。`1→0` 交换会提高它。公式在 `sqrt_p` 和 `sqrt_target` 交换时是对称的。
+
+### 精确输出步骤
+
+结构相同，但求解 `Δin` 而不是输出。
+
+## 多跳价格交换循环
+
+交换会遍历跳价格直到输入耗尽或达到价格限制：
+
+```
+while Δin_remaining > 0 and sqrt_p != sqrt_price_limit:
+    next_tick = find_next_initialized_tick(pool.tick_current, direction)
+    sqrt_target = min(next_tick.sqrt_price, sqrt_price_limit)       // 按方向
+
+    (Δin, Δout, sqrt_p') = single_step(sqrt_p, sqrt_target, L, Δin_remaining)
+
+    Δin_remaining -= Δin
+    accumulated_out += Δout
+
+    if sqrt_p' == next_tick.sqrt_price:
+        // 穿越跳价格
+        L += next_tick.liquidity_net * direction_sign
+        flip_fee_growth_outside(next_tick)
+        match_limit_orders_at_tick(next_tick, ...)        // 见 products/clmm/math
+        pool.tick_current = next_tick.tick_index
+    sqrt_p = sqrt_p'
+```
+
+每个 `single_step` 使用池的当前 `L`。`L` **仅**在穿越初始化的跳价格时改变。跳价格间的流动性是恒定的，这正是单步数学具有闭式解的原因。
+
+跳价格处的 `liquidity_net` 是在该跳价格处开始的头寸流动性的有符号总和减去在该处结束的头寸流动性。向上穿越会加上 `liquidity_net`；向下穿越会减去它。
+
+当池在跳价格处有限价单打开时，穿越跳价格步骤也会机会性地消耗部分交换输入来填补这些订单（按队列在集群间）。匹配算法和可能在基本步骤之上应用的动态费用附加费在 [`products/clmm/math`](/zh/products/clmm/math) 中有文档说明；它们不改变上述闭式单步公式。
+
+## 费用增长累加器
+
+CLMM 按活跃流动性单位跟踪费用，每侧、全局和每跳价格：
+
+```
+fee_growth_global_0_x64     // Q64.64，单调递增
+fee_growth_global_1_x64
+tick.fee_growth_outside_0_x64   // "该跳价格在活跃范围外时累积的费用"
+tick.fee_growth_outside_1_x64
+```
+
+在每个 `single_step` 上：
+
+```
+step_lp_fee = (Δin · fee_rate) · (1 − protocol_fraction − fund_fraction)
+fee_growth_global += step_lp_fee · 2^64 / L     // 仅适用于输入侧
+```
+
+（另一侧的 `fee_growth_global` 在本步骤不移动，因为该侧没有 token 作为输入支付。）
+
+穿越跳价格时，程序会**翻转** `fee_growth_outside`：
+
+```
+tick.fee_growth_outside_0_x64 = fee_growth_global_0_x64 − tick.fee_growth_outside_0_x64
+tick.fee_growth_outside_1_x64 = fee_growth_global_1_x64 − tick.fee_growth_outside_1_x64
+```
+
+"Outside"（外侧）是相对于 `tick_current` 而言的。当 `tick_current` 在跳价格上方时，外侧意味着"下方"。当 `tick_current` 在下方时，外侧意味着"上方"。翻转会交换这种解释。
+
+### 头寸的 `fee_growth_inside`
+
+给定一个头寸 `[tick_lower, tick_upper]` 和当前 `tick_current`：
+
+```
+if tick_current >= tick_upper:
+    inside = tick_lower.fee_growth_outside − tick_upper.fee_growth_outside
+else if tick_current < tick_lower:
+    inside = tick_upper.fee_growth_outside − tick_lower.fee_growth_outside
+else:     // 头寸在范围内
+    inside = fee_growth_global
+           − tick_lower.fee_growth_outside
+           − tick_upper.fee_growth_outside
+```
+
+头寸对于 token 侧 `s` 的未收取费用为：
+
+```
+tokens_owed_s += L · (fee_growth_inside_s − fee_growth_inside_last_s) / 2^64
+fee_growth_inside_last_s = fee_growth_inside_s
+```
+
+此更新在与头寸的每次交互上运行（`IncreaseLiquidity`、`DecreaseLiquidity`、`CollectFees`）。
+
+## 工作示例——穿越一个跳价格
+
+池（简化）：
+
+- `sqrt_p_x64 = 2^64 · 1.0 = 2^64`（价格 = 1.0）
+- `L = 1_000_000`
+- `tick_current = 0`
+- 下方的下一个初始化跳价格：`tick = −60`，`sqrt_price = 1.0001^(−30) ≈ 0.99700`，`liquidity_net = −400_000`（此跳价格结束一个头寸，向下穿越移除 400k）
+- 费率：0.25%
+
+交换：`Δin = 10_000` token0，方向 = 0→1。
+
+**步骤 1——至 `sqrt_target = 0.99700 · 2^64`**：
+
+```
+amount_in_to_target = L · (1/sqrt_target − 1/sqrt_p)
+                    = 1_000_000 · (1/0.99700 − 1/1.0)
+                    ≈ 1_000_000 · 0.003009
+                    ≈ 3_009
+```
+
+3,009 &lt; 10,000，所以我们完全填满此步骤：
+
+```
+Δin_step  = 3_009 / (1 − 0.0025)  = 3_017    // 费用前
+Δout_step = L · (sqrt_p − sqrt_target) ≈ 1_000_000 · 0.00299 ≈ 2_990
+sqrt_p    = 0.99700 · 2^64
+tick_current = −60
+L         = 1_000_000 + (−400_000)  = 600_000         // 穿越跳价格
+跳价格 −60 处的 fee_growth_outside 被翻转
+Δin_remaining = 10_000 − 3_017 = 6_983
+```
+
+**步骤 2——使用新 `L = 600_000`**：
+
+下一个初始化跳价格（比如 `tick = −120`）位于 `sqrt = 0.99402`。重新计算 `amount_in_to_target`：
+
+```
+amount_in_to_target = 600_000 · (1/0.99402 − 1/0.99700)
+                    ≈ 600_000 · 0.003010
+                    ≈ 1_806
+```
+
+仍然小于 `Δin_remaining`。再次穿越。继续直到 `Δin_remaining` 变为零。
+
+完整的 `Δout` 序列累积到最终交换输出。
+
+## 初始化和溢出保护
+
+- `MIN_SQRT_PRICE_X64` 和 `MAX_SQRT_PRICE_X64` 对应 `tick = ±443636`。任何会将 `sqrt_p` 推出此范围的交换都会失败。
+- 用户的 `sqrt_price_limit` 参数必须在同一区间内；程序会检查。
+- `L · Δsqrt` 的乘积在 `u256` 中计算，然后移位回 `u128` 以避免溢出。
+
+## 与 Uniswap v3 的差异
+
+- **预言机。** Raydium 的 `ObservationState` 存储 `(block_timestamp, tick_cumulative, seconds_per_liquidity_cumulative)` 环形缓冲；与 Uniswap 的格式略有不同，但 TWAP 数学相同。
+- **Token-2022。** Raydium CLMM 支持 Token-2022 mints；转账费变体需要额外的交换前后金额调整。见 [`algorithms/token-2022-transfer-fees`](/zh/algorithms/token-2022-transfer-fees)。
+- **跳价格位图。** Raydium 将初始化跳价格位图打包成每个池的 `[u64; 16]` 以加快 `find_next_initialized_tick`；Uniswap 使用每字的链上映射。权衡是租金与查找成本。
+- **奖励槽。** Raydium 支持 3 个每池奖励流，每个流有单独的 `reward_growth_global_x64` 计数器；与费用增长累加器结构相同。
+
+## 指针
+
+- [`products/clmm/math`](/zh/products/clmm/math)——链上实现和使用实际 CLMM 结构字段的工作示例。
+- [`products/clmm/ticks-and-positions`](/zh/products/clmm/ticks-and-positions)——跳价格格子、`liquidity_net`/`gross`、活跃范围语义。
+- [`products/clmm/fees`](/zh/products/clmm/fees)——费用增长累加器的实际应用。
+
+来源：
+
+- Uniswap v3 白皮书（sqrt-price 数学的规范推导）。
+- Raydium CLMM 程序源代码。

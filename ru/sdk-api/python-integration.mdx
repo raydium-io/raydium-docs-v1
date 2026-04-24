@@ -1,0 +1,268 @@
+---
+title: "Интеграция на Python"
+description: "Создание ботов и бэкендов для Raydium на Python с помощью solders, solana-py и anchorpy — настройка окружения, чтение состояния пула, отправка свопов и типичная архитектура бота."
+---
+
+<Info>
+  **Эта страница переведена с помощью ИИ. За эталон принимается английская версия.**
+
+  [Открыть английскую версию →](/sdk-api/python-integration)
+</Info>
+
+<Info>
+  Raydium не публикует официальный Python SDK. Описанные здесь подходы объединяют три хорошо поддерживаемые библиотеки сообщества: **`solders`** (привязки на Rust для примитивов Solana), **`solana-py`** (RPC-клиент) и **`anchorpy`** (построение инструкций в стиле Anchor из IDL). Такая комбинация покрывает всё, что делает TS SDK, просто менее отполирована.
+</Info>
+
+## Окружение
+
+```bash
+python -m venv .venv
+source .venv/bin/activate
+
+pip install solders solana anchorpy construct base58
+```
+
+Версии, которые работают вместе на момент написания:
+
+```
+solders == 0.21.*
+solana  == 0.34.*
+anchorpy == 0.20.*
+```
+
+`anchorpy` периодически отстаёт от версии `anchor-lang`; для недавно развёрнутой программы Raydium проверьте, что IDL компилируется с вашей закреплённой версией `anchorpy`, прежде чем публиковать код.
+
+## Подключение и ключевая пара
+
+```python
+from solana.rpc.async_api import AsyncClient
+from solders.keypair import Keypair
+
+client = AsyncClient("https://api.mainnet-beta.solana.com", commitment="confirmed")
+owner  = Keypair.from_bytes(bytes(open("keypair.json", "rb").read()))
+```
+
+`AsyncClient` — это асинхронный вариант; синхронный `Client` доступен для быстрых скриптов, но асинхронный предпочтителен для всего, что отправляет несколько запросов.
+
+## Чтение состояния пула
+
+В большинстве боевых приложений состояние пула читается из REST API Raydium (см. [`sdk-api/rest-api`](/ru/sdk-api/rest-api)) вместо ручного декодирования on-chain данных — это проще и задержка приемлема для большинства случаев.
+
+```python
+import httpx
+
+async def get_pool(pool_id: str) -> dict:
+    async with httpx.AsyncClient() as http:
+        r = await http.get(
+            "https://api-v3.raydium.io/pools/info/ids",
+            params={"ids": pool_id},
+        )
+        r.raise_for_status()
+        data = r.json()
+        if not data["success"]:
+            raise RuntimeError(data["error"]["message"])
+        return data["data"][0]
+
+pool = await get_pool("58oQChx4yWmvKdwLLZzBi4ChoCc2fqCUWBkwMihLYQo2")
+print(pool["price"], pool["day"]["volume"])
+```
+
+Для ботов, требующих минимальной задержки, декодируйте on-chain данные напрямую:
+
+```python
+from construct import Struct, Int64ul, Int128ul, Bytes, this
+
+# Partial CPMM PoolState layout (first few fields)
+POOL_STATE_LAYOUT = Struct(
+    "discriminator"     / Bytes(8),
+    "amm_config"        / Bytes(32),
+    "pool_creator"      / Bytes(32),
+    "token_0_vault"     / Bytes(32),
+    "token_1_vault"     / Bytes(32),
+    "lp_mint"           / Bytes(32),
+    "token_0_mint"      / Bytes(32),
+    "token_1_mint"      / Bytes(32),
+    # ...
+)
+
+from solders.pubkey import Pubkey
+
+async def decode_pool(pool_id: Pubkey) -> dict:
+    resp = await client.get_account_info(pool_id)
+    data = resp.value.data
+    return POOL_STATE_LAYOUT.parse(data)
+```
+
+Полный layout находится в `src/raydium/cpmm/layout.ts` (исходный код на TS); портируйте его в `construct` по мере необходимости. `anchorpy` может делать это автоматически на основе IDL — см. ниже.
+
+## Построение и отправка свопа
+
+Для простоты используйте endpoint **server-built-transaction** Raydium. Сервер возвращает готовую к подписанию транзакцию; вам остаётся только добавить свою подпись:
+
+```python
+import httpx
+import base64
+from solders.transaction import VersionedTransaction
+from solana.rpc.types import TxOpts
+
+async def swap(pool_id: str, amount_in: int, slippage_bps: int):
+    async with httpx.AsyncClient() as http:
+        r = await http.get(
+            "https://api-v3.raydium.io/transaction/swap-base-in",
+            params={
+                "poolId":       pool_id,
+                "amount":       amount_in,
+                "inputMint":    "So11111111111111111111111111111111111111112",  # WSOL
+                "outputMint":   "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",  # USDC
+                "slippageBps":  slippage_bps,
+                "wallet":       str(owner.pubkey()),
+                "txVersion":    "V0",
+                "computeUnitPriceMicroLamports": 50_000,
+            },
+        )
+        r.raise_for_status()
+        data = r.json()["data"]
+
+    # Decode the pre-built tx, sign with our keypair, send.
+    raw  = base64.b64decode(data["tx"]["transaction"])
+    tx   = VersionedTransaction.from_bytes(raw)
+    tx.sign([owner])
+
+    sig = await client.send_transaction(tx, opts=TxOpts(skip_preflight=False))
+    await client.confirm_transaction(sig.value, commitment="confirmed")
+    return sig.value, data["swapResponse"]
+```
+
+Это быстрейший путь к работающему боту. Котировка сервера действует недолго (≈30 сек); не кешируйте её.
+
+## Построение свопа на клиенте (через `anchorpy`)
+
+Для минимальной задержки или когда вы не можете достучаться до API Raydium (санкционированные регионы, изолированные системы):
+
+```python
+from anchorpy import Program, Provider, Wallet, Context
+from solana.rpc.async_api import AsyncClient
+from solders.pubkey import Pubkey
+import json
+
+idl = json.load(open("cpmm.json"))  # from raydium-sdk-v2
+provider = Provider(client, Wallet(owner))
+program  = Program(idl, Pubkey.from_string(CPMM_PROGRAM_ID), provider)
+
+# Invoke swap_base_input:
+tx_sig = await program.rpc["swap_base_input"](
+    amount_in,
+    minimum_amount_out,
+    ctx=Context(
+        accounts={
+            "payer":                owner.pubkey(),
+            "authority":            owner.pubkey(),
+            "amm_config":           amm_config_pk,
+            "pool_state":           pool_state_pk,
+            "input_token_account":  user_input_ata,
+            "output_token_account": user_output_ata,
+            "input_vault":          input_vault_pk,
+            "output_vault":         output_vault_pk,
+            "input_token_program":  TOKEN_PROGRAM_ID,
+            "output_token_program": TOKEN_PROGRAM_ID,
+            "input_token_mint":     input_mint,
+            "output_token_mint":    output_mint,
+            "observation_state":    observation_state_pk,
+        },
+    ),
+)
+```
+
+Вычисления PDA (observation state, pool authority) следуют тем же формулам, что и в главе CPMM. `anchorpy` не выводит их автоматически.
+
+## Типичная архитектура бота
+
+Распространённая структура Python-бота для Raydium:
+
+```
+┌──────────────────┐
+│ Scheduler        │  cron / asyncio / redis queue
+└──────────┬───────┘
+           │
+           ▼
+┌──────────────────┐
+│ Price poller     │  httpx + Raydium REST API
+│  (per pool)      │  or WebSocket RPC sub
+└──────────┬───────┘
+           │ event
+           ▼
+┌──────────────────┐
+│ Strategy engine  │  compute signal, decide trade params
+└──────────┬───────┘
+           │ trade params
+           ▼
+┌──────────────────┐
+│ TX builder       │  Raydium REST server-built-tx or anchorpy
+│ + signer         │  solders.Keypair
+└──────────┬───────┘
+           │ VersionedTransaction
+           ▼
+┌──────────────────┐
+│ RPC sender       │  solana-py AsyncClient + Jito RPC
+│ (retry + monitor)│  priority-fee logic
+└──────────┬───────┘
+           │ sig
+           ▼
+┌──────────────────┐
+│ Ledger store     │  Postgres for positions, pending txs, PnL
+└──────────────────┘
+```
+
+Ключевые решения для боевой эксплуатации:
+
+- **RPC-провайдер.** Публичные RPC mainnet-а агрессивно ограничивают. Используйте выделенного провайдера (Helius, QuickNode, Triton) для устойчивого трафика.
+- **WebSocket для состояния пула.** `client.account_subscribe(pool_id)` отправляет обновления при каждом изменении состояния. Намного плотнее, чем polling.
+- **Провайдер приоритетного комиссионера.** Helius имеет endpoint `getPriorityFeeEstimate`; Triton имеет свой. Размер комиссии рассчитывайте на основе 75-го процентиля недавних комиссий на целевой программе.
+- **Bundles для чувствительных к MEV сделок.** Маршрутизируйте через block engine Jito, если не можете допустить риск sandwich. Python-библиотеки: `jito-sdk-python` (третьесторонняя, качество варьируется).
+
+## Чтение состояния фермы
+
+```python
+FARM_V6_ID = Pubkey.from_string("...")
+
+async def get_farm_v6(farm_id: Pubkey):
+    resp = await client.get_account_info(farm_id)
+    return farm_v6_idl_program.account["FarmState"].decode(resp.value.data)
+
+farm = await get_farm_v6(farm_id)
+print(farm.total_staked, farm.reward_info_count)
+for r in farm.reward_infos[:farm.reward_info_count]:
+    print(r.reward_mint, r.emission_per_second_x64)
+```
+
+Метод `.account["X"].decode(bytes)` в `anchorpy` возвращает нативный Python-объект, соответствующий структуре из IDL.
+
+## Типичные ошибки
+
+### 1. Обработка десятичных чисел
+
+Нативный Python `float` — это IEEE-754 double; количества в 9-десятичных минтах (1 SOL = 1e9 единиц) остаются точными, но соотношения и произведения теряют точность. Используйте `int` (`solders` возвращает `int` для всех полей количеств) и проходите через `decimal.Decimal` для любой цены.
+
+### 2. Логика на основе слотов vs временных меток
+
+Некоторые версии фермы используют счётчики слотов; LaunchLab использует временные метки. `solana-py` возвращает `slot` в RPC-ответах, но преобразование slot → timestamp с потерями (зависит от schedule лидера). Если вам нужно реальное время, явно вызовите `get_block_time(slot)`.
+
+### 3. Истощение пула соединений
+
+`AsyncClient` по умолчанию открывает одно HTTP-соединение на запрос. При высокой нагрузке переиспользуйте сессии `httpx.AsyncClient` и установите подходящий `limits=httpx.Limits(max_connections=100)`.
+
+### 4. Ограничения размера транзакции
+
+Python-построенные транзакции не меньше TS-построенных — лимит 1232 байта применяется одинаково. Используйте V0-транзакции (таблицы поиска адресов) для всего, что маршрутизируется через более чем ~2 пула.
+
+## Дополнительные материалы
+
+- [`sdk-api/rest-api`](/ru/sdk-api/rest-api) — HTTP endpoints, используемые выше.
+- [`sdk-api/anchor-idl`](/ru/sdk-api/anchor-idl) — где взять IDL для `anchorpy`.
+- [`integration-guides/routing-and-mev`](/ru/integration-guides/routing-and-mev) — паттерны Jito bundles.
+
+Источники:
+
+- [solders](https://github.com/kevinheavey/solders)
+- [solana-py](https://github.com/michaelhly/solana-py)
+- [anchorpy](https://github.com/kevinheavey/anchorpy)

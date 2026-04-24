@@ -1,0 +1,174 @@
+---
+title: "Changelog"
+description: "Dated record of updates to this documentation set. Entries log which chapters changed, why, and when the content was verified against on-chain state and the program source."
+---
+
+<Info>
+  This is the documentation's changelog — the record of updates to these pages from the project go-live onward. For the protocol's own historical timeline, see [`introduction/history-and-milestones`](/introduction/history-and-milestones). Every entry here has a date, a list of affected chapters, the trigger, and a verified-date noting when on-chain state and program source were last cross-checked against the written content.
+</Info>
+
+## Unreleased — CLMM: limit orders, single-sided fee, dynamic fee
+
+The next CLMM release adds three pool-level capabilities. They are opt-in at pool-creation time and backwards-compatible with existing pools and positions.
+
+### TL;DR for integrators
+
+- **Limit orders** are now first-class CLMM primitives. LPs can open a single-tick order on a pool that supports them; the order is filled FIFO when a swap crosses the tick, and an off-chain keeper (`limit_order_admin`) can settle the filled output without the owner being online. Seven new SDK methods (`openLimitOrder`, `increaseLimitOrder`, `decreaseLimitOrder`, `settleLimitOrder`, `closeLimitOrder`, `closeAllLimitOrder`, `settleAllLimitOrder`) and three new Temp API endpoints under `/limit-order/` (active orders, per-user history, per-PDA event log) cover the full flow.
+- **Single-sided fee (`CollectFeeOn`)** lets a pool collect swap fees from the input side (legacy, mode `0`), or always from `token_0` (mode `1`), or always from `token_1` (mode `2`). Useful when one side of the pair is the canonical accounting token.
+- **Dynamic fee** lets a pool opt into a volatility-tracking surcharge that rises with rapid tick movement and decays over time, calibrated by a per-tier `DynamicFeeConfig` and a per-pool `DynamicFeeInfo`. The new `/main/clmm-dynamic-config` endpoint surfaces the tier list.
+- A new instruction, `CreateCustomizablePool`, exposes all three knobs at pool-creation time. Classic `CreatePool` continues to work for default-fee, no-limit-order pools.
+- **Indexer breaking change**: the per-direction volume counters (`swap_in_amount_token_{0,1}`, `swap_out_amount_token_{0,1}`) and lifetime fee counters (`total_fees_token_{0,1}`, `total_fees_claimed_token_{0,1}`) on `PoolState` were retired into padding to make room for `fee_on` and `dynamic_fee_info`. Indexers that read those fields directly must migrate to the on-chain `Observation` ring or the API.
+
+### Why this matters (for traders, LPs, and integrators)
+
+- **Traders** get tighter quotes on long-tail and event-driven pairs: dynamic fee lets the pool absorb volatility surcharges from the taker without LPs having to actively widen ranges, and limit-order ladders deepen on-chain liquidity at specific prices without committing range-wide capital.
+- **LPs** get a third strategy alongside concentrated ranges and full-range positions: park exact-price orders, get filled when the price visits, settle into the quote token. No active rebalancing required for the filled portion.
+- **Integrators** can model dynamic-fee pools deterministically — the algorithm and parameters are fully on-chain, the calibration tiers are queryable, and the swap path is unchanged in shape (only the fee per step varies).
+
+### What changed in the program
+
+#### New accounts
+
+- **`DynamicFeeConfig`** — per-tier calibration record (filter period, decay period, reduction factor, dynamic-fee control, max volatility accumulator). Created by `CreateDynamicFeeConfig` (admin), referenced by `CreateCustomizablePool` when dynamic fee is enabled.
+- **`LimitOrderState`** — per-order account (PDA seeds: `[owner, limit_order_nonce, order_nonce]`) holding the pool, tick, side, input amount, unfilled ratio, FIFO cohort phase, and book-keeping snapshots. Lifecycle is implicit (`filled_amount` vs `total_amount`, plus account existence): `Open → Filled → Settled → Closed`.
+- **`LimitOrderNonce`** — per-(owner, nonce_index) monotonically-incrementing counter that gets the limit-order PDA seeds. The `nonce_index: u8` lets the same owner partition orders into up to 256 independent nonce streams.
+
+See [Accounts → DynamicFeeConfig and DynamicFeeInfo](/products/clmm/accounts) and [Accounts → LimitOrderState](/products/clmm/accounts).
+
+#### `PoolState` reshape
+
+| Field group | Old layout | New layout |
+|-------------|------------|------------|
+| Per-direction volume counters | `swap_in_amount_token_0`, `swap_out_amount_token_0`, `swap_in_amount_token_1`, `swap_out_amount_token_1` | Folded into `padding5: [u128; 4]` |
+| Lifetime fee counters | `total_fees_token_0`, `total_fees_claimed_token_0`, `total_fees_token_1`, `total_fees_claimed_token_1` | Folded into `padding6: [u64; 4]` |
+| Single-sided fee | — | `fee_on: u8` (0 = FromInput, 1 = Token0Only, 2 = Token1Only) |
+| Dynamic fee | — | `dynamic_fee_info: DynamicFeeInfo` (embedded) |
+
+The total account size is unchanged. **Indexers**: switch volume-tracking off `PoolState` and onto the `Observation` ring or the API. The retired counters are not zeroed on existing pools (they hold whatever they happened to last carry), so re-reading them after upgrade will return stale data.
+
+#### `TickState` additions (no breaking change)
+
+Four new fields are added at the end of `TickState`, replacing some of its tail padding:
+
+- `order_phase: u64` — counter that disambiguates limit-order cohorts at this tick.
+- `orders_amount: u64` — total input committed by all open orders at this tick (not all of which are fully unfilled).
+- `part_filled_orders_remaining: u64` — input still unfilled in the cohort currently being consumed by swaps.
+- `unfilled_ratio_x64: u128` — Q64.64 ratio used to compute each order's fill share.
+
+Tick-array layout, sizing, and PDA seeds are unchanged.
+
+#### New instructions
+
+- **`CreateDynamicFeeConfig` (admin)** — create a calibrated `DynamicFeeConfig` tier. Authority: same treasury multisig as `CreateAmmConfig`.
+- **`UpdateDynamicFeeConfig` (admin)** — update an existing tier's parameters.
+- **`CreateCustomizablePool`** — pool-creation entry point that exposes `collect_fee_on`, `enable_dynamic_fee`, and `dynamic_fee_config`. Coexists with `CreatePool`; we recommend `CreateCustomizablePool` for any new pool that needs the new knobs.
+- **`OpenLimitOrder`** — open a single-tick limit order. Bumps `LimitOrderNonce`, allocates `LimitOrderState`, slots the order into the FIFO cohort at the tick.
+- **`IncreaseLimitOrder` / `DecreaseLimitOrder`** — adjust an order's unfilled portion. Reverts on a fully-filled order with `InvalidOrderPhase`.
+- **`SettleLimitOrder`** — sweep filled output to the owner's ATA. Caller can be the owner or the pool's `limit_order_admin` keeper.
+- **`CloseLimitOrder`** — close a fully-settled order to reclaim rent.
+
+#### `SwapV2` behavior changes
+
+The swap path itself is unchanged in shape, but three things now happen along the way:
+
+1. **Dynamic fee** (when enabled): the pool's `DynamicFeeInfo` is updated each step (decay → accumulate → cap), and the resulting surcharge is added on top of the base fee for that step.
+2. **Limit-order matching** (when the step crosses an initialized tick that has open orders): part of the swap input is consumed FIFO to fill the cohort at that tick, with `unfilled_ratio_x64` updated atomically.
+3. **Single-sided fee routing** (when `fee_on != 0`): the fee is taken from `token_0` or `token_1` regardless of swap direction, instead of always from the input side.
+
+Each of these is a no-op when the pool was created with the legacy defaults. See [Instructions → SwapV2](/products/clmm/instructions) for the updated state-change matrix.
+
+#### New error codes
+
+The `ErrorCode` enum was renumbered in this release: five legacy variants (`LOK`, `ZeroMintAmount`, `InvalidLiquidity`, `TransactionTooOld`, `InvalidRewardDesiredAmount`) were removed, and eleven new variants were appended. Because Anchor numbers errors by enum order from `6000`, **every error code at or after the removed positions has shifted** — clients that hard-coded numeric codes need to remap.
+
+The new codes are:
+
+- `6040` `OrderAlreadyFilled`
+- `6041` `InvalidOrderPhase`
+- `6042` `InvalidLimitOrderAmount`
+- `6043` `OrderPhaseSaturated`
+- `6044` `InvalidDynamicFeeConfigParams`
+- `6045` `InvalidFeeOn`
+- `6046` `ZeroSqrtPrice`
+- `6047` `ZeroLiquidity`
+- `6048` `MissingBaseFlag`
+- `6049` `MissingMintAccount`
+- `6050` `MissingTokenProgram2022`
+
+Full strings and the post-shift table for all CLMM errors are in [Error codes](/reference/error-codes).
+
+### What changed in the SDK (`@raydium-io/raydium-sdk-v2`)
+
+- **New methods on `raydium.clmm`**: `createCustomizablePool`, `openLimitOrder`, `increaseLimitOrder`, `decreaseLimitOrder`, `settleLimitOrder`, `settleAllLimitOrder`, `closeLimitOrder`, `closeAllLimitOrder`.
+- **New REST helpers on `raydium.api`**: `getClmmDynamicConfigs`, `getClmmLimitOrderConfigs`.
+- **New types**: `CollectFeeOn` enum, `DynamicFeeConfig`, `DynamicFeeInfo`, `LimitOrderState`, `LimitOrderConfig`.
+- **Internal reorg**: `utils/` moved to `libraries/`. The package barrel is unchanged; only deep imports under `@raydium-io/raydium-sdk-v2/utils/...` need updating to `…/libraries/...`.
+
+End-to-end TypeScript walkthroughs live in [`products/clmm/code-demos`](/products/clmm/code-demos).
+
+### What changed in the APIs
+
+- `api-v3` — two new endpoints under `/main/`:
+  - `GET /main/clmm-dynamic-config` — list of `DynamicFeeConfig` tiers.
+  - `GET /main/clmm-limit-order-config` — per-pool limit-order configuration.
+- `temp-api-v1` — three new endpoints under `/limit-order/`:
+  - `GET /limit-order/order/list?wallet=…` — a wallet's currently-parked orders (open and partially-filled, served from the indexer's Redis cache; same payload covers both phases via `totalAmount` / `filledAmount` / `pendingSettle`).
+  - `GET /limit-order/history/order/list-by-user?wallet=…` — a wallet's historical limit orders. Optional filters: `poolId`, `mint1`, `mint2`, `hideCancel`. Cursor-paginated via `nextPageId` / `size` (max 100).
+  - `GET /limit-order/history/event/list-by-pda?pda=…` — per-PDA event log (`open` / `increase` / `decrease` / `settle` / `close`) for one or more comma-separated limit-order PDAs. Cursor-paginated via `nextPageId` / `size` (max 100).
+
+All five are documented in the API Reference tab.
+
+### Authority surface
+
+The `limit_order_admin` is an off-chain operational keeper, **not a multisig**. It can only call `SettleLimitOrder` and `CloseLimitOrder` on existing orders, and the output of a settle always lands in the **owner's** ATA. It cannot mutate pool fields, open or modify orders, or sign for anything else. See [Admin keys and multisig → CLMM](/security/admin-and-multisig).
+
+### Pages updated
+
+- `products/clmm/overview` — new "What's new" section and updated next-step pointers.
+- `products/clmm/accounts` — three new accounts, `PoolState` reshape with migration warning, `TickState` additions, new PDA helpers.
+- `products/clmm/instructions` — seven new instructions, `SwapV2` behavior addendum, updated state-change matrix.
+- `products/clmm/fees` — single-sided fee section, dynamic-fee section with parameter table.
+- `products/clmm/math` — limit-order matching pseudo-code, dynamic-fee derivation.
+- `products/clmm/code-demos` — `createCustomizablePool` demo, full limit-order walkthrough, new pitfalls.
+- `algorithms/clmm-math` — cross-reference to limit-order matching and dynamic fee in the multi-tick swap loop.
+- `sdk-api/typescript-sdk` — CLMM module additions section, `utils/` → `libraries/` migration note.
+- `api-reference/openapi/api-v3.yaml` — two new endpoints with response schemas.
+- `api-reference/openapi/temp-api-v1.yaml` — three new limit-order endpoints (`/limit-order/order/list`, `/limit-order/history/order/list-by-user`, `/limit-order/history/event/list-by-pda`) with their request and response schemas.
+- `api-reference/api-v3/overview` — note on the new CLMM config endpoints.
+- `api-reference/temp-api-v1/overview` — note on the new active-orders, history-by-user, and event-by-PDA endpoints.
+- `reference/error-codes` — eleven new CLMM error codes (6040–6050) plus five removed legacy codes; numeric codes after the removal points have shifted.
+- `security/admin-and-multisig` — new `DynamicFeeConfig` admin row and `limit_order_admin` keeper row, with bounded-authority explainer.
+
+**Verified against**:
+- `raydium-clmm` source.
+- `@raydium-io/raydium-sdk-v2` source.
+- `api-v3` and `temp-api-v1` source.
+
+## 2026-04-26 — Initial publication
+
+First public release of the Raydium documentation set.
+
+**Verified against**:
+- Live program deployments on Solana mainnet-beta.
+- `@raydium-io/raydium-sdk-v2@0.2.42-alpha`.
+- Public Raydium docs and on-chain references through April 2026.
+
+Going forward, every protocol upgrade, audit, or doc revision lands as a new entry in this file.
+
+## Documentation conventions
+
+- **Versioning**: this documentation uses calendar-based versioning (YYYY-MM-DD). Each update creates a new entry at the top of the file.
+- **Verified date**: every entry records when the content was last cross-checked against on-chain / API state and the program source. If not stated, assume the entry's main date.
+- **Breaking changes**: called out in a boxed warning on affected pages and tagged in the entry below.
+- **Coverage**: this changelog covers the documentation set itself. The protocol's own historical timeline lives in [`introduction/history-and-milestones`](/introduction/history-and-milestones) and is the source of truth for "when did X happen on Raydium".
+
+## Corrections
+
+If you find an error in this documentation, please open an issue or pull request on the documentation repository. Corrections are logged in this changelog.
+
+## Pointers
+
+- [`introduction/history-and-milestones`](/introduction/history-and-milestones) — the protocol's own timeline.
+- [`security/audits`](/security/audits) — audit history.
+- [`ray/protocol-fees`](/ray/protocol-fees) — protocol fee splits.
+- [`reference/program-addresses`](/reference/program-addresses) — program ID source-of-truth.

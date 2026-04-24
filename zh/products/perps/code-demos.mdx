@@ -1,0 +1,312 @@
+---
+title: "Perps 代码演示"
+description: "通过 Orderly Network 的 API 以编程方式访问 Raydium Perps：存入 USDC、注册交易账户、下单/取消/修改订单、获取头寸、订阅市场 WebSocket 和提现。"
+---
+
+<Info>
+  **本页内容由 AI 自动翻译，所有内容以英文版本为准。**
+
+  [查看英文版 →](/products/perps/code-demos)
+</Info>
+
+<Info>
+  **Raydium Perps 是 Orderly Network 上的白标部署。** 订单簿、匹配引擎和账户状态全部位于 Orderly。Raydium SDK v2（`@raydium-io/raydium-sdk-v2`）**不涵盖** perps — 要实现编程访问，请直接使用 Orderly 的 REST + WebSocket API。下面的代码片段展示了最常见的流程；规范参考请见 [orderly.network/docs](https://orderly.network/docs/build-on-omnichain/evm-api/introduction)。
+</Info>
+
+<Info>
+  **版本信息。**
+
+  - 后端：Orderly Network REST + WebSocket API
+  - 代码片段架构已针对 Orderly 的 API 验证（截至 2026-04）
+  - 链上存入的 Solana 集群：`mainnet-beta`
+  - 签名：Solana ed25519 签署 Orderly EIP-712 风格的负载（Orderly 即使在非 EVM 链上也使用 EIP-712 架构；参见 Orderly 文档了解最新字段列表）
+
+  Orderly 的 API 表面在不断演变；在将这些代码片段复制到生产环境之前，请检查 [orderly.network/docs](https://orderly.network/docs/build-on-omnichain/evm-api/introduction)。
+</Info>
+
+## 本页内容
+
+下面的流程涵盖集成商相关的生命周期：
+
+1. 账户设置 — 存入 USDC 并向 Orderly 注册账户。
+2. 身份验证 REST 调用 — 请求签名以下单、取消订单和查询账户。
+3. 交易 — 下市价单/限价单、取消订单、获取头寸和成交。
+4. 市场数据 — 订阅订单簿和交易 WebSocket。
+5. 提现 — 启动提现回钱包。
+
+这些代码片段针对 Node.js + TypeScript，使用 `@solana/web3.js` 和 `tweetnacl` 进行 Ed25519 签名。它们是 **起点** — Orderly 的 API 表面很广泛且变化快速；在部署生产代码之前，始终检查 Orderly 的最新文档。
+
+## 设置
+
+```ts
+import { Connection, Keypair, PublicKey, clusterApiUrl } from "@solana/web3.js";
+import nacl from "tweetnacl";
+import bs58 from "bs58";
+import fs from "node:fs";
+
+// 1. Solana 钱包 — 拥有 USDC，签署存入/提现交易。
+const connection = new Connection(process.env.RPC_URL ?? clusterApiUrl("mainnet-beta"));
+const owner = Keypair.fromSecretKey(
+  new Uint8Array(JSON.parse(fs.readFileSync(process.env.KEYPAIR!, "utf8"))),
+);
+
+// 2. Orderly 交易密钥 — 单独的 Ed25519 密钥对，用于签署 API 请求。
+//    不是 Solana 钱包。生成一次，保密，跨会话重复使用。
+const orderlyKey = nacl.sign.keyPair();   // ed25519
+const orderlyPubB58 = "ed25519:" + bs58.encode(orderlyKey.publicKey);
+
+// 3. Orderly 基础 URL。Raydium 使用 Orderly 的主网主机。
+const ORDERLY_BASE = "https://api.orderly.org";
+const BROKER_ID    = "raydium";   // Raydium 在 Orderly 上的代理命名空间
+const CHAIN_ID     = "solana";    // 用于跨链账户注册
+```
+
+Orderly 交易密钥**不是**你的钱包密钥对。它是一个请求签名密钥，你在第一次使用时向你的钱包注册；你可以在不接触资金的情况下轮换它。将其视为会话凭证。
+
+## 账户注册
+
+在下任何订单之前，向 Orderly 注册钱包：
+
+```ts
+import { encodeUserSettlement } from "./eip712-helpers"; // 参见 Orderly 文档了解确切的负载
+
+// 1. 从 Orderly 请求注册 nonce。
+const nonceResp = await fetch(`${ORDERLY_BASE}/v1/registration_nonce`).then(r => r.json());
+const registrationNonce = nonceResp.data.registration_nonce;
+
+// 2. 用 Solana 钱包签署注册负载（Solana 上的 EIP-712 风格
+//    实现为结构化消息；Orderly 的 SDK 提供编码器）。
+const payload = encodeUserSettlement({
+  brokerId: BROKER_ID,
+  chainId: CHAIN_ID,
+  registrationNonce,
+  timestamp: Date.now(),
+});
+const walletSig = nacl.sign.detached(Buffer.from(payload), owner.secretKey);
+
+// 3. 注册，包括 Orderly Ed25519 交易密钥。
+const reg = await fetch(`${ORDERLY_BASE}/v1/register_account`, {
+  method: "POST",
+  headers: { "Content-Type": "application/json" },
+  body: JSON.stringify({
+    message: payload,
+    signature: bs58.encode(walletSig),
+    userAddress: owner.publicKey.toBase58(),
+    orderlyKey: orderlyPubB58,
+  }),
+}).then(r => r.json());
+
+console.log("Account ID:", reg.data.account_id);
+```
+
+账户 ID 对每对 `(broker_id, wallet_address)` 是确定的 — 注册是幂等的。如果钱包已向 Raydium 的代理注册，调用返回相同的账户 ID 而不创建新账户。
+
+## 存入 USDC
+
+存入将 USDC 从钱包 ATA 移到 Orderly 的结算金库。它们是链上 Solana 交易：
+
+```ts
+// 使用 Orderly 的 Solana 程序构建存入 ix（金库程序 ID 在
+// 他们的文档中发布；动态提取而不是硬编码）。
+const vaultProgramId = new PublicKey("<orderly_solana_vault_program_id>");
+
+const depositIx = await buildOrderlyDepositIx({
+  vaultProgramId,
+  user: owner.publicKey,
+  brokerId: BROKER_ID,
+  amountUsdc: BigInt(100_000_000),    // 100 USDC（6 位小数）
+});
+
+const tx = new Transaction().add(depositIx);
+const sig = await connection.sendTransaction(tx, [owner]);
+await connection.confirmTransaction(sig, "confirmed");
+console.log("Deposit tx:", sig);
+```
+
+约 30 秒后，Orderly 的中继器索引存入，余额显示在账户的可用保证金下。查询 `/v1/client/holding` 确认：
+
+```ts
+const holdingResp = await orderlyAuthGet("/v1/client/holding");
+console.log("Balances:", holdingResp.data.holding);
+```
+
+（`orderlyAuthGet` 定义在下面 — 每个身份验证调用都通过它。）
+
+## 请求签名辅助函数
+
+每个对 Orderly 的身份验证 REST 调用都包含 `(timestamp + method + path + body)` 上的 Ed25519 签名：
+
+```ts
+async function orderlyAuthRequest(
+  method: "GET" | "POST" | "PUT" | "DELETE",
+  path: string,
+  body?: unknown,
+): Promise<any> {
+  const ts   = Date.now().toString();
+  const json = body ? JSON.stringify(body) : "";
+  const msg  = `${ts}${method}${path}${json}`;
+  const sig  = nacl.sign.detached(Buffer.from(msg), orderlyKey.secretKey);
+
+  const resp = await fetch(ORDERLY_BASE + path, {
+    method,
+    headers: {
+      "Content-Type": "application/json",
+      "orderly-account-id":  /* 已注册的 account_id */ "",
+      "orderly-key":         orderlyPubB58,
+      "orderly-signature":   bs58.encode(sig),
+      "orderly-timestamp":   ts,
+    },
+    body: json || undefined,
+  });
+  return resp.json();
+}
+
+const orderlyAuthGet  = (p: string)            => orderlyAuthRequest("GET",  p);
+const orderlyAuthPost = (p: string, b: object) => orderlyAuthRequest("POST", p, b);
+const orderlyAuthDel  = (p: string)            => orderlyAuthRequest("DELETE", p);
+```
+
+重放保护：时间戳与服务器时钟相差超过 5 秒的请求被拒绝。同步你的时钟 (NTP) 并避免提前签署请求。
+
+## 下市价单
+
+```ts
+const marketResp = await orderlyAuthPost("/v1/order", {
+  symbol:        "PERP_SOL_USDC",
+  order_type:    "MARKET",
+  side:          "BUY",
+  order_quantity: 1.0,        // 1 SOL 的头寸
+  reduce_only:    false,
+});
+
+if (marketResp.success) {
+  console.log("Order ID:", marketResp.data.order_id);
+} else {
+  console.error("Reject:", marketResp.message);
+}
+```
+
+市价单立即执行。响应返回结果的 `order_id` 和状态。成交通过 WebSocket 到达（见下文）；REST 响应本身不会阻塞直到完全成交。
+
+## 下只做市商限价单
+
+```ts
+const limitResp = await orderlyAuthPost("/v1/order", {
+  symbol:         "PERP_SOL_USDC",
+  order_type:     "LIMIT",
+  side:           "SELL",
+  order_quantity: 0.5,
+  order_price:    140.50,
+  // 标志组合：
+  // post_only: true 使这成为只做市商订单 — 如果会跨越则取消。
+  // reduce_only / time_in_force 可独立设置。
+  post_only:      true,
+});
+console.log(limitResp);
+```
+
+对于 `IOC` / `FOK`，设置 `time_in_force: "IOC"` 或 `"FOK"`。参见 [`/zh/products/perps/order-types`](/zh/products/perps/order-types) 了解每个标志的语义。
+
+## 取消订单
+
+```ts
+// 按订单 ID
+await orderlyAuthDel(`/v1/order?order_id=${orderId}&symbol=PERP_SOL_USDC`);
+
+// 取消符号上的所有订单
+await orderlyAuthDel(`/v1/orders?symbol=PERP_SOL_USDC`);
+```
+
+取消同步确认但实际取消可能与成交竞争。始终通过轮询 `/v1/orders` 或监视 WebSocket 来协调 — 假设取消在没有确认的情况下成功会导致重复或意外头寸。
+
+## 获取开放头寸
+
+```ts
+const posResp = await orderlyAuthGet("/v1/positions");
+for (const p of posResp.data.rows) {
+  console.log(
+    p.symbol,
+    "size:",  p.position_qty,
+    "entry:", p.average_open_price,
+    "unrealized:", p.unsettled_pnl,
+  );
+}
+```
+
+负数的 `position_qty` 是空头，正数是多头。`position_qty == 0` 意味着头寸已平仓但行可能仍显示直到下一次清理。
+
+## 获取成交历史
+
+```ts
+const fills = await orderlyAuthGet(
+  "/v1/trades?symbol=PERP_SOL_USDC&start_t=" + (Date.now() - 86_400_000)
+);
+for (const t of fills.data.rows) {
+  console.log(t.executed_timestamp, t.side, t.executed_quantity, "@", t.executed_price);
+}
+```
+
+时间参数是毫秒 Unix 时间戳。默认页面大小为 25 行；使用 `page` 和 `size` 查询参数分页。
+
+## WebSocket：市场数据
+
+```ts
+import WebSocket from "ws";
+
+const ws = new WebSocket(`wss://ws.orderly.org/ws/stream/${accountId}`);
+
+ws.on("open", () => {
+  // 公共市场数据：一个符号的订单簿增量 + 交易
+  ws.send(JSON.stringify({ id: "ob1", topic: "orderbook@PERP_SOL_USDC" }));
+  ws.send(JSON.stringify({ id: "tr1", topic: "trade@PERP_SOL_USDC" }));
+});
+
+ws.on("message", (raw) => {
+  const msg = JSON.parse(raw.toString());
+  if (msg.topic?.startsWith("orderbook@")) {
+    // 深度差异：{ bids: [[price, qty], ...], asks: [[price, qty], ...] }
+    applyOrderbookDelta(msg.data);
+  } else if (msg.topic?.startsWith("trade@")) {
+    console.log("trade:", msg.data);
+  }
+});
+```
+
+对于**私有**流（你的成交、头寸更新、余额变化），WebSocket 必须进行身份验证。发送一个用与 REST 请求相同的方式签署的 `subscribe` 负载，范围限制于你的账户 ID。Orderly 的文档有确切的负载形状；它偶尔会改变，所以不要在这里硬编码特定架构。
+
+## 提现 USDC
+
+```ts
+// 1. 请求提现。
+const wRes = await orderlyAuthPost("/v1/withdraw_request", {
+  token:  "USDC",
+  chain_id: CHAIN_ID,
+  amount: 50.0,                          // 人类单位
+  receiver: owner.publicKey.toBase58(),
+});
+
+console.log("Withdrawal request id:", wRes.data.withdraw_id);
+```
+
+Orderly 将提现中继到链上接收地址。有一个固定的 **1 USDC** 提现费（参见 [`/zh/products/perps/fees`](/zh/products/perps/fees)）。链上转账在正常条件下在 1-2 分钟内发生；在拥塞期间可能更长。
+
+## 常见陷阱
+
+- **不要跨环境重复使用交易密钥。** 针对你的钱包注册的单个 Orderly 交易密钥与一个 Solana 主网账户相关联。如果你还需要 devnet 或 staging，为每个生成单独的密钥。
+- **时间同步。** Orderly 的时钟偏差容差很紧（±5 秒）。在长时间运行的服务上，NTP 漂移最终会破坏签名。定期重新同步。
+- **WebSocket 重连。** 公共 WS 在 Orderly 升级期间偶尔会断开连接。实施指数退避并在重新打开时重新订阅。
+- **速率限制。** REST 调用按账户分层速率限制。当你有 >5 个订单要取消时，通过 `cancel_all` 而不是循环 `cancel`-by-id 批量取消。
+- **头寸方向是隐含的。** 在 `PERP_SOL_USDC` 上的 `BUY` 订单打开或扩展多头；`SELL` 打开或扩展空头 — 但如果你已是多头，`SELL` *减少*（并可能翻转）头寸因为 Raydium Perps 是单向模式。在下单前总是检查当前头寸如果方向很重要。
+- **资金费和清算独立于订单流。** 资金支付和清算作为单独的事件流显示；它们不是"订单"。如果你需要观察它们，订阅相关的私有 WS 主题。
+
+## 后续阅读
+
+- [`/zh/products/perps/trading-basics`](/zh/products/perps/trading-basics) — 关于永续合约机制的概念入门。
+- [`/zh/products/perps/order-types`](/zh/products/perps/order-types) — 每个订单类型和标志的语义。
+- [`/zh/products/perps/collateral`](/zh/products/perps/collateral) — 支持的抵押资产和每链限制。
+- [`/zh/products/perps/fees`](/zh/products/perps/fees) — 做市商/交易者费率和提现费。
+
+来源：
+
+- [Orderly Network 开发者文档](https://orderly.network/docs/build-on-omnichain/evm-api/introduction) — 上述 API 表面的规范参考。Raydium Perps 直接使用此。
+- [Orderly TypeScript SDK](https://github.com/OrderlyNetwork/orderly-sdk-js) — 用类型化辅助函数包装相同的 REST/WebSocket 层；如果你想跳过自己编写签名层，很有用。

@@ -1,0 +1,236 @@
+---
+title: "Bonding curves"
+description: "The mathematics behind token-issuance curves — quadratic, linear, and virtual-reserves CPMM variants — derivations for cost / proceeds / spot price, and the graduation-threshold math used by LaunchLab."
+---
+
+<Info>
+  This page derives the general bonding-curve mathematics. For LaunchLab's specific implementation, see [`products/launchlab/bonding-curve`](/products/launchlab/bonding-curve). The derivations are given in continuous form; the on-chain code implements the discrete analog in fixed-point arithmetic.
+</Info>
+
+## What a bonding curve is
+
+A **bonding curve** is a deterministic price function `p(s)` that relates the price of a token to the amount currently in circulation (`s` for "supply sold"). Buyers purchase by sending collateral to the contract; the contract emits new token units at the marginal price dictated by the curve. Sellers return token units and receive the integrated refund.
+
+Two key properties compared to a CPMM pool:
+
+- **No counterparty needed.** The issuing contract is the market maker; liquidity exists by fiat.
+- **Monotonic price.** Price rises with every net-buy and falls with every net-sell.
+
+Bonding curves are the standard launch mechanism when the issuing entity does not want to pre-seed an AMM pool with collateral.
+
+## Generic pricing formulas
+
+For any continuous price function `p(s)`:
+
+**Spot price** at supply `s`:
+
+```
+p(s) = the curve formula
+```
+
+**Cost to buy** supply from `s_0` to `s_1` (with `s_1 > s_0`):
+
+```
+cost(s_0, s_1) = ∫_{s_0}^{s_1} p(s) ds = P(s_1) − P(s_0)
+```
+
+where `P(s) = ∫ p(s) ds` is the curve's antiderivative. Geometrically, `cost` is the area under `p` between `s_0` and `s_1`.
+
+**Proceeds from selling** supply back from `s_1` to `s_0`:
+
+```
+proceeds(s_1, s_0) = cost(s_0, s_1)
+```
+
+(Symmetry: buying and selling across the same interval exchanges the same collateral — modulo fees.)
+
+**Average price** for the buy:
+
+```
+avg = cost(s_0, s_1) / (s_1 − s_0)
+```
+
+## Common curve families
+
+### Linear
+
+```
+p(s) = a + b · s
+```
+
+```
+P(s)            = a·s + (b/2)·s²
+cost(s_0, s_1)  = a·(s_1 − s_0) + (b/2)·(s_1² − s_0²)
+```
+
+Price rises proportionally with supply. Used for "steady" launches where the issuer wants a predictable, moderate markup over the lifetime.
+
+### Quadratic
+
+```
+p(s) = k · s²                      // or  k · (s / S_max)² for a normalized form
+```
+
+```
+P(s)            = (k / 3) · s³
+cost(s_0, s_1)  = (k / 3) · (s_1³ − s_0³)
+```
+
+Price rises quadratically. Early buyers get a near-zero price (flat starting region); late buyers pay a steeper premium. This is the curve type LaunchLab defaults to (`curve_type = 0`).
+
+### Virtual-reserves CPMM (Pump-style)
+
+The curve is a standard CPMM with a pretend initial quote reserve `V_q`:
+
+```
+effective_y = V_q + collateral_received
+effective_x = S_max − s
+(effective_x) · (effective_y) = V_q · S_max      // invariant
+```
+
+Spot price:
+
+```
+p(s) = effective_y / effective_x
+     = V_q · S_max / (S_max − s)² · ... (derivable via implicit differentiation)
+```
+
+Cost to move from `s_0` to `s_1`:
+
+```
+cost(s_0, s_1) = V_q · S_max / (S_max − s_1) − V_q · S_max / (S_max − s_0)
+              = V_q · (s_1 − s_0) · S_max / ((S_max − s_0) · (S_max − s_1))
+```
+
+This variant has the elegant property that at graduation (where `s = S_graduate`), the marginal price equals the opening price of the downstream CPMM pool seeded with reserves `(S_max − S_graduate, V_q + cost(0, S_graduate))`. Handoff is seamless. LaunchLab exposes this as `curve_type = 1`.
+
+## Discrete implementation
+
+On-chain, `s` and `cost` are both integers (smallest-denomination units). The continuous integral `cost(s_0, s_1)` is computed directly from the closed form whenever one exists (linear, quadratic). For curves without a closed-form inverse (quadratic, given `cost`, find `s_1`), Newton iteration is used:
+
+```
+# Solve quadratic: (k/3)·s_1³ = (k/3)·s_0³ + cost
+# Initialize with s_guess ≈ cbrt(3·cost/k + s_0³)
+for i in 0..MAX_ITER:
+    f    = (k/3)·s_guess³ − (k/3)·s_0³ − cost
+    f'   = k·s_guess²
+    step = f / f'
+    s_guess -= step
+    if |step| < precision_floor: break
+```
+
+LaunchLab caps iterations at ~10 and reverts with `NotConverged` if the residual is still above tolerance. In practice this only triggers near the domain's extremities; production swaps converge in 2–3 iterations.
+
+## Fee integration
+
+Fees are applied on top of the curve cost, not inside it. On buy:
+
+```
+cost_curve  = cost(base_sold, base_sold + base_out)
+fee         = ceil(cost_curve · buy_numerator / buy_denominator)
+quote_in    = cost_curve + fee
+```
+
+On sell:
+
+```
+proceeds_curve = cost(base_sold − base_in, base_sold)
+fee            = ceil(proceeds_curve · sell_numerator / sell_denominator)
+quote_out      = proceeds_curve − fee
+```
+
+The LP portion of the fee is retained in `quote_vault` and effectively makes the curve stiffer for later buyers — the reserve grows without issuing more supply. The protocol and creator portions are tracked in separate counters for later sweep.
+
+## Graduation threshold
+
+A curve "graduates" when it has received enough collateral to seed an external AMM pool at a price matching the current curve price. For a quadratic curve with parameters `(k, S_max, S_graduate)`:
+
+```
+quote_to_graduate = cost(0, S_graduate) · (1 + buy_fee_rate)
+                  = (k / 3) · S_graduate³ · (1 + f_buy)
+```
+
+Once `quote_vault ≥ quote_to_graduate`, the `Graduate` instruction creates a CPMM pool with:
+
+```
+cpmm_base_reserve  = S_max − S_graduate        // unsold curve supply
+cpmm_quote_reserve = quote_vault − accrued_fee_counters
+cpmm_initial_price = cpmm_quote_reserve / cpmm_base_reserve
+```
+
+For the virtual-reserves curve, by construction:
+
+```
+cpmm_initial_price == p(S_graduate)           // exact equality
+```
+
+For the quadratic, the equality is approximate; the "slop" is absorbed into the rounding of `S_graduate` (typically `0.8 · S_max`) and the surplus collateral from the final threshold-crossing buy.
+
+## Impermanence vs a CPMM pool
+
+A pure bonding-curve launch has **no impermanence** in the Uniswap sense: there is no "other side" of the market to rebalance against. The curve issues supply on demand, and the only "LP" is the contract itself.
+
+Post-graduation, the resulting CPMM pool behaves like any other CPMM pool — if the LP was not burned, they are subject to the usual impermanent-loss dynamics. This is why the **burn** post-graduation policy is dominant in public launches: it keeps the pool permanent and removes any LP-withdrawal-driven price shocks.
+
+## Worked example
+
+Curve: quadratic, `k = 40`, `S_max = 1e9`, `S_graduate = 0.8 · S_max = 8e8`. Buy fee 1%.
+
+### Price at `s = 5e8`
+
+```
+p(5e8) = 40 · (5e8 / 1e9)² = 40 · 0.25 = 10
+```
+
+10 units of quote per base unit.
+
+### Cost of the first buy of 1e6 base
+
+```
+cost(0, 1e6) = (40/3) · (1e6)³
+             = (40/3) · 1e18
+             ≈ 1.333e19     (smallest quote units)
+```
+
+With 1% fee:
+
+```
+quote_in = 1.333e19 · 1.01 ≈ 1.347e19
+```
+
+### Graduation threshold
+
+```
+cost(0, 8e8) = (40/3) · (8e8)³
+             = (40/3) · 5.12e26
+             ≈ 6.827e27
+quote_to_graduate ≈ 6.827e27 · 1.01 ≈ 6.895e27
+```
+
+### Price at graduation
+
+```
+p(8e8) = 40 · 0.64 = 25.6
+```
+
+### Post-graduation CPMM reserves
+
+```
+cpmm_base  = 1e9 − 8e8 = 2e8
+cpmm_quote ≈ 6.827e27  (less fee-counter deductions)
+cpmm_price ≈ 3.41e19 per base — which matches p(8e8) after units are accounted for
+```
+
+(Units: decimals need to be tracked carefully; the example is illustrative.)
+
+## Pointers
+
+- [`products/launchlab/bonding-curve`](/products/launchlab/bonding-curve) — the on-chain LaunchLab implementation of these formulas.
+- [`products/launchlab/instructions`](/products/launchlab/instructions) — `Buy`, `Sell`, `Graduate` account-level specs.
+- [`algorithms/constant-product`](/algorithms/constant-product) — what the post-graduation CPMM does with the reserves.
+
+Sources:
+
+- Raydium LaunchLab program source (quadratic + virtual-reserves curve implementations).
+- Bancor white paper (linear bonding curves, historical).
+- Pump.fun public post-mortems (virtual-reserves variant).

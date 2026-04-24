@@ -1,0 +1,193 @@
+---
+title: "Admin keys and multisig"
+description: "The authority surface across Raydium programs — what each admin can do, how the multisig is structured, and how to verify on-chain who currently holds each role."
+---
+
+<Info>
+  Every Raydium program has at least one privileged role — a key that can upgrade the program, create new configs, or withdraw protocol fees. Minimizing what these roles can do (and gating them behind multisigs with delays) is the primary defense against a compromised admin. This page catalogs the roles and how they're secured in practice.
+</Info>
+
+## Roles by program
+
+### AMM v4
+
+| Role | Authority address | What it can do |
+|------|-------------------|----------------|
+| Program upgrade | Squads multisig (3/4) | Deploy new program bytecode |
+| Pool admin | Treasury multisig (3/5) | Toggle pool status, update fees on existing pools |
+
+### CPMM
+
+| Role | Authority address | What it can do |
+|------|-------------------|----------------|
+| Program upgrade | Squads multisig (3/4) | Deploy new program bytecode |
+| AmmConfig admin | Treasury multisig (3/5) | Create new AmmConfigs (fee tiers); toggle existing |
+| Create pool fee recipient | Treasury multisig (3/5) | Receive the one-time create-pool fee |
+
+### CLMM
+
+| Role | Authority address | What it can do |
+|------|-------------------|----------------|
+| Program upgrade | Squads multisig (3/4) | Deploy new program bytecode |
+| AmmConfig admin | Treasury multisig (3/5) | Create/modify AmmConfigs |
+| DynamicFeeConfig admin | Treasury multisig (3/5) | `CreateDynamicFeeConfig` / `UpdateDynamicFeeConfig` — calibrate the dynamic-fee tiers a `CreateCustomizablePool` call may opt into |
+| `limit_order_admin` (program-wide) | **Off-chain operational hot wallet, not a multisig** | Settle and close limit orders on behalf of their owners. The keeper key is a single program-wide constant (different value on mainnet vs devnet), checked via `signer == limit_order.owner \|\| signer == limit_order_admin::ID` on `SettleLimitOrder` / `CloseLimitOrder`. Output always lands in the original owner's ATA; the keeper cannot redirect funds, modify orders, or open new ones. |
+
+The `limit_order_admin` is a deliberately narrow operational role. It exists so an off-chain keeper can sweep filled orders without the order's owner having to be online. The keeper key is hot (lives on the keeper VM) and is rotated independently of the multisigs above. Concretely, the keeper authority is bounded to:
+
+- `SettleLimitOrder` — push the filled output of an order to the **owner's** ATA at the order's limit price.
+- `CloseLimitOrder` — close a fully-settled order's account to reclaim rent (rent goes to the order owner).
+
+It cannot call `OpenLimitOrder`, `IncreaseLimitOrder`, `DecreaseLimitOrder`, mutate any pool field, or sign for any other instruction — those checks are enforced on-chain by the seed and `has_one` constraints in the instruction's `Accounts` struct. A compromised keeper can at worst be unavailable (orders stay parked until the owner settles them themselves) or settle/close legitimately-fillable orders out of order; it cannot move user funds anywhere other than where the owner already authorized them to go.
+
+### Farm v6
+
+| Role | Authority address | What it can do |
+|------|-------------------|----------------|
+| Program upgrade | Squads multisig (3/4) | Deploy new program bytecode |
+| Farm creator (per farm) | The farm's creator wallet | Fund reward vaults, extend schedules, reclaim unused rewards |
+
+Individual farms have no protocol admin — each farm's creator controls only their farm, and the creator's powers are bounded (can't seize user stakes, can't change staking mint).
+
+### LaunchLab
+
+| Role | Authority address | What it can do |
+|------|-------------------|----------------|
+| Program upgrade | Squads multisig (3/4) | Deploy new program bytecode |
+| Launch creator (per launch) | The launch's creator wallet | Collect creator fees post-graduation; withdraw un-graduated curve remnant |
+
+Launches don't have a protocol admin that can change curves or seize raised funds.
+
+## Program upgrade authority
+
+Raydium's programs use the standard Solana **BPF Loader v3** upgrade mechanism. The upgrade authority for all programs is the 3/4 Squads multisig.
+
+Why 3/4: enough signers that a single compromise is insufficient; few enough that coordinating a legitimate upgrade is tractable. The four authorities are independent, air-gapped cold-device signers held by core team members. Sequential signing prevents parallel approvals on the same transaction; transactions carry a fixed expiration window. Multisig operations are reviewed periodically in partnership with **Solana's STRIDE Program (Asymmetric Research)**.
+
+### Removing upgrade authority
+
+Raydium has not set any program's upgrade authority to null. The protocol operates under the principle that programs need to be upgradeable (to patch bugs, add extensions like Token-2022, fix integration drift). Trade-off: users trust that the 3/4 multisig will only deploy well-reviewed upgrades.
+
+For users who want an immutable alternative, the older AMM v4 program has been stable since its last audit; zero upgrades in 18 months. That code path is effectively frozen even though the authority still exists.
+
+## AmmConfig authority
+
+Each new AmmConfig creation is permissioned — the 3/5 treasury multisig authorizes new fee tiers and tick spacings. Existing pools reference their AmmConfig by PDA; the pool's fee tier is whatever the AmmConfig says.
+
+**Can admins change an existing AmmConfig?** Yes, technically. `updateAmmConfig` is callable by the admin. In practice, modifications to deployed AmmConfigs are avoided because it changes the economics of all pools using that config silently. Protocol policy is to create a new AmmConfig for any change and migrate.
+
+**Can admins steal protocol fees via config?** No — the AmmConfig contains fee parameters but not the protocol fee recipient; that's a separate immutable address per pool.
+
+## Protocol fee claim
+
+A portion of swap fees (typically 3–12 bps of 25 bps swap fee, depending on config) accrues to a protocol fee vault. The multisig can withdraw these accrued fees. Users never see their LP balance change from this — it's the protocol's pre-allocated share, not LP money.
+
+## Farm creator authority
+
+Farms v6 give the creator the power to:
+
+- Fund the reward vault (add more tokens).
+- Extend the schedule (push end time later).
+- Call `withdrawReward` after end time to reclaim unused vault balance.
+
+Farm creators **cannot**:
+
+- Withdraw staked user LP.
+- Change the staking mint.
+- Change emission rates retroactively (only forward-looking via `setRewards`).
+- Freeze user harvests.
+
+A malicious farm creator can at worst under-fund the vault so the farm runs dry; users' principal stake is always safe.
+
+## Squads multisig configuration
+
+Raydium operates two separate Squads multisigs for distinct risk surfaces. Both can be inspected on-chain via the [Squads Protocol](https://app.squads.so) UI.
+
+| Multisig | Threshold | Timelock | Scope |
+|----------|-----------|----------|-------|
+| **Program upgrade** | **3/4** | **24 hours** | Sole authority for deploying new program bytecode for AMM v4, CPMM, CLMM, LaunchLab, Lock, AMM Routing, Stable Swap, and the legacy Farm/Staking programs. View at [`app.squads.so/.../FytDr…ceZQK`](https://app.squads.so/squads/FytDrVzDybM1TwFQPGb8qaxZR7dBCzNeqT3vtQsceZQK/home). |
+| **Treasury** | **3/5** | none | Treasury assets, protocol revenue, operational expenses. Also holds Raydium's limited program-admin authority (creating AmmConfigs, sweeping protocol fees, configuring pool parameters) for the time being. View at [`v3.squads.so/dashboard/RVha…dHdtYz09`](https://v3.squads.so/dashboard/RVhaWTdGUGNjTnVFdmdIWk1DTXB3dzJGZW44b0xXQlNKemRnQ3NYM0Rqd20=). |
+
+Operational properties of the upgrade multisig:
+
+- **24-hour timelock** on any transaction. An upgrade approved today executes no earlier than 24 hours later, giving users time to respond.
+- **Air-gapped cold-device signing.** Cold devices have network cards physically removed; they connect only to a hardware wallet and read transaction data via QR code from a separate hot device.
+- **Sequential signing.** Only after one cold device generates and signs a transaction can the next cold device begin its signing process — preventing conflicting or parallel signatures on the same transaction.
+- **Transaction expiration.** Every transaction carries a fixed expiration window, so stale transactions auto-invalidate.
+- **TOTP + physical-key enforcement** on the hot devices used for transaction initiation and on-chain broadcast.
+- **Public transaction queue.** Anyone can monitor pending upgrades on the Squads UI.
+
+The treasury multisig has no timelock — its scope is narrower and routine ops (creating AmmConfigs, sweeping fees) need to land same-day. The treasury multisig also holds the limited program-admin authority listed in the per-program tables above; this is an interim arrangement and is reviewed periodically with the project's security partners.
+
+## Verifying authority on-chain
+
+The simplest way to verify a program's current upgrade authority:
+
+```bash
+solana program show <PROGRAM_ID>
+```
+
+Output includes:
+
+```
+Program Id:          CPMMoo8L3F4NbTegBCKVNunggL7H1Zpdmwpwh8KMoZ0F
+Owner:               BPFLoaderUpgradeab1e11111111111111111111111
+ProgramData Address: <ProgramDataPDA>
+Authority:           <EXPECTED_MULTISIG_ADDRESS>
+Last Deployed In Slot: <slot>
+Data Length: <n> bytes
+```
+
+If `Authority` is not the expected Squads multisig address, something is wrong. Raydium publishes the expected authority addresses on [`reference/program-addresses`](/reference/program-addresses).
+
+For AmmConfig / pool admin roles, fetch the on-chain account and decode:
+
+```ts
+const config = await raydium.cpmm.getAmmConfig(configPda);
+console.log("AmmConfig admin:", config.admin.toBase58());
+// Expected: 3/5 treasury multisig.
+```
+
+## Historical authority changes
+
+| Date | Program | Change |
+|------|---------|--------|
+| 2022-12 | AMM v4 | Upgrade authority migrated from single-sig to 3/4 multisig after incident |
+| 2023-02 | All programs | All operational roles unified under 3/5 treasury multisig |
+| 2023-11 | CLMM | Added second multisig for reward-only operations to reduce exposure |
+| 2024-05 | CPMM | Initial deploy with multisig authority from day zero |
+
+## User-side considerations
+
+What should you do as a user/LP/integrator?
+
+1. **Check upgrade authority before large allocations.** Confirm it matches the documented multisig.
+2. **Monitor multisig activity.** [Squads UI](https://v4.squads.so) shows pending transactions; a scheduled upgrade gives you 24 hours to unwind if you disagree with the change.
+3. **Time-lock-aware redemption strategies.** If you're running an auto-compounder, make sure your unwind path doesn't require an instruction that's being changed.
+4. **Don't assume program immutability.** Every Raydium program can be upgraded; plan for it.
+
+## Pitfalls for integrators
+
+### 1. Caching authority addresses
+
+If you hardcode the upgrade authority or admin multisig address in your code and it later rotates, your verification fails. Fetch from [`reference/program-addresses`](/reference/program-addresses) at runtime or refresh periodically.
+
+### 2. Assuming AmmConfigs are stable
+
+A new AmmConfig can be created at any time. Your aggregator/router should re-fetch the full config list periodically (hourly is fine).
+
+### 3. Farm-creator grief vectors
+
+If you're depositing into a low-reputation farm, the creator could end the farm early and reclaim reward vault (assuming no user has staked yet). Once users have staked, pro-rata entitlements are enforced by the program; reclaim only gets the leftover after rational end.
+
+## Pointers
+
+- [`reference/program-addresses`](/reference/program-addresses) — canonical authority addresses.
+- [`security/attack-vectors`](/security/attack-vectors) — how admin compromises manifest.
+- [`ray/treasury`](/ray/treasury) — treasury and fee collection addresses.
+- [`security/disclosure`](/security/disclosure) — reporting suspected admin issues.
+
+Sources:
+
+- [Squads Protocol](https://v4.squads.so) — multisig UI.
+- [Solana BPF Loader docs](https://docs.solana.com/developing/runtime-facilities/programs#bpf-loader) — upgrade mechanism.

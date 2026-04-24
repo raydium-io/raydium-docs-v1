@@ -1,0 +1,224 @@
+---
+title: "Routage et MEV"
+description: "Répartition du routage sur les produits Raydium, modèles de résistance aux sandwich, intégration de bundle Jito et compromis entre soumission en mempool privé et public."
+---
+
+<Info>
+  **Cette page est traduite automatiquement par IA. La version anglaise fait foi.**
+
+  [Voir la version anglaise →](/integration-guides/routing-and-mev)
+</Info>
+
+<Info>
+  Le « MEV » sur Solana ne fonctionne pas comme le MEV d'Ethereum basé sur le mempool. Les leaders de bloc voient les paquets de transactions au fur et à mesure qu'ils arrivent, pas dans un mempool ordonné ; le front-running se fait via la réorganisation du côté leader ou des chercheurs colocalisés, et les attaques sandwich sont exécutées par des bots qui observent l'état du pool et tentent de vous devancer en payant des frais plus élevés. Les atténuations diffèrent en conséquence.
+</Info>
+
+## Primer sur la répartition du routage
+
+« Répartition du routage » signifie diviser un swap logique entre plusieurs pools de sorte que les prix marginaux s'égalisent — même résultat que si vous tradez chaque tranche au prix spécifique de son pool. Cela réduit l'impact de prix effectif quand un pool unique est peu profond par rapport à la taille de votre trade.
+
+Le problème : étant donné des pools `P_1, ..., P_n` avec des fonctions `f_i(x)` mappant l'input `x` à l'output, trouver la répartition `x_1 + ... + x_n = X` qui maximise `Σ f_i(x_i)`. Puisque chaque `f_i` est concave, l'optimum satisfait `f'_1(x_1) = f'_2(x_2) = ... = f'_n(x_n)` (prix marginaux égaux).
+
+### Implémentation gloutonne
+
+Une approche simple qui atteint ~1% de l'optimal en pratique :
+
+```
+remaining = X
+routes    = []
+step      = X / 1000     // taille de la tranche
+while remaining > 0:
+    best_pool = argmax over i of f'_i(current_x_i + step)
+    x_i += step
+    routes.append((best_pool, step))
+    remaining -= step
+```
+
+Un `step` plus fin → plus proche de l'optimal, plus d'itérations. En pratique, 100–500 tranches est un bon compromis.
+
+### Implémentation par optimisation convexe
+
+Pour les agrégateurs de niveau production, résolvez l'optimisation directement. Chaque pool a une `f'_i(x)` sous forme fermée :
+
+- **Constant-product (CPMM / AMM v4)** : `f'(x) = y * R_y / (R_x + x)^2` où `R_x, R_y` sont les réserves et `y = R_x * R_y / (R_x + x) - R_y` ... (dérivation plus simple : le prix marginal est `R_y / (R_x + x)`, donc la répartition pour égaliser les prix marginaux est une recherche 1D).
+- **CLMM** : lisse par morceaux — dans un tick, `f'(x)` est une fonction rationnelle de `sqrt_price` ; à travers un tick, il change discrètement. Répartissez avec un solveur petit-step ou traitez chaque tick contigu comme son propre « pool ».
+
+Le résultat du routage réparti est un vecteur `[(pool_1, x_1), (pool_2, x_2), ...]` que votre étape d'assemblage de transaction transforme en une séquence d'instructions de swap.
+
+### Quand la répartition aide
+
+| Taille du trade vs TVL | La répartition aide ? |
+|-------------------|--------------|
+| `<0.1%` | Non — un pool unique domine |
+| 0.1–1% | Marginalement |
+| 1–5% | Oui, amélioration 10–50 bps |
+| `>5%` | Oui, grande amélioration |
+
+Si vous exécutez un swap in-UI pour un utilisateur détail avec `<$10k` sur un pool profond, ne vous embêtez pas à le répartir — le surcoût en gaz dépasse l'amélioration. Pour un agrégateur cotant un flux institutionnel, répartissez toujours.
+
+## Routes multi-hop
+
+Quand aucun pool direct n'existe, ou que l'impact du pool direct est énorme, passez par un intermédiaire :
+
+```
+tokenA → tokenHub → tokenB
+```
+
+Hubs courants : USDC, SOL, RAY. Chaque hop a :
+
+- Son propre slippage bound (plus bas sur les hops directs ; par-hop sur les multi-hop).
+- Ses propres frais.
+- Son propre impact de prix.
+
+L'impact total s'ajoute : `(1 - impact_1) * (1 - impact_2)`. Un hop d'impact 1% deux fois, c'est 1,99% total, pas 2%.
+
+**Ne passez jamais deux fois par le même pool.** Aller `A → B → A → B` via le même CLMM brûle simplement les frais et le slippage. Les agrégateurs doivent filtrer de telles routes à la génération. (Note : c'est *faire un cycle de la même paire*, pas le multi-hop en général — router `A → USDC → B` via différents pools est le modèle standard et utile endorsé ci-dessus.)
+
+**Par-hop vs minimum de bout-en-bout.** Avec la composition CPI ([`integration-guides/cpi-integration`](/fr/integration-guides/cpi-integration)), vous pouvez définir `minimum_amount_out` de chaque hop à 0 et enforcer un minimum de bout-en-bout unique dans votre proxy. Sans CPI, chaque hop enforce son propre minimum, ce qui exige de calculer des bornes intermédiaires raisonnables — généralement `quote_i * (1 - slippage_bps/10000)` par hop.
+
+## Attaques sandwich
+
+### Mécanisme
+
+Un bot observe le flux de gossip des transactions. Quand il voit votre swap :
+
+1. Front-run : le bot achète le même token *avant* vous, poussant le prix du pool à la hausse.
+2. Tx victime : vous swappez à un prix pire.
+3. Back-run : le bot vend au prix élevé, capturant le spread.
+
+Le bot paye des frais de priorité pour ses deux transactions ; le profit est le delta sandwich moins deux fois les frais de priorité. Rentable uniquement sur les pools où votre trade bouge le prix significativement.
+
+### Atténuations
+
+**Slippage serré.** Si votre minimum-out est 0,5% en dessous du quote, un sandwich qui bouge le prix de plus de 0,5% vous reverte mais la pré-trade du bot s'exécute toujours à votre ancien prix. Ils perdent de l'argent. Les bots sandwich ciblent un slippage large (≥1–2%) ; un slippage &lt;0,3% est largement immunisé.
+
+**Soumission en mempool privé (Jito).** Soumettez votre transaction dans un bundle Jito. Les bundles n'apparaissent pas sur le flux public ; les bots ne peuvent pas voir le trade en vol et le front-runner. Compromis : les bundles exigent un tip côté validateur, et tous les leaders ne sont pas Jito-activés (mais la plupart le sont).
+
+**Tailles de trade plus petites.** Divisez le trade sur plusieurs transactions de sorte qu'aucune tx unique ne bouge le prix assez pour être une cible sandwich rentable. Augmente le coût total en gaz.
+
+**Randomisation temporelle.** Soumettez durant des périodes de plus bas volume si possible. Non disponible pour les swaps interactifs utilisateur mais viable pour le flux bot programmé.
+
+Les pools CLMM de Raydium voient typiquement moins d'activité sandwich que CPMM parce que la structure de liquidité single-tick signifie que les petits trades ne bougent pas le prix du tout (ils restent dans un tick). Les pools CLMM profonds sont le meilleur venue pour la résistance au sandwich organiquement.
+
+## Bundles Jito
+
+Jito est un client validateur Solana modifié qui accepte les **bundles** — des groupes de transactions ordonnés atterrissant atomiquement. Les bots utilisent Jito pour l'extraction MEV ; les utilisateurs réguliers utilisent Jito pour la protection contre les mêmes bots.
+
+### Comment les bundles fonctionnent
+
+- Connectez-vous à un endpoint Jito block engine (ex. `https://mainnet.block-engine.jito.wtf`).
+- Soumettez un bundle de 1–5 transactions plus un tip à l'un des comptes tip Jito.
+- Si le leader actuel exécute Jito, votre bundle est considéré. Le gagnant de l'enchère pour ce slot (bundle avec le plus haut tip-par-CU) atterrit ; les autres sont abandonnés.
+
+### Taille du tip
+
+Les tailles de tip suivent la distribution récente des bundles. Jito publie les percentiles en temps réel :
+
+```ts
+const tipRes = await fetch("https://worker.jito.wtf/api/v1/bundles/tip_floor");
+const tips   = await tipRes.json();
+// { ema_landed_tips_25th_percentile, 50th, 75th, 95th, 99th }
+
+// Un swap user-facing un jour normal — le 50e percentile suffit.
+const tipSol = tips.ema_landed_tips_50th_percentile_lamports / 1e9;
+
+// Un trade bot critique en temps lors de congestion — 75–95e percentile.
+```
+
+Plages typiques : 0,0001–0,001 SOL pour les swaps utilisateur non-urgents ; 0,01–0,1 SOL pendant la congestion pour les bots haute-priorité.
+
+### Construire un bundle
+
+```ts
+import { SearcherClient } from "jito-ts";
+
+const client = new SearcherClient("https://mainnet.block-engine.jito.wtf");
+
+const tipIx = SystemProgram.transfer({
+  fromPubkey: user.publicKey,
+  toPubkey:   JITO_TIP_ACCOUNTS[Math.floor(Math.random() * 8)],  // 8 tip accts
+  lamports:   tipLamports,
+});
+
+const tx1 = new VersionedTransaction(...);  // le swap
+tx1.sign([user]);
+
+const bundleUuid = await client.sendBundle([tx1], tipLamports);
+// Optionnel : await confirmation via client.getBundleStatuses([bundleUuid])
+```
+
+Pièges :
+
+- **Le tip doit être dans le bundle.** Incluez le `SystemProgram.transfer` à un compte tip Jito comme instruction dans l'une des transactions du bundle (généralement la dernière). Un tip tx séparé qui ne fait pas partie du bundle est ignoré.
+- **Le leader n'est pas Jito-activé.** ~75% des leaders exécutent Jito ; ~25% ne le font pas. Les bundles envoyés quand un leader non-Jito tient le slot sont abandonnés. Le client renverra automatiquement.
+- **Expiry.** Les bundles utilisent le même modèle d'expiry blockhash que les txs régulières. Assemblez et envoyez rapidement ; fenêtre ~60s.
+
+### Bundles vs frais de priorité
+
+Les frais de priorité soudoient le leader pour inclure votre tx plus tôt. Les bundles Jito cachent en plus la tx du mempool public. Utilisez les frais de priorité pour l'urgence ; utilisez les bundles pour la protection sandwich. Ceinture et bretelles : utilisez les deux sur les swaps utilisateur haute-valeur.
+
+Voir [`integration-guides/priority-fee-tuning`](/fr/integration-guides/priority-fee-tuning) pour le dimensionnement des frais de priorité.
+
+## MEV-share / RPC révert-protégé
+
+Certains fournisseurs RPC offrent les endpoints « MEV-share » ou « révert-protégé » qui routent en interne votre transaction via des bundles Jito ou des chemins privés équivalents :
+
+- **Helius** — connexions staked avec support bundle.
+- **QuickNode** — endpoint « Revert Protect » ; forme automatiquement des bundles autour des txs soumises.
+- **Triton** — tier private-flow.
+
+Utiliser l'un de ceux-ci est le chemin le plus simple pour les projets qui ne veulent pas gérer eux-mêmes la logique des bundles. Compromis : internes opaques ; vous faites confiance à la construction de bundle du fournisseur.
+
+## Gestion de la congestion
+
+Pendant les fenêtres de haut volume (lancements mainnet, listings majeurs, rally soutenu), les files de paquets des leaders se remplissent. Symptômes :
+
+- Les txs restent unconfirmed pendant 60+ secondes, puis expirent avec « blockhash not found ».
+- Les frais de priorité qui fonctionnaient hier sont insuffisants aujourd'hui.
+- La simulation réussit mais l'exécution n'atterrit jamais.
+
+Stratégies :
+
+1. **Retry agressif en cas d'expiry.** Sur `TransactionExpiredBlockheightExceeded`, rebâtissez avec un nouveau blockhash et renvoyez. N'essayez *pas* de renvoyez en cas de revert — les reverts sont déterministes.
+2. **Broadcast multi-RPC.** Soumettez la même tx à plusieurs RPC en parallèle ; celui qui atteint un leader en premier gagne.
+3. **Ramping des frais de priorité.** Commencez au 50e percentile ; si la première tentative expire, renvoyez au 75e, puis au 95e.
+4. **Bundles Jito comme fallback.** Les leaders Jito tendent à être moins congestionnés parce que le block engine trie les bundles par tip-par-CU ; les bundles haute-tip obtiennent la priorité.
+5. **Simulez moins.** En congestion, simulez une fois en avant ; ne re-simulez pas en envoi puisque l'état du pool aura changé de toute façon. La re-simulation en congestion échoue souvent spurieusement.
+
+## Considérations MEV par-produit
+
+**CPMM.** Hautement sandwichable sur les pools bas-TVL. La courbe constant-product amplifie même les pré-trades bot petits. Recommandez les bundles Jito pour tout trade CPMM >0,5% du TVL du pool.
+
+**CLMM.** Moins sandwichable sur les pools profonds parce que les trades intra-tick ne bougent pas le prix. Mais les trades cross-tick le font absolument ; les sandwiches ciblant les croisements de tick sont un modèle connu. Le slippage serré (`<0,3%`) est la meilleure défense.
+
+**AMM v4 + OpenBook.** Les remplissages du orderbook OpenBook tournent via la même tx, donc les bots sandwich qui ne connaissent pas l'état du orderbook sous-estiment l'impact de prix et échouent souvent. Venue bas-MEV organique pour cette raison.
+
+**LaunchLab.** Durant la phase early-bonding-curve, le front-running est rampant sur les lancements hyped. Les courbes bougent vite et le slippage est large. Les bundles Jito sont fortement recommandés. Après graduation, le CPMM résultant suit les dynamiques normales de CPMM.
+
+**Farms.** Les opérations harvest et stake ne sont pas des swaps et ne sont pas sandwichables. Aucune gestion spéciale requise.
+
+## Liste de vérification
+
+Pour un agrégateur production / UI swap wallet :
+
+- [ ] Slippage par défaut ≤0,5% sur les paires normales ; utilisateur peut overrider.
+- [ ] Soumission de bundle Jito activée par défaut pour les swaps >\$1k USD.
+- [ ] Frais de priorité sourced d'une estimation live (pas hard-coded).
+- [ ] Logique de retry distingue revert (ne renvoyez pas) d'expiry (renvoyez avec nouveau blockhash).
+- [ ] Routes multi-hop définissent les minimums par-hop, pas de bout-en-bout.
+- [ ] Routage réparti actif pour les trades >1% du TVL de tout pool unique.
+- [ ] Fraîcheur du pool : re-fetch l'état immédiatement avant soumission ; re-quote si stale.
+- [ ] Sandwich-résistant sur les pools peu profonds : soit Jito-seulement, soit rejet si slippage >1%.
+
+## Pointeurs
+
+- [`integration-guides/aggregator`](/fr/integration-guides/aggregator) — découverte pool, quoting, assemblage de transaction.
+- [`integration-guides/priority-fee-tuning`](/fr/integration-guides/priority-fee-tuning) — dimensionnement CU et frais de priorité.
+- [`integration-guides/cpi-integration`](/fr/integration-guides/cpi-integration) — composition multi-hop single-slippage-gate.
+- [`algorithms/slippage-and-price-impact`](/fr/algorithms/slippage-and-price-impact) — définitions formelles.
+
+Sources :
+
+- [Jito docs](https://docs.jito.wtf)
+- [Solana validator docs on priority fees](https://docs.solana.com/transaction_fees)
+- [jito-ts](https://github.com/jito-labs/jito-ts) — client bundle TypeScript.

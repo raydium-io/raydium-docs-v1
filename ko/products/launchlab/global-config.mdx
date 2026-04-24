@@ -1,0 +1,211 @@
+---
+title: "LaunchLab GlobalConfig"
+description: "모든 LaunchLab 런칭을 바탕으로 하는 프로토콜 레벨 구성 계정 — 수수료율, 공급 최소값, 락 비율 상한선, 졸업을 제어하는 마이그레이션 지갑, 곡선별 인덱싱 체계."
+---
+
+<Info>
+  **이 페이지는 AI 자동 번역입니다. 모든 내용은 영문판을 기준으로 합니다.**
+
+  [영문판 보기 →](/products/launchlab/global-config)
+</Info>
+
+<Info>
+  `GlobalConfig`는 **프로토콜 레벨** 구성 계정입니다. 여러 개가 존재할 수 있으며 `(curve_type, index)`로 구분되고, 모든 런칭은 `Initialize` 시점에 정확히 하나를 선택합니다. 선택된 `GlobalConfig`의 값은 해당 런칭 매개변수의 하드 리밋이 됩니다. 플랫폼 레벨 사용자 지정(플랫폼별 수수료율, 허용되는 곡선 형태, 졸업 시 NFT 분할)은 [`products/launchlab/platform-config`](/ko/products/launchlab/platform-config)를 참고하세요.
+</Info>
+
+## 개요
+
+`GlobalConfig`는 `(curve_type, index)`별 싱글톤 PDA로, 모든 런칭이 따라야 하는 프로토콜 측 규칙을 정합니다:
+
+- 허용되는 본딩 곡선의 종류(`curve_type`).
+- 곡선이 매 매입/매도 시 부과하는 거래 수수료율.
+- 졸업 시 부과되는 마이그레이션 수수료.
+- 공급, 락 비율, 매도 비율, 마이그레이션 비율의 하한선.
+- 쿼트 민트(일반적으로 래핑된 SOL 또는 USDC) — 사용자가 구입하는 자산.
+- 프로토콜 측 세 개의 지갑: 프로토콜 수수료 소유자, 마이그레이션 수수료 소유자, 그리고 AMM v4 / CPMM으로의 졸업을 인증하는 두 개의 마이그레이션 제어 지갑.
+- 선택적 플래그(`requires_platform_auth`) — 이 구성을 사용할 수 있는 플랫폼을 제한합니다.
+
+`GlobalConfig` 계정은 LaunchLab 프로그램 관리자(Anchor 기반 Raydium 프로그램 전체에서 공유되는 하드코딩된 관리자 퍼블릭 키 — [`reference/program-addresses`](/ko/reference/program-addresses) 참고)에 의해 생성 및 업데이트됩니다.
+
+## 구조
+
+```rust
+// states/config.rs
+pub const GLOBAL_CONFIG_SEED: &str = "global_config";
+
+#[account]
+pub struct GlobalConfig {
+    pub epoch:                   u64,         // recent_epoch tracker
+    pub curve_type:              u8,          // 0 = ConstantProduct, 1 = FixedPrice, 2 = LinearPrice
+    pub index:                   u16,         // discriminator within a curve_type
+    pub migrate_fee:             u64,         // SOL paid on graduation
+    pub trade_fee_rate:          u64,         // 1/1_000_000 of volume
+    pub max_share_fee_rate:      u64,         // 100 bps cap on platform share fee
+    pub min_base_supply:         u64,         // floor on Initialize supply (no decimals)
+    pub max_lock_rate:           u64,         // ceiling on vesting locked / supply
+    pub min_base_sell_rate:      u64,         // floor on base_supply_graduation / supply
+    pub min_base_migrate_rate:   u64,         // floor on tokens that seed the post-graduation pool
+    pub min_quote_fund_raising:  u64,         // floor on quote_reserve_target (with decimals)
+    pub quote_mint:              Pubkey,
+    pub protocol_fee_owner:      Pubkey,      // claims protocol fees via CollectFee
+    pub migrate_fee_owner:       Pubkey,      // claims migration fees via CollectMigrateFee
+    pub migrate_to_amm_wallet:   Pubkey,      // can sign MigrateToAmm
+    pub migrate_to_cpswap_wallet:Pubkey,      // can sign MigrateToCpswap
+    pub requires_platform_auth:  u8,          // 0/1 flag
+    pub padding_alignment:       [u8; 7],
+    pub padding:                 [u64; 15],
+}
+```
+
+PDA 유도:
+
+```ts
+const [globalConfig] = PublicKey.findProgramAddressSync(
+  [
+    Buffer.from("global_config"),
+    Buffer.from(quoteMint.toBytes()),
+    Buffer.from([curveType]),
+    u16ToBytes(index),
+  ],
+  LAUNCHLAB_PROGRAM_ID,
+);
+```
+
+(서명 전에 온체인 계정에서 정확한 시드 순서를 확인하세요 — 프로그램의 `create_config` 명령어가 신뢰할 수 있는 소스입니다.)
+
+## 필드 의미
+
+### `curve_type`과 `index`
+
+이 두 필드는 `GlobalConfig`를 고유하게 결정합니다. `(curve_type, index)` 쌍마다 하나의 `GlobalConfig`가 있습니다:
+
+- `curve_type = 0` — 상수곱 가상 리저브 곡선. 가장 기본적이고 많이 사용됨.
+- `curve_type = 1` — 고정 가격 곡선.
+- `curve_type = 2` — 선형 가격 곡선.
+
+`index`는 `u16`으로, 관리자가 곡선 타입별로 여러 구성을 게시할 수 있게 합니다(예: 낮은 수수료 구성, 높은 최소 쿼트 모금액 구성). `Initialize` 시 런칭이 `(curve_type, index)` 쌍을 제공하면 프로그램이 일치하는 `GlobalConfig`를 로드합니다.
+
+### 수수료
+
+- `trade_fee_rate` — 거래 규모의 `1/1_000_000` 단위로 표시됩니다. 곡선의 모든 매입/매도에 적용됩니다. `protocol_fee_owner`는 `CollectFee`를 통해 자신의 몫을 청구합니다.
+- `migrate_fee` — 졸업 시 한 번 부과되는 고정 수수료(lamp 또는 쿼트 단위, 구성에 따라 다름). `migrate_fee_owner`가 `CollectMigrateFee`를 통해 청구합니다.
+- `max_share_fee_rate` — `10_000`(100 bps)으로 초기화됩니다. 바인딩된 `PlatformConfig`의 **플랫폼** 공유 수수료율을 제한합니다([`platform-config`](/ko/products/launchlab/platform-config) 참고). 프로그램은 `trade_fee_rate + max_share_fee_rate < RATE_DENOMINATOR_VALUE`를 강제합니다.
+
+### 공급 및 비율 하한선
+
+이 하한선은 런칭이 `Initialize` 시 선택할 수 있는 곡선 형태 매개변수를 제한합니다. 작성자의 `CurveParams`이 이들 중 하나를 위반하면 `Initialize`는 `InvalidInput`으로 되돌립니다.
+
+- `min_base_supply` — 곡선이 선언할 수 있는 최소 `supply`(소수점 제외). 기본값 `10_000_000`.
+- `max_lock_rate` — `1/1_000_000` 단위, 기본값 `300_000`(30%). `total_locked_amount <= supply * max_lock_rate / 1_000_000`를 통해 베스팅을 제한합니다.
+- `min_base_sell_rate` — `1/1_000_000` 단위, 기본값 `200_000`(20%). `base_supply_graduation / supply`를 아래에서 제한합니다.
+- `min_base_migrate_rate` — `1/1_000_000` 단위, 기본값 `200_000`(20%). 졸업 후 풀에 시드할 남은 토큰 수를 제한합니다.
+- `min_quote_fund_raising` — 런칭이 선언할 수 있는 최소 `quote_reserve_target`(소수점 포함). 기본값 쿼트 민트의 `30_000_000_000` 단위.
+
+### 쿼트 민트 및 프로토콜 지갑
+
+- `quote_mint` — 사용자가 구입하는 자산. 대부분의 런칭은 래핑된 SOL(`So111…112`) 또는 USDC(`EPjF…Dt1v`)를 사용합니다. 하나의 `GlobalConfig`는 하나의 쿼트 민트에 바인딩되어 있으며, 다른 쿼트가 필요한 런칭은 다른 `(curve_type, index)`를 대상으로 합니다.
+- `protocol_fee_owner` — `CollectFee`에 서명하고 이 구성에 바인딩된 모든 런칭에서 누적된 프로토콜 수수료를 청구하는 퍼블릭 키. 온체인에 저장되어 있으며 관리자는 `UpdateConfig`를 통해 회전할 수 있습니다.
+- `migrate_fee_owner` — `CollectMigrateFee`에 서명하는 퍼블릭 키.
+
+### 마이그레이션 지갑
+
+두 졸업 경로에는 서로 다른 서명자가 필요합니다:
+
+- `migrate_to_amm_wallet` — `MigrateToAmm`에 서명해야 합니다. `migrate_type = 0`인 런칭(AMM v4 + OpenBook으로 졸업)에 사용됩니다.
+- `migrate_to_cpswap_wallet` — `MigrateToCpswap`에 서명해야 합니다. `migrate_type = 1`(CPMM으로 졸업)에 사용됩니다. Token-2022 런칭은 항상 이 경로를 취합니다.
+
+이들은 일반적으로 Raydium에서 운영하는 졸업 크랭크가 보유하므로, 곡선이 임계값에 도달한 직후 졸업이 진행되며 작성자의 호출을 기다릴 필요가 없습니다.
+
+### `requires_platform_auth`
+
+`u8` 플래그(`0` = 누구나 이 구성을 사용할 수 있음; 0이 아닌 값 = 유효한 `PlatformGlobalAccess` PDA를 가진 플랫폼만 이에 대해 런칭할 수 있음). 설정된 경우, 이 `GlobalConfig`에 대한 모든 `Initialize`는 매칭되는 `PlatformGlobalAccess` 계정을 포함해야 하며, 이는 `CreatePlatformGlobalAccess`(관리자 전용 명령어)를 통해 플랫폼이 사전 인증받았음을 증명합니다. 플랫폼 측 메커니즘은 [`platform-config`](/ko/products/launchlab/platform-config)를 참고하세요.
+
+## 초기화 시 기본값
+
+`CreateConfig`가 호출될 때, 프로그램은 많은 필드를 하드코딩된 기본값으로 시드합니다:
+
+```rust
+self.max_share_fee_rate     = 10_000;                  // 100 bps
+self.min_base_supply        = 10_000_000;              // no decimals
+self.max_lock_rate          = 300_000;                 // 30%
+self.min_base_migrate_rate  = 200_000;                 // 20%
+self.min_base_sell_rate     = 200_000;                 // 20%
+self.min_quote_fund_raising = 30_000_000_000;
+self.requires_platform_auth = 0;
+```
+
+관리자는 `curve_type`, `index`, `migrate_fee`, `trade_fee_rate`, `quote_mint`, 그리고 네 개의 지갑 퍼블릭 키를 생성 시점에 명시적으로 설정합니다. 이후 값들은 `UpdateConfig`를 통해 조정할 수 있습니다.
+
+## 런칭이 `GlobalConfig`를 선택하는 방법
+
+`Initialize` 시, 작성자는 다음을 전달합니다:
+
+- 어떤 `GlobalConfig` PDA를 로드할지 선택하는 `(curve_type, index)`.
+- 곡선 형태를 설명하는 `CurveParams`(`supply`, `total_base_sell`, `total_quote_fund_raising`, `migrate_type`).
+- 락된 공급을 설명하는 `VestingParams`.
+- 기본 민트용 `MintParams`.
+
+프로그램은 다음을 강제합니다:
+
+- `curve_type`이 `global_config.curve_type`과 일치합니다.
+- `supply >= global_config.min_base_supply`.
+- `total_locked_amount <= supply * max_lock_rate / 1_000_000`.
+- `total_base_sell >= supply * min_base_sell_rate / 1_000_000`.
+- `(supply − total_base_sell − total_locked_amount) >= supply * min_base_migrate_rate / 1_000_000` — 즉, 졸업 후 풀에 시드할 충분한 토큰이 남아있습니다.
+- `total_quote_fund_raising >= min_quote_fund_raising`.
+- `requires_platform_auth != 0`인 경우, 유효한 `PlatformGlobalAccess` PDA가 포함됩니다.
+
+`Initialize` 후, 런칭의 `PoolState`는 `global_config` 퍼블릭 키를 직접 저장하므로 바인딩은 영구적입니다.
+
+## 업데이트 경로
+
+`UpdateConfig`는 관리자 전용이며 `(param: u8, value: u64)` 쌍을 취합니다. 각 `param` 값은 어떤 필드를 변경할지 선택합니다:
+
+| `param` | 변경되는 필드 |
+|---------|---------------|
+| 0 | `migrate_fee` |
+| 1 | `trade_fee_rate` |
+| 2 | `max_share_fee_rate` |
+| 3 | `min_base_supply` |
+| 4 | `max_lock_rate` |
+| 5 | `min_base_sell_rate` |
+| 6 | `min_base_migrate_rate` |
+| 7 | `min_quote_fund_raising` |
+
+지갑 회전(`protocol_fee_owner`, `migrate_fee_owner`, `migrate_to_amm_wallet`, `migrate_to_cpswap_wallet`)은 별도의 `Pubkey` 인자 형태를 취하므로, 관리자 트랜잭션을 구성하기 전에 `update_config` 소스에서 정확한 디스패치 테이블을 확인하세요.
+
+`requires_platform_auth`는 `set_requires_platform_auth(bool)`을 통해 토글됩니다.
+
+## 클라이언트에서 `GlobalConfig` 읽기
+
+```ts
+import { Raydium } from "@raydium-io/raydium-sdk-v2";
+
+// Fetch by PDA derivation:
+const [configPda] = PublicKey.findProgramAddressSync(
+  [
+    Buffer.from("global_config"),
+    quoteMint.toBytes(),
+    Buffer.from([curveType]),
+    u16ToBytes(index),
+  ],
+  LAUNCHLAB_PROGRAM_ID,
+);
+
+const config = await raydium.launchpad.getGlobalConfig(configPda);
+console.log(config.tradeFeeRate, config.minQuoteFundRaising);
+```
+
+사용 가능한 모든 구성을 나열하는 UI의 경우, SDK의 `getAllGlobalConfigs` 헬퍼를 사용하거나 이들을 반영하는 LaunchLab API 엔드포인트를 쿼리하세요. 온체인 계정 수는 적습니다(실제로는 한 자릿수).
+
+## 관련 항목
+
+- [`products/launchlab/platform-config`](/ko/products/launchlab/platform-config) — 곡선 형태를 추가로 제한하는 플랫폼별 오버레이.
+- [`products/launchlab/accounts`](/ko/products/launchlab/accounts) — 런칭을 위한 전체 계정 그래프.
+- [`products/launchlab/instructions`](/ko/products/launchlab/instructions) — `Initialize` 및 업데이트 명령어.
+- [`reference/program-addresses`](/ko/reference/program-addresses) — 관리자 퍼블릭 키, 프로그램 ID, 공유 권한.
+
+출처:
+
+- `raydium-launch/programs/launchpad/src/states/config.rs` — `GlobalConfig` 구조체 및 `initialize`.
+- `raydium-launch/programs/launchpad/src/lib.rs` — `create_config`, `update_config`.

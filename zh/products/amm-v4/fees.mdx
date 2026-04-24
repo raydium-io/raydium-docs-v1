@@ -1,0 +1,112 @@
+---
+title: "AMM v4 费用"
+description: "0.25% 交易费用、LP/协议分成、OpenBook 成交的 PnL 生成，以及管理员如何扫出累计的协议费用。"
+---
+
+<Info>
+  **本页内容由 AI 自动翻译，所有内容以英文版本为准。**
+
+  [查看英文版 →](/products/amm-v4/fees)
+</Info>
+
+## 唯一公开的层级
+
+与 CPMM 和 CLMM 不同，AMM v4 **没有 `AmmConfig` 账户**。费用直接存储在每个流动性池的 `AmmInfo.fees` 结构中，并在池创建时固定。以下是覆盖几乎所有在线 AMM v4 池的默认值：
+
+| 链上字段 | 默认值 | 含义 |
+|---------|-------|------|
+| `swap_fee_numerator / swap_fee_denominator` | `25 / 10_000` | **AMM 路径交换的总交易费：输入量的 0.25%。** |
+| `trade_fee_numerator / trade_fee_denominator` | `25 / 10_000` | 由 OpenBook 集成使用，计算包含费用的限价单定价。默认与 `swap_fee` 相同，都是 0.25%。 |
+| `pnl_numerator / pnl_denominator` | `12 / 100` | **协议的交易费份额：12%** — 即交易量的 `0.25% × 12% = 0.03%`。累计到 `need_take_pnl_*` 计数器中。 |
+| `min_separate_numerator / min_separate_denominator` | `5 / 10_000` | 费用分割舍入逻辑使用的内部精度下限。 |
+
+注意 `pnl_numerator / pnl_denominator` 是交易费的一个比例，**而不是交易量的比例** — 这是常见的误读。LP 份额是补集（费用的 `88%` = 交易量的 `0.22%`），是隐含的；没有单独的"LP 份额"分子。
+
+少数早期池在创建时使用了不同的分子；引用前始终要读取 `AmmInfo.fees`。
+
+**没有基金费用**和**没有创建者费用**：这些是 CPMM/CLMM 的创意，在 AMM v4 的原始费用模型中不存在。
+
+## 分成如何计算
+
+每次交换时，池从输入金额中扣除总交易费，然后分配：
+
+```
+gross_fee   = ceil(amount_in * swap_fee_numerator / swap_fee_denominator)        // amount_in 的 0.25%
+pnl_portion = gross_fee * pnl_numerator / pnl_denominator                        // gross_fee 的 12%
+lp_portion  = gross_fee − pnl_portion                                            // gross_fee 的 88%
+```
+
+- `lp_portion` 保留在金库中，对下一个 `k` 有贡献。LP 通过稍后赎回 LP 代币来获得它。
+- `pnl_portion` 增加 `AmmInfo.state_data.need_take_pnl_coin` 或 `need_take_pnl_pc`，具体取决于交换输入来自哪一侧。
+
+与 CPMM 相同的不变量保持技巧：PnL 金额物理上位于金库中，但在曲线计算中从准备金中减去，因此 `TakePnl` 移动代币而不改变价格。
+
+## 来自 OpenBook 的 PnL（历史记录）
+
+<Note>
+  **不再累计。** OpenBook 集成已停用，因此本部分描述的*第二个* PnL 流不再生成。现有池上的 `total_pnl_{coin,pc}` 计数器可能携带历史值，但不添加新金额。0.03% 协议费路径（上面）不受影响，仍然活跃。
+</Note>
+
+历史上，AMM v4 有一个*第二个*类似费用的收入流：当它在 OpenBook 上的限价单被成交时，池可能在成交的接单方，赚取或支付市场的做市商/接单者价差。这些 PnL 事件在 `MonitorStep` 期间结算到池金库，程序将它们记录到 `state_data.total_pnl_{coin,pc}` 作为信息计数器。
+
+- 当池的发布网格在曲线价格周围正确校准时，OpenBook 成交往往对池**产生正费用** — AMM 实际上是在 OpenBook 上做市并赚取做市商回扣。
+- 当 OpenBook 暂停或事件队列填满时，池可能会有陈旧的订单以不利价格成交，产生负 PnL。这种操作耦合是移离混合设计的动机之一。
+
+这个 OpenBook PnL **不同于** 0.03% 的协议费。OpenBook PnL 直接膨胀了池准备金（按费用分成比例同时惠及 LP 和协议），而 0.03% 的协议费特别标记供管理员扫出。OpenBook 方面关闭后，今天唯一的费用累计是 AMM 交换上的 0.25% 及其 88/12 分成。
+
+## 收集
+
+管理员（Raydium 多签）调用 `WithdrawPnl` / `TakePnl` 将 `need_take_pnl_*` 扫出到程序 `AmmConfig` 上配置的池级"PnL 所有者"账户（一个不同的、程序作用域的配置 — 不是 CPMM 风格的单池 AmmConfig）。扫出过程：
+
+1. 首先结算任何未决的 OpenBook 成交。*（现在 OpenBook 不活跃，这是空操作。）*
+2. 将 `need_take_pnl_coin` / `need_take_pnl_pc` 从池金库转移到 PnL 目标。
+3. 将计数器清零。
+
+该操作不移动曲线。LP 在 `TakePnl` 调用期间不应看到任何价格变化。
+
+## LP 费用兑现
+
+没有专用的"收集 LP 费用"指令。LP 费用在金库中累计，随时间膨胀 `k`；LP 通过 `Withdraw` 销毁 LP 代币来兑现它们。LP 代币的价值随着 `(coin_reserve_effective, pc_reserve_effective)` 增长而单调增长。
+
+## 可视化：1,000 USDC 交易量的去向
+
+在针对默认参数池的 USDC 重型交换，金额为 \$1,000：
+
+```
+总交易费 (0.25%):     $2.50
+  LP 份额 (0.22%):      $2.20   → 保留在池中，提高 k
+  PnL 份额 (0.03%):      $0.30   → need_take_pnl_pc，由 TakePnl 扫出
+发送给用户的余额：   $997.50   （减去曲线驱动的价格影响）
+```
+
+对比 CPMM `AmmConfig[0]`（0.25% 层级，无创建者费）：LP 获得 \$2.10，协议 \$0.30，基金 \$0.10。CPMM 通过从 AMM v4 等效层级中 LP 将获得的部分中切割来引入基金行。
+
+## 对比表
+
+| | AMM v4 | CPMM `index=0` | CLMM `index=2` |
+|---|---|---|---|
+| 交易费 | 0.25% | 0.25% | 0.25% |
+| LP | 0.22% | 0.21% | 因发放而异 |
+| 协议 | 0.03% | 0.03% | 按层级 |
+| 基金 | N/A | 0.01% | 按层级 |
+| 创建者（可选） | N/A | 默认为 0 | N/A |
+| 费用位置 | 池金库 + need_take_pnl_* | 池金库 + protocol_fees_* + fund_fees_* | 全局 + 按刻度 + 按头寸 |
+
+完整矩阵见 [`reference/fee-comparison`](/zh/reference/fee-comparison)。
+
+## 集成者注意事项
+
+- **报价。** 通过 SDK 或 `api-v3.raydium.io/pools/info/ids` 获取 `AmmInfo`。**不要**根据原始金库余额计算自己的报价 — OpenBook 托管金额和 PnL 排除都将有效准备金从 `getTokenAccountBalance` 显示的内容中拉离。
+- **陈旧的费用参数。** 原则上 `SetParams` 可以改变 `swap_fee_numerator`，但实际上 Raydium 多签对任何在线池都没有改变默认值。仍然，始终从链上状态读取而不是硬编码。
+- **无奖励。** AMM v4 不支持池上奖励发放。遗留生态系统农场（Farm v3 / v5 / v6）是质押层等价物 — 见 [`products/farm-staking`](/zh/products/farm-staking)。
+
+## 后续步骤
+
+- [`products/amm-v4/math`](/zh/products/amm-v4/math) — 曲线内的交易费推导。
+- [`products/amm-v4/instructions`](/zh/products/amm-v4/instructions) — `WithdrawPnl` / `SetParams` 账户列表。
+- [`reference/fee-comparison`](/zh/reference/fee-comparison) — 并排矩阵。
+
+来源：
+
+- [Raydium AMM 程序 — `raydium-io/raydium-amm`](https://github.com/raydium-io/raydium-amm)
+- 链上 AMM v4 费用分子/分母字段（对照主网 `AmmInfo` 账户验证）。

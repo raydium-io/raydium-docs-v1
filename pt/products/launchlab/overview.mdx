@@ -1,0 +1,150 @@
+---
+title: "Visão geral do LaunchLab"
+description: "Como funciona de ponta a ponta o mecanismo de lançamento com curva de vinculação do Raydium: negociação pré-graduação contra uma curva determinística, o limite de financiamento que dispara a graduação e a migração automática para um pool CPMM padrão."
+---
+
+<Info>
+  **Esta página foi traduzida automaticamente por IA. A versão em inglês é a fonte oficial.**
+
+  [Ver versão em inglês →](/products/launchlab/overview)
+</Info>
+
+## O problema que o LaunchLab resolve
+
+Antes do LaunchLab, lançar um novo token no Raydium exigia que o criador alimentasse um pool AMM com ambos os lados do par antecipadamente — ou seja, o time precisava fornecer a liquidez do lado de cotação (SOL ou USDC) do próprio bolso. Isso favorecia projetos bem-financiados e restringia o acesso ao mecanismo de lançamento ao capital inicial.
+
+O LaunchLab substitui essa etapa inicial por uma **curva de vinculação**: o token é lançado contra uma curva precificada em um mint de cotação (tipicamente SOL ou USDC). Compradores adquirem o token enviando cotação para a curva, que atomicamente cunha ou libera unidades do token base a um preço determinado pela fórmula da curva e oferta atual. Nenhuma liquidez pré-alimentada necessária.
+
+Quando a curva coleta cotação suficiente para corresponder à fórmula de liquidez de um pool AMM real, ela **se gradua**: o programa cria um pool CPMM na mainnet alimentado com a reserva base e reserva de cotação da curva, e a partir desse ponto a negociação se move para o AMM.
+
+## Ciclo de vida
+
+```
+             ┌───────────────────────┐
+creator  ──▶ │  Initialize (Launch)  │   ▸ mints the base token, funds the curve vaults,
+             │                        │     sets curve params and graduation threshold
+             └───────────┬────────────┘
+                         │
+                         ▼
+             ┌───────────────────────┐       repeated N times
+             │   Buy  /  Sell        │ ◀─── traders interact with the curve
+             └───────────┬────────────┘
+                         │ curve quote_reserve
+                         │ crosses threshold
+                         ▼
+             ┌───────────────────────┐   ▸ snapshots curve state
+             │      Graduate         │   ▸ deploys CPMM pool seeded with curve reserves
+             │                        │   ▸ locks / burns remaining base supply per policy
+             └───────────┬────────────┘
+                         │
+                         ▼
+             ┌───────────────────────┐
+             │   CPMM pool live      │   ▸ standard CPMM behavior going forward
+             └───────────────────────┘
+```
+
+Cada lançamento passa por essa sequência exatamente uma vez. `Buy` e `Sell` são as únicas instruções invocáveis pelos usuários na fase intermediária; `Graduate` é sem permissão (qualquer pessoa pode chamar uma vez que o limite é ultrapassado), mas na prática o SDK a chama automaticamente dentro da transação que ultrapassa o limite.
+
+## Duas partes fixas
+
+Um estado LaunchLab possui duas contas distinguidas:
+
+- **O mint base** — o token sendo lançado. Sua autoridade de cunhagem é mantida pelo programa LaunchLab até a graduação; pós-graduação, ela é revogada.
+- **O mint de cotação** — a garantia. Sempre um mint mainstream (SOL / USDC / RAY). A configuração do lançamento escolhe um em `Initialize`; não pode ser alterado.
+
+Além de dois cofres:
+
+- **`base_vault`** — contém a porção da oferta base que foi pré-cunhada para a curva mas ainda não foi vendida. Diminui conforme os usuários compram.
+- **`quote_vault`** — acumula a cotação paga pelos compradores. Aumenta conforme os usuários compram. Este é o saldo que é verificado contra o limite de graduação.
+
+## Modelo de precificação
+
+LaunchLab suporta múltiplas fórmulas de curva (veja [`bonding-curve`](/pt/products/launchlab/bonding-curve)). A mais comum é uma **curva de vinculação quadrática** análoga à linhagem Pump.fun / Curve.fi / Bancor:
+
+```
+price(s) = k × (s / S_max)²     (or similar — exact formula is curve-config dependent)
+```
+
+onde `s` é a quantidade de base já vendida aos usuários e `S_max` é a oferta máxima da curva. O preço sobe monotonicamente a cada compra e cai a cada venda. Como o programa calcula o custo integrado ao AMM exatamente, uma compra de qualquer tamanho retorna a quantidade integrada correta; não há slippage por operação além da convexidade natural da curva.
+
+## Graduação
+
+Um lançamento se gradua quando `quote_vault.balance ≥ graduation_threshold`. O limite é definido em `Initialize` e é tipicamente escolhido de modo que na graduação o preço implícito da curva corresponda ao preço que o pool AMM abrirá com as reservas coletadas. Concretamente:
+
+```
+threshold ≈ S_graduate × price(S_graduate) × f
+```
+
+onde `S_graduate` é a quantidade base já vendida, `price(S_graduate)` é o preço marginal da curva naquele ponto, e `f` é um pequeno fator para contabilizar a linha de taxa (1–2%).
+
+Na graduação:
+
+1. O programa captura `(base_vault_remaining, quote_vault)`.
+2. Ele chama CPMM `CreatePool` CPI com essas duas reservas, cunhando o LP inicial para uma autoridade pertencente ao programa (geralmente queimada / bloqueada por política).
+3. Ele revoga a autoridade de cunhagem do mint base (para que nenhum token base adicional possa ser cunhado).
+4. `LaunchState.status` muda para `Graduated`.
+
+Pós-graduação, `Buy` e `Sell` são rejeitados. A negociação continua no pool CPMM resultante, que é indistinguível de qualquer outro pool CPMM do Raydium.
+
+## Taxas
+
+Durante a fase da curva, cada `Buy` e `Sell` incorre em uma taxa dividida entre:
+
+- **Lado LP da curva** — aumenta o `k` implícito da curva, o que beneficia compradores posteriores (preço mais apertado).
+- **Protocolo** — acumula para o admin do LaunchLab, coletado via `CollectFees`.
+- **Criador** — opcional, configurável em `Initialize`. Alguns lançamentos direcionam uma parcela para o criador como fluxo de receita contínuo.
+
+As taxas padrão estão documentadas em [`bonding-curve`](/pt/products/launchlab/bonding-curve). A divisão exata é armazenada em `LaunchState.fees` e pode diferir por lançamento.
+
+As taxas pós-graduação seguem a configuração CPMM com a qual o pool foi criado (tipicamente `AmmConfig[0]`, a camada de 0,25%).
+
+## Quem detém o LP após a graduação?
+
+LaunchLab suporta várias políticas de LP pós-graduação:
+
+- **Queimar** — LP é cunhado para um endereço morto. O pool se torna permanente; ninguém pode remover liquidez.
+- **Bloquear** — LP é cunhado para um depósito com tempo de bloqueio que é liberado para o criador após um período de vesting.
+- **Criador recebe imediatamente** — usado apenas para lançamentos com permissão.
+
+A política é definida em `Initialize` e não pode ser alterada. A maioria dos lançamentos abertos usa **queimar** — uma vez que o pool existe, sua liquidez está lá para sempre.
+
+## Invariantes importantes
+
+- **O mint base é livre de inflação após a graduação.** Sua `mint_authority` é revogada; `freeze_authority` nunca foi definida.
+- **Token-2022 é suportado via `initialize_with_token_2022`.** `Initialize` / `InitializeV2` padrão criam lançamentos SPL Token; a instrução dedicada `InitializeWithToken2022` cria um lançamento cujo mint base é Token-2022 (com `TransferFeeConfig` opcional). Os lançamentos Token-2022 devem se graduar para um pool CPMM — eles não podem se graduar para AMM v4, que é apenas SPL Token.
+- **O estado da curva é monótono em uma direção.** `base_sold` apenas aumenta durante Buy, `quote_vault` apenas aumenta durante Buy (diminui durante Sell — que simetricamente reduz `base_sold`). O programa nunca deixa a curva ficar negativa.
+- **A graduação é uma porta única.** Mesmo que a negociação pós-graduação empurre o preço do pool AMM de volta para baixo do preço de graduação, o lançamento não reverte para a curva.
+
+## Quando usar LaunchLab
+
+<Note>
+  Esta página descreve apenas a mecânica do protocolo. Nada aqui constitui orientação financeira, legal ou de investimento. Lançamentos de tokens carregam risco financeiro significativo. Consulte profissionais apropriados antes de lançar um token que envolva arrecadação de fundos pública.
+</Note>
+
+- Você está lançando um novo token sem mercado anterior.
+- Você quer que o mercado determine o preço CPMM de abertura em vez de pré-declará-lo.
+- Você quer permitir que qualquer pessoa — incluindo o próprio time — compre aos mesmos preços determinados pela curva, em vez de pré-alocar para insiders com desconto.
+
+**Não** use LaunchLab para:
+
+- Tokens existentes com mercados estabelecidos (use `CreatePool` em CPMM diretamente).
+- Lançamentos onde você precisa de controle preciso sobre o preço AMM de abertura (você pode aproximá-lo com configuração cuidadosa da curva, mas o mecanismo ainda é orientado pela curva).
+- Tokens que exigem extensões Token-2022 que LaunchLab não coloca na lista de permissões (o programa de lançamento rejeita extensões como `TransferHook` e `PermanentDelegate` mesmo no caminho Token-2022).
+
+## Conteúdo do capítulo
+
+- [`bonding-curve`](/pt/products/launchlab/bonding-curve) — a fórmula da curva, matemática de custo e receitas, derivação do limite de graduação.
+- [`accounts`](/pt/products/launchlab/accounts) — `LaunchConfig`, `LaunchState`, cofres, PDAs de autoridade.
+- [`instructions`](/pt/products/launchlab/instructions) — `Initialize`, `Buy`, `Sell`, `Graduate`, `CollectFees`, `SetParams`.
+- [`code-demos`](/pt/products/launchlab/code-demos) — exemplos TypeScript de ponta a ponta.
+
+## Por onde ir em seguida
+
+- [`products/cpmm/overview`](/pt/products/cpmm/overview) — o que acontece depois que um lançamento se gradua.
+- [`user-flows/create-cpmm-pool`](/pt/user-flows/create-cpmm-pool) — caminho alternativo para tokens que não precisam de uma curva.
+- [`reference/program-addresses`](/pt/reference/program-addresses) — ID do programa LaunchLab.
+
+Fontes:
+
+- [Módulo Raydium SDK v2 `LaunchLab`](https://github.com/raydium-io/raydium-sdk-V2) (IDL sob `src/raydium/launchpad/`).
+- A fonte do programa LaunchLab não é atualmente publicada como um repositório independente. O IDL agrupado com o SDK acima é a interface canônica.

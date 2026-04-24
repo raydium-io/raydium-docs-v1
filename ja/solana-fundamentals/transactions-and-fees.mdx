@@ -1,0 +1,278 @@
+---
+title: "トランザクションと手数料"
+description: "Solana トランザクションの構造、その制限、および典型的なスワップが支払う 2 つの異なる手数料カテゴリ（Solana ネットワーク手数料と Raydium プロトコル手数料）について。"
+---
+
+<Info>
+  **このページは AI による自動翻訳です。すべての内容は英語版を正とします。**
+
+  [英語版を表示 →](/solana-fundamentals/transactions-and-fees)
+</Info>
+
+Solana トランザクションは、アトミックに実行される命令のリストです。トランザクション構造（命令、アカウント、署名者、コンピュートバジェット）を理解することは、Raydium で何かを構築、デバッグ、または最適化するための前提条件です。このページではその構造、それを制約する制限、および実際のスワップでの 2 つの手数料カテゴリ（Solana ネットワーク手数料、Raydium プロトコル手数料）のスタッキング方法を説明します。
+
+## トランザクションの構成
+
+Solana トランザクションは 3 つのコアコンポーネントから構成されています：
+
+- **メッセージ**：命令の順序付きリスト、それらが参照するアカウント、および最近のブロックハッシュ。
+- **署名**：署名者あたり 1 つ、トランザクションが認可されたことを証明します。
+- **最近のブロックハッシュ**：トランザクションが最新であることを証明します。古いブロックハッシュ（150 スロット以上前）を持つトランザクションは拒否されます。
+
+### 命令
+
+命令は以下を指定します：
+
+- `program_id` — 呼び出すプログラム。
+- `accounts` — プログラムが触れる可能性があるアカウント（と書き込み可能/署名者フラグ）。
+- `data` — プログラムが解釈する不透明なバイト。
+
+1 つのトランザクションに複数の命令を含めることができます。順序に実行され、いずれかが失敗した場合、すべての前の命令がロールバックされます（アトミック）。
+
+典型的な Raydium スワップトランザクションには以下が含まれます：
+
+1. `ComputeBudget::SetComputeUnitLimit` — デフォルトの CU 制限を上げます。
+2. `ComputeBudget::SetComputeUnitPrice` — プライオリティ手数料を設定します。
+3. オプション `CreateAssociatedTokenAccount` — ユーザーが持っていない場合、出力 ATA を作成します。
+4. `Raydium::SwapBaseInput` — スワップを実行します。
+5. オプション `CloseAccount` — ラップされた SOL ATA を閉じます。
+
+SDK は `raydium.trade.swap()` を通じてこれらを自動的にパックします。
+
+## トランザクション内のアカウント
+
+トランザクション内の任意の命令に触れられるすべてのアカウントは、トランザクションのアカウントキーにリストされる必要があります。各アカウントは次のようにフラグされます：
+
+- **署名者/非署名者**：アカウントの所有者がトランザクションに署名する必要がありますか？
+- **書き込み可能/読み取り専用**：トランザクションはアカウントを変更できますか？
+
+ランタイムはこれらのフラグを強制します。非書き込み可能なアカウントに書き込もうとするプログラムは失敗し、ランタイムは必要な署名者を欠いているトランザクションを拒否します。
+
+CPMM スワップの場合、アカウントリストには約 13 エントリがあります（[`solana-fundamentals/account-model`](/ja/solana-fundamentals/account-model) を参照）。複数のティック配列クロッシングを含む CLMM スワップは 20 以上が可能です。
+
+## トランザクションサイズ制限
+
+Solana はトランザクションを**1232 バイト**に制限しており、署名、メッセージ、ヘッダーを含みます。これは複雑なトランザクションにおける最も一般的な障害です — Raydium の CLMM とマルチホップルーティングは定期的にこの制限に対抗します。
+
+典型的な約 1000 バイトの Raydium スワップの内訳：
+
+| コンポーネント | サイズ |
+|-----------|------|
+| 署名 | 64 B |
+| 署名カウント | 1 B |
+| メッセージヘッダー | 3 B |
+| ブロックハッシュ | 32 B |
+| アカウントキー（13 × 32 B） | 416 B |
+| 命令（4 × 約 100–150 B） | 400–600 B |
+| **合計** | 約 900–1100 B |
+
+### アドレスルックアップテーブル（ALT）
+
+ALT を使用すると、トランザクションは完全な 32 バイトの公開キーではなく、公開されたテーブルへの 1 バイトインデックスで参照できます。これはトランザクションを大幅に圧縮します：
+
+- 20 個のアカウントを直接参照するトランザクション：約 640 B の公開キー。
+- ALT を使用した同じトランザクション：約 20 B のインデックス + ALT 参照。
+
+Raydium はメインネット上で CPMM/CLMM スワップパス用の ALT を維持しています。SDK はこれを自動的に使用します。マルチホップルーティングを構築するアグリゲーターは、これを大量に使用します。
+
+```ts
+import { VersionedTransaction } from "@solana/web3.js";
+
+// SDK は ALT 参照を含む v0（バージョン管理）tx を構築します
+const { transaction } = await raydium.trade.swap({ /* ... */ });
+// transaction は VersionedTransaction であり、レガシー Transaction ではありません。
+```
+
+## コンピュートバジェット
+
+すべてのトランザクションには**コンピュートユニット（CU）バジェット**があります。それを超えると実行が終了し、トランザクションは失敗します。
+
+- **デフォルト**：トランザクションあたり 200,000 CU。
+- **最大**：トランザクションあたり 1,400,000 CU（`ComputeBudget::SetComputeUnitLimit` で上げられます）。
+- **ブロックあたりの上限**：ブロックあたり 48M CU（プロトコルレベル）。
+
+典型的な Raydium CU 消費（完全なテーブルは [`integration-guides/priority-fee-tuning`](/ja/integration-guides/priority-fee-tuning) を参照）：
+
+| 命令 | CU |
+|-------------|-----|
+| CPMM スワップ | 約 140,000 |
+| CLMM スワップ（ティッククロッシングなし） | 約 170,000 |
+| CLMM スワップ（4 ティッククロッシング） | 約 320,000 |
+| Farm v6 ステーク | 約 130,000 |
+| CPMM プール作成 | 約 250,000 |
+
+常に `ComputeBudget` を通じて明示的な CU 制限を設定してください。そうしないと、ほとんどの Raydium 命令には低すぎる 200k デフォルトを取得します。
+
+```ts
+import { ComputeBudgetProgram } from "@solana/web3.js";
+
+tx.add(
+  ComputeBudgetProgram.setComputeUnitLimit({ units: 300_000 }),
+);
+```
+
+CU 制限を低く設定しすぎた場合、トランザクションは制限に達すると失敗します。高く設定しすぎた場合、混雑時に優先度が下げられるリスクがあります（価格設定モデルによっては、使用しなかったコンピュートに対して支払う可能性があります）。
+
+## プライオリティ手数料
+
+基本トランザクション手数料（署名あたり 5000 ラムポート）を超えて、バリデーターはますます**プライオリティ手数料**を支払うトランザクションを優先しています：マイクロラムポート単位の CU あたりのチップ。
+
+```
+priority_fee = compute_unit_price (マイクロラムポート) × compute_unit_limit
+```
+
+例：10,000 µL/CU × 300,000 CU = 3,000,000 µL = 0.003 SOL。
+
+プライオリティ手数料はローカルです — ブロック内の順序のみに影響し、含まれる可能性を改善しません。合理的なプライオリティ手数料を設定することは、混雑時に不可欠です。
+
+```ts
+tx.add(
+  ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 10_000 }),
+);
+```
+
+[`integration-guides/priority-fee-tuning`](/ja/integration-guides/priority-fee-tuning) でこれを動的にサイズする方法を参照してください。
+
+## 命令カウントとアカウントカウント制限
+
+1232 バイトの合計制限を超えて：
+
+- **トランザクションあたりの最大アカウント数**：128。
+- **命令あたりの最大アカウント数（CPI）**：64。
+- **トランザクションあたりの最大命令数**：ハード制限なし、サイズ制限によってのみ制限されます。
+- **最大 CPI 深度**：4（プログラムは別のプログラムを呼び出すことができ、別のプログラムは 4 レベル深くまで呼び出すことができます）。
+
+複数のティック配列を横断する Raydium CLMM スワップは、アカウント制限に対して強く対抗することができます — 1 つのスワップはプール、入力/出力ボールト、入力/出力 ATA、複数のティック配列、おそらくトランスファーフックプログラムの追加アカウント、および必須のコンピュートバジェット/システム/トークンプログラム参照に触れます。CPI を通じて Raydium を構成する設計（例えば、オートコンパウンダー）は、これを考慮する必要があります。
+
+## Raydium スワップの手数料カテゴリ
+
+ユーザースワップトランザクションは 2 つのカテゴリで手数料を支払います：
+
+### Solana ネットワーク手数料
+
+SOL でバリデーターに支払われます。
+
+- **基本署名手数料**：署名あたり 5000 ラムポート。ほぼ常に 1 署名 = 0.000005 SOL。
+- **プライオリティ手数料**：マイクロラムポート単位の CU 価格 × CU 制限。混雑と共に変わります。[`integration-guides/priority-fee-tuning`](/ja/integration-guides/priority-fee-tuning) を参照してください。
+
+これらの手数料はバリデーターに行き、Raydium とは無関係で、失敗したトランザクションに対しても請求されます（プライオリティ手数料のエッジケースを除く）。
+
+### Raydium プロトコル手数料
+
+スワップ金額から控除されます。
+
+- **スワップ手数料**：入力の割合（CPMM 典型的 0.25%、CLMM ティアごと 0.01%～1%）。LP とプロトコル先へ分割。[`ray/protocol-fees`](/ja/ray/protocol-fees) を参照してください。
+
+これらの手数料は Raydium の会計内部です — ユーザーはゼロ手数料プールが生成する出力額より小さい出力額として見ます。
+
+### 例：CPMM 0.25% ティア経由で \$1000 USDC → SOL
+
+| 手数料カテゴリ | 金額 | 行き先 |
+|--------------|--------|---------|
+| 基本署名手数料 | 0.000005 SOL（約 \$0.0007） | バリデーター |
+| プライオリティ手数料（10k µL × 300k CU） | 0.003 SOL（約 \$0.45） | バリデーター |
+| CPMM スワップ手数料（0.25%） | \$2.50 | LP + プロトコル |
+| **ユーザーの総コスト** | 約 \$2.95 | |
+
+スリッページ（価格インパクト + 市場変動）は手数料ではありませんが、同じ底線に影響します。
+
+## バージョン管理トランザクション
+
+Solana には 2 つのトランザクション形式があります：
+
+- **レガシー**：元の形式、ALT サポートなし。
+- **v0（バージョン管理）**：ALT をサポートし、将来のバージョンに拡張可能。
+
+すべての最新 Solana ツーリングは v0 を使用します。Raydium SDK はデフォルトで v0 トランザクションを発行します。
+
+```ts
+// v0 tx を直接構築
+import { VersionedTransaction, TransactionMessage } from "@solana/web3.js";
+
+const msg = new TransactionMessage({
+  payerKey:        owner.publicKey,
+  recentBlockhash: blockhash,
+  instructions:    [ /* ... */ ],
+}).compileToV0Message([lookupTableAccount]);
+
+const tx = new VersionedTransaction(msg);
+tx.sign([owner]);
+```
+
+## ブロックハッシュの新鮮さ
+
+トランザクションは過去約 150 スロット（約 60 秒）以内のブロックハッシュを含める必要があります。その窓を超えると、バリデーターはこれを拒否します。
+
+リトライループの場合、各リトライで新しいブロックハッシュをフェッチしてください：
+
+```ts
+async function sendWithRetry(tx, maxRetries = 3) {
+  for (let i = 0; i < maxRetries; i++) {
+    const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash();
+    tx.message.recentBlockhash = blockhash;
+    tx.sign([owner]);
+    try {
+      return await connection.sendRawTransaction(tx.serialize());
+    } catch (e) {
+      if (i === maxRetries - 1) throw e;
+    }
+  }
+}
+```
+
+昇格手数料パターンを含む完全なリトライについては、[`integration-guides/priority-fee-tuning`](/ja/integration-guides/priority-fee-tuning) を参照してください。
+
+## 並列実行
+
+Solana はマルチコアバリデーターで競合しないトランザクションを並列に実行します。 2 つのトランザクションが同じアカウントに両方書き込む場合、競合します。
+
+Raydium への影響：
+
+- 同じプール上の 2 つのスワップは並列で実行できません — 両方ともプール状態に書き込みます。
+- プール A 上のスワップとプール B 上のスワップは、アカウントリストが重ならない場合は並列で実行されます。
+- 読み取り専用トランザクションは同じアカウント上のライターをブロックしません（読み取り専用は自身と同時実行ですが、書き込みとは同時実行しません）。
+
+これが、Solana が単一プールのシリアライゼーションにもかかわらず高い DEX スループットを維持できる理由です。
+
+## トランザクション確認レベル
+
+トランザクションを送信する際に確認レベルを選択します：
+
+| レベル | 待機 | 最終性 |
+|-------|------|----------|
+| `processed` | 約 400 ms | ファイナライズされていません。ロールバック可能 |
+| `confirmed` | 約 1 s | スーパーマジョリティが投票 |
+| `finalized` | 約 13 s | スーパーマジョリティがルート化 |
+
+スワップ UX の場合、`confirmed` が標準です。大きな価値を扱う操作（プール作成、報酬トップアップ）の場合、`finalized` がより安全です。
+
+```ts
+await connection.sendAndConfirmTransaction(tx, [owner], {
+  commitment: "confirmed",
+});
+```
+
+## シミュレーション
+
+Solana は送信前にトランザクションをシミュレートすることをサポートしています：
+
+```ts
+const sim = await connection.simulateTransaction(tx);
+console.log(sim.value.logs);
+console.log(sim.value.unitsConsumed);
+```
+
+Raydium SDK は `getBestSwapInfo` を計算するときに内部的にシミュレーションを使用して、選択されたルートが実際に成功することを確認しています。シミュレーションは無料ではありません — RPC 容量を消費します — しかし、支払う前にエラーをキャッチします。
+
+## ポインター
+
+- [`solana-fundamentals/account-model`](/ja/solana-fundamentals/account-model) — トランザクション内のアカウント。
+- [`solana-fundamentals/pdas-and-cpis`](/ja/solana-fundamentals/pdas-and-cpis) — プログラムが互いに呼び出す方法。
+- [`integration-guides/priority-fee-tuning`](/ja/integration-guides/priority-fee-tuning) — CU 制限とプライオリティ手数料のサイズ変更。
+- [`ray/protocol-fees`](/ja/ray/protocol-fees) — Raydium プロトコル手数料構造。
+
+ソース：
+
+- [Solana Transaction docs](https://docs.solana.com/developing/programming-model/transactions).
+- [Address Lookup Tables proposal](https://docs.solana.com/developing/lookup-tables).
+- [Compute budget documentation](https://docs.solana.com/developing/programming-model/runtime).

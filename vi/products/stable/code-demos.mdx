@@ -1,0 +1,250 @@
+---
+title: "Stable AMM code demos"
+description: "Cách xác định pool Stable AMM từ API, swap qua nó bằng module Liquidity (hỗ trợ native pools version=5), và sử dụng các helper stable-curve off-chain."
+---
+
+<Info>
+  **Trang này được dịch tự động bằng AI. Phiên bản tiếng Anh là bản chính thức.**
+
+  [Xem bản tiếng Anh →](/products/stable/code-demos)
+</Info>
+
+<Info>
+  **Banner phiên bản.**
+
+  - SDK: `@raydium-io/raydium-sdk-v2@0.2.42-alpha`
+  - Cluster: Solana `mainnet-beta`
+  - ID chương trình Stable AMM: `5quBtoiQqxF9Jv6KYKctB59NT3gtJD2Y65kdnB1Uev3h` (xem [`reference/program-addresses`](/vi/reference/program-addresses))
+  - Lần xác minh cuối cùng: 2026-04
+
+  Module `liquidity` của SDK xử lý các pool Stable AMM một cách native. Các pool Stable xuất hiện dưới dạng **`version: 5`** (hoặc `pooltype: "StablePool"`) trên `ApiV3PoolInfoStandardItem`; các helper `addLiquidity` / `removeLiquidity` / swap giống nhau cho cả pool AMM v4 (`version: 4`) constant-product — SDK tự động phát hiện biến thể và phát sinh các instruction chính xác. Toán học stable-curve off-chain nằm trong `src/raydium/liquidity/stable.ts`.
+</Info>
+
+## Thiết lập
+
+```bash
+npm install @raydium-io/raydium-sdk-v2 @solana/web3.js @solana/spl-token
+```
+
+```ts
+import { Raydium, TxVersion } from "@raydium-io/raydium-sdk-v2";
+import { Connection, Keypair, clusterApiUrl } from "@solana/web3.js";
+import BN from "bn.js";
+import bs58 from "bs58";
+
+const connection = new Connection(clusterApiUrl("mainnet-beta"));
+const owner = Keypair.fromSecretKey(bs58.decode(process.env.PRIVATE_KEY!));
+
+const raydium = await Raydium.load({
+  connection,
+  owner,
+  cluster: "mainnet",
+  // Tùy chọn: tải layout mô hình stable curve nếu bạn dự định gọi
+  // các helper quoting từ `liquidity/stable.ts` trực tiếp. Swap / add / remove
+  // cấp pool làm việc này một cách lazy cho bạn, vì vậy hầu hết lượt gọi có thể
+  // bỏ qua bước này.
+});
+
+// Một lần: tìm nạp trước layout dữ liệu on-chain được sử dụng bởi các helper
+// stable-curve off-chain. Chỉ cần thiết nếu bạn gọi trực tiếp getStablePrice / getDxByDyBaseIn /
+// getDyByDxBaseIn. addLiquidity / removeLiquidity / swap không cần.
+await raydium.liquidity.initLayout();
+```
+
+## Xác định pool Stable
+
+Hai tín hiệu tương đương trên `ApiV3PoolInfoStandardItem`:
+
+```ts
+const isStable =
+  pool.version === 5 ||
+  pool.pooltype.includes("StablePool"); // SDK sử dụng kiểm tra chuỗi này trong nội bộ
+
+// Hoặc thay thế, theo ID chương trình:
+const STABLE_AMM_PROGRAM_ID = "5quBtoiQqxF9Jv6KYKctB59NT3gtJD2Y65kdnB1Uev3h";
+const isStableByProgram = pool.programId === STABLE_AMM_PROGRAM_ID;
+```
+
+Cả AMM v4 (`version: 4`, constant-product) và Stable AMM (`version: 5`) đều chạy qua cùng một API `LiquidityModule` trên SDK. Trong nội bộ, module điều phối tới:
+
+- `InstructionType.AmmV4AddLiquidity` / `AmmV4RemoveLiquidity` cho pool v4
+- `InstructionType.AmmV5AddLiquidity` / `AmmV5RemoveLiquidity` cho pool v5 (Stable)
+
+`programId` của pool (được trả về cùng với pool keys) cho SDK biết chương trình nào để CPI vào; bạn không cần hardcode nó.
+
+## Tìm pool theo cặp mint
+
+```ts
+import { PublicKey } from "@solana/web3.js";
+
+// Hai mint phổ biến dùng làm ví dụ
+const mintA = new PublicKey("Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB"); // USDT
+const mintB = new PublicKey("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"); // USDC
+
+const pools = await raydium.api.fetchPoolByMintPair({
+  mint1: mintA.toBase58(),
+  mint2: mintB.toBase58(),
+});
+
+const stablePool = pools.find(
+  (p) => p.version === 5 || p.pooltype.includes("StablePool"),
+);
+
+if (!stablePool) {
+  throw new Error("Không tồn tại pool Stable cho cặp mint này");
+}
+
+console.log("ID pool Stable:", stablePool.id);
+console.log("programId pool Stable:", stablePool.programId);
+console.log("TVL:", stablePool.tvl);
+```
+
+Nếu cặp mint có cả pool v4 (constant-product) và v5 (stable), phản hồi sẽ bao gồm cả hai — chọn cái mà luồng của bạn cần, hoặc gửi chúng tới chương trình [AMM Routing](/vi/products/routing) và để nó chọn tuyến đường tốt nhất.
+
+## Swap qua pool Stable
+
+Luồng `LiquidityModule.swap` có hình dạng giống như đối với các pool v4 — chỉ cần gửi một đối tượng pool v5:
+
+```ts
+import { Percent, TokenAmount, toToken } from "@raydium-io/raydium-sdk-v2";
+
+const inputAmount = new TokenAmount(toToken(stablePool.mintA), 1_000_000); // 1 USDT
+const slippage = new Percent(50, 10_000); // 0.5%
+
+// Tính toán kết quả đầu ra dự kiến bằng cách sử dụng các helper stable-curve của SDK trong nội bộ.
+const { amountOut, minAmountOut } = raydium.liquidity.computeAmountOut({
+  poolInfo: stablePool,
+  amountIn: inputAmount,
+  mintIn:  stablePool.mintA.address,
+  mintOut: stablePool.mintB.address,
+  slippage,
+});
+
+console.log("Kết quả dự kiến:", amountOut.toSignificant());
+console.log("Tối thiểu:", minAmountOut.toSignificant());
+
+// Xây dựng & ký giao dịch swap.
+const { transaction, execute } = await raydium.liquidity.swap({
+  poolInfo: stablePool,
+  amountIn:    inputAmount.raw,
+  amountOut:   minAmountOut.raw,
+  fixedSide:   "in",
+  txVersion:   TxVersion.V0,
+});
+
+const { txId } = await execute({ sendAndConfirm: true });
+console.log("Giao dịch Stable swap:", txId);
+```
+
+SDK đọc `programId` của pool từ pool keys và điều phối vào chương trình Stable AMM. Không cần tham số `programId` đặc biệt nào.
+
+## Thêm và xóa liquidity
+
+`addLiquidity` và `removeLiquidity` hoạt động giống hệt nhau trên các pool v4 và v5:
+
+```ts
+import { Percent, TokenAmount, toToken } from "@raydium-io/raydium-sdk-v2";
+
+const amountInA = new TokenAmount(toToken(stablePool.mintA), 100_000_000); // 100 USDT
+const slippage  = new Percent(50, 10_000); // 0.5%
+
+// Tính toán số lượng B tương ứng mà đường cong yêu cầu cho kích thước A này.
+const { anotherAmount, minAnotherAmount } = raydium.liquidity.computePairAmount({
+  poolInfo: stablePool,
+  amount:   amountInA.toSignificant(),
+  baseIn:   true,
+  slippage,
+});
+
+const { execute } = await raydium.liquidity.addLiquidity({
+  poolInfo: stablePool,
+  amountInA,
+  amountInB:      anotherAmount,
+  otherAmountMin: minAnotherAmount,
+  fixedSide:      "a",
+  txVersion:      TxVersion.V0,
+});
+
+const { txId } = await execute({ sendAndConfirm: true });
+console.log("Giao dịch thêm liquidity:", txId);
+```
+
+Trong nội bộ, SDK phát sinh `InstructionType.AmmV5AddLiquidity` vì `pooltype.includes("StablePool")` là true. Luồng `removeLiquidity` tương ứng là đối xứng — nhập `lpAmount` và số lượng tối thiểu mà bạn sẽ chấp nhận ở mỗi bên.
+
+## Các helper quote off-chain (stable.ts)
+
+Để báo giá phía máy chủ hoặc backtesting, SDK để lộ toán học stable-curve cơ bản:
+
+```ts
+import {
+  getStablePrice,
+  getDxByDyBaseIn,
+  getDyByDxBaseIn,
+} from "@raydium-io/raydium-sdk-v2";
+
+// Bạn phải gọi initLayout() một lần trước khi sử dụng các helper này (tải
+// layout dữ liệu on-chain `ModelDataInfo` PDA vào bộ nhớ cache StableLayout của SDK).
+await raydium.liquidity.initLayout();
+
+const modelData = raydium.liquidity.stableLayout;
+
+// Giá spot tại các reserve hiện tại của pool.
+const price = getStablePrice(modelData, /* x */, /* y */, /* withFee */);
+console.log("Giá spot:", price);
+
+// Báo giá: cho trước dx vào, bao nhiêu dy ra (không áp dụng phí ở đây)?
+const dyOut = getDyByDxBaseIn(modelData, /* x */, /* y */, /* dx */);
+
+// Báo giá: cho trước mục tiêu dy ra, cần bao nhiêu dx vào?
+const dxIn  = getDxByDyBaseIn(modelData, /* x */, /* y */, /* dy */);
+```
+
+Đây là các hàm thuần — không RPC, không ký. On-chain `ModelDataInfo` được tìm nạp một lần bởi `initLayout()` và được lưu vào bộ nhớ cache trong `raydium.liquidity.stableLayout`. Truyền reserve hiện tại (`x`, `y`) và các helper tính toán bằng cách tìm kiếm nhị phân bảng tra cứu và nội suy tuyến tính giữa hai hàng `DataElement` xung quanh. Xem [`products/stable/math`](/vi/products/stable/math) để tìm hiểu thuật toán cơ bản.
+
+## Định tuyến qua AMM Routing (multi-hop / best-price)
+
+Nếu bạn không muốn tự chọn một địa điểm, chương trình [AMM Routing](/vi/products/routing) sẽ xem xét mọi Raydium AMM (v4 / CPMM / CLMM / Stable) và định tuyến qua bất kỳ sự kết hợp nào tốt nhất:
+
+```ts
+const route = await raydium.tradeV2.fetchRoutes({
+  inputMint:  mintA,
+  outputMint: mintB,
+  amount:     new BN(1_000_000),
+  slippage,
+});
+
+// route.routes[0].poolType cho bạn biết những chương trình nào mà tuyến đường tốt nhất sử dụng;
+// "Stable" xuất hiện ở đây bất cứ khi nào pool Stable là một phần của đường dẫn tối ưu.
+console.log(route.routes[0]);
+
+const { execute } = await raydium.tradeV2.swap({
+  inputMint:    mintA,
+  outputMint:   mintB,
+  inputAmount:  new BN(1_000_000),
+  swapResult:   route.routes[0],
+  slippage,
+  txVersion:    TxVersion.V0,
+});
+
+const { txId } = await execute({ sendAndConfirm: true });
+```
+
+Đây là đường dẫn được khuyên dùng cho các swapper và aggregator sản xuất — bạn không cần phải tự quyết định xem pool Stable có tồn tại hay nó có phải là địa điểm tốt hơn hôm nay hay không.
+
+## Khuyến nghị
+
+1. **Đối với swap của người dùng cuối**, ưu tiên luồng định tuyến [`tradeV2`](/vi/products/routing). Nó xử lý mọi loại pool Raydium bao gồm Stable.
+2. **Đối với các hoạt động cụ thể của pool** (thêm/xóa LP trên một pool Stable đã biết), sử dụng `LiquidityModule` trực tiếp — nó tự động phát hiện các pool v5.
+3. **Đối với báo giá/phân tích off-chain**, gọi `getStablePrice` / `getDyByDxBaseIn` / `getDxByDyBaseIn` sau `initLayout()`. Không có lưu lượng RPC cho mỗi báo giá sau khi dữ liệu mô hình được lưu vào bộ nhớ cache.
+4. **Không mã hóa tay raw `SwapBaseIn` instruction.** Chương trình Stable AMM (được fork từ AMM v4) mong đợi 17–19 tài khoản OpenBook cho các điểm cuối swap V1, với `model_data_account` được lắp vào giữa chúng. Các helper được xây dựng sẵn của SDK xử lý mọi tài khoản và thứ tự một cách chính xác; tự mình thực hiện dễ gây lỗi.
+
+## Đi đâu tiếp theo
+
+- [Math](/vi/products/stable/math) — cách nội suy bảng tra cứu hoạt động.
+- [Instructions](/vi/products/stable/instructions) — tham chiếu instruction đầy đủ.
+- [AMM Routing](/vi/products/routing) — định tuyến đa pool qua AMM v4, CPMM, CLMM, Stable.
+
+Nguồn:
+
+- [`raydium-sdk-V2/src/raydium/liquidity/liquidity.ts`](https://github.com/raydium-io/raydium-sdk-V2/blob/master/src/raydium/liquidity/liquidity.ts) — điểm vào module; điều phối v4 / v5.
+- [`raydium-sdk-V2/src/raydium/liquidity/stable.ts`](https://github.com/raydium-io/raydium-sdk-V2/blob/master/src/raydium/liquidity/stable.ts) — `StableLayout`, `getStablePrice`, `getDxByDyBaseIn`, `getDyByDxBaseIn`.

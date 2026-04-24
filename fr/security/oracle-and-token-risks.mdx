@@ -1,0 +1,174 @@
+---
+title: "Risques liés aux oracles et aux tokens"
+description: "Comment Raydium gère les données d'oracle et les risques spécifiques introduits par les extensions Token-2022 — autorité de gel, transfer hook, délégué permanent, gel par défaut — y compris ce que les programmes protègent et ce que les utilisateurs doivent accepter."
+---
+
+<Info>
+  **Cette page est traduite automatiquement par IA. La version anglaise fait foi.**
+
+  [Voir la version anglaise →](/security/oracle-and-token-risks)
+</Info>
+
+<Info>
+  Les produits cœur de Raydium ne dépendent pas d'oracles externes pour la tarification — l'état du pool *est* l'oracle. Cependant, l'API et le SDK utilisent des oracles externes pour la tarification en USD affichée aux utilisateurs, et les mints Token-2022 offrent un ensemble plus riche de contrôles que SPL Token, dont certains changent fondamentalement le modèle de confiance d'un pool. Cette page en dresse l'inventaire.
+</Info>
+
+## Oracles dans Raydium
+
+### Interne : le pool est l'oracle
+
+Pour AMM v4, CPMM et CLMM, la définition du protocole du « prix actuel » est dérivée uniquement de l'état du pool :
+
+- AMM v4 / CPMM : `price = vaultB_balance / vaultA_balance` (en tenant compte des décimales).
+- CLMM : `price = (sqrtPriceX64 / 2^64)^2 × 10^(decimalsA - decimalsB)`.
+
+Aucun oracle externe n'est consulté lors d'un swap, d'un dépôt ou d'un retrait. C'est la partie « sans confiance » de la conception AMM : si les mathématiques du pool sont correctes, aucune manipulation externe d'un flux de prix ne peut le corrompre.
+
+### `ObservationState` CLMM en tant qu'oracle TWAP
+
+Les pools CLMM maintiennent un compte `ObservationState` qui enregistre des instantanés historiques de `sqrt_price`. D'autres programmes peuvent s'en appuyer pour dériver un prix moyen pondéré dans le temps résistant à la manipulation :
+
+```rust
+// Un TWAP simplifié : moyenne de (actuel, N slots il y a).
+let obs_now  = load_observation(pool, Clock::slot());
+let obs_past = load_observation(pool, Clock::slot() - 300);  // ~2 min ago
+let twap = (obs_now.price_cumulative - obs_past.price_cumulative)
+         / (obs_now.slot - obs_past.slot);
+```
+
+C'est le même modèle qu'Uniswap V3 utilise. Une manipulation de prix à court terme (une baleine poussant temporairement le pool) ne corrompt pas le TWAP car il est moyenné sur des centaines de slots.
+
+Les programmes qui ont besoin d'un flux de prix plus sûr pour les mints CLMM (oracles de liquidation, tarification d'options, etc.) devraient utiliser les TWAPs ObservationState plutôt que les prix instantanés.
+
+**N'utilisez pas les prix instantanés CLMM pour la composabilité.** Un seul grand swap peut pousser le prix au comptant de 10 %+ sur un pool peu profond ; le TWAP l'amortit. Voir [`products/clmm/accounts#observation-state`](/fr/products/clmm/accounts) pour la structure de données.
+
+### Externe : tarification en USD sur le frontend/l'API
+
+Le frontend de Raydium et `api-v3.raydium.io` affichent les valeurs en USD (TVL, APR des frais, \$ volume). Celles-ci proviennent de :
+
+- **Pyth** comme oracle principal pour les mints majeurs.
+- **L'agrégateur de prix de Jupiter** comme secours.
+- **Prix dérivé du pool** pour les mints long-tail sans couverture d'oracle externe.
+
+Les affichages en USD sont strictement cosmétiques — les opérations on-chain ne lisent jamais Pyth, et aucune mathématique de pool n'utilise l'USD. Si Pyth cesse de fournir des données pour un mint, l'interface affiche « — » ; le pool continue de fonctionner.
+
+### La manipulation d'oracle ne s'applique pas aux pools Raydium
+
+Parce que l'état du pool est l'oracle, il n'y a pas d' « attaque d'oracle » au sens que la littérature des bug-bounty entend — pas de source de données manipulable externe que l'attaquant peut corrompre. Les attaques économiques sur l'état du pool (manipulation de style flash-loan) sont couvertes dans [`security/attack-vectors`](/fr/security/attack-vectors).
+
+## Risques des extensions Token-2022
+
+SPL Token-2022 (alias « Token Extensions ») ajoute un comportement configurable aux mints via des extensions. Certaines extensions changent les propriétés de confiance des pools qui les incluent. Les programmes Raydium en gèrent certaines automatiquement et en surfacent d'autres comme avertissements utilisateur.
+
+### Frais de transfert
+
+**Qu'est-ce que c'est :** Un frais configurable (pourcentage du transfert, jusqu'à un plafond `maximum_fee` en termes absolus) payé par l'expéditeur à l'autorité de mint à chaque transfert.
+
+**Risque :** Le frais peut être modifié par l'autorité fee-config du mint. Si vous déposez de la liquidité quand les frais sont à 1 %, et que l'autorité les élève à 50 %, les swaps ultérieurs retournent beaucoup moins que prévu.
+
+**Atténuation dans Raydium :** Les pools lisent la `transferFeeConfig` actuelle au moment du swap et ajustent les mathématiques. Le pool lui-même n'est pas corrompu, mais les utilisateurs voient un rendement pire. L'autorité des frais peut également planifier un changement de frais différé ; l'interface de Raydium signale les pools avec des changements de frais imminents.
+
+**Risque résiduel :** Si une autorité de frais malveillante change les frais pendant votre swap en cours, votre `minimumAmountOut` protège le risque à la baisse — la tx revient. Si vous faites confiance à l'émetteur du mint, c'est bon ; si ce n'est pas le cas, n'y fournissez pas de liquidité.
+
+### Transfer hook
+
+**Qu'est-ce que c'est :** Un transfert invoque un programme distinct (le « hook ») pour exécuter une validation personnalisée ou des effets secondaires.
+
+**Risque :** Le hook peut bloquer tout transfert, y compris les transferts internes du pool lors d'un swap. Un hook modifiable peut devenir malveillant ultérieurement — ce qui était sûr au moment du dépôt peut devenir non échangeable au moment du retrait.
+
+**Atténuation dans Raydium :** Raydium répertorie un ID de programme de hook dans l'état du pool. Les intégrations doivent afficher l'ID de programme du hook aux utilisateurs pour qu'ils puissent vérifier qu'il s'agit du programme attendu (non modifiable, audité).
+
+**Risque résiduel :** Si un hook est modifiable et que son autorité devient hostile, le pool peut être gelé. Raydium ne bloque pas les pools avec transfer hooks, mais il les signale. Fournissez de la liquidité dans un pool avec transfer hook uniquement si le hook est vérifié comme sûr.
+
+### Autorité de gel
+
+**Qu'est-ce que c'est :** L'autorité de gel d'un mint peut geler n'importe quel compte token détenant ce mint, empêchant tous les transferts.
+
+**Risque :** Une autorité de gel capable de geler le compte vault du pool arrête effectivement le pool — les utilisateurs ne peuvent pas se retirer, les traders ne peuvent pas faire de swap. Cela s'applique à SPL Token *et* Token-2022 ; ce n'est pas nouveau avec Token-2022, mais c'est toujours un risque.
+
+**Atténuation dans Raydium :** Aucune au niveau du programme — le gel de SPL Token est opaque pour le pool. L'interface de Raydium avertit sur les pools avec des mints gelables. Les utilisateurs qui déposent doivent vérifier que l'autorité de gel est nulle ou un multisig en lequel ils ont confiance (USDC a une autorité de gel ; c'est l'émetteur Circle).
+
+**Risque résiduel :** Acceptez que les mints gelables puissent être gelés. Les mints majeurs (USDC, USDT, USDY) ont des autorités de gel détenues par l'émetteur et utilisées uniquement pour la conformité réglementaire ; c'est généralement acceptable.
+
+### Délégué permanent
+
+**Qu'est-ce que c'est :** Une extension Token-2022 qui désigne un délégué permanent qui peut transférer des tokens de n'importe quel détenteur sans approbation.
+
+**Risque :** Le délégué permanent peut vider le vault du pool à tout moment.
+
+**Atténuation dans Raydium :** CPMM et CLMM **refusent de créer des pools** avec des mints qui ont un délégué permanent. L'initialisation revient. Aucun pool Raydium en cours d'exécution n'a un mint avec délégué permanent.
+
+**Risque résiduel :** Zéro (tant que la vérification est correcte, ce que les deux audits ont vérifié).
+
+### Non transférable
+
+**Qu'est-ce que c'est :** Des mints qui ne peuvent pas être transférés par les détenteurs.
+
+**Risque :** Les pools dépendent de la transférabilité pour déplacer les tokens entre les ATAs utilisateur et les vaults du pool. Les mints non transférables cassent triviallement les pools.
+
+**Atténuation dans Raydium :** La création de pool revient sur les mints non transférables. Les farms refusent également les mints de staking non transférables.
+
+### Gel par défaut / autorité de fermeture / porteur d'intérêts
+
+Extensions à impact plus faible gérées par Raydium :
+
+- **Gel par défaut** : les nouveaux comptes token doivent être dégelés avant utilisation. Raydium le gère de manière transparente lors de la création d'ATA.
+- **Autorité de fermeture** : une autorité désignée peut fermer les comptes token. Les vaults du pool sont possédés par l'autorité dérivée du programme du pool, donc l'autorité de fermeture sur le *mint* ne s'applique pas au vault.
+- **Porteur d'intérêts** : le solde affiché accumule des intérêts ; `amount` reste fixe mais `uiAmount` augmente. Les mathématiques du pool Raydium utilisent `amount`, pas les intérêts accumulés ; l'affichage s'ajuste séparément.
+
+### Autorité de mint
+
+Pas un risque spécifique à Token-2022, mais à noter : si un mint conserve l'autorité de mint, le détenteur peut augmenter l'offre à volonté. Pour les tokens lancés, cela dilue les LPs au prix actuel du pool. LaunchLab refuse de créer des lancements sauf si l'autorité de mint est nulle.
+
+## Étiquettes de risque dans l'interface
+
+L'interface de Raydium étiquète chaque pool avec les balises de risque applicables :
+
+- **TRANSFER_FEE** — frais de transfert non nul.
+- **TRANSFER_HOOK** — extension transfer-hook active.
+- **FREEZE** — le mint a une autorité de gel.
+- **MINT** — le mint a une autorité de mint (l'offre peut augmenter).
+- **CLOSE** — le mint a une autorité de fermeture.
+
+Les agrégateurs consommant l'API de Raydium doivent surfacer ces étiquettes aux utilisateurs.
+
+## Liste de contrôle pour les intégrateurs
+
+Avant de composer avec un pool Raydium :
+
+- [ ] Vérifiez les extensions de chaque mint via `getMint(mint, TOKEN_2022_PROGRAM_ID)`.
+- [ ] Ignorez les pools où un mint a permanent_delegate ou non_transferable (ceux-ci ne devraient pas exister dans Raydium, mais défense en profondeur).
+- [ ] Vérifiez l'autorité de gel pour les deux mints ; nulle ou autorité de confiance uniquement.
+- [ ] Pour les pools avec transfer hook, vérifiez l'ID de programme du hook par rapport à une liste blanche.
+- [ ] Dimensionnez l'exposition par rapport aux scénarios de frais de transfert (que se passe-t-il si les frais atteignent le maximum ?).
+- [ ] Utilisez le TWAP CLMM (ObservationState) plutôt que le prix au comptant pour la tarification des dérivés.
+
+## Déclaration d'acceptation des risques résiduels
+
+Les programmes de Raydium appliquent ce qui peut être appliqué au niveau du programme :
+
+- La création de pool refuse les mints avec délégué permanent / non transférable.
+- Les mathématiques du swap s'ajustent correctement pour les frais de transfert actuels.
+- ObservationState fournit un oracle résistant à la manipulation.
+
+Les risques résiduels que les utilisateurs doivent accepter :
+
+- L'autorité de gel d'un mint peut geler le pool.
+- L'autorité des frais d'un mint peut augmenter les frais de transfert (jusqu'au plafond `maximum_fee`) à tout moment.
+- Un programme transfer-hook peut être mis à niveau avec du code malveillant.
+- Le taux d'accumulation d'un mint porteur d'intérêts peut être modifié.
+
+La bonne défense est la diligence avant de fournir de la liquidité : ne déposez pas dans des pools avec des mints qui ont des autorités concentrées en lesquelles vous n'avez pas confiance. Raydium ne peut pas décider de cette confiance pour vous ; il ne peut que surfacer les faits pertinents.
+
+## Pointeurs
+
+- [`algorithms/token-2022-transfer-fees`](/fr/algorithms/token-2022-transfer-fees) — ajustements mathématiques pour les mints avec frais de transfert.
+- [`security/attack-vectors`](/fr/security/attack-vectors) — comment ces risques se manifestent en tant qu'attaques concrètes.
+- [`integration-guides/wallet-integration`](/fr/integration-guides/wallet-integration) — affichage des étiquettes de risque Token-2022.
+- [`products/clmm/accounts`](/fr/products/clmm/accounts) — structure de ObservationState.
+
+Sources :
+
+- [Documentation des extensions SPL Token-2022](https://spl.solana.com/token-2022/extensions).
+- Logique de validation d'initialisation de pool : `src/raydium/cpmm/instrument.ts`, `src/raydium/clmm/instrument.ts`.
+- [Pyth](https://pyth.network) — oracle de prix externe utilisé sur le frontend.

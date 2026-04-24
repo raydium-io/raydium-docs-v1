@@ -1,0 +1,312 @@
+---
+title: "Perps コード例"
+description: "Orderly Networkの APIを通じたRaydium Perpsへのプログラマティックアクセス：USDC の入金、トレーディングアカウントの登録、オーダーの発注・キャンセル・変更、ポジション取得、マーケットWebSocketの購読、出金。"
+---
+
+<Info>
+  **このページは AI による自動翻訳です。すべての内容は英語版を正とします。**
+
+  [英語版を表示 →](/products/perps/code-demos)
+</Info>
+
+<Info>
+  **Raydium Perpsは、Orderly Networkのホワイトラベルデプロイメントです。** オーダーブック、マッチングエンジン、アカウント状態はすべてOrderlyに配置されています。Raydium SDK v2（`@raydium-io/raydium-sdk-v2`）はPerpsをサポートしていません。プログラマティックアクセスの場合は、OrderlyのREST + WebSocket APIを直接使用してください。以下のスニペットは最も一般的なフローを示しています。正規リファレンスは[orderly.network/docs](https://orderly.network/docs/build-on-omnichain/evm-api/introduction)にあります。
+</Info>
+
+<Info>
+  **バージョン情報**
+
+  - バックエンド：Orderly Network REST + WebSocket API
+  - スニペット検証：Orderly APIに対して2026-04時点で検証済み
+  - オンチェーン入金用Solanaクラスタ：`mainnet-beta`
+  - 署名：EIP-712形式のOrderlyペイロードに対するSolana ed25519（OrderlyはEVM以外のチェーンに対してもEIP-712スキーマを使用しています。最新フィールドリストはOrderlyドキュメントを参照）
+
+  OrderlyのAPI サーフェスは進化しています。本番環境にこれらのスニペットをコピーする前に、[orderly.network/docs](https://orderly.network/docs/build-on-omnichain/evm-api/introduction)を確認してください。
+</Info>
+
+## このページの内容
+
+以下のフローは、統合者にとって重要なライフサイクルをカバーしています：
+
+1. アカウント設定 — USDCを入金してアカウントをOrderlyに登録します。
+2. 認証されたREST呼び出し — オーダー発注、キャンセル、アカウントクエリのためにリクエスト署名を行います。
+3. トレーディング — マーケット・リミットオーダーの発注、キャンセル、ポジション・約定の取得。
+4. マーケットデータ — オーダーブックおよびトレードWebSocketへの購読。
+5. 出金 — ウォレットへの出金を開始します。
+
+これらのスニペットは、`@solana/web3.js`と ed25519署名用の`tweetnacl`を使用したNode.js + TypeScriptをターゲットとしています。これらは**スターティングポイント**です。OrderlyのAPIサーフェスは広く、このページより速く変化します。本番環境のコードをデプロイする前に、常にOrderlyの最新ドキュメントを確認してください。
+
+## セットアップ
+
+```ts
+import { Connection, Keypair, PublicKey, clusterApiUrl } from "@solana/web3.js";
+import nacl from "tweetnacl";
+import bs58 from "bs58";
+import fs from "node:fs";
+
+// 1. Solana ウォレット — USDC を保有し、入金・出金トランザクションに署名します。
+const connection = new Connection(process.env.RPC_URL ?? clusterApiUrl("mainnet-beta"));
+const owner = Keypair.fromSecretKey(
+  new Uint8Array(JSON.parse(fs.readFileSync(process.env.KEYPAIR!, "utf8"))),
+);
+
+// 2. Orderly トレーディングキー — API リクエストに署名するために使用される個別の Ed25519 キーペア。
+//    Solana ウォレットではありません。一度生成し、秘密にして、セッション全体で再利用します。
+const orderlyKey = nacl.sign.keyPair();   // ed25519
+const orderlyPubB58 = "ed25519:" + bs58.encode(orderlyKey.publicKey);
+
+// 3. Orderly ベースURL。Raydium は Orderly のメインネットホストを使用します。
+const ORDERLY_BASE = "https://api.orderly.org";
+const BROKER_ID    = "raydium";   // Orderly 上の Raydium のブローカーネームスペース
+const CHAIN_ID     = "solana";    // クロスチェーンアカウント登録用
+```
+
+Orderly トレーディングキーは、ウォレットキーペアではありません。最初の使用時にウォレットに対して登録するリクエスト署名キーです。ファンドに触れることなくローテーションできます。これをセッション認証情報として扱ってください。
+
+## アカウント登録
+
+オーダーを発注する前に、ウォレットをOrderlyに登録します：
+
+```ts
+import { encodeUserSettlement } from "./eip712-helpers"; // 正確なペイロードについては Orderly ドキュメントを参照
+
+// 1. Orderly から登録ノンスをリクエストします。
+const nonceResp = await fetch(`${ORDERLY_BASE}/v1/registration_nonce`).then(r => r.json());
+const registrationNonce = nonceResp.data.registration_nonce;
+
+// 2. Solana ウォレットで登録ペイロードに署名します（Solana 上の EIP-712形式は
+//    構造化メッセージとして実装されています。Orderly の SDK がエンコーダを提供しています）。
+const payload = encodeUserSettlement({
+  brokerId: BROKER_ID,
+  chainId: CHAIN_ID,
+  registrationNonce,
+  timestamp: Date.now(),
+});
+const walletSig = nacl.sign.detached(Buffer.from(payload), owner.secretKey);
+
+// 3. Orderly Ed25519 トレーディングキーを含めて登録します。
+const reg = await fetch(`${ORDERLY_BASE}/v1/register_account`, {
+  method: "POST",
+  headers: { "Content-Type": "application/json" },
+  body: JSON.stringify({
+    message: payload,
+    signature: bs58.encode(walletSig),
+    userAddress: owner.publicKey.toBase58(),
+    orderlyKey: orderlyPubB58,
+  }),
+}).then(r => r.json());
+
+console.log("Account ID:", reg.data.account_id);
+```
+
+アカウントIDは`(broker_id, wallet_address)`ペアごとに決定論的です。登録はべき等です。ウォレットがRaydiumのブローカーで既に登録されている場合、呼び出しは新しいものを作成することなく同じアカウントIDを返します。
+
+## USDC の入金
+
+入金は、ウォレットATAからOrderlyの決済ボールトにUSDCを移動させます。これらはオンチェーンのSolanaトランザクションです：
+
+```ts
+// Orderly の Solana プログラムを使用してデポジット ix を構築します
+//（ボルトプログラムIDはドキュメントに公開されています。ハードコーディングするのではなく、動的に取得してください）。
+const vaultProgramId = new PublicKey("<orderly_solana_vault_program_id>");
+
+const depositIx = await buildOrderlyDepositIx({
+  vaultProgramId,
+  user: owner.publicKey,
+  brokerId: BROKER_ID,
+  amountUsdc: BigInt(100_000_000),    // 100 USDC (6 decimals)
+});
+
+const tx = new Transaction().add(depositIx);
+const sig = await connection.sendTransaction(tx, [owner]);
+await connection.confirmTransaction(sig, "confirmed");
+console.log("Deposit tx:", sig);
+```
+
+約30秒後、Orderlyのリレーヤーがデポジットをインデックスし、残高はアカウントの余剰マージンに表示されます。`/v1/client/holding`をクエリして確認します：
+
+```ts
+const holdingResp = await orderlyAuthGet("/v1/client/holding");
+console.log("Balances:", holdingResp.data.holding);
+```
+
+（`orderlyAuthGet`は以下で定義されています。すべての認証済みコールはそれを通じて実行されます。）
+
+## リクエスト署名ヘルパー
+
+Orderlyへのすべての認証済みREST呼び出しは、`(timestamp + method + path + body)`上のEd25519署名を含みます：
+
+```ts
+async function orderlyAuthRequest(
+  method: "GET" | "POST" | "PUT" | "DELETE",
+  path: string,
+  body?: unknown,
+): Promise<any> {
+  const ts   = Date.now().toString();
+  const json = body ? JSON.stringify(body) : "";
+  const msg  = `${ts}${method}${path}${json}`;
+  const sig  = nacl.sign.detached(Buffer.from(msg), orderlyKey.secretKey);
+
+  const resp = await fetch(ORDERLY_BASE + path, {
+    method,
+    headers: {
+      "Content-Type": "application/json",
+      "orderly-account-id":  /* 登録されたaccount_id */ "",
+      "orderly-key":         orderlyPubB58,
+      "orderly-signature":   bs58.encode(sig),
+      "orderly-timestamp":   ts,
+    },
+    body: json || undefined,
+  });
+  return resp.json();
+}
+
+const orderlyAuthGet  = (p: string)            => orderlyAuthRequest("GET",  p);
+const orderlyAuthPost = (p: string, b: object) => orderlyAuthRequest("POST", p, b);
+const orderlyAuthDel  = (p: string)            => orderlyAuthRequest("DELETE", p);
+```
+
+リプレイ保護：サーバークロックより5秒以上ずれた`timestamp`を持つリクエストは拒否されます。クロックを同期し（NTP）、事前に署名したリクエストは避けてください。
+
+## マーケットオーダーの発注
+
+```ts
+const marketResp = await orderlyAuthPost("/v1/order", {
+  symbol:        "PERP_SOL_USDC",
+  order_type:    "MARKET",
+  side:          "BUY",
+  order_quantity: 1.0,        // 1 SOL のポジション
+  reduce_only:    false,
+});
+
+if (marketResp.success) {
+  console.log("Order ID:", marketResp.data.order_id);
+} else {
+  console.error("Reject:", marketResp.message);
+}
+```
+
+マーケットオーダーは即座に執行されます。レスポンスは、結果の`order_id`とステータスを返します。約定はWebSocket経由で到着します（以下を参照）。RESTレスポンス自体は完全に約定するまでブロックしません。
+
+## Post-Onlyでのリミットオーダー発注
+
+```ts
+const limitResp = await orderlyAuthPost("/v1/order", {
+  symbol:         "PERP_SOL_USDC",
+  order_type:     "LIMIT",
+  side:           "SELL",
+  order_quantity: 0.5,
+  order_price:    140.50,
+  // フラグの組み合わせ：
+  // post_only: true はこれをメーカーオンリーオーダーにします — クロスしそうになるとキャンセルします。
+  // reduce_only / time_in_force は独立して設定できます。
+  post_only:      true,
+});
+console.log(limitResp);
+```
+
+`IOC` / `FOK` については、`time_in_force: "IOC"`または`"FOK"`を設定してください。各フラグのセマンティクスについては[`products/perps/order-types`](/ja/products/perps/order-types)を参照してください。
+
+## オーダーのキャンセル
+
+```ts
+// オーダーID で
+await orderlyAuthDel(`/v1/order?order_id=${orderId}&symbol=PERP_SOL_USDC`);
+
+// シンボル上のすべてのオーダーをキャンセル
+await orderlyAuthDel(`/v1/orders?symbol=PERP_SOL_USDC`);
+```
+
+キャンセルは同期的に確認されますが、実際のキャンセルは約定と競合する可能性があります。`/v1/orders`をポーリングするか、WebSocketを観察して常に調整してください。キャンセルが確認なしで成功したと仮定すると、重複または意図しないポジションにつながる可能性があります。
+
+## オープンポジションの取得
+
+```ts
+const posResp = await orderlyAuthGet("/v1/positions");
+for (const p of posResp.data.rows) {
+  console.log(
+    p.symbol,
+    "size:",  p.position_qty,
+    "entry:", p.average_open_price,
+    "unrealized:", p.unsettled_pnl,
+  );
+}
+```
+
+負の`position_qty`はショート、正はロングです。`position_qty == 0`はポジションがクローズされていることを意味しますが、次のクリーンアップまで行が表示される場合があります。
+
+## 約定履歴の取得
+
+```ts
+const fills = await orderlyAuthGet(
+  "/v1/trades?symbol=PERP_SOL_USDC&start_t=" + (Date.now() - 86_400_000)
+);
+for (const t of fills.data.rows) {
+  console.log(t.executed_timestamp, t.side, t.executed_quantity, "@", t.executed_price);
+}
+```
+
+時刻引数はミリ秒単位のUnixタイムスタンプです。デフォルトのページサイズは25行です。`page`と`size`クエリパラメータを使用してページネーションします。
+
+## WebSocket：マーケットデータ
+
+```ts
+import WebSocket from "ws";
+
+const ws = new WebSocket(`wss://ws.orderly.org/ws/stream/${accountId}`);
+
+ws.on("open", () => {
+  // パブリックマーケットデータ：1つのシンボルのオーダーブックデルタ+トレード
+  ws.send(JSON.stringify({ id: "ob1", topic: "orderbook@PERP_SOL_USDC" }));
+  ws.send(JSON.stringify({ id: "tr1", topic: "trade@PERP_SOL_USDC" }));
+});
+
+ws.on("message", (raw) => {
+  const msg = JSON.parse(raw.toString());
+  if (msg.topic?.startsWith("orderbook@")) {
+    // depth diff: { bids: [[price, qty], ...], asks: [[price, qty], ...] }
+    applyOrderbookDelta(msg.data);
+  } else if (msg.topic?.startsWith("trade@")) {
+    console.log("trade:", msg.data);
+  }
+});
+```
+
+**プライベート**ストリーム（自分の約定、ポジション更新、残高変動）については、WebSocketを認証する必要があります。RESTリクエストと同じ方法で署名されたアカウントIDにスコープされた`subscribe`ペイロードを送信します。Orderlyのドキュメントに正確なペイロード形状があります。これは時々変わるため、ここで特定のスキーマをハードコーディングしないでください。
+
+## USDC の出金
+
+```ts
+// 1. 出金をリクエストします。
+const wRes = await orderlyAuthPost("/v1/withdraw_request", {
+  token:  "USDC",
+  chain_id: CHAIN_ID,
+  amount: 50.0,                          // human units
+  receiver: owner.publicKey.toBase58(),
+});
+
+console.log("Withdrawal request id:", wRes.data.withdraw_id);
+```
+
+Orderlyはオンチェーン出金を受け取りアドレスにリレーします。固定の**1 USDC**出金手数料があります（[`products/perps/fees`](/ja/products/perps/fees)参照）。オンチェーン転送は通常状況下で1～2分以内に発生します。混雑中はより長く予想されます。
+
+## よくある落とし穴
+
+- **トレーディングキーを環境間で再利用しないでください。** ウォレットに対して登録された単一のOrderlyトレーディングキーは、1つのSolanaメインネットアカウントに関連付けられています。devnetやステージングも必要な場合は、それぞれに個別のキーを生成してください。
+- **時刻同期。** Orderlyのクロックスキュー許容度は厳しい（±5秒）です。長時間実行されるサービスでは、NPTドリフトが最終的に署名を破壊します。定期的に再同期してください。
+- **WebSocketの再接続。** パブリックWSは、Orderlyのアップグレード中に時々接続を切断します。指数バックオフを実装し、再度開いたときに再購読してください。
+- **レート制限。** RESTコールはアカウントごとのティアレート制限です。>5個のオーダーをキャンセルする場合、`cancel`をIDでループするのではなく、`cancel_all`経由でキャンセルします。
+- **ポジション方向は暗黙的です。** `PERP_SOL_USDC`の`BUY`オーダーはロングを開くまたは拡張します。`SELL`はショートを開くまたは拡張します。既にロングの場合、Raydium Perpsは片方向モードであるため、`SELL`はポジションを*削減*（および反転させる可能性があります）。オーダーを発注する前に、方向が重要な場合は現在のポジションを常に確認してください。
+- **ファンディングと清算はオーダーフローとは別です。** ファンディング支払いと清算は個別のイベントストリームとして表示されます。これらは「オーダー」ではありません。これを観察する必要がある場合は、関連するプライベートWSトピックを購読してください。
+
+## 次のステップ
+
+- [`products/perps/trading-basics`](/ja/products/perps/trading-basics) — パーペチュアルメカニクスの概念プライマー。
+- [`products/perps/order-types`](/ja/products/perps/order-types) — 各オーダータイプとフラグのセマンティクス。
+- [`products/perps/collateral`](/ja/products/perps/collateral) — サポートされている担保資産およびチェーンごとの制限。
+- [`products/perps/fees`](/ja/products/perps/fees) — メーカー/テーカースケジュールと出金手数料。
+
+ソース：
+
+- [Orderly Network開発者ドキュメント](https://orderly.network/docs/build-on-omnichain/evm-api/introduction) — 上記で使用されるAPIサーフェスの正規リファレンス。Raydium Perpsは直接これを消費しています。
+- [Orderly TypeScript SDK](https://github.com/OrderlyNetwork/orderly-sdk-js) — 同じREST/WebSocketレイヤーを型付きヘルパーでラップします。署名レイヤー自体を書くのをスキップしたい場合に便利です。

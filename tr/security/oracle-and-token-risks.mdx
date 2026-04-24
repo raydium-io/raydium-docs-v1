@@ -1,0 +1,174 @@
+---
+title: "Oracle ve token riskleri"
+description: "Raydium'un oracle girdilerini nasıl yönettiği ve Token-2022 uzantılarının getirdiği spesifik riskler — dondurma yetkisi, transfer hook, kalıcı temsilci, varsayılan olarak dondurulmuş — programların neye karşı koruma sağladığı ve kullanıcıların neyi kabul etmesi gerektiği dahil."
+---
+
+<Info>
+  **Bu sayfa yapay zekâ tarafından otomatik olarak çevrilmiştir. İngilizce sürüm esas alınır.**
+
+  [İngilizce sürümü görüntüle →](/security/oracle-and-token-risks)
+</Info>
+
+<Info>
+  Raydium'un temel ürünleri fiyatlandırma için harici oraclelara bağlı değildir — havuz durumu *kendisi* oracle'dır. Ancak API ve SDK, kullanıcılara gösterilen USD fiyatlandırması için harici oracle'ları kullanır ve Token-2022 mintleri SPL Token'dan daha zengin kontrol seti sunar; bazıları bir havuzun güven modelini temelden değiştirir. Bu sayfa her ikisini de kataloglar.
+</Info>
+
+## Raydium'da Oracle'lar
+
+### İç: havuz oracle'dır
+
+AMM v4, CPMM ve CLMM için protokolün "mevcut fiyat" tanımı yalnızca havuz durumundan türetilir:
+
+- AMM v4 / CPMM: `price = vaultB_balance / vaultA_balance` (ondalık basamak hesaplaması dahil).
+- CLMM: `price = (sqrtPriceX64 / 2^64)^2 × 10^(decimalsA - decimalsB)`.
+
+Swap, deposit veya withdrawal sırasında hiçbir harici oracle danışılmaz. Bu, AMM tasarımının "güvensiz" kısmıdır: havuz matematiği doğruysa, bir fiyat feed'inin harici manipülasyonu onu bozamaz.
+
+### CLMM `ObservationState` bir TWAP oracle'ı olarak
+
+CLMM havuzları, geçmiş `sqrt_price` anlık görüntülerini kaydeden bir `ObservationState` hesabı yönetir. Diğer programlar manipülasyona dirençli zaman ağırlıklı ortalama fiyat elde etmek için buna göre oluşturabilir:
+
+```rust
+// Basitleştirilmiş bir TWAP: (mevcut, N slot öncesi) ortalaması.
+let obs_now  = load_observation(pool, Clock::slot());
+let obs_past = load_observation(pool, Clock::slot() - 300);  // ~2 dakika öncesi
+let twap = (obs_now.price_cumulative - obs_past.price_cumulative)
+         / (obs_now.slot - obs_past.slot);
+```
+
+Bu, Uniswap V3'ün kullandığı aynı desendir. Kısa vadeli fiyat manipülasyonu (bir balina havuzu geçici olarak iterse) TWAP'ı bozamaz çünkü yüzlerce slot üzerinde ortalanır.
+
+CLMM mintleri için daha güvenli bir fiyat feed'ine ihtiyaç duyan programlar (likidite ortaklığı oracle'ları, opsiyon fiyatlandırması vb.), anlık fiyatlardan ziyade ObservationState TWAP'larını kullanmalıdır.
+
+**CLMM anlık fiyatlarını birlikte oluşturmak için kullanmayın.** Tek bir büyük swap sığ bir havuzda spot fiyatı %10'dan fazla itebilir; TWAP bunu azaltır. Veri düzeni için [`products/clmm/accounts#observation-state`](/tr/products/clmm/accounts) bölümüne bakın.
+
+### Harici: frontend/API'de USD fiyatlandırması
+
+Raydium'un frontend ve `api-v3.raydium.io` USD değerlerini (TVL, ücret APR, \$ hacim) gösterir. Bunlar şundan gelir:
+
+- **Pyth** major mintler için birincil oracle.
+- **Jupiter'ın toplulaştırıcı fiyatı** yedek olarak.
+- **Havuzdan türetilen fiyat** harici oracle kapsaması olmayan uzun ince mintler için.
+
+USD gösterimleri kesinlikle kozmetiktir — zincir üstü işlemler asla Pyth'i okumazlar ve havuz matematiği USD kullanmaz. Pyth bir mint için veri sağlamayı durdurursa, UI "—" gösterir; havuz işlev görmeye devam eder.
+
+### Raydium havuzları için geçerli olmayan oracle manipülasyonu
+
+Havuz durumu oracle olduğundan, bug-bounty literatürünün kasteddiği anlamda "oracle saldırısı" yoktur — saldırganın bozabileceği harici manipüle edilebilir veri kaynağı yok. Havuz durumuna karşı ekonomik saldırılar (flash-loan stili manipülasyon) [`security/attack-vectors`](/tr/security/attack-vectors) içinde ele alınır.
+
+## Token-2022 uzantı riskleri
+
+SPL Token-2022 (yani "Token Uzantıları") uzantılar aracılığıyla mintlere yapılandırılabilir davranış ekler. Bazı uzantılar, onları içeren havuzların güven özelliklerini değiştirir. Raydium programları bazılarını otomatik olarak yönetir ve diğerlerini kullanıcı uyarıları olarak yüzey alır.
+
+### Transfer ücreti
+
+**Nedir:** Gönderici tarafından her transferde mint yetkilisine ödenen yapılandırılabilir bir ücret (transferin yüzdesi, mutlak terimler olarak `maximum_fee` kapına kadar).
+
+**Risk:** Ücret, mintín ücret-config yetkilisi tarafından değiştirilebilir. Ücret %1 iken likidite yatırıp, yetkilisi %50'ye yükseltirse, sonraki swap'lar beklentiden çok daha az geri döner.
+
+**Raydium'daki hafifletme:** Havuzlar swap sırasında mevcut `transferFeeConfig`'i okur ve matematiği ayarlar. Havuzun kendisi bozulmaz, ancak kullanıcılar daha kötü çıktı görür. Ücret yetkilisi ayrıca gecikmeli bir ücret değişikliği planlayabilir; Raydium'un UI'ı, yaklaşan ücret değişiklikleri olan havuzları işaretler.
+
+**Kalıcı risk:** Kötü niyetli bir ücret yetkilisi havalimanı swap'ınız sırasında ücreti değiştirirse, `minimumAmountOut` aşağı yönü korur — tx geri alınır. Mint yayıncısına güveniyorsanız, bu iyidir; güvenmiyorsanız, LP yapmayın.
+
+### Transfer hook'u
+
+**Nedir:** Bir transfer, özel doğrulama veya yan etkileri çalıştırmak için ayrı bir programı ("hook") çağırır.
+
+**Risk:** Hook, swap sırasında havuzun iç transferleri de dahil olmak üzere herhangi bir transferi engelleyebilir. Yükseltilebilir bir hook daha sonra kötü niyetli olabilir — deposit zamanında güvenli olan, withdrawal zamanında takas edilemez hale gelebilir.
+
+**Raydium'daki hafifletme:** Raydium, havuz durumundaki hook program ID'sini listeler. Entegrasyonlar, kullanıcıların beklenen (yükseltilemez, denetlenen) programın olduğunu doğrulayabilmesi için hook program ID'sini gösterelmelidir.
+
+**Kalıcı risk:** Bir hook yükseltilebilirse ve onun yetkilisi düşmanca hale gelirse, havuz dondurulabilir. Raydium transfer hook'u olan havuzları engellemez, ancak işaretler. Transfer-hook havuzuna yalnızca hook doğrulanmış güvenli ise LP yapın.
+
+### Dondurma yetkisi
+
+**Nedir:** Bir mintín dondurma yetkisi, o mint'i tutan herhangi bir token hesabını dondurabilerek tüm transferleri engelleyebilir.
+
+**Risk:** Havuzun vault hesabını dondurma yeteneğine sahip bir dondurma yetkisi havuzu etkili bir şekilde kapatır — kullanıcılar withdraw edemez, tüccarlar swap yapamazlar. Bu SPL Token *ve* Token-2022 için geçerlidir; Token-2022 ile yeni değildir, ancak yine de bir risktir.
+
+**Raydium'daki hafifletme:** Program seviyesinde hiçbiri — SPL Token'ın dondurması havuz için opaktır. Raydium'un UI'ı dondurulabilir mintleri olan havuzlarda uyarır. Deposit yapan kullanıcılar dondurma yetkilisinin null olduğunu veya güvendikleri bir multisig olduğunu doğrulamalıdır (USDC'nin dondurma yetkisi vardır; yayıncı Circle'dır).
+
+**Kalıcı risk:** Dondurulabilir mintlerin donduturulabileceğini kabul edin. Major mintler (USDC, USDT, USDY) yayıncı tarafından tutulan dondurma yetkililerine ve yalnızca düzenleme uyumluluğu için kullanılır; bu genellikle kabul edilebilir.
+
+### Kalıcı temsilci
+
+**Nedir:** Onay olmadan herhangi bir sahibinden token'ları aktarabilecek kalıcı bir temsilciyi atayan Token-2022 uzantısı.
+
+**Risk:** Kalıcı temsilci, havuzun vault'ını istediği zaman çalabilir.
+
+**Raydium'daki hafifletme:** CPMM ve CLMM, kalıcı temsilciye sahip mintler ile havuz oluşturmayı **reddeder**. Başlatma geri alınır. Hiçbir çalışan Raydium havuzunun kalıcı-temsilci mint'i yoktur.
+
+**Kalıcı risk:** Sıfır (kontrol doğru olduğu sürece, her iki denetim de doğruladı).
+
+### Aktarılamayan
+
+**Nedir:** Sahibiler tarafından aktarılamayan mintler.
+
+**Risk:** Havuzlar, token'ları kullanıcı ATA'ları ve havuz vault'ları arasında taşımak için aktarılabilirliğe bağlıdır. Aktarılamayan mintler trivial olarak havuzları bozar.
+
+**Raydium'daki hafifletme:** Aktarılamayan mintler üzerinde havuz oluşturma geri alınır. Çiftçilik de aktarılamayan staking mint'lerini reddeder.
+
+### Varsayılan olarak dondurulmuş / kapatma-yetkisi / faiz getiren
+
+Raydium tarafından yönetilen daha düşük etkili uzantılar:
+
+- **Varsayılan olarak dondurulmuş**: yeni token hesaplarının kullanılmadan önce çözülmesi gerekir. Raydium bunu ATA oluşturmada şeffaf olarak yönetir.
+- **Kapatma-yetkisi**: belirlenmiş bir yetkilisi token hesaplarını kapatabilir. Havuz vault'ları havuzun program tarafından türetilmiş yetkilisi tarafından sahip olunur, bu nedenle *mint* üzerindeki kapatma-yetkisi vault'a uygulanmaz.
+- **Faiz getiren**: görüntülenen bakiye faiz tahakkuk ettirir; `amount` sabit kalır ancak `uiAmount` artar. Raydium havuz matematiği faiz tahakkuk değil `amount` kullanır; görüntü ayrı ayarlanır.
+
+### Mint yetkisi
+
+Token-2022'ye spesifik bir risk değildir, ancak not edilmeye değer: bir mint mint yetkilisini alıkoyarsa, sahibi istediği zaman arzı şişirebilir. Başlatılmış token'lar için bu, LP'leri havuzun mevcut fiyatında seyreltir. LaunchLab, mint yetkisi null olmadığı sürece başlatmaları oluşturmayı reddeder.
+
+## UI'daki risk etiketleri
+
+Raydium'un frontend'i her havuzu geçerli risk etiketleriyle etiketler:
+
+- **TRANSFER_FEE** — sıfır olmayan transfer ücreti.
+- **TRANSFER_HOOK** — transfer-hook uzantısı aktif.
+- **FREEZE** — mint'in dondurma yetkisi vardır.
+- **MINT** — mint'in mint yetkisi vardır (arz şişebilir).
+- **CLOSE** — mint'in kapatma yetkisi vardır.
+
+Raydium'un API'sini kullanan toplayıcılar bu etiketleri kullanıcılara göstermelidir.
+
+## Entegratör kontrol listesi
+
+Raydium havuzu ile birlikte oluşturmadan önce:
+
+- [ ] Her mint'in uzantılarını `getMint(mint, TOKEN_2022_PROGRAM_ID)` aracılığıyla kontrol edin.
+- [ ] Herhangi bir mint'in permanent_delegate veya non_transferable'ı olan havuzları atlayın (bunlar Raydium'da var olmamalıdır, ancak derinlemesine savunma).
+- [ ] Her iki mint için dondurma yetkilisini kontrol edin; yalnızca null veya güvenilen yetkilisi.
+- [ ] Transfer-hook havuzları için, hook program ID'sini bir beyaz listeye karşı doğrulayın.
+- [ ] Transfer ücret senaryolarına karşı maruziyeti boyutlandırın (ücret maksimuma giderse ne olur?).
+- [ ] Spot fiyatından ziyade CLMM TWAP (ObservationState) türevleri fiyatlandırması için kullanın.
+
+## Kalıcı risk kabul beyanı
+
+Raydium'un programları program seviyesinde uygulanabilenler kuvvetlendiriyor:
+
+- Havuz oluşturma kalıcı-temsilci / aktarılamayan mintleri reddeder.
+- Swap matematiği mevcut transfer ücretleri için doğru ayarlanır.
+- ObservationState manipülasyona dirençli bir oracle sağlar.
+
+Kullanıcıların kabul etmesi gereken kalıcı riskler:
+
+- Bir mint'in dondurma yetkisi havuzu dondurabileceği.
+- Bir mint'in ücret yetkilisi transfer ücretini (`maximum_fee` kapına kadar) istediği zaman yükseltebileceği.
+- Bir transfer-hook programı kötü niyetli koda yükseltilmesi gerektiği.
+- Faiz getiren mint'in tahakkuk hızı değişti.
+
+Doğru savunma LP öncesi dikkat: konsantre yetkileri olmayan mint'leri içeren havuzlara yatırım yapmayın. Raydium bu güveni sizin için kararlaştıramaz; yalnızca ilgili gerçekleri yüzey alabilir.
+
+## İşaretçiler
+
+- [`algorithms/token-2022-transfer-fees`](/tr/algorithms/token-2022-transfer-fees) — transfer-fee mint'leri için matematik ayarlamaları.
+- [`security/attack-vectors`](/tr/security/attack-vectors) — bu risklerin somut saldırılar olarak nasıl kendini göstereceği.
+- [`integration-guides/wallet-integration`](/tr/integration-guides/wallet-integration) — Token-2022 risk etiketlerini gösterme.
+- [`products/clmm/accounts`](/tr/products/clmm/accounts) — ObservationState düzeni.
+
+Kaynaklar:
+
+- [SPL Token-2022 uzantıları belgeler](https://spl.solana.com/token-2022/extensions).
+- Havuz başlatma doğrulama mantığı: `src/raydium/cpmm/instrument.ts`, `src/raydium/clmm/instrument.ts`.
+- [Pyth](https://pyth.network) — frontend'de kullanılan harici fiyat oracle'ı.

@@ -1,0 +1,256 @@
+---
+title: "CLMM 수학"
+description: "sqrt-price 표현, 유동성-양 공식, 단일 틱 및 다중 틱 스왑 스텝, 수수료 성장 계산 — Raydium CLMM의 수학적 기초."
+---
+
+<Info>
+  **이 페이지는 AI 자동 번역입니다. 모든 내용은 영문판을 기준으로 합니다.**
+
+  [영문판 보기 →](/algorithms/clmm-math)
+</Info>
+
+<Info>
+  이 페이지는 CLMM의 유도 과정을 정리했습니다. 온체인 구현은 [`products/clmm/math`](/ko/products/clmm/math)를 참고하세요(이 페이지를 인용함). 틱 격자의 배경은 [`products/clmm/ticks-and-positions`](/ko/products/clmm/ticks-and-positions)에서 확인할 수 있습니다.
+</Info>
+
+## Sqrt-price를 쓰는 이유
+
+Uniswap v3 계열의 CLMM은 가격을 제곱근으로 표현하며, 고정 소수점 `Q64.64`로 저장합니다:
+
+```
+sqrt_price_x64 = floor(sqrt(price) · 2^64)
+```
+
+세 가지 이유가 있습니다:
+
+1. **선형 유동성 수학.** 가격 범위 내 token0 또는 token1의 양은 `price`의 함수가 아니라 `sqrt_price`의 선형 함수로 표현됩니다. `sqrt_price`를 저장하면 스왑 스텝에서 제곱근을 계산할 필요 없이 선형 공식을 평가할 수 있습니다.
+2. **오버플로우 방지.** `sqrt_price · L`은 모든 합리적인 매개변수에서 `u256`에 맞지만, `price · L`은 훨씬 빨리 오버플로우할 수 있습니다.
+3. **틱 수학의 균일성.** 틱이 `1.0001^i`로 정의되므로, `sqrt(price) = 1.00005^i`도 정확한 1.00005의 거듭제곱입니다. 각 틱 크로스는 `sqrt_price_x64` 공간에서 작은 곱셈으로 변환됩니다.
+
+가격과 sqrt-price는 일대일 대응이며, 변환은 `price = (sqrt_price_x64 / 2^64)^2`입니다.
+
+## 틱 격자
+
+가격은 격자로 이산화됩니다:
+
+```
+price(tick_i) = 1.0001^i
+```
+
+`tick_i`는 `i32`입니다. 활성 범위는 `[MIN_TICK, MAX_TICK] = [−443636, 443636]`이며, 가격 범위는 대략 `[2^−128, 2^128]`입니다. 각 풀의 `tick_spacing`은 수수료 등급에 따라 설정됩니다: 좁은 쌍의 경우 더 작은 간격(예: 스테이블코인 0.01% 등급은 간격 1), 변동성 높은 쌍의 경우 더 큰 간격(0.25% 등급은 60, 1% 등급은 120).
+
+포지션의 `tick_lower`와 `tick_upper`는 `tick_spacing`에 정렬되어야 합니다. 풀의 활성 틱(유동성이 시작 또는 종료되는 틱)은 스왑 스텝이 관심 있는 유일한 틱입니다.
+
+## 유동성에서 양으로의 변환
+
+유동성 `L`과 가격 범위 `[sqrt_lo, sqrt_hi]`(모두 `sqrt_price` 값)를 가진 포지션:
+
+| 풀 상태 | Token0 양 | Token1 양 |
+|------------|-------------------|-------------------|
+| 범위 위 가격 (`sqrt_p ≥ sqrt_hi`) | 0 | `L · (sqrt_hi − sqrt_lo)` |
+| 범위 내 가격 | `L · (sqrt_hi − sqrt_p) / (sqrt_p · sqrt_hi)` | `L · (sqrt_p − sqrt_lo)` |
+| 범위 아래 가격 (`sqrt_p ≤ sqrt_lo`) | `L · (sqrt_hi − sqrt_lo) / (sqrt_lo · sqrt_hi)` | 0 |
+
+유도: CPMM 불변식을 로컬에서 미분합니다. 단일 틱 범위 내에서 포지션은 가상 자산 `(x_v, y_v)`를 사용한 CPMM처럼 동작하며, 풀의 현재 `(sqrt_p, L)`이 `L = sqrt(x_v · y_v)`와 일치하도록 선택됩니다. `sqrt_p`에서 범위 경계까지 적분하면 위의 양을 얻습니다.
+
+**역 공식**(주어진 `amount0` 또는 `amount1`에 대해 포지션을 민팅할 때 사용):
+
+```
+L_from_amount0(amount0, sqrt_lo, sqrt_hi, sqrt_p) =
+    amount0 · sqrt_p · sqrt_hi / (sqrt_hi − sqrt_p)
+
+L_from_amount1(amount1, sqrt_lo, sqrt_hi, sqrt_p) =
+    amount1 / (sqrt_p − sqrt_lo)
+
+// 범위 내 포지션으로의 대칭 입금의 경우, 최소값을 취합니다.
+L = min(L_from_amount0, L_from_amount1)
+```
+
+## 단일 틱 스왑 스텝
+
+단일 틱 범위 내에서 풀은 CPMM처럼 동작합니다. 현재 `sqrt_p`와 목표 `sqrt_target`이 주어지면:
+
+```
+Δamount0_step = L · (sqrt_target − sqrt_p) / (sqrt_p · sqrt_target)     // token0으로 스왑하는 경우
+Δamount1_step = L · (sqrt_target − sqrt_p)                              // token1으로 스왑하는 경우
+```
+
+### 정확한 입력 스텝
+
+`Δin_remaining`이 주어질 때:
+
+```
+// 틱 경계까지 채운 경우 예상 새로운 sqrt_p:
+sqrt_after_full = sqrt_target
+amount_to_full  = Δamount_in_to_reach(sqrt_p → sqrt_target)
+
+if Δin_remaining ≥ amount_to_full:
+    // 나머지 버킷 소비
+    sqrt_p'         = sqrt_target
+    Δin_consumed    = amount_to_full
+    Δout            = amount_out_at_boundary
+else:
+    // 크로스하지 않음; 최종 sqrt_p에 대해 풀이
+    sqrt_p'         = L · sqrt_p / (L + Δin_remaining · sqrt_p)      // 0→1 스왑의 경우
+    Δin_consumed    = Δin_remaining
+    Δout            = L · (sqrt_p − sqrt_p')                          // Δsqrt에 비례
+```
+
+`0→1` 스왑은 `sqrt_p`를 낮춥니다(token0을 팔 때 가격이 하락). `1→0` 스왑은 이를 높입니다. 공식은 `sqrt_p`와 `sqrt_target`이 바뀌면 대칭입니다.
+
+### 정확한 출력 스텝
+
+동일한 구조로 `Δin`에 대해 풀이합니다.
+
+## 다중 틱 스왑 루프
+
+스왑은 입력이 소진되거나 가격 제한에 도달할 때까지 틱을 반복합니다:
+
+```
+while Δin_remaining > 0 and sqrt_p != sqrt_price_limit:
+    next_tick = find_next_initialized_tick(pool.tick_current, direction)
+    sqrt_target = min(next_tick.sqrt_price, sqrt_price_limit)       // 방향에 따라
+
+    (Δin, Δout, sqrt_p') = single_step(sqrt_p, sqrt_target, L, Δin_remaining)
+
+    Δin_remaining -= Δin
+    accumulated_out += Δout
+
+    if sqrt_p' == next_tick.sqrt_price:
+        // 틱 크로스
+        L += next_tick.liquidity_net * direction_sign
+        flip_fee_growth_outside(next_tick)
+        match_limit_orders_at_tick(next_tick, ...)        // products/clmm/math 참고
+        pool.tick_current = next_tick.tick_index
+    sqrt_p = sqrt_p'
+```
+
+각 `single_step`은 풀의 현재 `L`을 사용합니다. `L`은 **초기화된 틱을 크로스할 때만** 변합니다. 틱 간의 유동성은 일정하며, 이것이 스텝 수학이 닫힌 형태를 갖는 이유입니다.
+
+틱의 `liquidity_net`은 그 틱에서 시작하는 포지션 유동성의 합에서 그 틱에서 끝나는 포지션 유동성을 뺀 값입니다. 위쪽으로 크로스하면 `liquidity_net`을 더하고, 아래쪽으로 크로스하면 뺍니다.
+
+풀이 틱에서 제한 주문을 열고 있을 때, 틱 크로스 스텝은 또한 그 주문들을 채우기 위해 스왑 입력의 일부를 소비합니다(코호트별 FIFO). 매칭 알고리즘과 기본 스텝 위에 적용될 수 있는 동적 수수료 할증은 [`products/clmm/math`](/ko/products/clmm/math)에 문서화되어 있습니다. 위의 닫힌 형태 단일 스텝 공식은 변하지 않습니다.
+
+## 수수료 성장 누적기
+
+CLMM은 활성 유동성 단위당 수수료를 추적하며, 양쪽, 전역 및 틱별로 추적합니다:
+
+```
+fee_growth_global_0_x64     // Q64.64, 단조증가
+fee_growth_global_1_x64
+tick.fee_growth_outside_0_x64   // "이 틱이 활성 범위 밖에 있던 동안 누적된 수수료"
+tick.fee_growth_outside_1_x64
+```
+
+각 `single_step`에서:
+
+```
+step_lp_fee = (Δin · fee_rate) · (1 − protocol_fraction − fund_fraction)
+fee_growth_global += step_lp_fee · 2^64 / L     // 입력 측에만 해당
+```
+
+(다른 쪽의 `fee_growth_global`은 이 스텝에서 움직이지 않으므로, 그 쪽의 토큰이 입력으로 지급되지 않았습니다.)
+
+틱을 크로스할 때 프로그램은 `fee_growth_outside`를 **뒤집습니다**:
+
+```
+tick.fee_growth_outside_0_x64 = fee_growth_global_0_x64 − tick.fee_growth_outside_0_x64
+tick.fee_growth_outside_1_x64 = fee_growth_global_1_x64 − tick.fee_growth_outside_1_x64
+```
+
+"Outside"는 `tick_current`에 상대적입니다. `tick_current`가 틱 위에 있으면 outside는 "아래"를 의미합니다. `tick_current`가 아래에 있으면 outside는 "위"를 의미합니다. 뒤집기가 해석을 바꿉니다.
+
+### 포지션의 `fee_growth_inside`
+
+포지션 `[tick_lower, tick_upper]`과 현재 `tick_current`가 주어질 때:
+
+```
+if tick_current >= tick_upper:
+    inside = tick_lower.fee_growth_outside − tick_upper.fee_growth_outside
+else if tick_current < tick_lower:
+    inside = tick_upper.fee_growth_outside − tick_lower.fee_growth_outside
+else:     // 포지션이 범위 내
+    inside = fee_growth_global
+           − tick_lower.fee_growth_outside
+           − tick_upper.fee_growth_outside
+```
+
+포지션의 토큰 측면 `s`에 대한 미수수료는:
+
+```
+tokens_owed_s += L · (fee_growth_inside_s − fee_growth_inside_last_s) / 2^64
+fee_growth_inside_last_s = fee_growth_inside_s
+```
+
+이 업데이트는 포지션과의 모든 상호작용(`IncreaseLiquidity`, `DecreaseLiquidity`, `CollectFees`)에서 실행됩니다.
+
+## 작업 예제 — 한 틱 크로스
+
+풀(단순화):
+
+- `sqrt_p_x64 = 2^64 · 1.0 = 2^64` (가격 = 1.0)
+- `L = 1_000_000`
+- `tick_current = 0`
+- 아래의 다음 초기화된 틱: `tick = −60`, `sqrt_price = 1.0001^(−30) ≈ 0.99700`, `liquidity_net = −400_000` (이 틱은 포지션을 종료하므로 아래쪽 크로스는 400k를 제거)
+- 수수료율: 0.25%
+
+스왑: `Δin = 10_000` token0, 방향 = 0→1.
+
+**스텝 1 — `sqrt_target = 0.99700 · 2^64`까지**:
+
+```
+amount_in_to_target = L · (1/sqrt_target − 1/sqrt_p)
+                    = 1_000_000 · (1/0.99700 − 1/1.0)
+                    ≈ 1_000_000 · 0.003009
+                    ≈ 3_009
+```
+
+3,009 &lt; 10,000이므로 이 스텝을 완전히 채웁니다:
+
+```
+Δin_step  = 3_009 / (1 − 0.0025)  = 3_017    // 수수료 포함
+Δout_step = L · (sqrt_p − sqrt_target) ≈ 1_000_000 · 0.00299 ≈ 2_990
+sqrt_p    = 0.99700 · 2^64
+tick_current = −60
+L         = 1_000_000 + (−400_000)  = 600_000         // 틱을 크로스
+fee_growth_outside at tick −60 is flipped
+Δin_remaining = 10_000 − 3_017 = 6_983
+```
+
+**스텝 2 — 새로운 `L = 600_000`으로**:
+
+다음 초기화된 틱(예: `tick = −120`)은 `sqrt = 0.99402`에 있습니다. `amount_in_to_target`을 다시 계산합니다:
+
+```
+amount_in_to_target = 600_000 · (1/0.99402 − 1/0.99700)
+                    ≈ 600_000 · 0.003010
+                    ≈ 1_806
+```
+
+여전히 `Δin_remaining`보다 작습니다. 다시 크로스합니다. `Δin_remaining`이 0에 도달할 때까지 계속합니다.
+
+`Δout`의 전체 시퀀스는 최종 스왑 출력에 누적됩니다.
+
+## 초기화 및 오버플로우 방지
+
+- `MIN_SQRT_PRICE_X64`와 `MAX_SQRT_PRICE_X64`는 `tick = ±443636`에 해당합니다. 이 범위 밖으로 `sqrt_p`를 푸시하려는 스왑은 되돌립니다.
+- 사용자의 `sqrt_price_limit` 매개변수는 같은 간격 내에 있어야 합니다. 프로그램이 확인합니다.
+- `L · Δsqrt`의 곱은 `u256`에서 계산된 다음 오버플로우를 피하기 위해 `u128`로 다시 이동됩니다.
+
+## Uniswap v3과의 차이점
+
+- **Oracle.** Raydium의 `ObservationState`는 `(block_timestamp, tick_cumulative, seconds_per_liquidity_cumulative)` 링 버퍼를 저장합니다. Uniswap과 약간 다른 와이어 형식이지만 같은 TWAP 수학입니다.
+- **Token-2022.** Raydium CLMM은 Token-2022 민트를 지원합니다. 전송 수수료 변형에는 추가 사전/사후 스왑 양 조정이 필요합니다. [`algorithms/token-2022-transfer-fees`](/ko/algorithms/token-2022-transfer-fees)를 참고하세요.
+- **틱 비트맵.** Raydium은 초기화된 틱 비트맵을 풀당 `[u64; 16]`으로 압축하여 빠른 `find_next_initialized_tick`을 제공합니다. Uniswap은 단어별 온체인 맵핑을 사용합니다. 트레이드오프는 렌트 대 조회 비용입니다.
+- **보상 슬롯.** Raydium은 풀당 3개의 보상 스트림을 지원하며 별도의 `reward_growth_global_x64` 카운터를 사용합니다. 수수료 성장 누적기와 같은 구조입니다.
+
+## 참고 자료
+
+- [`products/clmm/math`](/ko/products/clmm/math) — 온체인 구현과 실제 CLMM 구조체 필드를 사용한 작업 예제.
+- [`products/clmm/ticks-and-positions`](/ko/products/clmm/ticks-and-positions) — 틱 격자, `liquidity_net`/`gross`, 활성 범위 의미론.
+- [`products/clmm/fees`](/ko/products/clmm/fees) — 작동 중인 수수료 성장 누적기.
+
+출처:
+
+- Uniswap v3 백서 (sqrt-price 수학의 정규 유도).
+- Raydium CLMM 프로그램 소스.

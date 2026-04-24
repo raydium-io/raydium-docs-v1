@@ -1,0 +1,183 @@
+---
+title: "AMM v4 matematisi"
+description: "Sabit-ürün değişmezi, AMM v4'ün ücret kuralı, rezerv-sipariş defteri fiyat dönüşümü, hedef-sipariş ızgarası inşası ve PnL kapatma adımı."
+---
+
+<Info>
+  **Bu sayfa yapay zekâ tarafından otomatik olarak çevrilmiştir. İngilizce sürüm esas alınır.**
+
+  [İngilizce sürümü görüntüle →](/products/amm-v4/math)
+</Info>
+
+## Değişmez
+
+Havuz `coin_reserve × pc_reserve = k` ilişkisini korur; burada:
+
+```
+coin_reserve = coin_vault_balance
+             + orders_posted_on_openbook.base
+             + pending_coin_fill_not_yet_settled
+pc_reserve   = pc_vault_balance
+             + orders_posted_on_openbook.quote
+             + pending_pc_fill_not_yet_settled
+             - accrued_pnl_pc
+```
+
+Dikkat edilmesi gereken iki husus:
+
+1. Rezervler, **OpenBook'ta kayıtlı tutulan** miktarları içerir. AMM'nin limit emirleri havuzun bir parçası olmaya devam eder — sipariş defterine "kaybedilmez", sadece orada emanete verilir. `k` hesaplaması yapılırken sadece on-chain kasa bakiyelerine bakılırsa, rezervler düşük hesaplanır.
+2. PnL birikimi (`need_take_pnl_*`) çıkartılır, böylece admin ücretleri aldığında eğri korunur. CPMM'nin `protocol_fees_*` istisna konseptiyle aynı ilkedir.
+
+Her `Swap*` işlemi, LP'nin ücret payını rezervlere geri ekledikten sonra `k' ≥ k` koşulunu zorunlu kılar.
+
+## Ücret kuralı
+
+AMM v4, CPMM / CLMM'nin `1/1_000_000` kuralı yerine **oran ücretleri** (pay/payda çiftleri) kullanır. On-chain `Fees` yapısı (program kaynağında [`Fees::initialize`](https://github.com/raydium-io/raydium-amm/blob/master/program/src/state.rs) bölümüne bakınız) varsayılan olarak:
+
+```
+Fees {
+  min_separate_numerator:    5,
+  min_separate_denominator:  10_000,   //  5/10_000 = 0.05%
+
+  trade_fee_numerator:      25,
+  trade_fee_denominator:    10_000,    // 25/10_000 = 0.25% — OpenBook limit emirleri fiyatlandırılırken kullanılır
+
+  pnl_numerator:            12,
+  pnl_denominator:          100,       // 12/100   = 12%   — ücretin protokol payı
+
+  swap_fee_numerator:       25,
+  swap_fee_denominator:     10_000,    // 25/10_000 = 0.25% — AMM yolu swaplarında brüt ücret
+}
+```
+
+Yorum (yayınlanmış mainnet varsayılanları):
+
+- **Toplam swap ücreti:** `swap_fee = amount_in × 25 / 10_000 = 0.25%` girişin brütü.
+- **Protokol payı:** `pnl_numerator / pnl_denominator = 12 / 100 = 12%` **swap ücretinin**, yani `0.25% × 12% = 0.03%` hacim. Bu pay PnL sayaçlarında birikir ve `WithdrawPnl` tarafından çekilir.
+- **LP payı:** swap ücretinin kalan `88%`, yani `0.25% × 88% = 0.22%` hacim. Havuzda kalır ve `k`'yi yükseltir.
+- **Fon payı yok.** AMM v4'te CPMM/CLMM'nin fon-ücret bölümü yoktur.
+
+Dikkat: `pnl_numerator / pnl_denominator` işlem hacminin değil, **ücretin** bir kesridir — bu alan adlarının yaygın yanlış yorumudur.
+
+`trade_fee_numerator / trade_fee_denominator` (ayrıca `25 / 10_000`), AMM'nin ızgara limit emirlerinin ücret-dahil fiyatlarını hesaplarken OpenBook entegrasyonu tarafından kullanılan ayrı bir alandır; varsayılan olarak `swap_fee`'ye eşittir ancak farklı bir kod yolundan okunur.
+
+Bu varsayılanlardan sapmalar nadir olmakla beraber az sayıda eski havuzda mevcuttur; her zaman `AmmInfo.fees`'ten ücretleri okuyunuz.
+
+## Doğrudan swap matematisi (AMM yolu)
+
+En basit durum: kullanıcı OpenBook'la etkileşim kurmaksızın havuzun kasalarına karşı swap yapar. Havuzun iç rezervleri (on-book tahsisatları dahil) paydadır.
+
+**SwapBaseIn (tam girişi):**
+
+```
+amount_after_fee = amount_in − ceil(amount_in × swap_fee_numerator / swap_fee_denominator)
+amount_out = amount_after_fee × out_reserve
+           / (in_reserve + amount_after_fee)
+require(amount_out >= minimum_amount_out)
+```
+
+Burada kullanılan rezervler **etkin** rezervlerdir. Tarihsel olarak bu, `coin_vault_balance + coin_posted_on_openbook + ...` idi (AMM'nin kasası artı OpenBook emirlerine kilitlenmiş jetonlar). **OpenBook deaktivasyonundan bu yana, on-book bakiye sıfırdır**, bu nedenle etkin rezervler ham kasa bakiyelerine eşittir. OpenBook tarafını yenilemek için kullanılan `MonitorStep` / örtük-kapatma yolu artık pratikte gerekli değildir.
+
+**SwapBaseOut (tam çıkışı):**
+
+```
+amount_in_after_fee = ceil(in_reserve × amount_out / (out_reserve − amount_out))
+amount_in_gross     = ceil(amount_in_after_fee × swap_fee_denominator
+                            / (swap_fee_denominator − swap_fee_numerator))
+require(amount_in_gross <= maximum_amount_in)
+```
+
+## Sipariş defteri etkileşimi (tarihsel)
+
+<Note>
+  **Artık aktif değildir.** Bu bölümde tanımlanan ızgara inşası, AMM v4'ün orijinal olarak eğriyi OpenBook pazarına nasıl yansıttığını gösterir. OpenBook entegrasyonu deaktive edilmiştir; havuzlar artık OpenBook'ta sipariş göndermesiniz veya korumaz. Aşağıdaki matematik bağlam için korunmuştur — on-chain `target_orders` / `amm_open_orders` hesaplarının neden bu şekilde boyutlandırıldığını ve program neden keeper artık onları hareketlendirmese de `MonitorStep` ile ilgili parametreleri doğrulamaya devam ettiğini açıklar.
+</Note>
+
+Kullanıcı swaplarından ayrı olarak, AMM v4 tarihsel olarak OpenBook pazarında bir **ızgara** limit emrini yerleştirirdi. İzgara, `AmmInfo` parametrelerinden hesaplanırdı:
+
+- **`depth`** — her taraf başına fiyat seviyeleri sayısı.
+- **`amount_wave`** — seviyelik başına boyut temel birimi.
+- **`min_size`**, **`coin_lot_size`**, **`pc_lot_size`** — OpenBook pazarı kısıtlamaları.
+- **`state_data.swap_acc_coin_fee`**, **`swap_acc_pc_fee`** — son `TakePnl`'den bu yana kümülatif ücret sayaçları.
+
+Program, sabit oranlı adımlarla mevcut eğri fiyatından çıkarak seviyelik fiyatları türetir:
+
+```
+price_level(k) = curve_price × (1.0001 ^ k)       # konseptüel olarak
+size_level(k)  = amount_wave × f(depth, k)        # derinliğe göre kalibre edilmiş
+```
+
+Tam fiyatlar ve boyutlar, `build_orders`'ta hesaplanan ve her `MonitorStep`'te `amm_open_orders` ile karşılaştırılan `target_orders` tarafından belirlenir. Herhangi bir sapma, iptal ve yeni gönderiler ile sonuçlanır. OpenBook'ta yeni doldurulmuş emirler, OpenBook tarafını yenilemek havuzun kasalarına sonraki işlemde kapanır.
+
+Entegratörler nadiren ızgarayı hesaplamak zorunda değildir — Raydium keeper bunu tutar — fakat şunu bilmek faydalıdır:
+
+- Önemli **on-book** likiditeye sahip bir havuz, bu likiditenin `k`'ye katkıda bulunduğu anlamına gelir, boşta oturmaz.
+- Bayat bir OpenBook pazarı (olay kuyruğu dolu, cranklar bloklanmış), ızgara güncellemelerini engeller; AMM daha sonra bir sonraki cranktaki kadar sipariş defterinde görülenlerden farklı fiyatlar iddia edebilir.
+
+## Kapatma adımı (PnL)
+
+%0,03 protokol payı, `state_data.need_take_pnl_coin` ve `state_data.need_take_pnl_pc`'ye birikir. `TakePnl`, bu tutarları kasalardan admin tarafından belirtilen hedefe çıkarır, ardından sayaçları sıfırlar.
+
+Kritik özellik: değişmezteki rezervler **her zaman** biriken PnL **eksi** olarak hesaplanır, böylece `TakePnl` eğriyi hareket ettirmez. Bu, CPMM kuralını eşleştirir.
+
+## Çalışılmış örnek
+
+Havuz durumu:
+
+- `coin_reserve = 1_000_000_000_000` (1.000.000 coin-tarafı; 6 ondalık)
+- `pc_reserve   = 2_000_000_000_000` (2.000.000 pc-tarafı; 6 ondalık)
+- Ücretler: varsayılan `swap = 25/10_000`, `pnl = 3/10_000`.
+
+Kullanıcı: `SwapBaseIn` tam-girişi `1_000_000_000` coin (1.000 coin).
+
+```
+swap_fee        = ceil(1_000_000_000 * 25 / 10_000)    = 2_500_000
+amount_after_fee =                                      997_500_000
+
+amount_out = amount_after_fee * pc_reserve
+           / (coin_reserve + amount_after_fee)
+           = 997_500_000 * 2_000_000_000_000
+           / (1_000_000_000_000 + 997_500_000)
+           ≈ 1_995_015_009  (1.995,015 pc)
+
+// 2_500_000 swap ücretinin dışında:
+pnl_share = 2_500_000 * 3 / 25  = 300_000    (need_take_pnl_coin aracılığıyla protokole gider)
+lp_share  = 2_500_000 * 22 / 25 = 2_200_000  (coin_reserve'de kalır)
+
+new coin_reserve = 1_000_000_000_000 + 1_000_000_000                 = 1_001_000_000_000
+                   (bunun içinde 300_000 biriken PnL)
+  curve coin_reserve = 1_001_000_000_000 − 300_000 = 1_000_999_700_000
+new pc_reserve   = 2_000_000_000_000 − 1_995_015_009                 ≈ 1_998_004_984_991
+
+k' = curve_coin_reserve * new_pc_reserve
+   ≈ 2.000_002_701E24
+k  = 1_000_000_000_000 * 2_000_000_000_000
+   = 2.0E24
+k' > k   ✓
+```
+
+LP payı (`2_200_000`) hiçbir yerde ayrı olarak yazılmaz — `k`'yi yükselten kalıntı olarak basitçe hesaplanır.
+
+## Duyarlılık kuralları
+
+- Rezerv çarpımları `u128` kullanır; son bölüşler sıfıra doğru yuvarlama.
+- `swap_fee` yukarı yuvarlanır (havuz az ücret almaz).
+- `SwapBaseOut` için `amount_in` yukarı yuvarlanır (kullanıcı az ödeme yapmaz).
+- Aşırı rezerv oranlarına sahip havuzlar çok küçük girişlerde `ZeroTradingTokens` ile karşılaşabilir; CPMM kuralı ile aynı.
+
+## CPMM'ye karşı sınırlamalar
+
+- AMM v4'ün rezervleri OpenBook-emanet kısmını içerir, bu nedenle entegratör `getTokenAccountBalance`'den yalnızca doğru bir şekilde alıntı yapamaz. Her zaman tam durumu (kasalar + `open_orders.free` + `open_orders.locked`) alınız veya SDK / API alıntısını kullanınız.
+- AMM v4, yapılandırılmış on-chain TWAP'ı açığa çıkarmaz. AMM v4 destekli fiyat isteyen harici tüketiciler bunu ticaret günlüklerinden kendileri hesaplamalıdır.
+- Token-2022 desteklenmiyor.
+
+## Sonra nereye gidilir
+
+- [`/tr/products/amm-v4/instructions`](/tr/products/amm-v4/instructions) — `SwapBaseIn`, `Deposit` vb. nereye girer.
+- [`/tr/products/amm-v4/fees`](/tr/products/amm-v4/fees) — tam ücret mekanikleri, `TakePnl` detayları.
+- [`/tr/algorithms/constant-product`](/tr/algorithms/constant-product) — paylaşılan türev.
+
+Kaynaklar:
+
+- [Raydium AMM program kaynağı — `raydium-io/raydium-amm`](https://github.com/raydium-io/raydium-amm)
+- Raydium SDK v2 `Liquidity` modülü

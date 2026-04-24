@@ -1,0 +1,145 @@
+---
+title: "Deploy a CPMM pool"
+description: "Paste-and-go Node script that creates a new CPMM pool. Configure mints and seed amounts via env vars."
+---
+
+<Info>
+  **What this does.** Creates a brand-new CPMM pool for two mints you specify, picks the 0.25% fee tier, seeds initial liquidity at the price implied by the seed amounts, and prints the new pool ID and tx signature.
+</Info>
+
+## Setup
+
+Make sure you've read the [Quick start prerequisites](/quick-start) and have `RPC_URL`, `KEYPAIR`, and the deps installed.
+
+You'll also need to **fund the wallet with the seed amounts** of both mints, plus enough SOL to cover the one-time pool-creation fee (~0.15 SOL on mainnet, see [`reference/program-addresses`](/reference/program-addresses) for the current value).
+
+## The script
+
+Save as `create-cpmm.mjs`:
+
+```ts
+// create-cpmm.mjs
+import { Connection, Keypair, PublicKey } from "@solana/web3.js";
+import {
+  Raydium,
+  TxVersion,
+  CREATE_CPMM_POOL_PROGRAM,
+  CREATE_CPMM_POOL_FEE_ACC,
+} from "@raydium-io/raydium-sdk-v2";
+import BN from "bn.js";
+import fs from "node:fs";
+
+// ── Config from env ──────────────────────────────────────────────
+const RPC_URL  = process.env.RPC_URL  ?? "https://api.mainnet-beta.solana.com";
+const KEYPAIR  = process.env.KEYPAIR  ?? `${process.env.HOME}/.config/solana/id.json`;
+const MINT_A   = process.env.MINT_A;   // required, base58
+const MINT_B   = process.env.MINT_B;   // required, base58
+const AMOUNT_A = process.env.AMOUNT_A; // required, integer raw units
+const AMOUNT_B = process.env.AMOUNT_B; // required, integer raw units
+
+if (!MINT_A || !MINT_B || !AMOUNT_A || !AMOUNT_B) {
+  console.error("Set MINT_A, MINT_B, AMOUNT_A, AMOUNT_B env vars.");
+  process.exit(1);
+}
+
+// ── Setup ────────────────────────────────────────────────────────
+const connection = new Connection(RPC_URL, "confirmed");
+const owner = Keypair.fromSecretKey(
+  new Uint8Array(JSON.parse(fs.readFileSync(KEYPAIR, "utf8"))),
+);
+const raydium = await Raydium.load({
+  owner,
+  connection,
+  cluster: "mainnet",
+  disableFeatureCheck: true,
+  blockhashCommitment: "finalized",
+});
+
+// ── Pick the 0.25% fee tier ─────────────────────────────────────
+const feeConfigs = await raydium.api.getCpmmConfigs();
+const feeConfig  = feeConfigs.find((c) => c.index === 0);
+if (!feeConfig) throw new Error("0.25% fee tier not found in CPMM configs.");
+
+// ── Resolve mint metadata (Token-2022-aware) ────────────────────
+const mintA = await raydium.token.getTokenInfo(new PublicKey(MINT_A));
+const mintB = await raydium.token.getTokenInfo(new PublicKey(MINT_B));
+
+// ── Build and execute ───────────────────────────────────────────
+const { execute, extInfo } = await raydium.cpmm.createPool({
+  programId:       CREATE_CPMM_POOL_PROGRAM,
+  poolFeeAccount:  CREATE_CPMM_POOL_FEE_ACC,
+  mintA,
+  mintB,
+  mintAAmount:     new BN(AMOUNT_A),
+  mintBAmount:     new BN(AMOUNT_B),
+  startTime:       new BN(0), // open immediately
+  feeConfig,
+  associatedOnly:  false,
+  ownerInfo:       { useSOLBalance: true },
+  txVersion:       TxVersion.V0,
+  computeBudgetConfig: {
+    units: 600_000,
+    microLamports: 100_000,
+  },
+});
+
+const { txId } = await execute({ sendAndConfirm: true });
+
+console.log(`Pool ID:  ${extInfo.address.poolId.toBase58()}`);
+console.log(`LP mint:  ${extInfo.address.lpMint.toBase58()}`);
+console.log(`Vault A:  ${extInfo.address.vaultA.toBase58()}`);
+console.log(`Vault B:  ${extInfo.address.vaultB.toBase58()}`);
+console.log(`Tx:       https://solscan.io/tx/${txId}`);
+```
+
+## Run it
+
+Example: create a SOL/USDC pool with 1 SOL and 160 USDC seed:
+
+```bash
+export MINT_A="So11111111111111111111111111111111111111112"   # wSOL
+export MINT_B="EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"   # USDC
+export AMOUNT_A="1000000000"   # 1 SOL (9 decimals)
+export AMOUNT_B="160000000"    # 160 USDC (6 decimals)
+
+node create-cpmm.mjs
+```
+
+Expected output:
+
+```
+Pool ID:  HgC5...3kXb
+LP mint:  4ZAS...9rkV
+Vault A:  J9Mu...mP2k
+Vault B:  AaJq...8wxx
+Tx:       https://solscan.io/tx/5dQ...
+```
+
+## What just happened
+
+1. **`getCpmmConfigs`** pulled the live list of fee tiers from `api-v3.raydium.io` and picked index 0 (the 0.25% tier — see [`reference/fee-comparison`](/reference/fee-comparison) for the full set).
+2. **`getTokenInfo`** resolved each mint's metadata, including which token program owns it. CPMM accepts both SPL Token and Token-2022 mints; the SDK routes automatically.
+3. **`createPool`** built one transaction that:
+   - sorts the mints into canonical order,
+   - derives the pool PDA, vaults, LP mint, and authority,
+   - pays the one-time `create_pool_fee` to `CREATE_CPMM_POOL_FEE_ACC`,
+   - creates the caller's ATAs if missing,
+   - seeds the vaults with `AMOUNT_A` and `AMOUNT_B`.
+4. The **initial price** is set by the seed ratio: `price = AMOUNT_B / AMOUNT_A` after decimal adjustment. Pick this carefully — bots will arbitrage any mispricing within seconds of the pool opening.
+5. **`startTime: new BN(0)`** opens trading immediately. To stage liquidity before opening to the public, set a future Unix timestamp.
+
+## Common errors
+
+- **`pool already exists`** — A pool already exists for this mint pair at this fee tier. Look it up before creating.
+- **`insufficient funds`** — Your wallet doesn't have enough of `MINT_A`, `MINT_B`, or SOL (for the create-pool fee + rent).
+- **`Token-2022 extension not supported`** — One of your mints uses an extension CPMM doesn't accept. See [`reference/token-2022-support`](/reference/token-2022-support).
+
+## After deploy
+
+You can immediately swap against the new pool — the [Swap from CLI](/quick-start/swap-from-cli) script accepts your new `POOL_ID` directly. Aggregators (Jupiter, etc.) will index the new pool within minutes.
+
+## Next
+
+- [`products/cpmm/overview`](/products/cpmm/overview) — what CPMM is and when to choose it.
+- [`user-flows/create-cpmm-pool`](/user-flows/create-cpmm-pool) — the same flow with screenshots, via the Raydium UI.
+- [`user-flows/choosing-a-pool-type`](/user-flows/choosing-a-pool-type) — should you have used CLMM instead?

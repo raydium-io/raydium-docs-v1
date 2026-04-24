@@ -1,0 +1,341 @@
+---
+title: "Exemples de code CPMM"
+description: "Exemples TypeScript complets pour chaque opération CPMM — créer un pool, swap, dépôt, retrait, collecter les frais — plus un squelette CPI Rust minimal."
+---
+
+<Info>
+  **Cette page est traduite automatiquement par IA. La version anglaise fait foi.**
+
+  [Voir la version anglaise →](/products/cpmm/code-demos)
+</Info>
+
+## Prérequis
+
+```bash
+npm install @raydium-io/raydium-sdk-v2 @solana/web3.js @solana/spl-token bn.js decimal.js
+```
+
+Chaque démo sur cette page correspond à un fichier dans [`raydium-sdk-V2-demo/src/cpmm`](https://github.com/raydium-io/raydium-sdk-V2-demo/tree/master/src/cpmm) ; le lien GitHub se trouve à côté de chaque section. L'initialisation suit le fichier `config.ts.template` du dépôt de démo ([source](https://github.com/raydium-io/raydium-sdk-V2-demo/blob/master/src/config.ts.template)) :
+
+```ts
+import { Connection, Keypair, clusterApiUrl } from "@solana/web3.js";
+import { Raydium, TxVersion } from "@raydium-io/raydium-sdk-v2";
+import fs from "node:fs";
+
+const connection = new Connection(process.env.RPC_URL ?? clusterApiUrl("mainnet-beta"));
+const owner = Keypair.fromSecretKey(
+  new Uint8Array(JSON.parse(fs.readFileSync(process.env.KEYPAIR!, "utf8"))),
+);
+
+const raydium = await Raydium.load({
+  owner,
+  connection,
+  cluster: "mainnet",
+  disableFeatureCheck: true,
+  blockhashCommitment: "finalized",
+});
+```
+
+L'instance `Raydium` est la façade du SDK — chaque démo ci-dessous l'utilise. Elle récupère paresseusement les listes de tokens et les configs de frais depuis `api-v3.raydium.io` ; vous pouvez la pré-remplir avec vos propres données dans les environnements hors ligne.
+
+## Créer un pool CPMM
+
+Source : [`src/cpmm/createCpmmPool.ts`](https://github.com/raydium-io/raydium-sdk-V2-demo/blob/master/src/cpmm/createCpmmPool.ts)
+
+```ts
+import { PublicKey } from "@solana/web3.js";
+import BN from "bn.js";
+import { getCpmmPdas, CREATE_CPMM_POOL_PROGRAM, CREATE_CPMM_POOL_FEE_ACC }
+  from "@raydium-io/raydium-sdk-v2";
+
+const mintA = new PublicKey("So11111111111111111111111111111111111111112"); // wSOL
+const mintB = new PublicKey("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"); // USDC
+
+// 1. Choisissez une config de frais. index=0 est l'échelon de 0,25%.
+const feeConfigs = await raydium.api.getCpmmConfigs();
+const feeConfig  = feeConfigs.find((c) => c.index === 0)!;
+
+// 2. Récupérez les métadonnées des mints pour que le SDK gère les extensions Token-2022.
+const mintAInfo = await raydium.token.getTokenInfo(mintA);
+const mintBInfo = await raydium.token.getTokenInfo(mintB);
+
+// 3. Construisez la transaction.
+const { execute, extInfo } = await raydium.cpmm.createPool({
+  programId:       CREATE_CPMM_POOL_PROGRAM,
+  poolFeeAccount:  CREATE_CPMM_POOL_FEE_ACC,
+  mintA:           mintAInfo,
+  mintB:           mintBInfo,
+  mintAAmount:     new BN(1_000_000_000),   // 1 SOL (en supposant 9 décimales)
+  mintBAmount:     new BN(   160_000_000),  // 160 USDC (à 160/SOL)
+  startTime:       new BN(0),               // ouvrir immédiatement
+  feeConfig,
+  associatedOnly:  false,
+  ownerInfo:       { useSOLBalance: true },
+  txVersion:       TxVersion.V0,
+});
+
+const { txId } = await execute({ sendAndConfirm: true });
+console.log("Pool créé à", extInfo.address.poolId.toBase58());
+console.log("Tx :", txId);
+```
+
+Quelques opérations que le SDK gère silencieusement :
+
+- Tri des mints selon l'ordre token0/token1 avant dérivation du PDA.
+- Paiement du `create_pool_fee` une seule fois à `poolFeeAccount`.
+- Création des comptes de tokens associés de l'appelant s'ils manquent.
+- Choix du bon programme de tokens (SPL Token vs Token-2022) de chaque côté.
+
+Après confirmation, vous pouvez récupérer l'état du pool en direct avec :
+
+```ts
+const { poolKeys, poolInfo, rpcData } = await raydium.cpmm.getPoolInfoFromRpc(
+  extInfo.address.poolId,
+);
+```
+
+## Swap (entrée en base)
+
+Source : [`src/cpmm/swap.ts`](https://github.com/raydium-io/raydium-sdk-V2-demo/blob/master/src/cpmm/swap.ts)
+
+```ts
+import { CurveCalculator } from "@raydium-io/raydium-sdk-v2";
+
+const poolId = new PublicKey("<POOL_ID>");
+
+// 1. Chargez l'état du pool actuel directement depuis un RPC (pas depuis l'API).
+const { poolInfo, poolKeys, rpcData } = await raydium.cpmm.getPoolInfoFromRpc(poolId);
+
+const inputMint  = new PublicKey(poolInfo.mintA.address); // swap A → B
+const amountIn   = new BN(100_000_000);                   // 0,1 SOL
+const slippage   = 0.005;                                 // 0,5%
+
+// 2. Cotez localement. Le CurveCalculator du SDK reflète la logique en chaîne,
+//    y compris les frais de transfert Token-2022 de chaque côté.
+const baseIn = inputMint.equals(new PublicKey(poolInfo.mintA.address));
+const swapResult = CurveCalculator.swap(
+  amountIn,
+  baseIn ? rpcData.baseReserve : rpcData.quoteReserve,
+  baseIn ? rpcData.quoteReserve : rpcData.baseReserve,
+  rpcData.configInfo!.tradeFeeRate,
+);
+const minimumAmountOut =
+  swapResult.destinationAmountSwapped.muln(1 - slippage * 100).divn(100);
+
+// 3. Construisez et envoyez.
+const { execute } = await raydium.cpmm.swap({
+  poolInfo,
+  poolKeys,
+  inputAmount: amountIn,
+  swapResult,
+  slippage,
+  baseIn,
+  txVersion: TxVersion.V0,
+});
+
+const { txId } = await execute({ sendAndConfirm: true });
+console.log("Tx de swap :", txId);
+```
+
+Remarque : le SDK **récupère toujours** l'état du pool depuis un RPC à l'intérieur de `getPoolInfoFromRpc`. Ne cotez pas depuis `api-v3.raydium.io` pour une transaction que vous allez signer — une cotation d'un bloc en retard peut glisser dans `ExceededSlippage` au moment du règlement.
+
+## Swap (sortie en base)
+
+Source : [`src/cpmm/swapBaseOut.ts`](https://github.com/raydium-io/raydium-sdk-V2-demo/blob/master/src/cpmm/swapBaseOut.ts)
+
+```ts
+const amountOutWanted = new BN(15_000_000);        // 15 USDC
+const slippage        = 0.005;
+
+const baseIn = false; // B en entrée, A en sortie ? dépend de votre direction
+const swapResult = CurveCalculator.swapBaseOutput(
+  amountOutWanted,
+  rpcData.baseReserve,
+  rpcData.quoteReserve,
+  rpcData.configInfo!.tradeFeeRate,
+);
+const maxAmountIn = swapResult.sourceAmountSwapped.muln(1 + slippage * 100).divn(100);
+
+const { execute } = await raydium.cpmm.swap({
+  poolInfo,
+  poolKeys,
+  inputAmount: maxAmountIn,
+  fixedOut:    true,
+  amountOut:   amountOutWanted,
+  baseIn,
+  slippage,
+  txVersion:   TxVersion.V0,
+});
+
+await execute({ sendAndConfirm: true });
+```
+
+## Dépôt de liquidité
+
+Source : [`src/cpmm/deposit.ts`](https://github.com/raydium-io/raydium-sdk-V2-demo/blob/master/src/cpmm/deposit.ts)
+
+```ts
+const lpAmount = new BN(100_000);           // montant de mint LP désiré
+const slippage = 0.01;
+
+const { execute } = await raydium.cpmm.addLiquidity({
+  poolInfo,
+  poolKeys,
+  lpAmount,
+  slippage,
+  baseIn: true,           // citation depuis le côté mintA
+  txVersion: TxVersion.V0,
+});
+
+await execute({ sendAndConfirm: true });
+```
+
+Le SDK convertit `lpAmount` en `needed_token_0` et `needed_token_1` en utilisant les réserves actuelles du pool, gonfle chacun de `1 + slippage` pour les arguments `maximum_*` de l'instruction, et construit les créations d'ATA si nécessaire.
+
+## Retrait de liquidité
+
+Source : [`src/cpmm/withdraw.ts`](https://github.com/raydium-io/raydium-sdk-V2-demo/blob/master/src/cpmm/withdraw.ts)
+
+```ts
+const lpAmount = new BN(100_000);           // LP à brûler
+const slippage = 0.01;
+
+const { execute } = await raydium.cpmm.withdrawLiquidity({
+  poolInfo,
+  poolKeys,
+  lpAmount,
+  slippage,
+  txVersion: TxVersion.V0,
+});
+
+await execute({ sendAndConfirm: true });
+```
+
+## Collecter les frais de protocole/fonds/créateur
+
+Source : [`src/cpmm/collectCreatorFee.ts`](https://github.com/raydium-io/raydium-sdk-V2-demo/blob/master/src/cpmm/collectCreatorFee.ts), [`src/cpmm/collectAllCreatorFee.ts`](https://github.com/raydium-io/raydium-sdk-V2-demo/blob/master/src/cpmm/collectAllCreatorFee.ts)
+
+Ces instructions sont protégées par un admin ou un créateur et sont généralement invoquées depuis un signataire détenu par le multisig Raydium ou le créateur du pool. Le SDK les expose sous forme de constructeurs bruts :
+
+```ts
+import {
+  makeCollectProtocolFeeInstruction,
+  makeCollectFundFeeInstruction,
+  makeCollectCreatorFeeInstruction,
+} from "@raydium-io/raydium-sdk-v2";
+
+// Les PDAs et autorités ont été définis à la création du pool ; voir reference/program-addresses
+// pour les semences canoniques. Le SDK expose des assistants si vous préférez.
+```
+
+Hors chaîne, vous pouvez lire les frais accumulés directement depuis `PoolState` :
+
+```ts
+const pool = await raydium.cpmm.getRpcPoolInfo(poolId);
+console.log("Frais de protocole accumulés token0 :", pool.protocolFeesToken0.toString());
+console.log("Frais de protocole accumulés token1 :", pool.protocolFeesToken1.toString());
+```
+
+## Squelette CPI Rust
+
+Si vous souhaitez invoquer CPMM depuis votre propre programme Anchor — par exemple, un coffre qui effectue des swaps au nom de ses déposants — le contexte CPI ressemble à ceci. L'ordre des comptes suit [`products/cpmm/instructions`](/fr/products/cpmm/instructions).
+
+```rust
+// Cargo.toml
+// raydium-cp-swap = { git = "https://github.com/raydium-io/raydium-cp-swap" }
+// anchor-spl       = "0.30"
+
+use anchor_lang::prelude::*;
+use anchor_spl::token_interface::{TokenAccount, TokenInterface, Mint};
+use raydium_cp_swap::cpi::accounts::Swap;
+use raydium_cp_swap::cpi;
+use raydium_cp_swap::program::RaydiumCpSwap;
+
+#[derive(Accounts)]
+pub struct ProxySwap<'info> {
+    #[account(mut)]
+    pub payer: Signer<'info>,
+
+    /// CHECK: validé par le programme CPMM
+    pub authority:     UncheckedAccount<'info>,
+    /// CHECK:
+    pub amm_config:    UncheckedAccount<'info>,
+    #[account(mut)]
+    /// CHECK:
+    pub pool_state:    UncheckedAccount<'info>,
+
+    #[account(mut)]
+    pub input_token_account:  InterfaceAccount<'info, TokenAccount>,
+    #[account(mut)]
+    pub output_token_account: InterfaceAccount<'info, TokenAccount>,
+
+    #[account(mut)]
+    pub input_vault:  InterfaceAccount<'info, TokenAccount>,
+    #[account(mut)]
+    pub output_vault: InterfaceAccount<'info, TokenAccount>,
+
+    pub input_token_program:  Interface<'info, TokenInterface>,
+    pub output_token_program: Interface<'info, TokenInterface>,
+
+    pub input_token_mint:  InterfaceAccount<'info, Mint>,
+    pub output_token_mint: InterfaceAccount<'info, Mint>,
+
+    #[account(mut)]
+    /// CHECK: ring buffer
+    pub observation_state: UncheckedAccount<'info>,
+
+    pub cpmm_program: Program<'info, RaydiumCpSwap>,
+}
+
+pub fn proxy_swap_base_input(
+    ctx: Context<ProxySwap>,
+    amount_in: u64,
+    minimum_amount_out: u64,
+) -> Result<()> {
+    let cpi_accounts = Swap {
+        payer:                ctx.accounts.payer.to_account_info(),
+        authority:            ctx.accounts.authority.to_account_info(),
+        amm_config:           ctx.accounts.amm_config.to_account_info(),
+        pool_state:           ctx.accounts.pool_state.to_account_info(),
+        input_token_account:  ctx.accounts.input_token_account.to_account_info(),
+        output_token_account: ctx.accounts.output_token_account.to_account_info(),
+        input_vault:          ctx.accounts.input_vault.to_account_info(),
+        output_vault:         ctx.accounts.output_vault.to_account_info(),
+        input_token_program:  ctx.accounts.input_token_program.to_account_info(),
+        output_token_program: ctx.accounts.output_token_program.to_account_info(),
+        input_token_mint:     ctx.accounts.input_token_mint.to_account_info(),
+        output_token_mint:    ctx.accounts.output_token_mint.to_account_info(),
+        observation_state:    ctx.accounts.observation_state.to_account_info(),
+    };
+    let cpi_ctx = CpiContext::new(
+        ctx.accounts.cpmm_program.to_account_info(),
+        cpi_accounts,
+    );
+    cpi::swap_base_input(cpi_ctx, amount_in, minimum_amount_out)
+}
+```
+
+Si votre CPI signe en tant que PDA (par exemple, vous gérez un coffre au nom des déposants), échangez `CpiContext::new` contre `CpiContext::new_with_signer` et passez vos semences.
+
+## Pièges courants
+
+Une courte liste de vérification avant d'ouvrir un ticket de support :
+
+- **Mints triés.** Si votre PDA `poolState` dérivé ne correspond pas au pool en chaîne, vous avez probablement oublié de trier les mints.
+- **Cotation d'API obsolète.** Ne passez jamais une valeur de réserve de `api-v3.raydium.io` dans `CurveCalculator.swap`. Récupérez depuis un RPC.
+- **Mauvais programme de tokens.** Le coffre-fort d'un mint Token-2022 est détenu par le programme Token-2022, pas par SPL Token. Utilisez toujours les champs `token_0_program` / `token_1_program` du pool.
+- **Slippage sous-dénominé pour les mints à frais de transfert.** Si l'un ou l'autre côté du pool est un mint Token-2022 avec frais de transfert, votre `minimum_amount_out` doit être dénominé en ce que l'utilisateur reçoit réellement, pas ce que le coffre envoie.
+- **`NotApproved` sur un swap.** Vérifiez `PoolState.status` — l'admin peut avoir mis en pause les swaps sur ce pool. Consultez [`products/cpmm/instructions`](/fr/products/cpmm/instructions) pour le masque de statut.
+
+## Par la suite
+
+- [`sdk-api/typescript-sdk`](/fr/sdk-api/typescript-sdk) — référence SDK complète.
+- [`sdk-api/rest-api`](/fr/sdk-api/rest-api) — points de terminaison de cotation et de métadonnées de pools.
+- [`user-flows/create-cpmm-pool`](/fr/user-flows/create-cpmm-pool) — la procédure pas à pas non-code du même flux.
+- [`integration-guides/aggregator`](/fr/integration-guides/aggregator) — si vous acheminez CPMM dans le cadre d'un chemin multi-hops.
+
+Sources :
+
+- [Raydium SDK v2 — `@raydium-io/raydium-sdk-v2`](https://github.com/raydium-io/raydium-sdk-V2)
+- [Démos Raydium SDK v2 — `raydium-sdk-v2-demo`](https://github.com/raydium-io/raydium-sdk-V2-demo)
+- [`raydium-io/raydium-cp-swap`](https://github.com/raydium-io/raydium-cp-swap)

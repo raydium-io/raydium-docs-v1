@@ -1,0 +1,280 @@
+---
+title: "Программы и Anchor"
+description: "Как развёртываются и обновляются программы на Solana, что добавляет фреймворк Anchor к базовой модели Solana, и как читать IDL Raydium для генерации собственных клиентов."
+---
+
+<Info>
+  **Эта страница переведена с помощью ИИ. За эталон принимается английская версия.**
+
+  [Открыть английскую версию →](/solana-fundamentals/programs-and-anchor)
+</Info>
+
+<Info>
+  Новые программы Raydium (CPMM, CLMM, Farm v6, LaunchLab) написаны на **Anchor** — фреймворке на Rust, который расширяет базовую модель программ Solana, добавляя валидацию счётов, обработку ошибок и IDL (описание интерфейса). AMM v4 и более старые версии ферм были созданы до появления Anchor. Понимание обоих подходов помогает читать код, генерировать клиентов из IDL и отлаживать неожиданные ошибки.
+</Info>
+
+## Модель развёртывания программ
+
+Каждая программа на Solana живёт по адресу `Pubkey`. Байт-код программы хранится в **исполняемом** счёте, владельцем которого является **BPF Upgradable Loader** (`BPFLoaderUpgradeab1e11111111111111111111111`).
+
+Развёртывание программы состоит из трёх счётов:
+
+1. **Счёт программы**: небольшой счёт метаданных по адресу программы. Владелец: BPF Upgradable Loader.
+2. **Счёт ProgramData**: содержит реальный байт-код. Выводится как `[program_id, "programdata"]`.
+3. **Буферный счёт** (временный): содержит новый байт-код во время обновления. Удаляется после обновления.
+
+Счёт ProgramData имеет **authority обновления** — ключ, который может заменить байт-код на новую версию. Authority обновления Raydium — это мультиподпись за 24-часовым таймлоком; см. [`security/admin-and-multisig`](/ru/security/admin-and-multisig).
+
+### Проверка развёрнутой программы
+
+Чтобы убедиться, что код в сети соответствует одобренному при аудите исходному коду:
+
+```bash
+# Выгрузить программу с mainnet
+solana program dump CPMMoo8L3F4NbTegBCKVNunggL7H1Zpdmwpwh8KMoZ0F cpmm-onchain.so
+
+# Собрать из известного исходного кода
+cargo build-bpf --manifest-path raydium-cp-swap/programs/cp-amm/Cargo.toml
+cp target/deploy/raydium_cp_swap.so cpmm-source.so
+
+# Сравнить
+sha256sum cpmm-onchain.so cpmm-source.so
+```
+
+Совпадение хешей доказывает, что вы взаимодействуете с программой, исходный код которой вы знаете. Raydium публикует инструкции по верифицированной сборке в примечаниях релиза.
+
+## Anchor: фреймворк на основе Solana
+
+Базовые программы Solana — это функции на Rust с такой сигнатурой:
+
+```rust
+pub fn process_instruction(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    instruction_data: &[u8],
+) -> ProgramResult {
+    // Вручную парсить instruction_data
+    // Вручную валидировать счёты
+    // Вручную десериализовать данные счёта
+    // Вручную проверять флаги подписи/записи
+    // ... затем выполнить основную работу
+}
+```
+
+Anchor избавляет от этого шаблонного кода и позволяет писать:
+
+```rust
+#[program]
+pub mod cpmm {
+    use super::*;
+
+    pub fn swap_base_input(
+        ctx: Context<Swap>,
+        amount_in: u64,
+        min_out: u64,
+    ) -> Result<()> {
+        // Только бизнес-логика — ctx уже валидирован
+    }
+}
+
+#[derive(Accounts)]
+pub struct Swap<'info> {
+    pub payer: Signer<'info>,
+    #[account(mut, seeds = [b"pool", config.key().as_ref(), ...], bump)]
+    pub pool_state: AccountLoader<'info, PoolState>,
+    #[account(mut)]
+    pub input_vault: Box<Account<'info, TokenAccount>>,
+    // ... ещё счёты
+}
+```
+
+Anchor:
+
+- Автоматически генерирует детерминированный 8-байтовый **discriminator** для каждой инструкции и типа счёта.
+- Валидирует ограничения счётов (owner, seeds, writable, signer, mint-matches, token-program-matches) перед выполнением вашего кода.
+- Генерирует **IDL** — файл описания интерфейса, который клиенты используют для вызова программы.
+- Поставляется с клиентской библиотекой на Rust, TypeScript и Python.
+
+### 8-байтовый discriminator
+
+Каждый счёт Anchor и каждая инструкция Anchor начинаются с 8-байтового discriminator — первыми 8 байтами SHA-256 фиксированной строки:
+
+```
+Discriminator счёта:       sha256("account:PoolState")[0..8]
+Discriminator инструкции:  sha256("global:swap_base_input")[0..8]
+```
+
+Когда вы вызываете инструкцию Anchor, первые 8 байт данных инструкции — это этот discriminator; Anchor перенаправляет на правильный обработчик, найдя его.
+
+Когда вы читаете счёт Anchor, первые 8 байт показывают его тип — критически важно для инструментов типа `getProgramAccounts`, которые перечисляют все счёты определённого типа.
+
+### Ошибки
+
+Программы Anchor определяют ошибки через `#[error_code]`:
+
+```rust
+#[error_code]
+pub enum ErrorCode {
+    #[msg("Slippage tolerance exceeded")]
+    SlippageExceeded,
+    #[msg("Pool is disabled")]
+    PoolDisabled,
+    // ...
+}
+```
+
+Anchor автоматически присваивает эти числовые коды, начиная с 6000 (0x1770). Полная таблица кодов ошибок Raydium находится в [`reference/error-codes`](/ru/reference/error-codes).
+
+## IDL
+
+Файл **IDL** (Interface Description Language) Anchor — это JSON-описание программы: её инструкций, счётов, типов, ошибок и событий. Это эквивалент ABI для Ethereum.
+
+Raydium публикует IDL для всех программ Anchor. Можно получить живой код из сети:
+
+```bash
+anchor idl fetch CPMMoo8L3F4NbTegBCKVNunggL7H1Zpdmwpwh8KMoZ0F -o cpmm.idl.json
+```
+
+Или из исходного кода SDK: `src/raydium/*/idl/*.json`.
+
+### Структура IDL
+
+```json
+{
+  "version":      "0.1.0",
+  "name":         "raydium_cp_swap",
+  "instructions": [ { "name": "swap_base_input", "accounts": [ ... ], "args": [ ... ] }, ... ],
+  "accounts":     [ { "name": "PoolState", "type": { ... } }, ... ],
+  "types":        [ { "name": "AmmConfig", "type": { ... } }, ... ],
+  "errors":       [ { "code": 6000, "name": "SlippageExceeded", "msg": "..." }, ... ],
+  "events":       [ { "name": "SwapEvent", "fields": [ ... ] }, ... ]
+}
+```
+
+### Генерация клиента из IDL
+
+CLI `anchor` Anchor генерирует типы TypeScript и Rust:
+
+```bash
+anchor idl build -o target/idl/cpmm.json
+# Типы TypeScript автоматически генерируются ts-client Anchor
+# SDK Raydium уже включает их
+```
+
+Сторонние инструменты типа [Kinobi](https://github.com/metaplex-foundation/kinobi) могут генерировать клиентов на Rust, Python, C или Go из IDL.
+
+### Когда IDL — ваш помощник
+
+Если вы хотите построить кастомную интеграцию, которая не использует SDK Raydium:
+
+1. Получите IDL (живой код из сети или из исходного кода SDK).
+2. Найдите нужную инструкцию (например, `swap_base_input`).
+3. Конструируйте данные инструкции: 8-байтовый discriminator + закодированные аргументы.
+4. Передайте счёты в порядке, указанном в IDL.
+
+Примеры работы см. в [`sdk-api/anchor-idl`](/ru/sdk-api/anchor-idl).
+
+## Программы до Anchor: AMM v4 и Farm v3/v5
+
+Эти программы были созданы до появления Anchor. Они используют:
+
+- **Ручную диспетчеризацию инструкций**: `u8`-тег в `instruction_data` с оператором `match`.
+- **Ручную валидацию счётов**: `if accounts[0].owner != &expected_program { ... }`.
+- **Borsh-сериализованные аргументы инструкций**: нет discriminator, просто `instruction_data[1..]`.
+- **Layout через `#[repr(C, packed)]`**: бинарный layout структуры C.
+
+SDK Raydium v2 поставляется с TypeScript layouts для инструкций AMM v4 без Anchor, чтобы клиенты могли кодировать/декодировать без Anchor:
+
+```ts
+import { liquidityStateV4Layout, swapInstructionData }
+  from "@raydium-io/raydium-sdk-v2";
+
+const data = swapInstructionData.encode({
+  instruction: 9,   // swap
+  amountIn:    1_000_000n,
+  minAmountOut: 950_000n,
+});
+```
+
+Паттерн интеграции аналогичен — просто вы не получаете автоматическую генерацию на основе IDL Anchor.
+
+## Механика обновления программ
+
+Только `upgrade_authority` счёта ProgramData может обновить программу. Шаги:
+
+1. Скомпилировать новый байт-код.
+2. Записать его в буферный счёт (`solana program write-buffer`).
+3. Отправить инструкцию обновления: `BpfLoaderUpgradeable::Upgrade { buffer, program, authority }`.
+4. Среда выполнения атомарно заменяет байт-код программы содержимым буфера.
+
+Raydium заблокирована это за **24-часовым таймлоком**, реализованным в настройках мультиподписи Squads. Транзакция обновления должна ждать 24 часа после одобрения мультиподписью перед выполнением. Это защищает от спешных или вынужденных обновлений.
+
+См. [`security/admin-and-multisig`](/ru/security/admin-and-multisig).
+
+### Сделать программу неизменяемой
+
+Authority обновления может быть установлена на `None`, и программа станет навсегда неизменяемой. Raydium не сделала это ни для какого продукта — команда оставляет возможность применить исправления безопасности. Компромисс: пользователи должны доверять процессу мультиподписи + таймлока.
+
+## Программы и рента
+
+Развёртывание программы требует ламортов, свободных от ренты:
+
+- Программа объёмом 50 КБ: ~0.35 SOL ренты.
+- Программа объёмом 200 КБ: ~1.4 SOL ренты.
+
+Закрытие программы (через `solana program close`) возвращает ламорты. Программы Raydium остаются активными и не запланированы на закрытие.
+
+## Отладка программ Anchor
+
+### Вывод логов
+
+Макрос `msg!` Anchor записывает в лог транзакции. Имитируйте транзакцию, чтобы увидеть логи:
+
+```ts
+const sim = await connection.simulateTransaction(tx);
+console.log(sim.value.logs);
+```
+
+Логи включают:
+
+- Вызов программы (`Program CPMMoo8... invoke [1]`).
+- Вызовы `msg!` из кода программы.
+- Потребление вычислительных единиц (`consumed 137842 of 400000 compute units`).
+- Успех или ошибку программы.
+
+### Коды ошибок
+
+Если программа Anchor выбросит исключение, лог показывает:
+
+```
+Program CPMMoo8... failed: custom program error: 0x1770
+```
+
+0x1770 = 6000 в десятичной = первая ошибка Anchor (например, `SlippageExceeded`). Сопоставьте с массивом `errors` в IDL.
+
+Полную таблицу ошибок Raydium см. в [`reference/error-codes`](/ru/reference/error-codes).
+
+### Несоответствие layout счётов
+
+Если вы передали неправильный счёт в неправильный слот, макросы валидации счётов Anchor возвращают ошибки вроде:
+
+```
+AnchorError: AccountNotInitialized. Error Number: 3012
+```
+
+Номера ошибок ниже 6000 — это встроенные ошибки Anchor (см. enum `ErrorCode` Anchor); ошибки ≥6000 — пользовательские коды программы.
+
+## Ссылки
+
+- [`solana-fundamentals/account-model`](/ru/solana-fundamentals/account-model) — как программы владеют счётами.
+- [`solana-fundamentals/pdas-and-cpis`](/ru/solana-fundamentals/pdas-and-cpis) — PDA как их объявляет Anchor.
+- [`sdk-api/anchor-idl`](/ru/sdk-api/anchor-idl) — получение и использование IDL Raydium.
+- [`reference/program-addresses`](/ru/reference/program-addresses) — адреса программ.
+- [`reference/error-codes`](/ru/reference/error-codes) — справочник кодов ошибок.
+- [`security/admin-and-multisig`](/ru/security/admin-and-multisig) — управление правами обновления.
+
+Источники:
+
+- [Anchor book](https://book.anchor-lang.com).
+- [Solana program deployment](https://docs.solana.com/cli/deploy-a-program).
+- IDL Raydium (опубликованы в SDK `src/raydium/*/idl/*.json`).

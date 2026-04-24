@@ -1,0 +1,179 @@
+---
+title: "Transfer fee Token-2022 dalam swap"
+description: "Bagaimana extension transfer-fee Token-2022 mengubah akuntansi jumlah pra/pasca-swap, produk Raydium mana saja yang mendukungnya, dan edge case yang perlu ditangani integrator (fee asimetris, update fee, batas max-fee, extension non-transferable)."
+---
+
+<Info>
+  **Halaman ini diterjemahkan secara otomatis oleh AI. Versi bahasa Inggris adalah acuan resmi.**
+
+  [Lihat versi bahasa Inggris →](/algorithms/token-2022-transfer-fees)
+</Info>
+
+<Info>
+  Matriks dukungan: **CPMM** mendukung Token-2022 sepenuhnya, termasuk mint dengan transfer fee. **CLMM** mendukung Token-2022 dengan transfer fee melalui akun `SwapV2` eksplisit. **AMM v4** tidak mendukung Token-2022 sama sekali. **LaunchLab** tidak mendukung Token-2022 untuk base mint (menciptakan mint SPL klasik). **Farm v6** mendukung Token-2022 pada mint staking dan reward.
+</Info>
+
+## Apa itu transfer fee
+
+Token-2022 adalah program SPL Token kedua (`TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA` → `TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb`). Di antara extension-nya, extension **transfer-fee** membuat setiap `TransferChecked` pada mint token mengurangi fee dari jumlah yang ditransfer. Fee disalurkan ke penerima yang ditunjuk oleh mint authority dan dapat diperbarui oleh authority (dalam batas-batas).
+
+Mint dengan transfer fee memiliki dua parameter relevan:
+
+- **`transfer_fee_basis_points`** — tingkat fee (contoh: 100 = 1%).
+- **`maximum_fee`** — batas absolut per transfer (agar pengguna yang memindahkan jumlah besar tidak membayar fee tanpa batas).
+
+Mint dapat memiliki **dua** konfigurasi transfer fee aktif sekaligus: yang "lebih baru" (berlaku sekarang) dan yang "lebih lama" (dijadwalkan keluar). Ini adalah desain "epoch transition" — perubahan transfer fee berlaku di perbatasan epoch untuk menghindari transaksi in-flight yang mengejutkan.
+
+## Mengapa ini penting untuk swap
+
+Vault pool menyimpan saldo sebenarnya. Ketika pengguna memanggil swap Raydium:
+
+1. Pengguna mengirim `amount_in` ke vault pool. Jika **in-mint** memiliki transfer fee, vault menerima `amount_in − fee_in`, bukan `amount_in`.
+2. Matematika swap beroperasi pada jumlah yang diterima vault.
+3. Pool mengirim `amount_out` ke ATA pengguna. Jika **out-mint** memiliki transfer fee, pengguna menerima `amount_out − fee_out`, bukan `amount_out`.
+
+Jika program swap naif dan menggunakan argumen `amount_in` mentah, pemeriksaan invarian gagal karena vault menerima lebih sedikit dari yang dipikirkan program. Sebaliknya, jika compute `amount_out` tanpa mengurangi transfer fee outbound, pengguna melihat kekurangan dan menyalahkan program.
+
+Raydium CPMM dan CLMM (via `SwapV2`) menangani ini dengan:
+
+- **Pra-swap**: menghitung `in_after_fee = amount_in − transfer_fee_on(amount_in, in_mint)`, dan menggunakan `in_after_fee` dalam matematika kurva.
+- **Pasca-swap**: menghitung `out_gross = amount_out_from_curve`, mengirim `out_gross` ke pengguna via `TransferChecked` yang program Token-2022 itu sendiri akan kurangi dengan transfer fee.
+
+`minAmountOut` slippage bound pengguna diperiksa terhadap `out_gross` (apa yang pool kirim), **bukan** terhadap apa yang pengguna terima. Ini adalah cara setiap DEX besar di Solana menangani Token-2022, dan penting karena:
+
+- Jika pool memeriksa pasca-fee, update fee antara quote dan execution akan menyebabkan trade revert.
+- Memeriksa pre-fee mengikat kegagalan pada kualitas quote itu sendiri, bukan pada perubahan fee out-of-band pengguna.
+
+UI harus mengurangi transfer fee Token-2022 yang diharapkan saat menampilkan "Anda terima" kepada pengguna.
+
+## Menghitung fee Token-2022
+
+Program SPL Token-2022 mengekspos helper deterministik. Dalam Rust:
+
+```rust
+use spl_token_2022::extension::transfer_fee::TransferFeeConfig;
+use spl_token_2022::extension::StateWithExtensions;
+
+let mint_data = ...;
+let state = StateWithExtensions::<Mint>::unpack(&mint_data)?;
+let config = state.get_extension::<TransferFeeConfig>()?;
+
+let epoch = Clock::get()?.epoch;
+let fee_bp = config.get_epoch_fee(epoch).transfer_fee_basis_points;
+let max_fee = u64::from(config.get_epoch_fee(epoch).maximum_fee);
+
+let fee = (amount as u128 * fee_bp as u128 / 10_000).min(max_fee as u128) as u64;
+```
+
+Dalam TypeScript (via `@solana/spl-token`):
+
+```ts
+import { getTransferFeeConfig, getTransferFeeAmount } from "@solana/spl-token";
+
+const config = getTransferFeeConfig(mintAccount);
+const currentEpochFee = config.olderTransferFee.epoch <= currentEpoch
+  ? config.newerTransferFee
+  : config.olderTransferFee;
+
+const rate   = currentEpochFee.transferFeeBasisPoints;
+const maxFee = currentEpochFee.maximumFee;
+const fee    = Math.min(Math.floor(amount * rate / 10_000), Number(maxFee));
+```
+
+## Formula swap yang disesuaikan (CPMM, exact-input)
+
+Misalkan `f_pool` adalah tingkat pool fee, `f_in` tingkat transfer fee in-mint, `max_in` batas maksnya, `f_out` tingkat transfer fee out-mint, `max_out` batas maksnya.
+
+```
+transfer_fee_in  = min(amount_in · f_in / 10_000, max_in)
+vault_received   = amount_in − transfer_fee_in
+
+pool_fee         = ceil(vault_received · f_pool / 1_000_000)
+amount_after     = vault_received − pool_fee
+amount_out_gross = y · amount_after / (x + amount_after)
+
+transfer_fee_out = min(amount_out_gross · f_out / 10_000, max_out)
+user_receives    = amount_out_gross − transfer_fee_out
+```
+
+Pemeriksaan slippage: `amount_out_gross ≥ min_amount_out` (bukan `user_receives ≥ min_amount_out`). `minAmountOut` pengguna diatur oleh SDK ke `expected_gross · (1 − slippage)` — pertahankan bound di sisi "terkirim", bukan sisi "diterima".
+
+## Formula yang disesuaikan (CPMM, exact-output)
+
+SDK melakukan iterasi untuk menemukan `amount_in` sehingga `user_receives = amount_out_exact`:
+
+```
+# pengguna ingin menerima amount_out_exact setelah transfer fee
+amount_out_gross = amount_out_exact + transfer_fee_out_for(amount_out_exact)
+
+# lalu selesaikan CPMM exact-output untuk amount_after:
+amount_after     = ceil(x · amount_out_gross / (y − amount_out_gross))
+
+# lalu tambahkan pool fee:
+vault_received   = ceil(amount_after · 1_000_000 / (1_000_000 − f_pool))
+
+# lalu tambahkan in transfer fee:
+amount_in = ceil(vault_received · 10_000 / (10_000 − f_in))
+# (atau iterasi — lihat edge case fee-cap di bawah)
+```
+
+Batas `max_in` / `max_out` membuat komputasi non-linear karena setelah batas tercapai fee berhenti tumbuh. `computeAmountIn` / `computeAmountOut` SDK menangani ini dengan melakukan iterasi jika formula naif akan melampaui batas.
+
+## Edge case
+
+### Fee asimetris (satu sisi memiliki fee, sisi lain tidak)
+
+Umum dalam praktik. Formula di atas sudah menangani ini — jika satu sisi memiliki `f_in = 0`, term relevan akan collapse. Tidak ada kasus khusus dalam program.
+
+### Update fee mid-swap
+
+Jika transfer fee mint berubah antara waktu quote dan execution, swap akan mendarat dengan ekonomi sedikit lebih buruk (pengguna menanggung perbedaan dalam toleransi slippage) atau revert (output gross turun di bawah `minAmountOut`). Batas slippage menyerap ini; tidak ada perlindungan tambahan yang diperlukan.
+
+### Batas maximum-fee
+
+Setelah trade cukup besar untuk mencapai `maximum_fee`, fee jenuh dan pertumbuhan lebih lanjut adalah nol. Ini membuat tingkat efektif asimtotik ke nol untuk trade sangat besar, yang dapat menyebabkan kurva penetapan harga aneh di pasar sangat iliquida. `computeAmountOut` SDK memperhitungkan ini.
+
+### Extension non-transferable
+
+Beberapa mint Token-2022 menggunakan extension `NonTransferable`, yang menolak semua panggilan `Transfer` kecuali ke dan dari mint authority. Mint seperti itu **tidak dapat** digunakan dalam pool Raydium sama sekali. `CreatePool` menolaknya saat init.
+
+### Mint interest-bearing
+
+Token-2022 juga mendukung extension `InterestBearingConfig` yang membuat saldo tampak tumbuh seiring waktu. Pool Raydium membaca saldo vault mentah (yang mengabaikan akrual bunga), jadi pada pool dengan mint interest-bearing, LP menangkap bunga yang terakrual sebagai hadiah murni kapan pun mereka redeem (saldo vault tumbuh lebih cepat daripada representasi pasokan LP). Integrator harus memperlakukan ini sebagai non-issue tetapi mendokumentasikannya untuk sisi LP.
+
+### Transfer hooks
+
+Extension `TransferHook` Token-2022 memungkinkan CPI arbitrer pada setiap transfer. CPMM Raydium mendukung ini — instruksi swap meneruskan akun hook — tetapi menambah overhead CU dan memerlukan hook berperilaku baik. CLMM `SwapV2` juga mendukung hooks. AMM v4 tidak mendukung Token-2022 sama sekali, jadi pertanyaan tidak muncul.
+
+## Contoh yang dikerjakan
+
+Pool CPMM, `x = 1_000_000 USDY, y = 1_000_000 USDC`, pool fee 0,25%.
+
+- USDY memiliki transfer fee 1%, `max_fee = 10_000` (0,01 USDY dengan 6 desimal).
+- USDC tidak memiliki transfer fee.
+
+Pengguna menukar `amount_in = 1_000 USDY` untuk USDC (exact-input).
+
+```
+transfer_fee_in = min(1_000 · 100 / 10_000, 10_000)  = 10     // 1%, jauh di bawah batas
+vault_received  = 1_000 − 10 = 990
+
+pool_fee        = ceil(990 · 2_500 / 1_000_000)  = 3    // 0.25%
+amount_after    = 990 − 3 = 987
+
+amount_out_gross = 1_000_000 · 987 / (1_000_000 + 987) = 986_027 / ...  ≈ 985.97
+```
+
+≈ 985,97 USDC. Tidak ada transfer fee outbound, jadi pengguna menerima 985,97 USDC.
+
+## Pointer
+
+- [`products/cpmm/overview`](/id/products/cpmm/overview) — dukungan CPMM Token-2022.
+- [`products/clmm/instructions`](/id/products/clmm/instructions) — `SwapV2` vs `Swap` untuk routing Token-2022.
+- [`solana-fundamentals/spl-token-and-token-2022`](/id/solana-fundamentals/spl-token-and-token-2022) — model extension Token-2022 umum.
+
+Sumber:
+
+- [Dokumen extension transfer-fee SPL Token-2022](https://spl.solana.com/token-2022/extensions#transfer-fees)
+- Kode sumber program CPMM Raydium (penanganan Token-2022 `SwapBaseInput` / `SwapBaseOutput`).
+- Kode sumber program CLMM Raydium (`SwapV2`).

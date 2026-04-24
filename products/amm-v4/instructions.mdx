@@ -1,0 +1,294 @@
+---
+title: "AMM v4 instructions"
+description: "Every AMM v4 instruction with its arguments, the pool and OpenBook accounts it expects, and the pre/post conditions on each."
+---
+
+<Info>
+  AMM v4 instructions uniformly expect both a **pool side** (AMM v4 program accounts) and a **market side** (OpenBook accounts for the bound market). Omitting or mismatching either set reverts. The account lists below use the field names from the Raydium SDK for clarity; the underlying IDL sometimes uses `serum_*` prefixes.
+</Info>
+
+## Instruction inventory
+
+| Group | Instruction | Notes |
+|-------|-------------|-------|
+| Pool lifecycle | `Initialize2` | Current pool-creation instruction (still functional; UI defaults to CPMM for new pools). |
+| Liquidity | `Deposit` | Add liquidity, receive LP. |
+| Liquidity | `Withdraw` | Burn LP, receive both sides pro-rata. |
+| Swap | `SwapBaseIn` | Exact-input swap (full path: vaults + OpenBook). |
+| Swap | `SwapBaseOut` | Exact-output swap (full path). |
+| Swap | `SwapBaseInV2` | Exact-input swap that bypasses OpenBook — vaults only, fewer accounts. |
+| Swap | `SwapBaseOutV2` | Exact-output swap that bypasses OpenBook. |
+| Upkeep | `SetParams` | Admin: change pool parameters. |
+| Upkeep | `WithdrawPnl` | Sweep accrued protocol PnL into the PnL-owner accounts. |
+| Upkeep | `CreateConfigAccount` | Admin: initialize the program-level `AmmConfig` PDA. |
+| Upkeep | `UpdateConfigAccount` | Admin: change program-level config params. |
+
+The SDK exposes builders for the user-facing instructions only. Upkeep instructions are typically invoked by the Raydium keeper.
+
+## `Initialize2`
+
+Bootstrap a new AMM v4 pool bound to an existing OpenBook market.
+
+**Arguments**
+
+```
+nonce:        u8
+open_time:    u64
+init_pc_amount:   u64
+init_coin_amount: u64
+```
+
+**Accounts** (writable `W`, signer `S`)
+
+| # | Name | W | S | Notes |
+|---|------|---|---|-------|
+| 1 | `token_program` |   |   | SPL Token. |
+| 2 | `system_program` |   |   | |
+| 3 | `rent` |   |   | |
+| 4 | `amm` | W |   | `AmmInfo` account (seeded key). |
+| 5 | `amm_authority` |   |   | Program PDA. |
+| 6 | `amm_open_orders` | W |   | OpenBook `OpenOrders` (seeded). |
+| 7 | `lp_mint` | W |   | |
+| 8 | `coin_mint` |   |   | |
+| 9 | `pc_mint` |   |   | |
+| 10 | `pool_coin_token_account` | W |   | |
+| 11 | `pool_pc_token_account` | W |   | |
+| 12 | `pool_withdraw_queue` | W |   | |
+| 13 | `pool_target_orders_account` | W |   | |
+| 14 | `pool_lp_token_account` | W |   | Creator's LP ATA. |
+| 15 | `pool_temp_lp_token_account` | W |   | Scratch account. |
+| 16 | `market_program` |   |   | OpenBook program. |
+| 17 | `market` |   |   | OpenBook market. |
+| 18 | `user_wallet` | W | S | Creator. Pays rent and funds initial deposit. |
+| 19 | `user_token_coin` | W |   | |
+| 20 | `user_token_pc` | W |   | |
+
+**Postconditions**
+
+- `lp_supply = sqrt(init_coin_amount × init_pc_amount) − INIT_BURN`, where `INIT_BURN` ≈ 100 LP units are kept out of circulation.
+- OpenBook orders have **not** yet been posted; the first `MonitorStep` posts the initial grid.
+
+**Common errors** — `InvalidInput` (mismatched decimals, non-sorted), `NotApproved`, OpenBook-side `InvalidMarketState`.
+
+## `Deposit`
+
+Add liquidity.
+
+**Arguments**
+
+```
+max_coin_amount: u64
+max_pc_amount:   u64
+base_side:       u64    // 0 = base on coin, 1 = base on pc
+// (some SDK variants also accept other_amount_min)
+```
+
+**Accounts** (abridged)
+
+| # | Name | W | S |
+|---|------|---|---|
+| 1 | `token_program` |   |   |
+| 2 | `amm` | W |   |
+| 3 | `amm_authority` |   |   |
+| 4 | `amm_open_orders` |   |   |
+| 5 | `amm_target_orders` | W |   |
+| 6 | `lp_mint` | W |   |
+| 7 | `pool_coin_token_account` | W |   |
+| 8 | `pool_pc_token_account` | W |   |
+| 9 | `market` |   |   |
+| 10 | `user_coin_token_account` | W |   |
+| 11 | `user_pc_token_account` | W |   |
+| 12 | `user_lp_token_account` | W |   |
+| 13 | `user_owner` |   | S |
+
+**Math** — standard pro-rata. Using the pool's *effective* reserves (vaults + on-book), the SDK computes the coin/pc pair that yields the given LP amount and checks it against `max_*`. Reverts with `ExceededSlippage` if either side exceeds the cap.
+
+## `Withdraw`
+
+Burn LP, receive both sides.
+
+**Arguments**
+
+```
+amount: u64    // LP to burn
+```
+
+**Accounts** — like `Deposit` with the direction reversed; `lp_mint` is writable for burn, the user ATAs are receivers. A `MonitorStep`-like settle-from-OpenBook step happens internally before the pro-rata math so the redemption uses fresh reserves.
+
+## `SwapBaseIn`
+
+Exact-input swap. Always an **AMM-path** swap (does not route through OpenBook matching).
+
+<Note>
+  **Use the V2 variants for new code.** Since AMM v4 no longer shares liquidity to OpenBook, the V1 entrypoints (`SwapBaseIn`, `SwapBaseOut`) — which still require the full set of OpenBook accounts for validation — are functionally redundant. New integrations should use [`SwapBaseInV2` / `SwapBaseOutV2`](#swapbaseinv2-swapbaseoutv2), which take a much smaller account list and represent the canonical execution path today. The V1 forms are documented here for completeness and for reading existing on-chain transactions.
+</Note>
+
+**Arguments**
+
+```
+amount_in:            u64
+minimum_amount_out:   u64
+```
+
+**Accounts** (abridged)
+
+| # | Name | W | S |
+|---|------|---|---|
+| 1 | `token_program` |   |   |
+| 2 | `amm` | W |   |
+| 3 | `amm_authority` |   |   |
+| 4 | `amm_open_orders` | W |   |
+| 5 | `amm_target_orders` | W |   |
+| 6 | `pool_coin_token_account` | W |   |
+| 7 | `pool_pc_token_account` | W |   |
+| 8 | `market_program` |   |   |
+| 9 | `market` | W |   |
+| 10 | `market_bids` | W |   |
+| 11 | `market_asks` | W |   |
+| 12 | `market_event_queue` | W |   |
+| 13 | `market_coin_vault` | W |   |
+| 14 | `market_pc_vault` | W |   |
+| 15 | `market_vault_signer` |   |   |
+| 16 | `user_source_token_account` | W |   |
+| 17 | `user_dest_token_account` | W |   |
+| 18 | `user_owner` |   | S |
+
+**Math** — see [`products/amm-v4/math`](/products/amm-v4/math).
+
+**Preconditions**
+
+- `amm.status` allows swap (bit 0 of the status bitmask not set).
+- `amm.state_data.pool_open_time <= now`.
+- `amount_in > 0`.
+- `user_source_token_account` holds at least `amount_in`.
+
+**Postconditions**
+
+- User loses `amount_in` of source token, gains `amount_out ≥ minimum_amount_out` of dest token.
+- `state_data.swap_*_in_amount` and `swap_*_out_amount` incremented (for analytics).
+- `need_take_pnl_*` incremented by the protocol fee share.
+
+**Common errors** — `ExceededSlippage`, `InvalidInput`, `InvalidStatus`, `InvalidMarket`.
+
+## `SwapBaseOut`
+
+Exact-output, inverse of `SwapBaseIn`. Same accounts.
+
+**Arguments**
+
+```
+max_amount_in: u64
+amount_out:    u64
+```
+
+## `SwapBaseInV2` / `SwapBaseOutV2`
+
+Variant swap entrypoints that **skip the OpenBook accounts entirely**. The math is identical to the V1 path, but the account list shrinks to the AMM side only:
+
+| # | Name | W | S |
+|---|------|---|---|
+| 1 | `token_program` |   |   |
+| 2 | `amm` | W |   |
+| 3 | `amm_authority` |   |   |
+| 4 | `amm_open_orders` |   |   |
+| 5 | `pool_coin_token_account` | W |   |
+| 6 | `pool_pc_token_account` | W |   |
+| 7 | `user_source_token_account` | W |   |
+| 8 | `user_dest_token_account` | W |   |
+| 9 | `user_owner` |   | S |
+
+The pool's effective reserves still account for tokens posted on OpenBook, so quote math is unchanged. Use V2 to save compute and avoid passing the market accounts when you don't need an OpenBook crank in the same transaction. The Raydium router always uses the V2 form when routing through AMM v4.
+
+Arguments are the same as the V1 forms (`amount_in / minimum_amount_out` for `SwapBaseInV2`; `max_amount_in / amount_out` for `SwapBaseOutV2`).
+
+## `MonitorStep` (legacy / inert)
+
+<Note>
+  **No longer cranked.** AMM v4 no longer shares liquidity to OpenBook, so `MonitorStep` has nothing to do — the pool has no orders posted to settle, cancel, or replace. The instruction remains in the on-chain program for backwards compatibility but the Raydium keeper no longer calls it. Calling it manually is effectively a no-op (other than refreshing zeroed-out state) and should not be needed by integrators.
+</Note>
+
+Originally this instruction cranked the pool's OpenBook interaction.
+
+**Arguments**
+
+```
+plan_order_limit:   u16
+place_order_limit:  u16
+cancel_order_limit: u16
+```
+
+**Accounts** — everything above for a swap, plus administrative OpenBook accounts.
+
+**Original effect** (no longer relevant in practice):
+
+- Settled any filled orders (their proceeds moved from `market_coin_vault`/`market_pc_vault` into the pool's vaults via OpenBook CPI).
+- Cancelled stale orders whose prices or sizes no longer matched `target_orders`.
+- Posted new orders to close the gap between `target_orders` and `amm_open_orders`.
+
+Permissionless. Any account could call it; historically the Raydium keeper did so routinely.
+
+## `WithdrawPnl` / `TakePnl`
+
+Admin sweep of accrued protocol fees.
+
+**Arguments**
+
+- `WithdrawPnl` takes no args; it reads `need_take_pnl_*` and moves those exact amounts.
+
+**Accounts** (abridged)
+
+| # | Name | W | S |
+|---|------|---|---|
+| 1 | `token_program` |   |   |
+| 2 | `amm` | W |   |
+| 3 | `amm_authority` |   |   |
+| 4 | `amm_config` |   |   |
+| 5 | `amm_open_orders` | W |   |
+| 6 | `pool_coin_token_account` | W |   |
+| 7 | `pool_pc_token_account` | W |   |
+| 8 | `pnl_coin_token_account` | W |   | Recipient, stored on `AmmConfig`. |
+| 9 | `pnl_pc_token_account` | W |   |
+| 10 | `pnl_owner` |   | S | Admin multisig. |
+| 11 | `market_program` |   |   |
+| 12 | `market` | W |   |
+| 13 | `market_event_queue` | W |   |
+| 14 | `market_coin_vault` | W |   |
+| 15 | `market_pc_vault` | W |   |
+| 16 | `market_vault_signer` |   |   |
+
+**Effect**
+
+- Transfers `need_take_pnl_coin` from `pool_coin_token_account` to `pnl_coin_token_account`.
+- Same for pc.
+- Zeros `need_take_pnl_coin` and `need_take_pnl_pc`.
+
+No change to reserves since accrued PnL was already excluded from the invariant.
+
+## `SetParams`
+
+Admin param changes: status bitmask, ordering-grid depth, amount waves, fees (rarely), etc. Called by the Raydium multisig. Arguments are a `param: u8` tag + payload, analogous to CPMM's `UpdateAmmConfig`.
+
+## State-change matrix
+
+| Instruction | `lp_mint` supply | Vaults | PnL counters | OpenBook |
+|-------------|------------------|--------|--------------|----------|
+| `Initialize2` | init supply minted to creator | `+ init_coin_amount`, `+ init_pc_amount` | 0 | OpenOrders created |
+| `Deposit` | + | + both | — | settle fills |
+| `Withdraw` | − | − both | — | settle fills |
+| `SwapBaseIn` | — | + in, − out | + pnl share | maybe re-post grid |
+| `SwapBaseOut` | — | + in, − out | + pnl share | maybe re-post grid |
+| `MonitorStep` | — | settle fills | — | cancel / post |
+| `WithdrawPnl` | — | − (pnl swept) | 0 | — |
+| `SetParams` | — | — | — | — |
+
+## Where to go next
+
+- [`products/amm-v4/code-demos`](/products/amm-v4/code-demos) — TypeScript examples for swap and LP flows.
+- [`products/amm-v4/fees`](/products/amm-v4/fees) — `WithdrawPnl` details and the fee split.
+- [`reference/error-codes`](/reference/error-codes) — forward-reference table (AMM v4 errors are listed on that page).
+
+Sources:
+
+- [Raydium AMM program — `raydium-io/raydium-amm`](https://github.com/raydium-io/raydium-amm)
+- Raydium SDK v2 `Liquidity` module
+- OpenBook program — account validations on the market side

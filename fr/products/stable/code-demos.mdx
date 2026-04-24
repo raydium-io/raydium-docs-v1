@@ -1,0 +1,249 @@
+---
+title: "Démonstrations de code pour Stable AMM"
+description: "Comment identifier un pool Stable AMM via l'API, effectuer un swap via le module Liquidity (il traite nativement les pools version=5), et utiliser les assistants de courbe stable hors chaîne."
+---
+
+<Info>
+  **Cette page est traduite automatiquement par IA. La version anglaise fait foi.**
+
+  [Voir la version anglaise →](/products/stable/code-demos)
+</Info>
+
+<Info>
+  **Banneau de version.**
+
+  - SDK : `@raydium-io/raydium-sdk-v2@0.2.42-alpha`
+  - Cluster : Solana `mainnet-beta`
+  - ID du programme Stable AMM : `5quBtoiQqxF9Jv6KYKctB59NT3gtJD2Y65kdnB1Uev3h` (voir [`reference/program-addresses`](/fr/reference/program-addresses))
+  - Dernière vérification : 2026-04
+
+  Le module `liquidity` du SDK traite les pools Stable AMM nativement. Les pools Stable apparaissent sous la forme **`version: 5`** (ou `pooltype: "StablePool"`) sur `ApiV3PoolInfoStandardItem` ; les mêmes assistants `addLiquidity` / `removeLiquidity` / swap fonctionnent pour eux que pour les pools constant-product AMM v4 (`version: 4`) — le SDK détecte la variante et émet automatiquement les bonnes instructions. Les mathématiques de la courbe stable hors chaîne se trouvent dans `src/raydium/liquidity/stable.ts`.
+</Info>
+
+## Configuration
+
+```bash
+npm install @raydium-io/raydium-sdk-v2 @solana/web3.js @solana/spl-token
+```
+
+```ts
+import { Raydium, TxVersion } from "@raydium-io/raydium-sdk-v2";
+import { Connection, Keypair, clusterApiUrl } from "@solana/web3.js";
+import BN from "bn.js";
+import bs58 from "bs58";
+
+const connection = new Connection(clusterApiUrl("mainnet-beta"));
+const owner = Keypair.fromSecretKey(bs58.decode(process.env.PRIVATE_KEY!));
+
+const raydium = await Raydium.load({
+  connection,
+  owner,
+  cluster: "mainnet",
+  // Optionnel : charger la disposition du modèle de courbe stable si vous avez l'intention d'appeler les assistants
+  // de cotation directement depuis `liquidity/stable.ts`. Les opérations de swap / add / remove au niveau du pool
+  // font cela en différé pour vous, donc la plupart des appelants peuvent ignorer cette étape.
+});
+
+// Une seule fois : charger au préalable la disposition des données du modèle sur chaîne utilisée par les
+// assistants de courbe stable hors chaîne. Nécessaire uniquement si vous appelez getStablePrice / getDxByDyBaseIn /
+// getDyByDxBaseIn directement. addLiquidity / removeLiquidity / swap n'en ont pas besoin.
+await raydium.liquidity.initLayout();
+```
+
+## Identifier un pool Stable
+
+Deux signaux équivalents sur `ApiV3PoolInfoStandardItem` :
+
+```ts
+const isStable =
+  pool.version === 5 ||
+  pool.pooltype.includes("StablePool"); // le SDK utilise en interne cette vérification de chaîne
+
+// Ou bien, par ID du programme :
+const STABLE_AMM_PROGRAM_ID = "5quBtoiQqxF9Jv6KYKctB59NT3gtJD2Y65kdnB1Uev3h";
+const isStableByProgram = pool.programId === STABLE_AMM_PROGRAM_ID;
+```
+
+Les flux AMM v4 (`version: 4`, constant-product) et Stable AMM (`version: 5`) passent tous par la même API `LiquidityModule` sur le SDK. En interne, le module se déporte vers :
+
+- `InstructionType.AmmV4AddLiquidity` / `AmmV4RemoveLiquidity` pour les pools v4
+- `InstructionType.AmmV5AddLiquidity` / `AmmV5RemoveLiquidity` pour les pools v5 (Stable)
+
+Le `programId` du pool (retourné avec les clés du pool) indique au SDK dans quel programme CPI ; vous n'avez pas besoin de le hardcoder.
+
+## Trouver un pool par paire de mints
+
+```ts
+import { PublicKey } from "@solana/web3.js";
+
+// Deux mints courants à utiliser comme exemple
+const mintA = new PublicKey("Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB"); // USDT
+const mintB = new PublicKey("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"); // USDC
+
+const pools = await raydium.api.fetchPoolByMintPair({
+  mint1: mintA.toBase58(),
+  mint2: mintB.toBase58(),
+});
+
+const stablePool = pools.find(
+  (p) => p.version === 5 || p.pooltype.includes("StablePool"),
+);
+
+if (!stablePool) {
+  throw new Error("Aucun pool Stable n'existe pour cette paire de mints");
+}
+
+console.log("ID du pool Stable :", stablePool.id);
+console.log("ID du programme du pool Stable :", stablePool.programId);
+console.log("TVL :", stablePool.tvl);
+```
+
+Si la paire de mints a à la fois un pool v4 (constant-product) et un pool v5 (stable), la réponse inclut les deux — choisissez celui dont vous avez besoin, ou confiez-les au programme [AMM Routing](/fr/products/routing) et laissez-le choisir la meilleure route.
+
+## Swap via un pool Stable
+
+Le flux `LiquidityModule.swap` a la même forme que pour les pools v4 — il suffit de lui transmettre un objet pool v5 :
+
+```ts
+import { Percent, TokenAmount, toToken } from "@raydium-io/raydium-sdk-v2";
+
+const inputAmount = new TokenAmount(toToken(stablePool.mintA), 1_000_000); // 1 USDT
+const slippage = new Percent(50, 10_000); // 0.5%
+
+// Calculez la sortie attendue en utilisant en interne les assistants de courbe stable du SDK.
+const { amountOut, minAmountOut } = raydium.liquidity.computeAmountOut({
+  poolInfo: stablePool,
+  amountIn: inputAmount,
+  mintIn:  stablePool.mintA.address,
+  mintOut: stablePool.mintB.address,
+  slippage,
+});
+
+console.log("Sortie prévue :", amountOut.toSignificant());
+console.log("Sortie minimale :", minAmountOut.toSignificant());
+
+// Construisez et signez la transaction de swap.
+const { transaction, execute } = await raydium.liquidity.swap({
+  poolInfo: stablePool,
+  amountIn:    inputAmount.raw,
+  amountOut:   minAmountOut.raw,
+  fixedSide:   "in",
+  txVersion:   TxVersion.V0,
+});
+
+const { txId } = await execute({ sendAndConfirm: true });
+console.log("Tx de swap Stable :", txId);
+```
+
+Le SDK lit le `programId` du pool depuis les clés du pool et se déporte dans le programme Stable AMM. Aucun argument `programId` spécial n'est nécessaire.
+
+## Ajouter et retirer de la liquidité
+
+`addLiquidity` et `removeLiquidity` fonctionnent de manière identique sur les pools v4 et v5 :
+
+```ts
+import { Percent, TokenAmount, toToken } from "@raydium-io/raydium-sdk-v2";
+
+const amountInA = new TokenAmount(toToken(stablePool.mintA), 100_000_000); // 100 USDT
+const slippage  = new Percent(50, 10_000); // 0.5%
+
+// Calculez le montant B correspondant que la courbe demande pour cette taille de A.
+const { anotherAmount, minAnotherAmount } = raydium.liquidity.computePairAmount({
+  poolInfo: stablePool,
+  amount:   amountInA.toSignificant(),
+  baseIn:   true,
+  slippage,
+});
+
+const { execute } = await raydium.liquidity.addLiquidity({
+  poolInfo: stablePool,
+  amountInA,
+  amountInB:      anotherAmount,
+  otherAmountMin: minAnotherAmount,
+  fixedSide:      "a",
+  txVersion:      TxVersion.V0,
+});
+
+const { txId } = await execute({ sendAndConfirm: true });
+console.log("Tx d'ajout de liquidité :", txId);
+```
+
+En interne, le SDK émet `InstructionType.AmmV5AddLiquidity` car `pooltype.includes("StablePool")` est vrai. Le flux `removeLiquidity` correspondant est symétrique — fournissez `lpAmount` et les montants minimums que vous accepterez de chaque côté.
+
+## Assistants de cotation hors chaîne (stable.ts)
+
+Pour les cotations côté serveur ou les backtests, le SDK expose les mathématiques sous-jacentes de la courbe stable :
+
+```ts
+import {
+  getStablePrice,
+  getDxByDyBaseIn,
+  getDyByDxBaseIn,
+} from "@raydium-io/raydium-sdk-v2";
+
+// Vous devez appeler initLayout() une fois avant d'utiliser ceux-ci (charge la PDA
+// `ModelDataInfo` sur chaîne dans le cache StableLayout du SDK).
+await raydium.liquidity.initLayout();
+
+const modelData = raydium.liquidity.stableLayout;
+
+// Prix spot aux réserves actuelles du pool.
+const price = getStablePrice(modelData, /* x */, /* y */, /* withFee */);
+console.log("Prix spot :", price);
+
+// Cotation : étant donné dx en entrée, combien de dy en sortie (aucun frais appliqué ici) ?
+const dyOut = getDyByDxBaseIn(modelData, /* x */, /* y */, /* dx */);
+
+// Cotation : étant donné la cible dy en sortie, combien de dx en entrée est nécessaire ?
+const dxIn  = getDxByDyBaseIn(modelData, /* x */, /* y */, /* dy */);
+```
+
+Ce sont des fonctions pures — pas d'RPC, pas de signature. Le `ModelDataInfo` sur chaîne est récupéré une fois par `initLayout()` et mis en cache dans `raydium.liquidity.stableLayout`. Transmettez les réserves actuelles (`x`, `y`) et les assistants calculent en cherchant en binaire dans la table de consultation et en interpolant linéairement entre les deux lignes `DataElement` environnantes. Voir [`products/stable/math`](/fr/products/stable/math) pour l'algorithme sous-jacent.
+
+## Routage via AMM Routing (multi-hop / meilleur prix)
+
+Si vous ne voulez pas choisir vous-même une venue, le programme [AMM Routing](/fr/products/routing) considérera chaque AMM Raydium (v4 / CPMM / CLMM / Stable) et routera à travers quelle que soit la meilleure combinaison :
+
+```ts
+const route = await raydium.tradeV2.fetchRoutes({
+  inputMint:  mintA,
+  outputMint: mintB,
+  amount:     new BN(1_000_000),
+  slippage,
+});
+
+// route.routes[0].poolType vous indique les programmes que la meilleure route utilise ;
+// « Stable » apparaît ici chaque fois qu'un pool Stable fait partie du chemin optimal.
+console.log(route.routes[0]);
+
+const { execute } = await raydium.tradeV2.swap({
+  inputMint:    mintA,
+  outputMint:   mintB,
+  inputAmount:  new BN(1_000_000),
+  swapResult:   route.routes[0],
+  slippage,
+  txVersion:    TxVersion.V0,
+});
+
+const { txId } = await execute({ sendAndConfirm: true });
+```
+
+C'est le chemin recommandé pour les swaps de production et les agrégateurs — vous n'avez jamais besoin de décider manuellement si un pool Stable existe ou s'il est la meilleure venue aujourd'hui.
+
+## Recommandations
+
+1. **Pour les swaps des utilisateurs finaux**, préférez le flux de routage [`tradeV2`](/fr/products/routing). Il traite tous les types de pools Raydium y compris Stable.
+2. **Pour les opérations spécifiques du pool** (ajout / suppression de LP sur un pool Stable connu), utilisez le `LiquidityModule` directement — il détecte automatiquement les pools v5.
+3. **Pour les cotations hors chaîne / analytiques**, appelez `getStablePrice` / `getDyByDxBaseIn` / `getDxByDyBaseIn` après `initLayout()`. Pas de trafic RPC par cotation une fois les données du modèle en cache.
+4. **Ne codez pas à la main les instructions `SwapBaseIn` brutes.** Le programme Stable AMM (forké à partir d'AMM v4) s'attend à 17–19 comptes OpenBook pour les points d'entrée de swap V1, avec le `model_data_account` inséré parmi eux. Les assistants pré-construits du SDK gèrent correctement chaque compte et l'ordre ; rouler le vôtre est sujette aux erreurs.
+
+## Où aller ensuite
+
+- [Math](/fr/products/stable/math) — comment fonctionne l'interpolation de table de consultation.
+- [Instructions](/fr/products/stable/instructions) — référence complète des instructions.
+- [AMM Routing](/fr/products/routing) — routage multi-pool sur AMM v4, CPMM, CLMM, Stable.
+
+Sources :
+
+- [`raydium-sdk-V2/src/raydium/liquidity/liquidity.ts`](https://github.com/raydium-io/raydium-sdk-V2/blob/master/src/raydium/liquidity/liquidity.ts) — point d'entrée du module ; répartition v4 / v5.
+- [`raydium-sdk-V2/src/raydium/liquidity/stable.ts`](https://github.com/raydium-io/raydium-sdk-V2/blob/master/src/raydium/liquidity/stable.ts) — `StableLayout`, `getStablePrice`, `getDxByDyBaseIn`, `getDyByDxBaseIn`.

@@ -1,0 +1,258 @@
+---
+title: "CPMM matematiği"
+description: "Sabit-çarpım değişmezi, SwapBaseInput ve SwapBaseOutput, Token-2022 transfer ücreti işleme ve observation hesabının nasıl güncellendiği."
+---
+
+<Info>
+  **Bu sayfa yapay zekâ tarafından otomatik olarak çevrilmiştir. İngilizce sürüm esas alınır.**
+
+  [İngilizce sürümü görüntüle →](/products/cpmm/math)
+</Info>
+
+## Değişmez
+
+CPMM, iki kasasında klasik sabit-çarpım değişmezini korur:
+
+$$
+x \cdot y = k
+$$
+
+burada `x`, vault0 bakiyesidir; alındığında Token-2022 transfer ücreti **sonrası**, ve `y` de benzer şekilde. Her swap, işlem ücretleri LP'ye kredilendirildikten sonra `k' ≥ k` bırakmalıdır (protokol, fon ve yaratıcı demetleri `k` içine sayılmaz — kasada bulunur ancak eğri görünüşünden hariç tutulur, aşağıdaki [Eğri üzerindeki ücretler](#fees-on-the-curve) bölümüne bakın). Bu nedenle `k`, LP'ler ücretleri biriktirdikçe zaman içinde monoton olarak büyür.
+
+LP hisseleri `k` tarafından değil, havuzun rezervleri tarafından fiyatlandırılır:
+
+$$
+\text{LP fiyatı token0'da} = \frac{x}{\text{lpSupply}}, \qquad \text{LP fiyatı token1'de} = \frac{y}{\text{lpSupply}}
+$$
+
+`ΔLP` LP tokenini yakıp ortadan kaldırmak tam olarak `ΔLP × x / lpSupply` token0 ve `ΔLP × y / lpSupply` token1 döndürür. Ne eğri ne de `k`, yatırım veya çekilişte hareket eder — yalnızca swaplar fiyatı değiştirir.
+
+## Swap yolunda ücret modeli
+
+CPMM, her swapda **bağımsız olarak oranlandırılmış iki ücreti** uygular:
+
+- **İşlem ücreti**, giriş tarafında alınır ve `AmmConfig.trade_fee_rate` oranında ücretlendirilir. Daha sonra LP, protokol ve fon hisseleri arasında bölünür (LP hissesi kasada kalır ve `k`'ı büyütür; protokol ve fon hisseleri kasa muhasebesiyle çıkarılır).
+- **Yaratıcı ücreti** (yalnızca `enable_creator_fee == true` olduğunda aktif) `AmmConfig.creator_fee_rate` oranında ücretlendirilir. `PoolState.creator_fee_on` ve swap yönüne bağlı olarak **giriş** tarafında veya **çıkış** tarafında alınır (bkz. [`/tr/products/cpmm/fees`](/tr/products/cpmm/fees#which-side-of-the-trade-the-fees-are-taken-from)). Kendi demetidir — hiçbir zaman işlem ücretinin bir dilimi değildir.
+
+Şu şekilde tanımlayın:
+
+- `FEE_RATE_DENOMINATOR = 1_000_000`
+- `trade_fee_rate` — `AmmConfig`'den, ör., `2500` = ilgili hacim tarafının %0,25'i
+- `creator_fee_rate` — `AmmConfig`'den, ör., `1000` = ilgili hacim tarafının %0,10'u
+- `protocol_fee_rate`, `fund_fee_rate` — `1/FEE_RATE_DENOMINATOR` birimleri **işlem ücretinin**, hacmin değil, cinsinden belirlenir
+
+Yaratıcı ücreti giriş tarafında olduğunda:
+
+```
+total_input_fee = ceil(amount_in * (trade_fee_rate + creator_fee_rate) / FEE_RATE_DENOMINATOR)
+creator_fee     = floor(total_input_fee * creator_fee_rate / (trade_fee_rate + creator_fee_rate))
+trade_fee       = total_input_fee - creator_fee
+amount_in_after_fees = amount_in - total_input_fee
+```
+
+Yaratıcı ücreti çıkış tarafında olduğunda:
+
+```
+trade_fee            = ceil(amount_in * trade_fee_rate / FEE_RATE_DENOMINATOR)
+amount_in_after_fees = amount_in - trade_fee
+amount_out_curve     = curve_output(amount_in_after_fees, ...)
+creator_fee          = ceil(amount_out_curve * creator_fee_rate / FEE_RATE_DENOMINATOR)
+amount_out           = amount_out_curve - creator_fee
+```
+
+Her iki durumda da işlem ücreti aynı şekilde bölünür:
+
+```
+protocol_fee   = floor(trade_fee * protocol_fee_rate / FEE_RATE_DENOMINATOR)
+fund_fee       = floor(trade_fee * fund_fee_rate     / FEE_RATE_DENOMINATOR)
+lp_fee         = trade_fee - protocol_fee - fund_fee     // creator_fee burada çıkarılmaz
+```
+
+`protocol_fee + fund_fee + creator_fee` miktarı kasalarda tutulur ancak havuz durumunda ayrı olarak takip edilir (`protocol_fees_token*`, `fund_fees_token*`, `creator_fees_token*`). Sabit-çarpım değişmezi `k' ≥ k`'yi kontrol ettiğinde, kasa bakiyelerini **eksi** birikmiş ancak temizlenmemiş üçü de kullanan ücretleri kullanır — böylece LP'ler yalnızca `lp_fee`'yi yakalar.
+
+Koleksiyon talimatları ve çalışılmış sayısal örnekler için [`/tr/products/cpmm/fees`](/tr/products/cpmm/fees) bölümüne bakın.
+
+## SwapBaseInput (giriş-kesin)
+
+"Kullanıcı giriş tokeni için tam olarak `amount_in` verir ve çıkış tokeni için en az `minimum_amount_out` alır."
+
+Şimdilik Token-2022'yi göz ardı ederek:
+
+```
+amount_in_after_trade_fee = amount_in - trade_fee
+amount_out                = y − (x * y) / (x + amount_in_after_trade_fee)
+```
+
+Cebir ile:
+
+$$
+\text{amount\_out} = \frac{y \cdot \Delta x_{\text{net}}}{x + \Delta x_{\text{net}}}
+$$
+
+burada `Δx_net = amount_in_after_trade_fee`.
+
+Program daha sonra kasa muhasebesiyle güncellenecektir, öyle ki `trade_fee`'nin protokol/fon/yaratıcıya ödenmesi gereken kısmı "birikmiş" demetlerde oturur (sonraki eğrinin `x`'ine dahil değildir), LP hissesi ise sonraki swap için `x`'e katılır.
+
+### Giriş tarafında Token-2022
+
+Giriş tokeni bir transfer-fee uzantısına sahipse, **mint**, kullanıcı → kasa transferinde ücretini düşer. Bu nedenle kasa aslında `amount_in − transfer_fee_in(amount_in)` alır. CPMM programı bu nedenle şunları hesaplar:
+
+```
+amount_actually_received = amount_in − transfer_fee_in(amount_in)
+trade_fee                = ceil(amount_actually_received * trade_fee_rate / FEE_RATE_DENOMINATOR)
+amount_in_after_trade_fee = amount_actually_received − trade_fee
+```
+
+ve eğriyi `amount_in_after_trade_fee`'e karşı çalıştırır. Bu önemlidir çünkü **eğri fiyatı, kasaya inen net tutardan hesaplanır**, kullanıcının manşet tutarından değil.
+
+### Çıkış tarafında Token-2022
+
+Çıkış tokeninin bir transfer ücreti varsa, havuz kasasından kullanıcıya `amount_out` gönderir. **Mint**, çıkış sırasında ücretini keser, böylece kullanıcı `amount_out − transfer_fee_out(amount_out)` alır. Program `amount_out`'u eğriden her zamanki gibi hesaplar, ancak alıntılar gösterilirken havuzun "kasa gönder" numarasını "kullanıcı al" numarasına dönüştürmek entegratörün sorumluluğudur.
+
+### Kaymama kontrolü
+
+`amount_out` hesaplandıktan sonra:
+
+```
+require(amount_out >= minimum_amount_out, "AmountSpecifiedLessThanMinimum")
+```
+
+Çıkış tokeni transfer ücreti ücretlendiriyorsa, SDK transfer ücretini `minimum_amount_out` ayarlamadan *önce* uygular, böylece kaymama sabiti kasanın gönderdiğinden değil, kullanıcının gerçekten alacağından cinsinden belirlenir.
+
+## SwapBaseOutput (çıkış-kesin)
+
+"Kullanıcı çıkış tokeni için tam olarak `amount_out` alacak ve giriş tokeni için en fazla `maximum_amount_in` ödemeye isteklidir."
+
+Eğriyi `Δx_net` için ters çevirme:
+
+$$
+\Delta x_{\text{net}} = \left\lceil \frac{x \cdot \text{amount\_out}}{y - \text{amount\_out}} \right\rceil
+$$
+
+Tavansetin önemli — tamsayı kesme sonrası `k' ≥ k`'yi garanti eder. Daha sonra:
+
+```
+// Net girişten brüt girişe doğru geri çalışın.
+// ücret brüt üzerinde uygulanır, bu nedenle:
+//   net = brut − ceil(brut * oran / D)
+//       ≈ brut * (D − oran) / D
+// sıvı yerlerde tavanlama ile ters çevirme:
+gross_needed = ceil(Δx_net * D / (D − trade_fee_rate))
+```
+
+Token-2022 girişinde bunu sarın:
+
+```
+gross_needed_before_mint_fee
+  = inflate_for_transfer_fee(gross_needed, input_mint)
+```
+
+böylece kullanıcı yeterince öder ki mint'in transfer-fee kesintisinden sonra havuz `gross_needed`'i almaya devam eder.
+
+### Kaymama kontrolü
+
+```
+require(gross_needed_before_mint_fee <= maximum_amount_in, "AmountSpecifiedExceedsMaximum")
+```
+
+## Çalışılmış örnek
+
+Havuz durumu, Token-2022'yi göz ardı ederek:
+
+- `x = 1_000_000_000_000` (token0 için 1.000.000,000000, 6 ondalak)
+- `y = 2_000_000_000_000` (token1 için 2.000.000,000000, 6 ondalak)
+- `AmmConfig`: `trade_fee_rate = 2500`, `protocol_fee_rate = 120_000`, `fund_fee_rate = 40_000`, `creator_fee_rate = 0`
+
+Kullanıcı: `amount_in = 1_000_000_000` (token0 için 1.000,000000) ile `SwapBaseInput`. Yaratıcı ücreti devre dışı (`enable_creator_fee = false`).
+
+```
+trade_fee                = ceil(1_000_000_000 * 2500 / 1_000_000)       = 2_500_000
+  protocol_fee           = floor(2_500_000 * 120_000 / 1_000_000)       = 300_000
+  fund_fee               = floor(2_500_000 *  40_000 / 1_000_000)       = 100_000
+  lp_fee                 = 2_500_000 − 300_000 − 100_000                 = 2_100_000
+creator_fee              = 0                                              // devre dışı
+
+amount_in_after_trade_fee = 1_000_000_000 − 2_500_000                    = 997_500_000
+
+amount_out = y − (x * y) / (x + Δx_net)
+           = 2_000_000_000_000
+             − (1_000_000_000_000 * 2_000_000_000_000)
+               / (1_000_000_000_000 + 997_500_000)
+           ≈ 1_995_015_009
+
+new_vault0_raw   = x + amount_in                                        = 1_001_000_000_000
+new_vault1       = y − amount_out                                       ≈ 1_998_004_984_991
+
+// Kasada0 alınan 1_000_000_000'dan 400_000'i "birikmiş ücret"
+// (protokol + fon) eğrinin hariç tutması gereken:
+curve_x          = new_vault0_raw − (protocol_fees_token0 + fund_fees_token0)
+                 = 1_001_000_000_000 − 400_000
+                 = 1_000_999_600_000
+
+k' = curve_x * new_vault1 ≈ 2.000_002_501_E24  ≥  k = 2.0E24   ✓
+```
+
+Eğer aynı havuzun `enable_creator_fee = true` ile `creator_fee_rate = 1000` (giriş tarafında %0,10) olsaydı, program `total_input_fee = ceil(1_000_000_000 * 3500 / 1_000_000) = 3_500_000` ücretlendirecek, daha sonra bunu `creator_fee = 1_000_000` ve `trade_fee = 2_500_000` olarak bölecekti. `trade_fee`'deki protokol/fon/LP aritmetiği yukarıdaki örnekten değişmez — yaratıcı ücreti kendi demetidir, `creator_fees_token0`'e biriktirilir ve protokol ve fon demetleriyle birlikte `curve_x`'ten hariç tutulur.
+
+Eğer giriş mint'inin %1 Token-2022 transfer ücreti varsa, kasa `1_000_000_000` yerine `990_000_000` token alır ve sonraki her hesaplama bu net tutarı kullanır.
+
+## Observation güncelleme kuralı
+
+Her swapda, program halka tamponuna yeni bir observation itip itiyeceğini değerlendirirmiş:
+
+```
+let since_last = now − observations[head].block_timestamp;
+if since_last >= MIN_OBSERVATION_INTERVAL {
+    let price0 = (vault1 << 32) / vault0;            // Q32.32-ish
+    let price1 = (vault0 << 32) / vault1;
+    let head' = (head + 1) % OBSERVATION_NUM;
+    observations[head'] = Observation {
+        block_timestamp: now,
+        cumulative_token0_price_x32:
+            observations[head].cumulative_token0_price_x32 + price0 * since_last,
+        cumulative_token1_price_x32:
+            observations[head].cumulative_token1_price_x32 + price1 * since_last,
+    };
+    head = head';
+}
+```
+
+İki özellik:
+
+- **Kümülatif fiyat, spot fiyat değil.** Tek bir observation fiyat değildir. `t0`'dan `t1`'e TWAP almak için, her ucuna en yakın observationları okuyun ve `(cumulative(t1) − cumulative(t0)) / (t1 − t0)`'ı hesaplayın.
+- **Örnekler hız sınırlıdır.** Aynı slotta arka arkaya swaplar bir observation paylaşabilir. Bir swapdan hemen sonra bir observation okumak bu nedenle bir slot tarafından bozuk görünebilir — bu normaldir.
+
+Daha fazla [`/tr/products/clmm/accounts`](/tr/products/clmm/accounts) bölümünde.
+
+## Eğri üzerindeki ücretler
+
+Bu ince kısım ve dikkat çekmeye değer. Eğri aritmetiği **net** kasa bakiyelerine karşı çalışır — yani ham SPL bakiyesi eksi birikmiş protokol, fon ve yaratıcı ücretleri (üçü de bağımsız demetlerdir — [`/tr/products/cpmm/fees`](/tr/products/cpmm/fees) bölümüne bakın). Somut bir resim:
+
+```
+raw_vault_balance   = RPC getTokenAccountBalance'in döndürdüğü şey
+accrued_fees        = protocol_fees_token{0,1} + fund_fees_token{0,1} + creator_fees_token{0,1}
+curve_balance       = raw_vault_balance − accrued_fees
+invariant           = curve_balance0 * curve_balance1
+```
+
+Entegratörler için sonuçlar:
+
+- **Ham bakiyelerden alıntı yapmayın.** Önce birikmiş-ücret alanlarını çıkartın veya benzetim olarak `SwapBaseInput`'ı çağırın ve dönüşünü alın.
+- **`CollectProtocolFee` tokenları kasanın dışına taşır.** Koleksiyondan sonra `raw_vault_balance` düşer ancak `curve_balance` değişmez; havuzun fiyatı hareket etmez. Bu kasten tasarlanmıştır.
+
+## Hassasiyet ve taşma
+
+- Tüm eğri aritmetiği `x * y` üzerinde taşmayı önlemek için `u128` ara değerlerini kullanır.
+- Bölme sıfıra doğru yuvarlanır, bunun istisnası `SwapBaseOutput`'un `Δx_net`'idir (yukarı yuvarlanır) ve ücret hesaplaması (`trade_fee`'de yukarı, alt bölmeler üzerinde aşağı yuvarlanır). Bu yuvarlama yönleri, değişmezin asla tamsayı kesme nedeniyle azalmaması için seçilmiştir.
+- Aşırı kasa oranlarına sahip havuzlar (milyarlar : 1) küçük işlemler üzerinde hassasiyet katlarına çarpabilir; bu durumda program `ZeroTradingTokens` döndürür. [`/tr/reference/error-codes`](/tr/reference/error-codes) bölümüne bakın.
+
+## Sonraki adım nedir
+
+- [`/tr/products/cpmm/fees`](/tr/products/cpmm/fees) — tam ücret seviyesi ve koleksiyon semantiği.
+- [`/tr/products/cpmm/instructions`](/tr/products/cpmm/instructions) — bu matematiği çağıran talimatlar.
+- [`/tr/algorithms/constant-product`](/tr/algorithms/constant-product) — AMM v4 ve CPMM arasında paylaşılan `x · y = k`'ın türetmesi ve kenar durumları.
+
+Kaynaklar:
+
+- [`raydium-io/raydium-cp-swap` — `states/curve.rs`'deki swap matematiği](https://github.com/raydium-io/raydium-cp-swap)
+- [`/tr/security/audits`](/tr/security/audits) bölümünde bağlantılandırılan Raydium denetim raporları

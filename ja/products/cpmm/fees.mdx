@@ -1,0 +1,264 @@
+---
+title: "CPMMのフィー"
+description: "CPMMがスワップごとにトレードフィーとクリエイターフィーの2つのフィーをどのように請求し、トレードフィーをLP、プロトコルトレジャリー、ファンドマルチシグ間でどのように分割し、誰が何をいつ集めるかについて。"
+---
+
+<Info>
+  **このページは AI による自動翻訳です。すべての内容は英語版を正とします。**
+
+  [英語版を表示 →](/products/cpmm/fees)
+</Info>
+
+## 2つの独立したフィー、4つの宛先
+
+CPMMはすべてのスワップに対して**レートが別々に設定された2つのフィー**を課します。
+
+1. **トレードフィー** — `AmmConfig.trade_fee_rate`で請求され、3つの宛先に分割されます：
+   - **LPシェア** — バルトに留まり、`k`を増やします。LPトークンをバーンすることで暗黙的に請求されます。
+   - **プロトコルシェア** — `PoolState.protocol_fees_token*`に計上され、`protocol_owner`が`CollectProtocolFee`経由で回収します。
+   - **ファンドシェア** — `PoolState.fund_fees_token*`に計上され、`fund_owner`が`CollectFundFee`経由で回収します。
+2. **クリエイターフィー**（オプション、プールごと） — `AmmConfig.creator_fee_rate`で請求され、トレードフィーとは**独立して**、`PoolState.creator_fees_token*`に計上され、`pool_state.pool_creator`が`CollectCreatorFee`経由で回収します。プールが`enable_creator_fee = true`で作成された場合のみアクティブです。
+
+クリエイターフィーはトレードフィーのスライスでは**ありません**。2つのレートはスワップ入力時にフィーが差し引かれるときに加算されますが、各々は独立したバケットであり続けます — プロトコルとファンドのシェアは常に`trade_fee`からのみ導出され、`creator_fee`からは導出されません。`creator_fee_rate = 1000`（0.10%）と`trade_fee_rate = 2500`（0.25%）のプールは、クリエイターフィーが入力側の場合、入力の合計0.35%を請求し、そのうちクリエイターが0.10%を保持し、トレードフィーバケットが0.25%を受け取ります。
+
+トレードフィーレート（`trade_fee_rate`、`protocol_fee_rate`、`fund_fee_rate`）とクリエイターフィーレートはすべて`AmmConfig`に配置されます。プールごとの`enable_creator_fee`フラグとクリエイターフィーモード（トレードのどちら側からクリエイターフィーを取得するか）は`PoolState`に配置されます。[`products/cpmm/accounts`](/ja/products/cpmm/accounts)を参照してください。
+
+## レートと単位
+
+すべてのレートは`1 / FEE_RATE_DENOMINATOR`の単位で示される`u64`です。ここで`FEE_RATE_DENOMINATOR = 1_000_000`です。
+
+- **`trade_fee_rate`** は**スワップボリューム**の分数です。`2500` ⇒ 関連する側（`creator_fee_on`に応じて入力または出力）のボリュームの0.25%。
+- **`creator_fee_rate`** は**スワップボリューム**の分数で、トレードフィーとは**別に**取得されます。`1000` ⇒ 関連する側のボリュームの0.10%。
+- **`protocol_fee_rate`** と**`fund_fee_rate`** はボリュームではなく、**トレードフィー**の分数です。`120_000` ⇒ トレードフィーの12%。
+
+メインネット上の`AmmConfig[index=0]`（「標準」0.25%プール）のデフォルトパラメータ参照用：
+
+| フィールド | 値 | 実効パーセンテージ |
+|-------|-------|-------------------|
+| `trade_fee_rate` | `2500` | ボリュームの0.25%（トレードフィーバケット） |
+| `protocol_fee_rate` | `120000` | トレードフィーの12% ≈ **ボリュームの0.030%** |
+| `fund_fee_rate` | `40000` | トレードフィーの4% ≈ **ボリュームの0.010%** |
+| `creator_fee_rate` | `0`（デフォルト） | 0%（別バケット） |
+| → LP シェア実効 | | **ボリュームの0.210%** |
+
+したがって、`AmmConfig[0]`に対する\$1,000スワップで`enable_creator_fee = false`の場合：\$2.50の合計トレードフィー、そのうち\$2.10はLPに残り、\$0.30はプロトコルに、\$0.10はファンドに行きます。クリエイターフィーが無効化されているため、クリエイターバケットは0です。
+
+同じプールが`enable_creator_fee = true`と`creator_fee_rate = 1000`（0.10%）を持っていた場合、ユーザーはクリエイターバケットに追加で\$1.00を支払う — `creator_fee_on`で設定されたトレードの同じ側から取得 — 合計\$3.50のフィーになります。トレードフィーバケットとそのプロトコル/ファンド分割は変わりません。
+
+現在のメインネット値を`GET https://api-v3.raydium.io/main/cpmm-config`で確認してください — レートは管理者が変更可能で、ハードコーディングするのではなく新鮮に読む必要があります。
+
+## コードでの分割
+
+```rust
+// raydium-cp-swap/programs/cp-swap/src/curve/{calculator,fees}.rs からのパラフレーズ。
+// 実際のコードは `is_creator_fee_on_input` 上で分岐します；両方の分岐は
+// creator_fee がトレードフィーのスライスではなく、独自のレートであるという不変量を保持します。
+
+const FEE_RATE_DENOMINATOR_VALUE: u64 = 1_000_000;
+
+pub struct FeeBreakdown {
+    pub amount_in_after_fees: u64,    // 入力から取得されたすべてのフィーを差引いた金額
+    pub amount_out_after_fees: u64,   // 出力側で取得されたクリエイターフィーを差引いた金額
+    pub trade_fee:    u64,            // → 以下の LP / プロトコル / ファンド バケットに分割
+    pub protocol_fee: u64,            // trade_fee のシェア
+    pub fund_fee:     u64,            // trade_fee のシェア
+    pub creator_fee:  u64,            // 独立バケット（入力または出力側）
+}
+
+fn take_fees_on_input(
+    amount_in: u64,
+    trade_rate: u64,
+    creator_rate: u64,
+    protocol_rate: u64,
+    fund_rate: u64,
+) -> (u64 /* trade_fee */, u64 /* creator_fee */, u64 /* amount_in_after_fees */) {
+    // 2つのレートが加算されるため、組み合わせたフィーで1回ラウンドしてから
+    // 比例配分します — これは純粋なラウンディング/効率トリックです。
+    // 分割はレートを正確に尊重します： creator_fee/trade_fee == creator_rate/trade_rate。
+    let total_fee = ((amount_in as u128) * ((trade_rate + creator_rate) as u128))
+        .div_ceil(FEE_RATE_DENOMINATOR_VALUE as u128) as u64;
+
+    let creator_fee = ((total_fee as u128) * (creator_rate as u128)
+                       / ((trade_rate + creator_rate) as u128)) as u64;
+    let trade_fee   = total_fee - creator_fee;
+
+    (trade_fee, creator_fee, amount_in - total_fee)
+}
+
+fn take_creator_fee_on_output(amount_out_swapped: u64, creator_rate: u64) -> (u64, u64) {
+    // creator_fee_on がクリエイターフィーを出力側にルーティングする場合、
+    // trade_fee は入力として単一レートで取得され、creator_fee
+    // はカーブ出力に対して計算されます。
+    let creator_fee = ((amount_out_swapped as u128) * (creator_rate as u128))
+        .div_ceil(FEE_RATE_DENOMINATOR_VALUE as u128) as u64;
+    (amount_out_swapped - creator_fee, creator_fee)
+}
+
+fn split_trade_fee(
+    trade_fee: u64,
+    protocol_rate: u64,
+    fund_rate: u64,
+) -> (u64 /* protocol_fee */, u64 /* fund_fee */) {
+    let protocol_fee = (trade_fee as u128 * protocol_rate as u128
+                        / FEE_RATE_DENOMINATOR_VALUE as u128) as u64;
+    let fund_fee     = (trade_fee as u128 * fund_rate as u128
+                        / FEE_RATE_DENOMINATOR_VALUE as u128) as u64;
+    (protocol_fee, fund_fee)
+}
+```
+
+注記：
+
+- 入力の合計フィーは**切り上げ**なので、プールは決してフィーの過少請求をしません。
+- `trade_fee`のサブスプリット（プロトコル、ファンド）は**切り下げ**なので、合計は`trade_fee`を超えません；残りはLPシェアです。
+- `lp_share = trade_fee − protocol_fee − fund_fee`（creator_fee はこれが独自バケットであるため、**差引かれません**）。
+- クリエイターフィーは`PoolState.creator_fee_on`に応じて入力側または出力側から取得されます（次のセクションを参照）。レートはどちらの場合でも変わりません。
+
+## トレードのどちら側からフィーを取得するか
+
+CPMMにはプールごとの`creator_fee_on`設定（`BothToken` / `OnlyToken0` / `OnlyToken1`）があり、クリエイターフィーを特定のスワップの**入力**側または**出力**側から取得するかを決定します。ランタイムヘルパー`is_creator_fee_on_input(direction)`はそれをスワップごとのブール値に圧縮します：
+
+| `creator_fee_on` | スワップ `0 → 1` | スワップ `1 → 0` |
+|------------------|---------------|---------------|
+| `BothToken`（`0`） | 入力側 | 入力側 |
+| `OnlyToken0`（`1`） | 入力側 | 出力側 |
+| `OnlyToken1`（`2`） | 出力側 | 入力側 |
+
+クリエイターフィーが**入力**側の場合、トレードフィーとクリエイターフィーの両方がカーブを実行する前に`amount_in`から差引かれます。見積もり計算：入力から組み合わせた`trade_rate + creator_rate`を取得します。
+
+クリエイターフィーが**出力**側の場合、トレードフィーのみが`amount_in`から差引かれます；カーブは未処理の出力を生成し、その後クリエイターフィーはその出力から差引かれます。見積もり計算：入力から`trade_rate`を取得；出力から`creator_rate`を取得します。
+
+トレードフィー自体は常に入力側から取得されます（標準的なUniswap-V2パターン）。クリエイターフィーのみが出力に到達できます。
+
+## 「計上」フィーがカーブとどのように相互作用するか
+
+重要な微妙な点：**プロトコル、ファンド、クリエイターのフィーは、それぞれの`Collect*`命令が呼ばれるまで物理的にバルトに留まります**。しかし、それらはバルトバランスのカーブ側からは除外されます。
+
+1回のスワップ後の具体的な図：
+
+```
+raw_vault_0_balance = getTokenAccountBalance(vault_0).amount
+                    = lp_entitled + protocol_fees_token0
+                      + fund_fees_token0 + creator_fees_token0
+
+curve_x = raw_vault_0_balance − (protocol_fees_token0
+                                  + fund_fees_token0
+                                  + creator_fees_token0)
+```
+
+プログラムは`k' ≥ k`を強制するときに`curve_x`（および同様の`curve_y`）を使用します。これは、LP シェアをインフレさせずに、非 LP フィーがそれらの宛先に到達する方法です。
+
+設計時に考慮すべき結果：
+
+- **生のバランスから見積もるのは間違いです。** `getTokenAccountBalance`を使用して見積もりを構築する場合、プールが承認する価格を一貫して過大評価します。計上されたフィーを常に差引くか、`SwapBaseInput` / API経由でシミュレートしてください。
+- **`CollectProtocolFee`は価格を動かしません。** バルトからトークンを移動し、*かつ*`protocol_fees_token*`カウンターをゼロにするため、`curve_x`と`curve_y`は変わりません。
+- **LPフィーはカウンターに計上されません。** バルトバランスに暗黙的です。蓄積されたLPフィーへのLPの権利は、LPトークンをバーン（つまり`Withdraw`経由）することで行使されます — `CollectLpFee`はありません。
+
+## Token-2022転送フィーとの相互作用
+
+Token-2022転送フィーは**CPMM により、ミントによって**適用されます。スワップ、デポジット、ウィズドロウ、および`Collect*`スイープを含むすべてのトークン転送に作用します。CPMMのトレードフィー計算は、実際にバルトに着地した金額、つまり入力ミントの転送フィーを差し引いた金額（存在する場合）に対して計算されます。
+
+したがって最悪の場合、ユーザーは入力額確定スワップで3つの異なる税を支払う：
+
+1. 入力ミントの`amount_in`に対する転送フィー（ミントのフィー権限に）。
+2. プールの`trade_fee`で残金（上記のように分割）。
+3. 出力ミントの`amount_out`に対する転送フィー（ミントのフィー権限に）。
+
+SDKの見積もりは3つすべてを考慮に入れるため、`minimum_amount_out`はユーザーが実際に受け取る金額で示されます。独自の見積もりを書く場合は、その動作をミラーするか、スリップページチェックが体系的に寛容になります。
+
+詳細な導出については[`algorithms/token-2022-transfer-fees`](/ja/algorithms/token-2022-transfer-fees)を参照してください。
+
+## クリエイターフィー
+
+クリエイターフィーはオプションでプールごとです。**レート**は`AmmConfig.creator_fee_rate`に、**有効化フラグ**と**側**（`creator_fee_on`）は`PoolState`に配置されます：
+
+- **プール作成時に有効化。** `Initialize`はデフォルトで`enable_creator_fee = false`を設定します；`InitializeWithPermission`経由で作成されたプール（LaunchLab卒業やその他のゲート付きパスで使用）は`enable_creator_fee = true`を渡し、`creator_fee_on`を選択できます。
+- **レートはフィーティアと共有。** レート自体は`AmmConfig.creator_fee_rate`で、そのコンフィグに結合されたすべてのプール間で同じ値です。各プールはそれを請求するかどうか（`enable_creator_fee`）と、スワップのどちら側を請求するか（`creator_fee_on`）を決定します。`enable_creator_fee = false`の場合、プールの有効なクリエイターフィーレートはコンフィグ値に関係なくゼロです（ソースの`PoolState::adjust_creator_fee_rate`を参照）。
+- **トレードフィーと独立。** クリエイターフィーはLP/プロトコル/ファンドシェアを削減しません — それは独自のレートで、別に適用され、独自のカウンターに計上されます。
+- **`CollectCreatorFee`経由で回収**され、`PoolState.pool_creator`でサイン。
+- **作成後に再有効化または再ルーティングできません。** `enable_creator_fee = false`で初期化されたプールはクリエイターフィーを請求しません；特定の`creator_fee_on`で初期化されたプールはサイドを切り替えできません。
+
+クリエイターフィーはRaydium の「Burn & Earn」パターンの仕組みです：LPトークンは[LP Lock](/reference/program-addresses)プログラムの下でロックされるため、クリエイターはリクイディティを引き出せませんが、無期限に`CollectCreatorFee`を請求できます。
+
+## 回収操作フロー
+
+| サイナー | 命令 | ゼロ化されるカウンター | 典型的なペース |
+|--------|-------------|------------------------|-----------------|
+| `amm_config.protocol_owner` | `CollectProtocolFee` | `protocol_fees_token{0,1}` | 週次またはプログラマティック |
+| `amm_config.fund_owner` | `CollectFundFee` | `fund_fees_token{0,1}` | 週次またはプログラマティック |
+| `pool_state.pool_creator` | `CollectCreatorFee` | `creator_fees_token{0,1}` | いつでも |
+
+プロトコルおよびファンド所有者はメインネット上のRaydiumマルチシグです；[`security/admin-and-multisig`](/ja/security/admin-and-multisig)を参照してください。クリエイターサイナーは`Initialize`を実行したアカウントです。
+
+## フィーティアの変更
+
+フィーレートは管理者が`UpdateAmmConfig`経由で変更できます（[`products/cpmm/instructions`](/ja/products/cpmm/instructions)を参照）。変更は、そのコンフィグに結合されたすべてのプール対して**次のスワップ**で有効になります — プールは各スワップでコンフィグを読み込むため、マイグレーションはありません。
+
+管理者ができないこと：
+
+- プールを1つの`AmmConfig`から別のものに移動。
+- すでに計上されたフィーを遡及的に価格設定し直す。
+- `protocol_owner` / `fund_owner`サイナーなしでフィーを集める。
+
+## 実行中のプールからフィーを読む
+
+```ts
+// オフチェーン：各バケットに現在計上されているフィー
+const pool = await connection.getAccountInfo(poolStatePda);
+const decoded = PoolState.decode(pool.data);
+console.log(
+  "Protocol accrued:",
+  decoded.protocolFeesToken0.toString(),
+  decoded.protocolFeesToken1.toString(),
+);
+console.log(
+  "Fund accrued:",
+  decoded.fundFeesToken0.toString(),
+  decoded.fundFeesToken1.toString(),
+);
+console.log(
+  "Creator accrued:",
+  decoded.creatorFeesToken0.toString(),
+  decoded.creatorFeesToken1.toString(),
+);
+
+// オフチェーン：今日の有効レート。
+// trade_fee_rate、creator_fee_rate はボリュームの分数（分母 1e6）です。
+// protocol_fee_rate、fund_fee_rate は*トレードフィー*の分数（同じ分母）です。
+const config = await fetch("https://api-v3.raydium.io/main/cpmm-config")
+  .then((r) => r.json());
+const tier = config.data.find((t) => t.index === decoded.ammConfigIndex);
+
+const tradeFeeOfVolume   = tier.tradeFeeRate / 1_000_000;
+const protocolOfTradeFee = tier.protocolFeeRate / 1_000_000;
+const fundOfTradeFee     = tier.fundFeeRate / 1_000_000;
+const lpOfTradeFee       = 1 - protocolOfTradeFee - fundOfTradeFee;
+
+console.log("LP fee effective:",       (tradeFeeOfVolume * lpOfTradeFee * 100).toFixed(4), "%");
+console.log("Protocol fee effective:", (tradeFeeOfVolume * protocolOfTradeFee * 100).toFixed(4), "%");
+console.log("Fund fee effective:",     (tradeFeeOfVolume * fundOfTradeFee * 100).toFixed(4), "%");
+console.log(
+  "Creator fee effective:",
+  decoded.enableCreatorFee
+    ? ((tier.creatorFeeRate / 1_000_000) * 100).toFixed(4) + " %"
+    : "0 % (disabled on this pool)",
+);
+```
+
+## CLMMおよびAMM v4との比較
+
+[`reference/fee-comparison`](/ja/reference/fee-comparison)で並列マトリックスを参照してください。サマリ：
+
+- **AMM v4**は異なるLP/プロトコル分割でコンバイン固定0.25%トレードフィーを使用し、ファンドフィーはありません。
+- **CLMM**フィーはティック間隔ティアごと（プールごとではなくポジションごと）で、`DecreaseLiquidity`または`CollectFees`経由で請求されます。
+
+## 次に行く場所
+
+- [`products/cpmm/math`](/ja/products/cpmm/math) — トレードフィー控除がカーブにどのように適用されるか。
+- [`products/cpmm/instructions`](/ja/products/cpmm/instructions) — `Collect*`命令アカウントリスト。
+- [`algorithms/token-2022-transfer-fees`](/ja/algorithms/token-2022-transfer-fees) — プールトレードフィーとミント転送フィーを正しく組み合わせる方法。
+
+出典：
+
+- [`raydium-io/raydium-cp-swap` — `states/config.rs`, `states/pool.rs`, `states/curve.rs`](https://github.com/raydium-io/raydium-cp-swap)
+- [Raydium API — `GET /main/cpmm-config`](https://api-v3.raydium.io/main/cpmm-config)

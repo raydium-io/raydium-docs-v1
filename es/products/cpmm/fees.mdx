@@ -1,0 +1,264 @@
+---
+title: "Cuotas CPMM"
+description: "Cómo CPMM cobra una cuota de intercambio y una cuota de creador separada, divide la cuota de intercambio entre los proveedores de liquidez, la tesorería del protocolo y la multisig del fondo, y quién cobra qué y cuándo."
+---
+
+<Info>
+  **Esta página fue traducida automáticamente por IA. La versión en inglés es la fuente autorizada.**
+
+  [Ver versión en inglés →](/products/cpmm/fees)
+</Info>
+
+## Dos cuotas independientes, cuatro destinos
+
+CPMM cobra **dos cuotas con tasas independientes** en cada intercambio:
+
+1. **Cuota de intercambio** — cobrada en `AmmConfig.trade_fee_rate` y dividida entre tres destinos:
+   - **Participación de LP** — permanece en la bóveda y crece `k`. Se reclama implícitamente al quemar tokens de LP.
+   - **Participación del protocolo** — acumulada en `PoolState.protocol_fees_token*`; retirada por el `protocol_owner` vía `CollectProtocolFee`.
+   - **Participación del fondo** — acumulada en `PoolState.fund_fees_token*`; retirada por el `fund_owner` vía `CollectFundFee`.
+2. **Cuota de creador** (opcional, por pool) — cobrada en `AmmConfig.creator_fee_rate` **independientemente** de la cuota de intercambio, acumulada en `PoolState.creator_fees_token*`, retirada por `pool_state.pool_creator` vía `CollectCreatorFee`. Activa solo cuando el pool se creó con `enable_creator_fee = true`.
+
+La cuota de creador **no es** una parte de la cuota de intercambio. Las dos tasas se suman cuando se cobra en la entrada del intercambio, pero cada una permanece en su propio depósito — las participaciones del protocolo y del fondo siempre se derivan de `trade_fee` únicamente, nunca de `creator_fee`. Un pool con `creator_fee_rate = 1000` (0.10%) y `trade_fee_rate = 2500` (0.25%) cobra un total combinado del 0.35% de la entrada en un intercambio con cuota de creador en entrada, de la cual el creador retiene el 0.10% y el depósito de cuota de intercambio obtiene el 0.25%.
+
+Las tasas de cuota de intercambio (`trade_fee_rate`, `protocol_fee_rate`, `fund_fee_rate`) y `creator_fee_rate` se encuentran en `AmmConfig`. La bandera `enable_creator_fee` por pool y el modo `creator_fee_on` (de qué lado del intercambio se cobra la cuota de creador) se encuentran en `PoolState`. Ver [`products/cpmm/accounts`](/es/products/cpmm/accounts).
+
+## Tasas y unidades
+
+Todas las tasas son `u64` denominadas en unidades de `1 / FEE_RATE_DENOMINATOR` donde `FEE_RATE_DENOMINATOR = 1_000_000`.
+
+- **`trade_fee_rate`** es una fracción del **volumen de intercambio**. `2500` ⇒ 0.25% del lado relevante (entrada o salida, dependiendo de `creator_fee_on` — ver "De qué lado del intercambio se cobran las cuotas" más abajo).
+- **`creator_fee_rate`** es una fracción del **volumen de intercambio**, cobrada **separadamente** de la cuota de intercambio. `1000` ⇒ 0.10% del lado relevante.
+- **`protocol_fee_rate`** y **`fund_fee_rate`** son fracciones de la **cuota de intercambio**, no del volumen. `120_000` ⇒ 12% de la cuota de intercambio.
+
+Parámetros predeterminados para `AmmConfig[index=0]` (el pool estándar del 0.25%) en mainnet, como referencia:
+
+| Campo | Valor | Porcentaje efectivo |
+|-------|-------|-------------------|
+| `trade_fee_rate` | `2500` | 0.25% del volumen (depósito de cuota de intercambio) |
+| `protocol_fee_rate` | `120000` | 12% de la cuota de intercambio ≈ **0.030% del volumen** |
+| `fund_fee_rate` | `40000` | 4% de la cuota de intercambio ≈ **0.010% del volumen** |
+| `creator_fee_rate` | `0` (predeterminado) | 0% (depósito separado) |
+| → Participación efectiva de LP | | **0.210% del volumen** |
+
+Entonces en un intercambio de \$1,000 contra `AmmConfig[0]` con `enable_creator_fee = false`: \$2.50 de cuota de intercambio total, de los cuales \$2.10 permanecen con los LP, \$0.30 van al protocolo, \$0.10 al fondo. El depósito de creador es 0 porque la cuota de creador está deshabilitada.
+
+Si el mismo pool tuviera `enable_creator_fee = true` y `creator_fee_rate = 1000` (0.10%), el usuario paga un \$1.00 adicional al depósito del creador — cobrado del mismo lado del intercambio configurado por `creator_fee_on` — para un total de \$3.50 en cuotas. El depósito de cuota de intercambio y sus divisiones de protocolo/fondo no cambian.
+
+Confirma los valores mainnet actuales contra `GET https://api-v3.raydium.io/main/cpmm-config` — las tasas son mutables por administrador y deben leerse frescos en lugar de codificarse.
+
+## La división, en código
+
+```rust
+// Parafraseado de raydium-cp-swap/programs/cp-swap/src/curve/{calculator,fees}.rs.
+// El código real se ramifica en `is_creator_fee_on_input`; ambas ramas preservan el
+// invariante de que creator_fee es su propia tasa, nunca una parte de trade_fee.
+
+const FEE_RATE_DENOMINATOR_VALUE: u64 = 1_000_000;
+
+pub struct FeeBreakdown {
+    pub amount_in_after_fees: u64,    // entrada menos todas las cuotas cobradas en el lado de entrada
+    pub amount_out_after_fees: u64,   // salida menos cualquier cuota de creador cobrada en el lado de salida
+    pub trade_fee:    u64,            // → dividida en depósitos de LP / protocolo / fondo abajo
+    pub protocol_fee: u64,            // parte de trade_fee
+    pub fund_fee:     u64,            // parte de trade_fee
+    pub creator_fee:  u64,            // depósito independiente (lado de entrada o salida)
+}
+
+fn take_fees_on_input(
+    amount_in: u64,
+    trade_rate: u64,
+    creator_rate: u64,
+    protocol_rate: u64,
+    fund_rate: u64,
+) -> (u64 /* trade_fee */, u64 /* creator_fee */, u64 /* amount_in_after_fees */) {
+    // Las dos tasas se suman para que redondeemos una vez en la cuota combinada, luego dividimos
+    // proporcionalmente — esto es puramente un truco de redondeo/eficiencia. La división
+    // honra las tasas exactamente: creator_fee/trade_fee == creator_rate/trade_rate.
+    let total_fee = ((amount_in as u128) * ((trade_rate + creator_rate) as u128))
+        .div_ceil(FEE_RATE_DENOMINATOR_VALUE as u128) as u64;
+
+    let creator_fee = ((total_fee as u128) * (creator_rate as u128)
+                       / ((trade_rate + creator_rate) as u128)) as u64;
+    let trade_fee   = total_fee - creator_fee;
+
+    (trade_fee, creator_fee, amount_in - total_fee)
+}
+
+fn take_creator_fee_on_output(amount_out_swapped: u64, creator_rate: u64) -> (u64, u64) {
+    // Cuando creator_fee_on encamina la cuota de creador al lado de salida,
+    // trade_fee se cobra en entrada como una tasa única, y creator_fee
+    // se calcula contra la salida de la curva.
+    let creator_fee = ((amount_out_swapped as u128) * (creator_rate as u128))
+        .div_ceil(FEE_RATE_DENOMINATOR_VALUE as u128) as u64;
+    (amount_out_swapped - creator_fee, creator_fee)
+}
+
+fn split_trade_fee(
+    trade_fee: u64,
+    protocol_rate: u64,
+    fund_rate: u64,
+) -> (u64 /* protocol_fee */, u64 /* fund_fee */) {
+    let protocol_fee = (trade_fee as u128 * protocol_rate as u128
+                        / FEE_RATE_DENOMINATOR_VALUE as u128) as u64;
+    let fund_fee     = (trade_fee as u128 * fund_rate as u128
+                        / FEE_RATE_DENOMINATOR_VALUE as u128) as u64;
+    (protocol_fee, fund_fee)
+}
+```
+
+Notas:
+
+- La cuota total en entrada redondea **hacia arriba** para que el pool nunca cobre de menos.
+- Las subdivisiones de `trade_fee` (protocolo, fondo) redondean **hacia abajo** para que su suma nunca exceda `trade_fee`; el resto es la participación de LP.
+- `lp_share = trade_fee − protocol_fee − fund_fee` (creator_fee **no** se resta aquí porque es su propio depósito).
+- La cuota de creador se cobra de entrada o salida dependiendo de `PoolState.creator_fee_on` (ver siguiente sección). La tasa permanece sin cambios de cualquier manera.
+
+## De qué lado del intercambio se cobran las cuotas
+
+CPMM tiene una configuración `creator_fee_on` por pool (`BothToken` / `OnlyToken0` / `OnlyToken1`) que determina si la cuota de creador se cobra del lado de **entrada** o **salida** de un intercambio dado. La función de ayuda en tiempo de ejecución `is_creator_fee_on_input(direction)` reduce eso a un booleano por intercambio:
+
+| `creator_fee_on` | Intercambio `0 → 1` | Intercambio `1 → 0` |
+|------------------|---------------|---------------|
+| `BothToken` (`0`) | lado de entrada | lado de entrada |
+| `OnlyToken0` (`1`) | lado de entrada | lado de salida |
+| `OnlyToken1` (`2`) | lado de salida | lado de entrada |
+
+Cuando la cuota de creador está en el lado de **entrada**, tanto la cuota de intercambio como la cuota de creador se deducen de `amount_in` antes de que se ejecute la curva. Matemática de cotización: toma el `trade_rate + creator_rate` combinado de la entrada.
+
+Cuando la cuota de creador está en el lado de **salida**, solo la cuota de intercambio se deduce de `amount_in`; la curva produce una salida sin cuota, luego se deduce la cuota de creador de esa salida. Matemática de cotización: toma `trade_rate` de la entrada; toma `creator_rate` de la salida.
+
+La cuota de intercambio en sí siempre se cobra en el lado de entrada (el patrón estándar de Uniswap-V2). Solo la cuota de creador puede aterrizarse en la salida.
+
+## Cómo las cuotas "acumuladas" interactúan con la curva
+
+Un detalle importante: **las cuotas de protocolo, fondo y creador permanecen físicamente en la bóveda** hasta que se llama a su respectiva instrucción `Collect*`. Pero se excluyen de la vista de la curva del saldo de la bóveda.
+
+Una imagen concreta después de un intercambio:
+
+```
+raw_vault_0_balance = getTokenAccountBalance(vault_0).amount
+                    = lp_entitled + protocol_fees_token0
+                      + fund_fees_token0 + creator_fees_token0
+
+curve_x = raw_vault_0_balance − (protocol_fees_token0
+                                  + fund_fees_token0
+                                  + creator_fees_token0)
+```
+
+El programa usa `curve_x` (y el análogo `curve_y`) cuando aplica `k' ≥ k`. Así es como las cuotas que no son de LP alcanzan sus destinos **sin** inflar la participación de LP del pool.
+
+Consecuencias que deberías tener en cuenta:
+
+- **Cotizar a partir de saldos brutos es incorrecto.** Si construyes un cotizador a partir de `getTokenAccountBalance`, consistentemente sobreestimarás el precio que el pool honrará. Siempre resta cuotas acumuladas, o simula vía `SwapBaseInput` / la API.
+- **`CollectProtocolFee` no mueve el precio.** Saca tokens de la bóveda *y* pone a cero los contadores `protocol_fees_token*`, por lo que `curve_x` y `curve_y` permanecen sin cambios.
+- **Las cuotas de LP no se acumulan en un contador.** Son implícitas en el saldo de la bóveda. El derecho de LP a las cuotas de LP acumuladas se ejerce quemando tokens de LP (es decir, vía `Withdraw`) — no hay `CollectLpFee`.
+
+## Interacción con cuotas de transferencia de Token-2022
+
+Las cuotas de transferencia de Token-2022 se aplican por **mint**, no por CPMM. Actúan en cada transferencia de token — intercambio, depósito, retiro, y los barridos de `Collect*`. La matemática de cuota de intercambio de CPMM se calcula contra la cantidad que **realmente aterrizó en la bóveda**, es decir, neta de la cuota de transferencia del mint de entrada (si la hay).
+
+Entonces en el peor caso un usuario paga tres impuestos distintos en un intercambio exacto de entrada:
+
+1. La cuota de transferencia del mint de entrada en `amount_in` (a la autoridad de cuota del mint).
+2. La `trade_fee` del pool en el resto (dividida como se indicó anteriormente).
+3. La cuota de transferencia del mint de salida en `amount_out` (a la autoridad de cuota del mint).
+
+El cotizador del SDK da cuenta de los tres, por lo que `minimum_amount_out` se denomina en lo que el usuario realmente recibe. Si estás escribiendo tu propio cotizador, refleja ese comportamiento, o tus comprobaciones de deslizamiento serán sistemáticamente demasiado generosas.
+
+Ver [`algorithms/token-2022-transfer-fees`](/es/algorithms/token-2022-transfer-fees) para la derivación detallada.
+
+## Cuota de creador
+
+La cuota de creador es opcional y por pool. La **tasa** se encuentra en `AmmConfig.creator_fee_rate`; la **bandera de habilitación** y el **lado** (`creator_fee_on`) se encuentran en `PoolState`:
+
+- **Habilitada en la creación del pool.** `Initialize` establece `enable_creator_fee = false` por defecto; los pools creados vía `InitializeWithPermission` (usado por graduaciones de LaunchLab y otras rutas protegidas) pueden pasar `enable_creator_fee = true` y elegir `creator_fee_on`.
+- **La tasa se comparte con el nivel de cuota.** La tasa en sí es `AmmConfig.creator_fee_rate`, el mismo valor en todos los pools vinculados a esa configuración. Cada pool luego decide si cobrarla (`enable_creator_fee`) y de qué lado del intercambio cobrarla (`creator_fee_on`). Cuando `enable_creator_fee = false`, la tasa de cuota de creador efectiva del pool es cero independientemente del valor de config (ver `PoolState::adjust_creator_fee_rate` en el código fuente).
+- **Independiente de la cuota de intercambio.** La cuota de creador nunca reduce las participaciones de LP / protocolo / fondo — es su propia tasa, aplicada separadamente, acumulada en sus propios contadores.
+- **Barrida vía `CollectCreatorFee`**, firmada por `PoolState.pool_creator`.
+- **No se puede volver a habilitar o redirigir después de la creación.** Un pool inicializado con `enable_creator_fee = false` nunca cobrará una cuota de creador; uno inicializado con un `creator_fee_on` particular no puede cambiar de lado.
+
+Las cuotas de creador son el mecanismo detrás del patrón "Burn & Earn" de Raydium: los tokens de LP se bloquean bajo el programa [LP Lock](/es/reference/program-addresses) para que el creador no pueda retirar liquidez, pero aún puede reclamar `CollectCreatorFee` indefinidamente.
+
+## Flujo operacional de recolección
+
+| Firmante | Instrucción | Contadores fuente puesta a cero | Cadencia típica |
+|--------|-------------|------------------------|-----------------|
+| `amm_config.protocol_owner` | `CollectProtocolFee` | `protocol_fees_token{0,1}` | Semanal o programática |
+| `amm_config.fund_owner` | `CollectFundFee` | `fund_fees_token{0,1}` | Semanal o programática |
+| `pool_state.pool_creator` | `CollectCreatorFee` | `creator_fees_token{0,1}` | Cualquier momento |
+
+Los propietarios del protocolo y del fondo son la multisig de Raydium en mainnet; ver [`security/admin-and-multisig`](/es/security/admin-and-multisig). El firmante del creador es la cuenta que ejecutó `Initialize`.
+
+## Cambiar un nivel de cuota
+
+Las tasas de cuota se pueden cambiar por el administrador vía `UpdateAmmConfig` (ver [`products/cpmm/instructions`](/es/products/cpmm/instructions)). Los cambios toman efecto en el **siguiente intercambio** para cada pool vinculado a ese `AmmConfig` — no hay migración, porque los pools cargan la configuración en cada intercambio.
+
+Lo que el administrador no puede hacer:
+
+- Mover un pool de un `AmmConfig` a otro.
+- Repreciar retroactivamente cuotas ya acumuladas.
+- Recopilar cuotas sin la firma del `protocol_owner` / `fund_owner`.
+
+## Leyendo cuotas de un pool en ejecución
+
+```ts
+// Fuera de la cadena: cuotas acumuladas actuales en cada depósito
+const pool = await connection.getAccountInfo(poolStatePda);
+const decoded = PoolState.decode(pool.data);
+console.log(
+  "Protocol accrued:",
+  decoded.protocolFeesToken0.toString(),
+  decoded.protocolFeesToken1.toString(),
+);
+console.log(
+  "Fund accrued:",
+  decoded.fundFeesToken0.toString(),
+  decoded.fundFeesToken1.toString(),
+);
+console.log(
+  "Creator accrued:",
+  decoded.creatorFeesToken0.toString(),
+  decoded.creatorFeesToken1.toString(),
+);
+
+// Fuera de la cadena: tasas efectivas hoy.
+// trade_fee_rate, creator_fee_rate son fracciones del volumen (denominador 1e6).
+// protocol_fee_rate, fund_fee_rate son fracciones de la *cuota de intercambio* (mismo denominador).
+const config = await fetch("https://api-v3.raydium.io/main/cpmm-config")
+  .then((r) => r.json());
+const tier = config.data.find((t) => t.index === decoded.ammConfigIndex);
+
+const tradeFeeOfVolume   = tier.tradeFeeRate / 1_000_000;
+const protocolOfTradeFee = tier.protocolFeeRate / 1_000_000;
+const fundOfTradeFee     = tier.fundFeeRate / 1_000_000;
+const lpOfTradeFee       = 1 - protocolOfTradeFee - fundOfTradeFee;
+
+console.log("LP fee effective:",       (tradeFeeOfVolume * lpOfTradeFee * 100).toFixed(4), "%");
+console.log("Protocol fee effective:", (tradeFeeOfVolume * protocolOfTradeFee * 100).toFixed(4), "%");
+console.log("Fund fee effective:",     (tradeFeeOfVolume * fundOfTradeFee * 100).toFixed(4), "%");
+console.log(
+  "Creator fee effective:",
+  decoded.enableCreatorFee
+    ? ((tier.creatorFeeRate / 1_000_000) * 100).toFixed(4) + " %"
+    : "0 % (disabled on this pool)",
+);
+```
+
+## Comparación con CLMM y AMM v4
+
+Ver [`reference/fee-comparison`](/es/reference/fee-comparison) para una matriz lado a lado. Resumen:
+
+- **AMM v4** usa una cuota de intercambio fija del 0.25% con una división de LP/protocolo diferente y sin cuota de fondo.
+- **CLMM** las cuotas son por nivel de espaciamiento de tick, acumuladas por posición (no por pool), y reclamadas vía `DecreaseLiquidity` o `CollectFees`.
+
+## A dónde ir a continuación
+
+- [`products/cpmm/math`](/es/products/cpmm/math) — donde la deducción de cuota de intercambio se conecta a la curva.
+- [`products/cpmm/instructions`](/es/products/cpmm/instructions) — las listas de cuentas de la instrucción `Collect*`.
+- [`algorithms/token-2022-transfer-fees`](/es/algorithms/token-2022-transfer-fees) — cómo combinar correctamente una cuota de intercambio de pool con una cuota de transferencia de mint.
+
+Fuentes:
+
+- [`raydium-io/raydium-cp-swap` — `states/config.rs`, `states/pool.rs`, `states/curve.rs`](https://github.com/raydium-io/raydium-cp-swap)
+- [Raydium API — `GET /main/cpmm-config`](https://api-v3.raydium.io/main/cpmm-config)

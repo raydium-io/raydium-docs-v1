@@ -1,0 +1,211 @@
+---
+title: "LaunchLab GlobalConfig"
+description: "Akun konfigurasi tingkat protokol yang mengikat setiap peluncuran LaunchLab — tingkat biaya, minimum pasokan, batas laju kunci, dompet migrasi yang membatasi kelulusan, dan skema pengindeksan per-kurva."
+---
+
+<Info>
+  **Halaman ini diterjemahkan secara otomatis oleh AI. Versi bahasa Inggris adalah acuan resmi.**
+
+  [Lihat versi bahasa Inggris →](/products/launchlab/global-config)
+</Info>
+
+<Info>
+  `GlobalConfig` adalah akun konfigurasi **tingkat protokol**. Dapat ada banyak akun — dikunci dengan `(curve_type, index)` — dan setiap peluncuran memilih tepat satu pada waktu `Initialize`. Nilai pada `GlobalConfig` yang dipilih kemudian menjadi batas keras untuk parameter peluncuran tersebut. Untuk kustomisasi tingkat platform (tingkat biaya per-platform, bentuk kurva yang diizinkan, pembagian NFT saat kelulusan), lihat [`products/launchlab/platform-config`](/id/products/launchlab/platform-config).
+</Info>
+
+## Apa itu
+
+`GlobalConfig` adalah PDA singleton per `(curve_type, index)` yang menetapkan aturan tingkat protokol yang harus dipatuhi setiap peluncuran:
+
+- Jenis kurva obligasi yang diizinkan (`curve_type`).
+- Tingkat biaya perdagangan yang dikenakan kurva pada setiap pembelian dan penjualan.
+- Biaya migrasi yang dikenakan saat kelulusan.
+- Lantai pada pasokan, tingkat kunci, tingkat jual, dan tingkat migrasi.
+- Mint kutipan (biasanya SOL atau USDC terbungkus) — aset yang dibeli pengguna.
+- Tiga dompet tingkat protokol: pemilik biaya protokol, pemilik biaya migrasi, dan dua dompet kontrol migrasi yang mengotorisasi kelulusan ke AMM v4 / CPMM.
+- Bendera opsional (`requires_platform_auth`) yang membatasi platform mana yang dapat menggunakan konfigurasi ini.
+
+Akun `GlobalConfig` dibuat dan diperbarui oleh admin program LaunchLab (pubkey admin yang dikodekan keras yang dibagikan di seluruh program Raydium berbasis Anchor — lihat [`reference/program-addresses`](/id/reference/program-addresses)).
+
+## Tata letak
+
+```rust
+// states/config.rs
+pub const GLOBAL_CONFIG_SEED: &str = "global_config";
+
+#[account]
+pub struct GlobalConfig {
+    pub epoch:                   u64,         // recent_epoch tracker
+    pub curve_type:              u8,          // 0 = ConstantProduct, 1 = FixedPrice, 2 = LinearPrice
+    pub index:                   u16,         // discriminator within a curve_type
+    pub migrate_fee:             u64,         // SOL paid on graduation
+    pub trade_fee_rate:          u64,         // 1/1_000_000 of volume
+    pub max_share_fee_rate:      u64,         // 100 bps cap on platform share fee
+    pub min_base_supply:         u64,         // floor on Initialize supply (no decimals)
+    pub max_lock_rate:           u64,         // ceiling on vesting locked / supply
+    pub min_base_sell_rate:      u64,         // floor on base_supply_graduation / supply
+    pub min_base_migrate_rate:   u64,         // floor on tokens that seed the post-graduation pool
+    pub min_quote_fund_raising:  u64,         // floor on quote_reserve_target (with decimals)
+    pub quote_mint:              Pubkey,
+    pub protocol_fee_owner:      Pubkey,      // claims protocol fees via CollectFee
+    pub migrate_fee_owner:       Pubkey,      // claims migration fees via CollectMigrateFee
+    pub migrate_to_amm_wallet:   Pubkey,      // can sign MigrateToAmm
+    pub migrate_to_cpswap_wallet:Pubkey,      // can sign MigrateToCpswap
+    pub requires_platform_auth:  u8,          // 0/1 flag
+    pub padding_alignment:       [u8; 7],
+    pub padding:                 [u64; 15],
+}
+```
+
+Derivasi PDA:
+
+```ts
+const [globalConfig] = PublicKey.findProgramAddressSync(
+  [
+    Buffer.from("global_config"),
+    Buffer.from(quoteMint.toBytes()),
+    Buffer.from([curveType]),
+    u16ToBytes(index),
+  ],
+  LAUNCHLAB_PROGRAM_ID,
+);
+```
+
+(Verifikasi urutan seed yang tepat dari akun on-chain sebelum menandatangani — instruksi `create_config` program adalah sumber kebenaran.)
+
+## Semantik bidang
+
+### `curve_type` dan `index`
+
+Bersama-sama ini mengunci `GlobalConfig` secara unik. Ada satu `GlobalConfig` per pasangan `(curve_type, index)`:
+
+- `curve_type = 0` — Kurva cadangan virtual dengan produk konstan. Default dan paling banyak digunakan.
+- `curve_type = 1` — Kurva harga tetap.
+- `curve_type = 2` — Kurva harga linier.
+
+`index` adalah `u16` yang memungkinkan admin menerbitkan beberapa konfigurasi per jenis kurva (misalnya, satu dengan biaya lebih ketat, satu dengan kenaikan kutipan minimum lebih tinggi). Pada `Initialize` peluncuran memasok pasangan `(curve_type, index)` dan program memuat `GlobalConfig` yang cocok.
+
+### Biaya
+
+- `trade_fee_rate` — disebut dalam `1/1_000_000` dari volume perdagangan. Diterapkan pada setiap pembelian dan penjualan di kurva. `protocol_fee_owner` mengklaim bagiannya melalui `CollectFee`.
+- `migrate_fee` — biaya datar dalam lamports (atau satuan kutipan, tergantung konfigurasi) yang dikenakan sekali saat kelulusan. Diklaim oleh `migrate_fee_owner` melalui `CollectMigrateFee`.
+- `max_share_fee_rate` — diinisialisasi menjadi `10_000` (100 bps). Membatasi tingkat biaya berbagi **platform** dari `PlatformConfig` mengikat (lihat [`platform-config`](/id/products/launchlab/platform-config)). Program menegakkan `trade_fee_rate + max_share_fee_rate < RATE_DENOMINATOR_VALUE`.
+
+### Lantai pasokan dan laju
+
+Lantai ini membatasi parameter bentuk kurva apa yang dapat dipilih peluncuran pada `Initialize`. Jika `CurveParams` kreator melanggar salah satunya, `Initialize` dikembalikan dengan `InvalidInput`.
+
+- `min_base_supply` — minimum `supply` (tanpa desimal) yang dapat dinyatakan kurva. Default ke `10_000_000`.
+- `max_lock_rate` — disebut dalam `1/1_000_000`; default `300_000` (30%). Membatasi vesting melalui `total_locked_amount <= supply * max_lock_rate / 1_000_000`.
+- `min_base_sell_rate` — disebut dalam `1/1_000_000`; default `200_000` (20%). Membatasi `base_supply_graduation / supply` dari bawah.
+- `min_base_migrate_rate` — disebut dalam `1/1_000_000`; default `200_000` (20%). Membatasi jumlah token yang tersisa untuk menabur pool pasca-kelulusan.
+- `min_quote_fund_raising` — minimum `quote_reserve_target` yang dapat dinyatakan peluncuran (dengan desimal). Default ke satuan `30_000_000_000` dari mint kutipan.
+
+### Mint kutipan dan dompet protokol
+
+- `quote_mint` — aset yang dibeli pengguna. Sebagian besar peluncuran menggunakan SOL terbungkus (`So111…112`) atau USDC (`EPjF…Dt1v`). Satu `GlobalConfig` terikat pada satu mint kutipan; peluncuran yang membutuhkan target kutipan berbeda menargetkan `(curve_type, index)` berbeda.
+- `protocol_fee_owner` — pubkey yang menandatangani `CollectFee` dan mengklaim biaya protokol terkumpul pada setiap peluncuran yang terikat pada konfigurasi ini. Disimpan on-chain; admin dapat memutar melalui `UpdateConfig`.
+- `migrate_fee_owner` — pubkey yang menandatangani `CollectMigrateFee`.
+
+### Dompet migrasi
+
+Dua jalur kelulusan memerlukan penandatangan berbeda:
+
+- `migrate_to_amm_wallet` — harus menandatangani `MigrateToAmm`. Digunakan untuk peluncuran yang `migrate_type = 0` (kelulusan ke AMM v4 + OpenBook).
+- `migrate_to_cpswap_wallet` — harus menandatangani `MigrateToCpswap`. Digunakan untuk `migrate_type = 1` (kelulusan ke CPMM). Peluncuran Token-2022 selalu mengambil jalur ini.
+
+Ini biasanya dipegang oleh crank kelulusan yang dioperasikan Raydium, sehingga kelulusan terjadi segera setelah kurva mencapai ambang batas daripada menunggu kreator memanggilnya.
+
+### `requires_platform_auth`
+
+Bendera `u8` (`0` = siapa pun dapat menggunakan konfigurasi ini; bukan nol = hanya platform dengan PDA `PlatformGlobalAccess` yang valid yang dapat diluncurkan terhadapnya). Ketika diatur, setiap `Initialize` terhadap `GlobalConfig` ini harus menyertakan akun `PlatformGlobalAccess` yang cocok membuktikan bahwa platform telah diotorisasi sebelumnya melalui `CreatePlatformGlobalAccess` (instruksi admin-only). Lihat [`platform-config`](/id/products/launchlab/platform-config) untuk mekanik tingkat platform.
+
+## Default pada inisialisasi
+
+Ketika `CreateConfig` dipanggil, program menabur banyak bidang dengan default yang dikodekan keras:
+
+```rust
+self.max_share_fee_rate     = 10_000;                  // 100 bps
+self.min_base_supply        = 10_000_000;              // no decimals
+self.max_lock_rate          = 300_000;                 // 30%
+self.min_base_migrate_rate  = 200_000;                 // 20%
+self.min_base_sell_rate     = 200_000;                 // 20%
+self.min_quote_fund_raising = 30_000_000_000;
+self.requires_platform_auth = 0;
+```
+
+Admin menetapkan `curve_type`, `index`, `migrate_fee`, `trade_fee_rate`, `quote_mint`, dan empat pubkey dompet secara eksplisit pada waktu pembuatan; nilai berikutnya dapat disetel melalui `UpdateConfig`.
+
+## Bagaimana peluncuran memilih `GlobalConfig`
+
+Pada `Initialize`, kreator melewatkan:
+
+- `(curve_type, index)` untuk memilih PDA `GlobalConfig` mana yang akan dimuat.
+- `CurveParams` mendeskripsikan bentuk kurva (`supply`, `total_base_sell`, `total_quote_fund_raising`, `migrate_type`).
+- `VestingParams` mendeskripsikan pasokan terkunci.
+- `MintParams` untuk mint dasar.
+
+Program menegakkan:
+
+- `curve_type` cocok dengan `global_config.curve_type`.
+- `supply >= global_config.min_base_supply`.
+- `total_locked_amount <= supply * max_lock_rate / 1_000_000`.
+- `total_base_sell >= supply * min_base_sell_rate / 1_000_000`.
+- `(supply − total_base_sell − total_locked_amount) >= supply * min_base_migrate_rate / 1_000_000` — yaitu, cukup token tersisa untuk menabur pool pasca-kelulusan.
+- `total_quote_fund_raising >= min_quote_fund_raising`.
+- Jika `requires_platform_auth != 0`, PDA `PlatformGlobalAccess` yang valid disertakan.
+
+Setelah `Initialize`, `PoolState` peluncuran menyimpan pubkey `global_config` secara langsung, sehingga pengikatan permanen.
+
+## Jalur pembaruan
+
+`UpdateConfig` adalah admin-only dan mengambil pasangan `(param: u8, value: u64)`. Setiap nilai `param` memilih bidang mana yang harus dimutasi:
+
+| `param` | Bidang yang diubah |
+|---------|---------------|
+| 0 | `migrate_fee` |
+| 1 | `trade_fee_rate` |
+| 2 | `max_share_fee_rate` |
+| 3 | `min_base_supply` |
+| 4 | `max_lock_rate` |
+| 5 | `min_base_sell_rate` |
+| 6 | `min_base_migrate_rate` |
+| 7 | `min_quote_fund_raising` |
+
+Rotasi dompet (`protocol_fee_owner`, `migrate_fee_owner`, `migrate_to_amm_wallet`, `migrate_to_cpswap_wallet`) mengambil bentuk argumen `Pubkey` terpisah; periksa sumber `update_config` untuk tabel dispatch yang tepat sebelum menyusun transaksi admin.
+
+`requires_platform_auth` diaktifkan melalui `set_requires_platform_auth(bool)`.
+
+## Membaca `GlobalConfig` dari klien
+
+```ts
+import { Raydium } from "@raydium-io/raydium-sdk-v2";
+
+// Fetch by PDA derivation:
+const [configPda] = PublicKey.findProgramAddressSync(
+  [
+    Buffer.from("global_config"),
+    quoteMint.toBytes(),
+    Buffer.from([curveType]),
+    u16ToBytes(index),
+  ],
+  LAUNCHLAB_PROGRAM_ID,
+);
+
+const config = await raydium.launchpad.getGlobalConfig(configPda);
+console.log(config.tradeFeeRate, config.minQuoteFundRaising);
+```
+
+Untuk UI yang mencantumkan semua config yang tersedia, ikuti helper `getAllGlobalConfigs` SDK atau tanyakan endpoint API LaunchLab yang mencerminkannya; jumlah akun on-chain kecil (single digit dalam praktik).
+
+## Pointer
+
+- [`products/launchlab/platform-config`](/id/products/launchlab/platform-config) — overlay per-platform yang lebih lanjut membatasi bentuk kurva.
+- [`products/launchlab/accounts`](/id/products/launchlab/accounts) — grafik akun penuh untuk peluncuran.
+- [`products/launchlab/instructions`](/id/products/launchlab/instructions) — instruksi `Initialize` dan pembaruan.
+- [`reference/program-addresses`](/id/reference/program-addresses) — pubkey admin, ID program, otoritas bersama.
+
+Sumber:
+
+- `raydium-launch/programs/launchpad/src/states/config.rs` — struct `GlobalConfig` dan `initialize`.
+- `raydium-launch/programs/launchpad/src/lib.rs` — `create_config`, `update_config`.

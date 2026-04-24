@@ -1,0 +1,211 @@
+---
+title: "LaunchLab GlobalConfig"
+description: "协议级配置账户，约束每次 LaunchLab 启动——包括费率、供应最低值、锁定率上限、迁移钱包（控制毕业）和分曲线索引方案。"
+---
+
+<Info>
+  **本页内容由 AI 自动翻译，所有内容以英文版本为准。**
+
+  [查看英文版 →](/products/launchlab/global-config)
+</Info>
+
+<Info>
+  `GlobalConfig` 是**协议级**配置账户。可以有多个——以 `(curve_type, index)` 作为密钥——每次启动在 `Initialize` 时选择一个。所选 `GlobalConfig` 中的参数值成为该启动各项参数的硬性上限。如需平台级自定义（按平台费率、允许的曲线形状、毕业时的 NFT 分成），请参阅 [`products/launchlab/platform-config`](/zh/products/launchlab/platform-config)。
+</Info>
+
+## 定义
+
+`GlobalConfig` 是每个 `(curve_type, index)` 对应的单个 PDA，用于确定所有启动都必须遵守的协议侧规则：
+
+- 允许的曲线类型（`curve_type`）。
+- 曲线在每次购买和出售时收取的交易费率。
+- 毕业时收取的迁移费。
+- 供应量、锁定率、出售率和迁移率的下限。
+- 报价币种（通常是包装的 SOL 或 USDC）——用户购买时使用的资产。
+- 三个协议侧钱包：协议费拥有者、迁移费拥有者，以及两个迁移控制钱包（授权毕业到 AMM v4/CPMM）。
+- 可选的标志（`requires_platform_auth`）用于控制哪些平台可使用此配置。
+
+`GlobalConfig` 账户由 LaunchLab 程序管理员创建和更新（硬编码的管理员公钥，在所有基于 Anchor 的 Raydium 程序间共享——见 [`reference/program-addresses`](/zh/reference/program-addresses)）。
+
+## 布局
+
+```rust
+// states/config.rs
+pub const GLOBAL_CONFIG_SEED: &str = "global_config";
+
+#[account]
+pub struct GlobalConfig {
+    pub epoch:                   u64,         // recent_epoch tracker
+    pub curve_type:              u8,          // 0 = ConstantProduct, 1 = FixedPrice, 2 = LinearPrice
+    pub index:                   u16,         // discriminator within a curve_type
+    pub migrate_fee:             u64,         // SOL paid on graduation
+    pub trade_fee_rate:          u64,         // 1/1_000_000 of volume
+    pub max_share_fee_rate:      u64,         // 100 bps cap on platform share fee
+    pub min_base_supply:         u64,         // floor on Initialize supply (no decimals)
+    pub max_lock_rate:           u64,         // ceiling on vesting locked / supply
+    pub min_base_sell_rate:      u64,         // floor on base_supply_graduation / supply
+    pub min_base_migrate_rate:   u64,         // floor on tokens that seed the post-graduation pool
+    pub min_quote_fund_raising:  u64,         // floor on quote_reserve_target (with decimals)
+    pub quote_mint:              Pubkey,
+    pub protocol_fee_owner:      Pubkey,      // claims protocol fees via CollectFee
+    pub migrate_fee_owner:       Pubkey,      // claims migration fees via CollectMigrateFee
+    pub migrate_to_amm_wallet:   Pubkey,      // can sign MigrateToAmm
+    pub migrate_to_cpswap_wallet:Pubkey,      // can sign MigrateToCpswap
+    pub requires_platform_auth:  u8,          // 0/1 flag
+    pub padding_alignment:       [u8; 7],
+    pub padding:                 [u64; 15],
+}
+```
+
+PDA 推导：
+
+```ts
+const [globalConfig] = PublicKey.findProgramAddressSync(
+  [
+    Buffer.from("global_config"),
+    Buffer.from(quoteMint.toBytes()),
+    Buffer.from([curveType]),
+    u16ToBytes(index),
+  ],
+  LAUNCHLAB_PROGRAM_ID,
+);
+```
+
+（签名前验证链上账户的确切 seed 顺序——程序的 `create_config` 指令是权威来源。）
+
+## 字段语义
+
+### `curve_type` 和 `index`
+
+这两个字段共同唯一标识一个 `GlobalConfig`。每个 `(curve_type, index)` 对有一个 `GlobalConfig`：
+
+- `curve_type = 0` — 常数乘积虚拟储备曲线。默认且最常用。
+- `curve_type = 1` — 固定价格曲线。
+- `curve_type = 2` — 线性价格曲线。
+
+`index` 是 `u16` 类型，允许管理员为每种曲线类型发布多个配置（例如一个费率更紧凑，一个最低报价募集额更高）。在 `Initialize` 时，启动提供一个 `(curve_type, index)` 对，程序加载匹配的 `GlobalConfig`。
+
+### 费用
+
+- `trade_fee_rate` — 以交易量的 `1/1_000_000` 计价。应用于曲线上的每次购买和出售。`protocol_fee_owner` 通过 `CollectFee` 声称其份额。
+- `migrate_fee` — 在毕业时收取的固定费用（以 lamport 或报价单位计，取决于配置）。由 `migrate_fee_owner` 通过 `CollectMigrateFee` 声称。
+- `max_share_fee_rate` — 初始化为 `10_000`（100 个基点）。限制绑定的 `PlatformConfig` 中**平台的**分成费率（见 [`platform-config`](/zh/products/launchlab/platform-config)）。程序强制 `trade_fee_rate + max_share_fee_rate < RATE_DENOMINATOR_VALUE`。
+
+### 供应量和费率下限
+
+这些下限约束启动在 `Initialize` 时可选择的曲线参数。若创建者的 `CurveParams` 违反任何下限，`Initialize` 将回滚并显示 `InvalidInput` 错误。
+
+- `min_base_supply` — 曲线可声明的最小 `supply`（无小数）。默认为 `10_000_000`。
+- `max_lock_rate` — 以 `1/1_000_000` 计价；默认 `300_000`（30%）。通过 `total_locked_amount <= supply * max_lock_rate / 1_000_000` 限制权益锁定。
+- `min_base_sell_rate` — 以 `1/1_000_000` 计价；默认 `200_000`（20%）。从下方限制 `base_supply_graduation / supply`。
+- `min_base_migrate_rate` — 以 `1/1_000_000` 计价；默认 `200_000`（20%）。限制保留用于初始化毕业后流动性池的令牌数量。
+- `min_quote_fund_raising` — 启动可声明的最小 `quote_reserve_target`（含小数）。默认为报价币种的 `30_000_000_000` 单位。
+
+### 报价币种和协议钱包
+
+- `quote_mint` — 用户购买时使用的资产。大多数启动使用包装的 SOL（`So111…112`）或 USDC（`EPjF…Dt1v`）。一个 `GlobalConfig` 绑定一个报价币种；需要不同报价的启动使用不同的 `(curve_type, index)`。
+- `protocol_fee_owner` — 签署 `CollectFee` 的公钥，声称绑定到此配置的每次启动上累积的协议费。链上存储；管理员可通过 `UpdateConfig` 轮换。
+- `migrate_fee_owner` — 签署 `CollectMigrateFee` 的公钥。
+
+### 迁移钱包
+
+两条毕业路径需要不同的签名者：
+
+- `migrate_to_amm_wallet` — 必须签署 `MigrateToAmm`。用于 `migrate_type = 0` 的启动（毕业到 AMM v4 + OpenBook）。
+- `migrate_to_cpswap_wallet` — 必须签署 `MigrateToCpswap`。用于 `migrate_type = 1`（毕业到 CPMM）。Token-2022 启动总是采用此路径。
+
+这些通常由 Raydium 运营的毕业自动执行者持有，因此毕业在曲线达到阈值后立即进行，而不是等待创建者调用。
+
+### `requires_platform_auth`
+
+一个 `u8` 标志（`0` = 任何人都可使用此配置；非零 = 仅具有有效 `PlatformGlobalAccess` PDA 的平台可针对此配置启动）。设置后，每个针对此 `GlobalConfig` 的 `Initialize` 必须包含匹配的 `PlatformGlobalAccess` 账户，证明该平台已通过 `CreatePlatformGlobalAccess`（仅限管理员的指令）预先授权。平台侧机制详见 [`platform-config`](/zh/products/launchlab/platform-config)。
+
+## 初始化时的默认值
+
+调用 `CreateConfig` 时，程序使用硬编码的默认值初始化许多字段：
+
+```rust
+self.max_share_fee_rate     = 10_000;                  // 100 bps
+self.min_base_supply        = 10_000_000;              // no decimals
+self.max_lock_rate          = 300_000;                 // 30%
+self.min_base_migrate_rate  = 200_000;                 // 20%
+self.min_base_sell_rate     = 200_000;                 // 20%
+self.min_quote_fund_raising = 30_000_000_000;
+self.requires_platform_auth = 0;
+```
+
+管理员在创建时显式设置 `curve_type`、`index`、`migrate_fee`、`trade_fee_rate`、`quote_mint` 和四个钱包公钥；后续值可通过 `UpdateConfig` 调整。
+
+## 启动如何选择 `GlobalConfig`
+
+在 `Initialize` 时，创建者传递：
+
+- `(curve_type, index)` 以选择要加载的 `GlobalConfig` PDA。
+- `CurveParams` 描述曲线形状（`supply`、`total_base_sell`、`total_quote_fund_raising`、`migrate_type`）。
+- `VestingParams` 描述锁定供应。
+- `MintParams` 针对基础币种。
+
+程序强制：
+
+- `curve_type` 匹配 `global_config.curve_type`。
+- `supply >= global_config.min_base_supply`。
+- `total_locked_amount <= supply * max_lock_rate / 1_000_000`。
+- `total_base_sell >= supply * min_base_sell_rate / 1_000_000`。
+- `(supply − total_base_sell − total_locked_amount) >= supply * min_base_migrate_rate / 1_000_000` — 即保留足够令牌初始化毕业后的流动性池。
+- `total_quote_fund_raising >= min_quote_fund_raising`。
+- 若 `requires_platform_auth != 0`，必须包含有效的 `PlatformGlobalAccess` PDA。
+
+`Initialize` 后，启动的 `PoolState` 直接存储 `global_config` 公钥，因此绑定是永久的。
+
+## 更新路径
+
+`UpdateConfig` 仅限管理员操作，接收一个 `(param: u8, value: u64)` 对。每个 `param` 值选择要修改的字段：
+
+| `param` | 修改的字段 |
+|---------|-----------|
+| 0 | `migrate_fee` |
+| 1 | `trade_fee_rate` |
+| 2 | `max_share_fee_rate` |
+| 3 | `min_base_supply` |
+| 4 | `max_lock_rate` |
+| 5 | `min_base_sell_rate` |
+| 6 | `min_base_migrate_rate` |
+| 7 | `min_quote_fund_raising` |
+
+钱包轮换（`protocol_fee_owner`、`migrate_fee_owner`、`migrate_to_amm_wallet`、`migrate_to_cpswap_wallet`）采用单独的 `Pubkey` 参数形状；在编写管理员交易前，检查 `update_config` 源代码获取确切的调度表。
+
+`requires_platform_auth` 通过 `set_requires_platform_auth(bool)` 切换。
+
+## 从客户端读取 `GlobalConfig`
+
+```ts
+import { Raydium } from "@raydium-io/raydium-sdk-v2";
+
+// Fetch by PDA derivation:
+const [configPda] = PublicKey.findProgramAddressSync(
+  [
+    Buffer.from("global_config"),
+    quoteMint.toBytes(),
+    Buffer.from([curveType]),
+    u16ToBytes(index),
+  ],
+  LAUNCHLAB_PROGRAM_ID,
+);
+
+const config = await raydium.launchpad.getGlobalConfig(configPda);
+console.log(config.tradeFeeRate, config.minQuoteFundRaising);
+```
+
+对于列出所有可用配置的 UI，遍历 SDK 的 `getAllGlobalConfigs` 辅助函数或查询镜像它们的 LaunchLab API 端点；链上账户数很少（实际上为个位数）。
+
+## 相关链接
+
+- [`products/launchlab/platform-config`](/zh/products/launchlab/platform-config) — 按平台的叠加层，进一步限制曲线形状。
+- [`products/launchlab/accounts`](/zh/products/launchlab/accounts) — 启动的完整账户图。
+- [`products/launchlab/instructions`](/zh/products/launchlab/instructions) — `Initialize` 和更新指令。
+- [`reference/program-addresses`](/zh/reference/program-addresses) — 管理员公钥、程序 ID、共享权限。
+
+源代码：
+
+- `raydium-launch/programs/launchpad/src/states/config.rs` — `GlobalConfig` 结构和 `initialize`。
+- `raydium-launch/programs/launchpad/src/lib.rs` — `create_config`、`update_config`。
