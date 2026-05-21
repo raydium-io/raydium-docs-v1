@@ -536,6 +536,7 @@ def _translate_string_batch(
             resp = client.messages.create(
                 model=model,
                 max_tokens=16000,
+                temperature=0,
                 system=system,
                 messages=[{"role": "user", "content": user_msg}],
             )
@@ -720,6 +721,7 @@ def _translate_mdx(
             resp = client.messages.create(
                 model=model,
                 max_tokens=16000,
+                temperature=0,
                 system=system,
                 messages=[{"role": "user", "content": user_msg}],
             )
