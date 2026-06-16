@@ -1,0 +1,149 @@
+---
+title: "2026-05-18 — CLMM : ordres à cours limité, frais unilatéraux, frais dynamiques"
+description: "Trois capacités CLMM optionnelles et rétrocompatibles : ordres à cours limité de première classe, collecte de frais unilatéraux, et frais dynamiques suivant la volatilité — plus la restructuration de PoolState et les nouveaux codes d'erreur."
+---
+
+<Info>
+  **Cette page est traduite automatiquement par IA. La version anglaise fait foi.**
+
+  [Voir la version anglaise →](/reference/changelog/2026-05-18-clmm-limit-orders)
+</Info>
+
+<Info>
+  Une entrée du journal des modifications de la documentation. Pour l'index de toutes les mises à jour, consultez [`reference/changelog`](/fr/reference/changelog). Pour la chronologie historique du protocole, consultez [`introduction/history-and-milestones`](/fr/introduction/history-and-milestones).
+</Info>
+
+La prochaine version de CLMM ajoute trois capacités au niveau du pool. Elles sont optionnelles au moment de la création du pool et rétrocompatibles avec les pools et positions existants.
+
+## TL;DR pour les intégrateurs
+
+- Les **ordres à cours limité** sont désormais des primitives CLMM de première classe. Les LP peuvent ouvrir un ordre sur un seul tick sur un pool qui les supporte ; l'ordre est exécuté FIFO quand un swap traverse le tick, et un gardien hors chaîne (`limit_order_admin`) peut régler la sortie remplie sans que le propriétaire soit en ligne. Sept nouvelles méthodes SDK (`openLimitOrder`, `increaseLimitOrder`, `decreaseLimitOrder`, `settleLimitOrder`, `closeLimitOrder`, `closeAllLimitOrder`, `settleAllLimitOrder`) et trois nouveaux points de terminaison Temp API sous `/limit-order/` (ordres actifs, historique par utilisateur, journal des événements par PDA) couvrent le flux complet.
+- Les **frais unilatéraux (`CollectFeeOn`)** permettent à un pool de collecter les frais de swap du côté d'entrée (hérité, mode `0`), ou toujours de `token_0` (mode `1`), ou toujours de `token_1` (mode `2`). Utile quand un côté de la paire est le jeton comptable canonique.
+- Les **frais dynamiques** permettent à un pool d'opter pour une surcharge suivant la volatilité qui augmente avec les mouvements rapides de tick et décroît au fil du temps, calibrée par une `DynamicFeeConfig` par niveau et une `DynamicFeeInfo` par pool. Le nouveau point de terminaison `/main/clmm-dynamic-config` expose la liste des niveaux.
+- Une nouvelle instruction, `CreateCustomizablePool`, expose les trois paramètres au moment de la création du pool. L'instruction classique `CreatePool` continue de fonctionner pour les pools sans ordres à cours limité et avec frais par défaut.
+- **Changement cassant pour l'indexeur** : les compteurs de volume par direction (`swap_in_amount_token_{0,1}`, `swap_out_amount_token_{0,1}`) et les compteurs de frais à vie (`total_fees_token_{0,1}`, `total_fees_claimed_token_{0,1}`) sur `PoolState` ont été retirés dans le remplissage pour faire de la place à `fee_on` et `dynamic_fee_info`. Les indexeurs qui lisent ces champs directement doivent migrer vers le ring `Observation` on-chain ou l'API.
+
+## Pourquoi cela importe (pour les traders, LP et intégrateurs)
+
+- Les **traders** obtiennent des devis plus serrés sur les paires de queue longue et événementielles : les frais dynamiques permettent au pool d'absorber les surcharges de volatilité du preneur sans que les LP doivent activement élargir les plages, et les échelles d'ordres à cours limité approfondissent la liquidité on-chain à des prix spécifiques sans engager le capital sur toute la plage.
+- Les **LP** obtiennent une troisième stratégie aux côtés des plages concentrées et des positions sur toute la plage : garez des ordres à prix exact, soyez remplis quand le prix visite, réglez dans le jeton de cotation. Aucun rééquilibrage actif requis pour la portion remplie.
+- Les **intégrateurs** peuvent modéliser les pools à frais dynamiques de manière déterministe — l'algorithme et les paramètres sont entièrement on-chain, les niveaux de calibrage sont interrogeables, et le chemin de swap est inchangé en forme (seuls les frais par étape varient).
+
+## Ce qui a changé dans le programme
+
+### Nouveaux comptes
+
+- **`DynamicFeeConfig`** — enregistrement de calibrage par niveau (période de filtre, période de décroissance, facteur de réduction, contrôle des frais dynamiques, accumulateur de volatilité max). Créé par `CreateDynamicFeeConfig` (admin), référencé par `CreateCustomizablePool` quand les frais dynamiques sont activés.
+- **`LimitOrderState`** — compte par ordre (graines PDA : `[owner, limit_order_nonce, order_nonce]`) contenant le pool, le tick, le côté, le montant d'entrée, le ratio non rempli, la phase de cohort FIFO, et les instantanés de tenue de livres. Le cycle de vie est implicite (`filled_amount` vs `total_amount`, plus l'existence du compte) : `Open → Filled → Settled → Closed`.
+- **`LimitOrderNonce`** — compteur monotone croissant par (propriétaire, index_nonce) qui obtient les graines PDA de l'ordre à cours limité. Le `nonce_index: u8` permet au même propriétaire de partitionner les ordres en jusqu'à 256 flux de nonce indépendants.
+
+Consultez [Accounts → DynamicFeeConfig and DynamicFeeInfo](/fr/products/clmm/accounts) et [Accounts → LimitOrderState](/fr/products/clmm/accounts).
+
+### Restructuration de `PoolState`
+
+| Groupe de champs | Ancienne disposition | Nouvelle disposition |
+|-------------|------------|------------|
+| Compteurs de volume par direction | `swap_in_amount_token_0`, `swap_out_amount_token_0`, `swap_in_amount_token_1`, `swap_out_amount_token_1` | Repliés dans `padding5: [u128; 4]` |
+| Compteurs de frais à vie | `total_fees_token_0`, `total_fees_claimed_token_0`, `total_fees_token_1`, `total_fees_claimed_token_1` | Repliés dans `padding6: [u64; 4]` |
+| Frais unilatéraux | — | `fee_on: u8` (0 = FromInput, 1 = Token0Only, 2 = Token1Only) |
+| Frais dynamiques | — | `dynamic_fee_info: DynamicFeeInfo` (intégré) |
+
+La taille totale du compte est inchangée. **Indexeurs** : basculez le suivi du volume de `PoolState` vers le ring `Observation` ou l'API. Les compteurs retirés ne sont pas mis à zéro sur les pools existants (ils contiennent ce qu'ils ont porté en dernier), donc les relire après la mise à niveau retournera des données obsolètes.
+
+### Ajouts à `TickState` (pas de changement cassant)
+
+Quatre nouveaux champs sont ajoutés à la fin de `TickState`, remplaçant une partie de son remplissage de queue :
+
+- `order_phase: u64` — compteur qui désambiguïse les cohortes d'ordres à cours limité à ce tick.
+- `orders_amount: u64` — total d'entrée engagé par tous les ordres ouverts à ce tick (pas tous entièrement non remplis).
+- `part_filled_orders_remaining: u64` — entrée toujours non remplie dans la cohorte actuellement consommée par les swaps.
+- `unfilled_ratio_x64: u128` — ratio Q64.64 utilisé pour calculer la part de remplissage de chaque ordre.
+
+La disposition du tableau de ticks, le dimensionnement et les graines PDA sont inchangés.
+
+### Nouvelles instructions
+
+- **`CreateDynamicFeeConfig` (admin)** — créer un niveau `DynamicFeeConfig` calibré. Autorité : même multisig de trésorerie que `CreateAmmConfig`.
+- **`UpdateDynamicFeeConfig` (admin)** — mettre à jour les paramètres d'un niveau existant.
+- **`CreateCustomizablePool`** — point d'entrée de création de pool qui expose `collect_fee_on`, `enable_dynamic_fee`, et `dynamic_fee_config`. Coexiste avec `CreatePool` ; nous recommandons `CreateCustomizablePool` pour tout nouveau pool qui a besoin des nouveaux paramètres.
+- **`OpenLimitOrder`** — ouvrir un ordre à cours limité sur un seul tick. Incrémente `LimitOrderNonce`, alloue `LimitOrderState`, place l'ordre dans la cohorte FIFO au tick.
+- **`IncreaseLimitOrder` / `DecreaseLimitOrder`** — ajuster la portion non remplie d'un ordre. Revient en arrière sur un ordre entièrement rempli avec `InvalidOrderPhase`.
+- **`SettleLimitOrder`** — balayer la sortie remplie vers l'ATA du propriétaire. L'appelant peut être le propriétaire ou le gardien `limit_order_admin` du pool.
+- **`CloseLimitOrder`** — fermer un ordre entièrement réglé pour récupérer le loyer.
+
+### Changements de comportement de `SwapV2`
+
+Le chemin de swap lui-même est inchangé en forme, mais trois choses se produisent maintenant en cours de route :
+
+1. **Frais dynamiques** (quand activés) : la `DynamicFeeInfo` du pool est mise à jour à chaque étape (décroissance → accumulation → plafond), et la surcharge résultante est ajoutée au-dessus des frais de base pour cette étape.
+2. **Correspondance d'ordres à cours limité** (quand l'étape traverse un tick initialisé qui a des ordres ouverts) : une partie de l'entrée de swap est consommée FIFO pour remplir la cohorte à ce tick, avec `unfilled_ratio_x64` mise à jour atomiquement.
+3. **Routage des frais unilatéraux** (quand `fee_on != 0`) : les frais sont prélevés sur `token_0` ou `token_1` indépendamment de la direction du swap, au lieu de toujours être prélevés du côté d'entrée.
+
+Chacun de ces éléments est une opération sans effet quand le pool a été créé avec les valeurs par défaut héritées. Consultez [Instructions → SwapV2](/fr/products/clmm/instructions) pour la matrice de changement d'état mise à jour.
+
+### Nouveaux codes d'erreur
+
+L'énumération `ErrorCode` a été renumérotée dans cette version : cinq variantes héritées (`LOK`, `ZeroMintAmount`, `InvalidLiquidity`, `TransactionTooOld`, `InvalidRewardDesiredAmount`) ont été supprimées, et onze nouvelles variantes ont été ajoutées. Parce qu'Anchor numérote les erreurs par ordre d'énumération à partir de `6000`, **chaque code d'erreur à ou après les positions supprimées a décalé** — les clients qui ont codé en dur les codes numériques doivent remapper.
+
+Les nouveaux codes sont :
+
+- `6040` `OrderAlreadyFilled`
+- `6041` `InvalidOrderPhase`
+- `6042` `InvalidLimitOrderAmount`
+- `6043` `OrderPhaseSaturated`
+- `6044` `InvalidDynamicFeeConfigParams`
+- `6045` `InvalidFeeOn`
+- `6046` `ZeroSqrtPrice`
+- `6047` `ZeroLiquidity`
+- `6048` `MissingBaseFlag`
+- `6049` `MissingMintAccount`
+- `6050` `MissingTokenProgram2022`
+
+Les chaînes complètes et le tableau post-décalage pour toutes les erreurs CLMM sont dans [Error codes](/fr/reference/error-codes).
+
+## Ce qui a changé dans le SDK (`@raydium-io/raydium-sdk-v2`)
+
+- **Nouvelles méthodes sur `raydium.clmm`** : `createCustomizablePool`, `openLimitOrder`, `increaseLimitOrder`, `decreaseLimitOrder`, `settleLimitOrder`, `settleAllLimitOrder`, `closeLimitOrder`, `closeAllLimitOrder`.
+- **Nouveaux assistants REST sur `raydium.api`** : `getClmmDynamicConfigs`, `getClmmLimitOrderConfigs`.
+- **Nouveaux types** : énumération `CollectFeeOn`, `DynamicFeeConfig`, `DynamicFeeInfo`, `LimitOrderState`, `LimitOrderConfig`.
+- **Réorganisation interne** : `utils/` déplacé vers `libraries/`. Le barrel du package est inchangé ; seules les importations profondes sous `@raydium-io/raydium-sdk-v2/utils/...` doivent être mises à jour vers `…/libraries/...`.
+
+Les procédures pas à pas TypeScript de bout en bout se trouvent dans [`products/clmm/code-demos`](/fr/products/clmm/code-demos).
+
+## Ce qui a changé dans les API
+
+- `api-v3` — deux nouveaux points de terminaison sous `/main/` :
+  - `GET /main/clmm-dynamic-config` — liste des niveaux `DynamicFeeConfig`.
+  - `GET /main/clmm-limit-order-config` — configuration des ordres à cours limité par pool.
+- `temp-api-v1` — trois nouveaux points de terminaison sous `/limit-order/` :
+  - `GET /limit-order/order/list?wallet=…` — ordres actuellement garés d'un portefeuille (ouverts et partiellement remplis, servis depuis le cache Redis de l'indexeur ; la même charge utile couvre les deux phases via `totalAmount` / `filledAmount` / `pendingSettle`).
+  - `GET /limit-order/history/order/list-by-user?wallet=…` — ordres à cours limité historiques d'un portefeuille. Filtres optionnels : `poolId`, `mint1`, `mint2`, `hideCancel`. Pagination par curseur via `nextPageId` / `size` (max 100).
+  - `GET /limit-order/history/event/list-by-pda?pda=…` — journal des événements par PDA (`open` / `increase` / `decrease` / `settle` / `close`) pour un ou plusieurs PDA d'ordres à cours limité séparés par des virgules. Pagination par curseur via `nextPageId` / `size` (max 100).
+
+Les cinq sont documentés dans l'onglet Référence API.
+
+## Surface d'autorité
+
+Le `limit_order_admin` est un gardien opérationnel hors chaîne, **pas un multisig**. Il ne peut appeler que `SettleLimitOrder` et `CloseLimitOrder` sur les ordres existants, et la sortie d'un règlement atterrit toujours dans l'ATA du **propriétaire**. Il ne peut pas muter les champs du pool, ouvrir ou modifier les ordres, ou signer pour autre chose. Consultez [Admin keys and multisig → CLMM](/fr/security/admin-and-multisig).
+
+## Pages mises à jour
+
+- `products/clmm/overview` — nouvelle section « What's new » et pointeurs de prochaines étapes mis à jour.
+- `products/clmm/accounts` — trois nouveaux comptes, restructuration de `PoolState` avec avertissement de migration, ajouts à `TickState`, nouveaux assistants PDA.
+- `products/clmm/instructions` — sept nouvelles instructions, addendum de comportement de `SwapV2`, matrice de changement d'état mise à jour.
+- `products/clmm/fees` — section des frais unilatéraux, section des frais dynamiques avec tableau de paramètres.
+- `products/clmm/math` — pseudo-code de correspondance d'ordres à cours limité, dérivation des frais dynamiques.
+- `products/clmm/code-demos` — démo de `createCustomizablePool`, procédure pas à pas complète des ordres à cours limité, nouveaux pièges.
+- `algorithms/clmm-math` — référence croisée à la correspondance d'ordres à cours limité et aux frais dynamiques dans la boucle de swap multi-tick.
+- `sdk-api/typescript-sdk` — section des ajouts du module CLMM, note de migration `utils/` → `libraries/`.
+- `api-reference/openapi/api-v3.yaml` — deux nouveaux points de terminaison avec schémas de réponse.
+- `api-reference/openapi/temp-api-v1.yaml` — trois nouveaux points de terminaison d'ordres à cours limité (`/limit-order/order/list`, `/limit-order/history/order/list-by-user`, `/limit-order/history/event/list-by-pda`) avec leurs schémas de requête et de réponse.
+- `api-reference/api-v3/overview` — note sur les nouveaux points de terminaison de configuration CLMM.
+- `api-reference/temp-api-v1/overview` — note sur les nouveaux points de terminaison d'ordres actifs, d'historique par utilisateur et d'événement par PDA.
+- `reference/error-codes` — onze nouveaux codes d'erreur CLMM (6040–6050) plus cinq codes hérités supprimés ; les codes numériques après les points de suppression ont décalé.
+- `security/admin-and-multisig` — nouvelle ligne d'admin `DynamicFeeConfig` et ligne de gardien `limit_order_admin`, avec explication d'autorité bornée.
+
+**Vérifié contre** :
+- source de `raydium-clmm`.
+- source de `@raydium-io/raydium-sdk-v2`.
+- source de `api-v3` et `temp-api-v1`.

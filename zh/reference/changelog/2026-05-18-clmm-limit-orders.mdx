@@ -1,0 +1,145 @@
+---
+title: "2026-05-18 — CLMM：限价单、单边费用、动态费用"
+description: "三项可选的、向后兼容的 CLMM 功能：一级限价单、单边费用收取和波动率追踪动态费用——加上 PoolState 重构和新错误代码。"
+---
+
+<Info>
+  **本页内容由 AI 自动翻译，所有内容以英文版本为准。**
+
+  [查看英文版 →](/reference/changelog/2026-05-18-clmm-limit-orders)
+</Info>
+
+下一个 CLMM 版本增加了三项池级功能。它们在池创建时可选，并与现有池和头寸向后兼容。
+
+## 集成者速览
+
+- **限价单**现在是一级 CLMM 原语。LP 可以在支持限价单的池上开设单个 tick 的订单；当交换穿过该 tick 时，订单按 FIFO 顺序成交，链下守护者（`limit_order_admin`）可以在所有者离线的情况下结算已成交的输出。七个新 SDK 方法（`openLimitOrder`、`increaseLimitOrder`、`decreaseLimitOrder`、`settleLimitOrder`、`closeLimitOrder`、`closeAllLimitOrder`、`settleAllLimitOrder`）和三个新 Temp API 端点（`/limit-order/` 下的活跃订单、按用户历史、按 PDA 事件日志）覆盖完整流程。
+- **单边费用（`CollectFeeOn`）**让池可以从输入端收取交换费（旧版，模式 `0`）、始终从 `token_0` 收取（模式 `1`）或始终从 `token_1` 收取（模式 `2`）。当交易对的一侧是规范记账代币时很有用。
+- **动态费用**让池可以选择启用波动率追踪的附加费，随着快速 tick 移动而上升，随时间衰减，由每层 `DynamicFeeConfig` 和每池 `DynamicFeeInfo` 校准。新的 `/main/clmm-dynamic-config` 端点展示层列表。
+- 新指令 `CreateCustomizablePool` 在池创建时公开所有三个旋钮。经典 `CreatePool` 继续用于默认费用、无限价单的池。
+- **索引器破坏性变更**：`PoolState` 上的按方向成交量计数器（`swap_in_amount_token_{0,1}`、`swap_out_amount_token_{0,1}`）和生命周期费用计数器（`total_fees_token_{0,1}`、`total_fees_claimed_token_{0,1}`）被退役到填充中，为 `fee_on` 和 `dynamic_fee_info` 腾出空间。直接读取这些字段的索引器必须迁移到链上 `Observation` 环或 API。
+
+## 为什么这很重要（对于交易者、LP 和集成者）
+
+- **交易者**在长尾和事件驱动交易对上获得更紧的报价：动态费用让池从接收者吸收波动率附加费，而无需 LP 主动扩大范围，限价单阶梯在特定价格加深链上流动性，无需承诺范围级资本。
+- **LP** 获得第三种策略，与集中范围和全范围头寸并列：停泊精确价格订单，价格访问时成交，结算为报价代币。已成交部分无需主动重新平衡。
+- **集成者**可以确定性地建模动态费用池——算法和参数完全在链上，校准层可查询，交换路径形状不变（仅每步的费用变化）。
+
+## 程序中的变更
+
+### 新账户
+
+- **`DynamicFeeConfig`** — 每层校准记录（过滤周期、衰减周期、缩减因子、动态费用控制、最大波动率累加器）。由 `CreateDynamicFeeConfig`（管理员）创建，在启用动态费用时由 `CreateCustomizablePool` 引用。
+- **`LimitOrderState`** — 每个订单账户（PDA 种子：`[owner, limit_order_nonce, order_nonce]`）持有池、tick、方向、输入金额、未成交比率、FIFO 队列阶段和簿记快照。生命周期是隐式的（`filled_amount` vs `total_amount`，加上账户存在）：`Open → Filled → Settled → Closed`。
+- **`LimitOrderNonce`** — 每个（所有者、nonce_index）单调递增计数器，获取限价单 PDA 种子。`nonce_index: u8` 让同一所有者将订单分区为最多 256 个独立的 nonce 流。
+
+参见 [Accounts → DynamicFeeConfig and DynamicFeeInfo](/zh/products/clmm/accounts) 和 [Accounts → LimitOrderState](/zh/products/clmm/accounts)。
+
+### `PoolState` 重构
+
+| 字段组 | 旧布局 | 新布局 |
+|-------------|------------|------------|
+| 按方向成交量计数器 | `swap_in_amount_token_0`、`swap_out_amount_token_0`、`swap_in_amount_token_1`、`swap_out_amount_token_1` | 折叠到 `padding5: [u128; 4]` |
+| 生命周期费用计数器 | `total_fees_token_0`、`total_fees_claimed_token_0`、`total_fees_token_1`、`total_fees_claimed_token_1` | 折叠到 `padding6: [u64; 4]` |
+| 单边费用 | — | `fee_on: u8`（0 = FromInput、1 = Token0Only、2 = Token1Only） |
+| 动态费用 | — | `dynamic_fee_info: DynamicFeeInfo`（嵌入） |
+
+总账户大小不变。**索引器**：将成交量追踪从 `PoolState` 切换到 `Observation` 环或 API。退役的计数器在现有池上不会被清零（它们持有它们碰巧最后携带的任何内容），因此升级后重新读取它们将返回陈旧数据。
+
+### `TickState` 添加（无破坏性变更）
+
+四个新字段添加到 `TickState` 的末尾，替换其部分尾部填充：
+
+- `order_phase: u64` — 计数器，消除此 tick 处限价单队列的歧义。
+- `orders_amount: u64` — 此 tick 处所有开放订单承诺的总输入（并非全部完全未成交）。
+- `part_filled_orders_remaining: u64` — 当前被交换消费的队列中仍未成交的输入。
+- `unfilled_ratio_x64: u128` — Q64.64 比率，用于计算每个订单的成交份额。
+
+Tick 数组布局、大小和 PDA 种子不变。
+
+### 新指令
+
+- **`CreateDynamicFeeConfig`（管理员）** — 创建校准的 `DynamicFeeConfig` 层。权限：与 `CreateAmmConfig` 相同的财务多签。
+- **`UpdateDynamicFeeConfig`（管理员）** — 更新现有层的参数。
+- **`CreateCustomizablePool`** — 池创建入口点，公开 `collect_fee_on`、`enable_dynamic_fee` 和 `dynamic_fee_config`。与 `CreatePool` 共存；我们建议任何需要新旋钮的新池使用 `CreateCustomizablePool`。
+- **`OpenLimitOrder`** — 开设单个 tick 限价单。碰撞 `LimitOrderNonce`，分配 `LimitOrderState`，将订单插入 tick 处的 FIFO 队列。
+- **`IncreaseLimitOrder` / `DecreaseLimitOrder`** — 调整订单的未成交部分。在完全成交的订单上使用 `InvalidOrderPhase` 恢复。
+- **`SettleLimitOrder`** — 将已成交输出扫入所有者的 ATA。调用者可以是所有者或池的 `limit_order_admin` 守护者。
+- **`CloseLimitOrder`** — 关闭完全结算的订单以回收租金。
+
+### `SwapV2` 行为变更
+
+交换路径本身形状不变，但沿途现在发生三件事：
+
+1. **动态费用**（启用时）：池的 `DynamicFeeInfo` 在每一步更新（衰减 → 累积 → 上限），生成的附加费添加到该步的基础费之上。
+2. **限价单匹配**（当步骤穿过具有开放订单的初始化 tick 时）：交换输入的一部分被 FIFO 消费以填充该 tick 处的队列，`unfilled_ratio_x64` 原子更新。
+3. **单边费用路由**（当 `fee_on != 0` 时）：无论交换方向如何，费用都从 `token_0` 或 `token_1` 获取，而不是始终从输入端。
+
+当池使用旧版默认值创建时，这些都是无操作。参见 [Instructions → SwapV2](/zh/products/clmm/instructions) 了解更新的状态变更矩阵。
+
+### 新错误代码
+
+此版本中 `ErrorCode` 枚举被重新编号：五个旧变体（`LOK`、`ZeroMintAmount`、`InvalidLiquidity`、`TransactionTooOld`、`InvalidRewardDesiredAmount`）被移除，十一个新变体被追加。因为 Anchor 从 `6000` 按枚举顺序编号错误，**移除位置处或之后的每个错误代码都已移位** — 硬编码数字代码的客户端需要重新映射。
+
+新代码是：
+
+- `6040` `OrderAlreadyFilled`
+- `6041` `InvalidOrderPhase`
+- `6042` `InvalidLimitOrderAmount`
+- `6043` `OrderPhaseSaturated`
+- `6044` `InvalidDynamicFeeConfigParams`
+- `6045` `InvalidFeeOn`
+- `6046` `ZeroSqrtPrice`
+- `6047` `ZeroLiquidity`
+- `6048` `MissingBaseFlag`
+- `6049` `MissingMintAccount`
+- `6050` `MissingTokenProgram2022`
+
+完整字符串和所有 CLMM 错误的移位后表在 [Error codes](/zh/reference/error-codes)。
+
+## SDK 中的变更（`@raydium-io/raydium-sdk-v2`）
+
+- **`raydium.clmm` 上的新方法**：`createCustomizablePool`、`openLimitOrder`、`increaseLimitOrder`、`decreaseLimitOrder`、`settleLimitOrder`、`settleAllLimitOrder`、`closeLimitOrder`、`closeAllLimitOrder`。
+- **`raydium.api` 上的新 REST 助手**：`getClmmDynamicConfigs`、`getClmmLimitOrderConfigs`。
+- **新类型**：`CollectFeeOn` 枚举、`DynamicFeeConfig`、`DynamicFeeInfo`、`LimitOrderState`、`LimitOrderConfig`。
+- **内部重组**：`utils/` 移至 `libraries/`。包桶不变；仅 `@raydium-io/raydium-sdk-v2/utils/...` 下的深层导入需要更新为 `…/libraries/...`。
+
+端到端 TypeScript 演练位于 [`products/clmm/code-demos`](/zh/products/clmm/code-demos)。
+
+## API 中的变更
+
+- `api-v3` — `/main/` 下的两个新端点：
+  - `GET /main/clmm-dynamic-config` — `DynamicFeeConfig` 层列表。
+  - `GET /main/clmm-limit-order-config` — 每池限价单配置。
+- `temp-api-v1` — `/limit-order/` 下的三个新端点：
+  - `GET /limit-order/order/list?wallet=…` — 钱包当前停泊的订单（开放和部分成交，从索引器的 Redis 缓存提供；相同有效负载通过 `totalAmount` / `filledAmount` / `pendingSettle` 覆盖两个阶段）。
+  - `GET /limit-order/history/order/list-by-user?wallet=…` — 钱包的历史限价单。可选过滤器：`poolId`、`mint1`、`mint2`、`hideCancel`。通过 `nextPageId` / `size`（最多 100）游标分页。
+  - `GET /limit-order/history/event/list-by-pda?pda=…` — 每 PDA 事件日志（`open` / `increase` / `decrease` / `settle` / `close`），用于一个或多个逗号分隔的限价单 PDA。通过 `nextPageId` / `size`（最多 100）游标分页。
+
+所有五个都在 API 参考选项卡中有文档。
+
+## 权限表面
+
+`limit_order_admin` 是链下操作守护者，**不是多签**。它只能在现有订单上调用 `SettleLimitOrder` 和 `CloseLimitOrder`，结算的输出始终进入**所有者的** ATA。它不能改变池字段、开设或修改订单，或为其他任何事签名。参见 [Admin keys and multisig → CLMM](/zh/security/admin-and-multisig)。
+
+## 更新的页面
+
+- `products/clmm/overview` — 新的"新增功能"部分和更新的后续步骤指针。
+- `products/clmm/accounts` — 三个新账户、`PoolState` 重构带迁移警告、`TickState` 添加、新 PDA 助手。
+- `products/clmm/instructions` — 七个新指令、`SwapV2` 行为附录、更新的状态变更矩阵。
+- `products/clmm/fees` — 单边费用部分、动态费用部分带参数表。
+- `products/clmm/math` — 限价单匹配伪代码、动态费用推导。
+- `products/clmm/code-demos` — `createCustomizablePool` 演示、完整限价单演练、新陷阱。
+- `algorithms/clmm-math` — 多 tick 交换循环中限价单匹配和动态费用的交叉引用。
+- `sdk-api/typescript-sdk` — CLMM 模块添加部分、`utils/` → `libraries/` 迁移说明。
+- `api-reference/openapi/api-v3.yaml` — 两个新端点带响应模式。
+- `api-reference/openapi/temp-api-v1.yaml` — 三个新限价单端点（`/limit-order/order/list`、`/limit-order/history/order/list-by-user`、`/limit-order/history/event/list-by-pda`）带其请求和响应模式。
+- `api-reference/api-v3/overview` — 新 CLMM 配置端点的说明。
+- `api-reference/temp-api-v1/overview` — 新活跃订单、按用户历史和按 PDA 事件端点的说明。
+- `reference/error-codes` — 十一个新 CLMM 错误代码（6040–6050）加五个移除的旧代码；移除点之后的数字代码已移位。
+- `security/admin-and-multisig` — 新 `DynamicFeeConfig` 管理员行和 `limit_order_admin` 守护者行，带有界限权限说明。
+
+**验证对比**：
+- `raydium-clmm` 源代码。
+- `@raydium-io/raydium-sdk-v2` 源代码。
+- `api-v3` 和 `temp-api-v1` 源代码。
