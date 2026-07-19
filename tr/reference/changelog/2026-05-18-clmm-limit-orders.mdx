@@ -1,0 +1,149 @@
+---
+title: "2026-05-18 — CLMM: limit order'lar, tek taraflı ücret, dinamik ücret"
+description: "Üç opt-in, geriye dönük uyumlu CLMM yeteneği: birinci sınıf limit order'lar, tek taraflı ücret tahsilatı ve volatilite izleyen dinamik ücret — artı PoolState yeniden şekillendirmesi ve yeni hata kodları."
+---
+
+<Info>
+  **Bu sayfa yapay zekâ tarafından otomatik olarak çevrilmiştir. İngilizce sürüm esas alınır.**
+
+  [İngilizce sürümü görüntüle →](/reference/changelog/2026-05-18-clmm-limit-orders)
+</Info>
+
+<Info>
+  Bir dokümantasyon değişiklik günlüğü girdisi. Tüm güncellemelerin dizini için bkz. [`reference/changelog`](/tr/reference/changelog). Protokolün kendi tarihsel zaman çizelgesi için bkz. [`introduction/history-and-milestones`](/tr/introduction/history-and-milestones).
+</Info>
+
+Sonraki CLMM sürümü üç havuz düzeyinde yetenek ekler. Bunlar havuz oluşturma zamanında opt-in'dir ve mevcut havuzlar ve pozisyonlarla geriye dönük uyumludur.
+
+## Entegratörler için TL;DR
+
+- **Limit order'lar** artık birinci sınıf CLMM ilkelleridir. LP'ler bunları destekleyen bir havuzda tek tick'li bir order açabilir; order bir swap tick'i geçtiğinde FIFO olarak doldurulur ve off-chain keeper (`limit_order_admin`) sahibi çevrimiçi olmadan doldurulmuş çıktıyı kapatabilir. Yedi yeni SDK yöntemi (`openLimitOrder`, `increaseLimitOrder`, `decreaseLimitOrder`, `settleLimitOrder`, `closeLimitOrder`, `closeAllLimitOrder`, `settleAllLimitOrder`) ve `/limit-order/` altında üç yeni Temp API uç noktası (aktif order'lar, kullanıcı başına geçmiş, PDA başına olay günlüğü) tam akışı kapsar.
+- **Tek taraflı ücret (`CollectFeeOn`)** bir havuzun swap ücretlerini giriş tarafından (eski, mod `0`), veya her zaman `token_0`'dan (mod `1`), veya her zaman `token_1`'den (mod `2`) toplamasını sağlar. Çiftin bir tarafı kanonik muhasebe token'ı olduğunda kullanışlıdır.
+- **Dinamik ücret** bir havuzun hızlı tick hareketi ile yükselen ve zaman içinde azalan volatilite izleyen bir ek ücrete katılmasını sağlar; bu, katman başına `DynamicFeeConfig` ve havuz başına `DynamicFeeInfo` tarafından kalibre edilir. Yeni `/main/clmm-dynamic-config` uç noktası katman listesini ortaya çıkarır.
+- Yeni bir talimat olan `CreateCustomizablePool` tüm üç düğmeyi havuz oluşturma zamanında ortaya çıkarır. Klasik `CreatePool` varsayılan ücret, limit order'suz havuzlar için çalışmaya devam eder.
+- **İndeksleyici kırılma değişikliği**: `PoolState` üzerindeki yön başına hacim sayaçları (`swap_in_amount_token_{0,1}`, `swap_out_amount_token_{0,1}`) ve yaşam boyu ücret sayaçları (`total_fees_token_{0,1}`, `total_fees_claimed_token_{0,1}`) `fee_on` ve `dynamic_fee_info` için yer açmak üzere padding'e alındı. Bu alanları doğrudan okuyan indeksleyiciler on-chain `Observation` halkasına veya API'ye geçiş yapmalıdır.
+
+## Bunun neden önemli olduğu (tüccarlar, LP'ler ve entegratörler için)
+
+- **Tüccarlar** uzun kuyruk ve olay odaklı çiftlerde daha sıkı teklifler alır: dinamik ücret havuzun volatilite ek ücretlerini alıcıdan absorbe etmesine izin verir ve LP'lerin aralıkları aktif olarak genişletmesi gerekmez; limit order merdivenleri belirli fiyatlarda zincir içi likiditeyi derinleştirir ve aralık genelinde sermaye taahhüdü olmadan.
+- **LP'ler** konsantre aralıklar ve tam aralık pozisyonlarının yanında üçüncü bir strateji alır: tam fiyat order'larını park edin, fiyat ziyaret ettiğinde doldurulun, alıntı token'ına kapatın. Doldurulmuş kısım için aktif yeniden dengeleme gerekli değildir.
+- **Entegratörler** dinamik ücret havuzlarını deterministik olarak modelleyebilir — algoritma ve parametreler tamamen zincir üzerindedir, kalibre katmanları sorgulanabilir ve swap yolu şekil olarak değişmez (yalnızca adım başına ücret değişir).
+
+## Programda ne değişti
+
+### Yeni hesaplar
+
+- **`DynamicFeeConfig`** — katman başına kalibre kaydı (filtre dönemi, bozunma dönemi, indirim faktörü, dinamik ücret kontrolü, maksimum volatilite biriktiricisi). `CreateDynamicFeeConfig` (yönetici) tarafından oluşturulur, dinamik ücret etkinleştirildiğinde `CreateCustomizablePool` tarafından referans alınır.
+- **`LimitOrderState`** — sipariş başına hesap (PDA tohumları: `[owner, limit_order_nonce, order_nonce]`) havuzu, tick'i, tarafı, giriş miktarını, doldurulmamış oranını, FIFO kohort fazını ve defter tutma anlık görüntülerini tutar. Yaşam döngüsü örtülüdür (`filled_amount` vs `total_amount`, artı hesap varlığı): `Open → Filled → Settled → Closed`.
+- **`LimitOrderNonce`** — (sahip, nonce_index) başına monoton olarak artan sayaç, limit order PDA tohumlarını alır. `nonce_index: u8` aynı sahibinin order'ları 256 bağımsız nonce akışına bölmesine izin verir.
+
+Bkz. [Hesaplar → DynamicFeeConfig ve DynamicFeeInfo](/tr/products/clmm/accounts) ve [Hesaplar → LimitOrderState](/tr/products/clmm/accounts).
+
+### `PoolState` yeniden şekillendirmesi
+
+| Alan grubu | Eski düzen | Yeni düzen |
+|-------------|------------|------------|
+| Yön başına hacim sayaçları | `swap_in_amount_token_0`, `swap_out_amount_token_0`, `swap_in_amount_token_1`, `swap_out_amount_token_1` | `padding5: [u128; 4]` içine katlanmış |
+| Yaşam boyu ücret sayaçları | `total_fees_token_0`, `total_fees_claimed_token_0`, `total_fees_token_1`, `total_fees_claimed_token_1` | `padding6: [u64; 4]` içine katlanmış |
+| Tek taraflı ücret | — | `fee_on: u8` (0 = FromInput, 1 = Token0Only, 2 = Token1Only) |
+| Dinamik ücret | — | `dynamic_fee_info: DynamicFeeInfo` (gömülü) |
+
+Toplam hesap boyutu değişmez. **İndeksleyiciler**: hacim izlemeyi `PoolState`'den `Observation` halkasına veya API'ye geçirin. Emekli sayaçlar mevcut havuzlarda sıfırlanmaz (son taşıdıkları her şeyi tutar), bu nedenle yükseltmeden sonra yeniden okumak eski verileri döndürecektir.
+
+### `TickState` eklemeleri (kırılma değişikliği yok)
+
+Dört yeni alan `TickState`'in sonuna eklenir ve bazı kuyruk padding'ini değiştirir:
+
+- `order_phase: u64` — bu tick'teki limit order kohortlarını ayırt eden sayaç.
+- `orders_amount: u64` — bu tick'teki tüm açık order'lar tarafından taahhüt edilen toplam giriş (hepsi tamamen doldurulmamış değildir).
+- `part_filled_orders_remaining: u64` — swap'lar tarafından tüketilen kohortda hala doldurulmamış giriş.
+- `unfilled_ratio_x64: u128` — her order'ın doldurma payını hesaplamak için kullanılan Q64.64 oranı.
+
+Tick dizisi düzeni, boyutu ve PDA tohumları değişmez.
+
+### Yeni talimatlar
+
+- **`CreateDynamicFeeConfig` (yönetici)** — kalibre edilmiş `DynamicFeeConfig` katmanı oluşturun. Yetki: `CreateAmmConfig` ile aynı hazine çoklu imza.
+- **`UpdateDynamicFeeConfig` (yönetici)** — mevcut bir katmanın parametrelerini güncelleyin.
+- **`CreateCustomizablePool`** — `collect_fee_on`, `enable_dynamic_fee` ve `dynamic_fee_config`'i ortaya çıkaran havuz oluşturma giriş noktası. `CreatePool` ile birlikte var; yeni knob'lara ihtiyaç duyan herhangi bir yeni havuz için `CreateCustomizablePool` önerilir.
+- **`OpenLimitOrder`** — tek tick'li limit order açın. `LimitOrderNonce`'u çıkarır, `LimitOrderState`'i tahsis eder, order'ı tick'teki FIFO kohortuna yerleştirir.
+- **`IncreaseLimitOrder` / `DecreaseLimitOrder`** — bir order'ın doldurulmamış kısmını ayarlayın. Tamamen doldurulmuş bir order'da `InvalidOrderPhase` ile geri döner.
+- **`SettleLimitOrder`** — doldurulmuş çıktıyı sahibinin ATA'sına taşıyın. Çağıran sahip veya havuzun `limit_order_admin` keeper'ı olabilir.
+- **`CloseLimitOrder`** — tamamen kapatılmış bir order'ı kira geri almak için kapatın.
+
+### `SwapV2` davranış değişiklikleri
+
+Swap yolu şekil olarak değişmez, ancak yol boyunca üç şey şimdi olur:
+
+1. **Dinamik ücret** (etkinleştirildiğinde): havuzun `DynamicFeeInfo`'su her adımda güncellenir (bozunma → birikme → sınır), ve sonuçta ortaya çıkan ek ücret o adım için temel ücretin üstüne eklenir.
+2. **Limit order eşleştirmesi** (adım açık order'ları olan başlatılmış bir tick'i geçtiğinde): swap girdisinin bir kısmı FIFO olarak o tick'teki kohortu doldurmak için tüketilir, `unfilled_ratio_x64` atomik olarak güncellenir.
+3. **Tek taraflı ücret yönlendirmesi** (`fee_on != 0` olduğunda): ücret swap yönü yerine her zaman giriş tarafından `token_0` veya `token_1`'den alınır.
+
+Bu yöntemlerin her biri havuz eski varsayılanlarla oluşturulduğunda no-op'tir. Güncellenmiş durum değişikliği matrisi için bkz. [Talimatlar → SwapV2](/tr/products/clmm/instructions).
+
+### Yeni hata kodları
+
+`ErrorCode` enum'u bu sürümde yeniden numaralandırılmıştır: beş eski varyant (`LOK`, `ZeroMintAmount`, `InvalidLiquidity`, `TransactionTooOld`, `InvalidRewardDesiredAmount`) kaldırılmış ve on bir yeni varyant eklenmiştir. Anchor hataları enum sırasından `6000` ile numaralandırdığından, **kaldırılan konumlarda veya sonrasındaki her hata kodu kaymıştır** — sayısal kodları sabit kodlayan istemcilerin yeniden eşlemesi gerekir.
+
+Yeni kodlar:
+
+- `6040` `OrderAlreadyFilled`
+- `6041` `InvalidOrderPhase`
+- `6042` `InvalidLimitOrderAmount`
+- `6043` `OrderPhaseSaturated`
+- `6044` `InvalidDynamicFeeConfigParams`
+- `6045` `InvalidFeeOn`
+- `6046` `ZeroSqrtPrice`
+- `6047` `ZeroLiquidity`
+- `6048` `MissingBaseFlag`
+- `6049` `MissingMintAccount`
+- `6050` `MissingTokenProgram2022`
+
+Tam dizeler ve tüm CLMM hataları için kaydırma sonrası tablo [Hata kodları](/tr/reference/error-codes) içindedir.
+
+## SDK'da ne değişti (`@raydium-io/raydium-sdk-v2`)
+
+- **`raydium.clmm` üzerinde yeni yöntemler**: `createCustomizablePool`, `openLimitOrder`, `increaseLimitOrder`, `decreaseLimitOrder`, `settleLimitOrder`, `settleAllLimitOrder`, `closeLimitOrder`, `closeAllLimitOrder`.
+- **`raydium.api` üzerinde yeni REST yardımcıları**: `getClmmDynamicConfigs`, `getClmmLimitOrderConfigs`.
+- **Yeni türler**: `CollectFeeOn` enum'u, `DynamicFeeConfig`, `DynamicFeeInfo`, `LimitOrderState`, `LimitOrderConfig`.
+- **İç yeniden düzenleme**: `utils/` `libraries/` içine taşındı. Paket barrel'ı değişmez; yalnızca `@raydium-io/raydium-sdk-v2/utils/...` altındaki derin içe aktarımlar `…/libraries/...` olarak güncellenmesi gerekir.
+
+Uçtan uca TypeScript izlenecek yollar [`products/clmm/code-demos`](/tr/products/clmm/code-demos) içinde yaşar.
+
+## API'lerde ne değişti
+
+- `api-v3` — `/main/` altında iki yeni uç nokta:
+  - `GET /main/clmm-dynamic-config` — `DynamicFeeConfig` katmanlarının listesi.
+  - `GET /main/clmm-limit-order-config` — havuz başına limit order yapılandırması.
+- `temp-api-v1` — `/limit-order/` altında üç yeni uç nokta:
+  - `GET /limit-order/order/list?wallet=…` — bir cüzdanın şu anda park edilmiş order'ları (açık ve kısmen doldurulmuş, indeksleyicinin Redis önbelleğinden sunulur; aynı yük `totalAmount` / `filledAmount` / `pendingSettle` aracılığıyla her iki fazı kapsar).
+  - `GET /limit-order/history/order/list-by-user?wallet=…` — bir cüzdanın tarihsel limit order'ları. İsteğe bağlı filtreler: `poolId`, `mint1`, `mint2`, `hideCancel`. `nextPageId` / `size` (maks 100) aracılığıyla imleç sayfalandırması.
+  - `GET /limit-order/history/event/list-by-pda?pda=…` — bir veya daha fazla virgülle ayrılmış limit order PDA'ları için PDA başına olay günlüğü (`open` / `increase` / `decrease` / `settle` / `close`). `nextPageId` / `size` (maks 100) aracılığıyla imleç sayfalandırması.
+
+Beşi de API Referans sekmesinde belgelenmiştir.
+
+## Yetki yüzeyi
+
+`limit_order_admin` off-chain operasyonel keeper'dır, **çoklu imza değildir**. Yalnızca mevcut order'larda `SettleLimitOrder` ve `CloseLimitOrder`'ı çağırabilir ve bir kapatmanın çıktısı her zaman **sahibinin** ATA'sında yer alır. Havuz alanlarını mutasyona uğratamazlar, order'ları açamaz veya değiştiremez, veya başka bir şey için imzalayamazlar. Bkz. [Yönetici anahtarları ve çoklu imza → CLMM](/tr/security/admin-and-multisig).
+
+## Güncellenen sayfalar
+
+- `products/clmm/overview` — yeni "Yenilikler" bölümü ve güncellenmiş sonraki adım işaretçileri.
+- `products/clmm/accounts` — üç yeni hesap, `PoolState` yeniden şekillendirmesi geçiş uyarısı ile, `TickState` eklemeleri, yeni PDA yardımcıları.
+- `products/clmm/instructions` — yedi yeni talimat, `SwapV2` davranış eki, güncellenmiş durum değişikliği matrisi.
+- `products/clmm/fees` — tek taraflı ücret bölümü, parametre tablosu ile dinamik ücret bölümü.
+- `products/clmm/math` — limit order eşleştirme sözde kodu, dinamik ücret türetmesi.
+- `products/clmm/code-demos` — `createCustomizablePool` demo, tam limit order izlenecek yolu, yeni tuzaklar.
+- `algorithms/clmm-math` — çok tick'li swap döngüsünde limit order eşleştirmesi ve dinamik ücrete çapraz referans.
+- `sdk-api/typescript-sdk` — CLMM modülü eklemeleri bölümü, `utils/` → `libraries/` geçiş notu.
+- `api-reference/openapi/api-v3.yaml` — yanıt şemaları ile iki yeni uç nokta.
+- `api-reference/openapi/temp-api-v1.yaml` — üç yeni limit order uç noktası (`/limit-order/order/list`, `/limit-order/history/order/list-by-user`, `/limit-order/history/event/list-by-pda`) istek ve yanıt şemaları ile.
+- `api-reference/api-v3/overview` — yeni CLMM config uç noktaları üzerinde not.
+- `api-reference/temp-api-v1/overview` — yeni aktif order'lar, kullanıcı başına geçmiş ve PDA başına olay uç noktaları üzerinde not.
+- `reference/error-codes` — on bir yeni CLMM hata kodu (6040–6050) artı beş kaldırılan eski kod; kaldırma noktalarından sonraki sayısal kodlar kaymıştır.
+- `security/admin-and-multisig` — yeni `DynamicFeeConfig` yönetici satırı ve `limit_order_admin` keeper satırı, sınırlı yetki açıklayıcısı ile.
+
+**Doğrulandı**:
+- `raydium-clmm` kaynağı.
+- `@raydium-io/raydium-sdk-v2` kaynağı.
+- `api-v3` ve `temp-api-v1` kaynağı.

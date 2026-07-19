@@ -1,0 +1,71 @@
+---
+title: "2026-07-22 — AMM v4: remove OpenBook / Serum dependency"
+description: "AMM v4 removes its dormant OpenBook/Serum dependency, CPIs, and market-making instructions: v1 Swap/Deposit/Withdraw stay compatible, WithdrawPnl and SetParams are hard-breaking, and several instructions are no longer callable."
+---
+
+<Info>
+  A documentation changelog entry. For the index of all updates, see [`reference/changelog`](/reference/changelog). For the protocol's own historical timeline, see [`introduction/history-and-milestones`](/introduction/history-and-milestones).
+</Info>
+
+AMM v4 **stopped sharing liquidity to OpenBook (formerly Serum) a long time ago**; the hybrid order-book market-making path has been dormant for years. This upgrade is the cleanup: it **removes the Serum dependency, all order-book CPIs, and the dead market-making instructions** from the program, leaving AMM v4 as a pure constant-product (`x·y=k`) AMM. It does **not** change any live trading behavior — there were no OpenBook orders left to stop placing.
+
+## TL;DR for integrators
+
+- **Swap / Deposit / Withdraw keep working without changes.** Transactions built with the old account layouts still execute — the removed Serum/market accounts are simply ignored (no validation, no CPI). `SwapBaseIn` / `SwapBaseOut` still expect **17 (+1 optional)** accounts; `Deposit` and `Withdraw` layouts are unchanged. You do **not** have to ship a client update to keep existing flows alive.
+- **Migrate to the V2 swap entrypoints.** `SwapBaseInV2` / `SwapBaseOutV2` carry no market accounts and no `amm_open_orders` (8 accounts total), so transactions are smaller and cheaper. Routers/aggregators should route through V2.
+- **`WithdrawPnl` is a hard breaking change (admin only).** It goes **17 (+1 optional) → 10** accounts with **no compatibility parsing**; the old layout misaligns (old #5 was `amm_open_orders`) and fails validation. Admin tooling must be updated.
+- **`SetParams` is a hard breaking change (admin only).** Accounts shrink to `[amm, admin]`, and the `param` enum is **renumbered** (`Fees` 9 → 2, `SetOpenTime` 11 → 3); `AmmOwner`, `LastOrderDistance`, `UpdateOpenOrder` and the grid params are removed.
+- **Several instructions are no longer callable.** `Initialize`, `PreInitialize`, `MonitorStep`, `MigrateToOpenBook`, `WithdrawSrm`, `SimulateInfo`, and `AdminCancelOrders` now revert. Use `Initialize2` to create pools.
+- **On-chain account layouts are byte-stable, and error codes are unchanged.** `AmmInfo` / `StateData` keep their layout (old OpenBook fields retained but deprecated/frozen); the `AmmError` numbering is preserved, with only a new `NotAllowed` appended.
+
+## Why this matters (for traders, LPs, and integrators)
+
+- **Traders** see no change in swap behavior or pricing — the constant-product curve is unchanged. V2-layout swaps are cheaper to land because they carry ~8 fewer accounts.
+- **LPs** keep the same deposit/withdraw economics. Liquidity has long sat entirely in the pool vaults, so pool value is fully on-pool; this upgrade only deletes the stale market plumbing.
+- **Integrators** get smaller, simpler transactions and a quoting model that reads straight from the vaults. Existing integrations do not break (except admin `WithdrawPnl` / `SetParams`), but the v1-swap compatibility shim is temporary — migrate to V2 at your convenience.
+
+## Instruction-level changes
+
+### Still callable, layout unchanged (backward compatible)
+
+`Initialize2`, `Deposit`, `Withdraw`, `SwapBaseIn`, `SwapBaseOut`, `CreateConfigAccount`, and `UpdateConfigAccount` keep their existing account lists. On `SwapBaseIn` / `SwapBaseOut`, `Deposit`, and `Withdraw` the OpenBook/market accounts are still accepted positionally but are **no longer validated or used** — no CPI is issued and pool reserves are computed vault-only. The account **count** must still match, so existing transactions continue to execute unchanged.
+
+### `SwapBaseInV2` / `SwapBaseOutV2` — recommended path
+
+Omit the market accounts and `amm_open_orders` entirely (8 accounts; tags 16 / 17). Quote math is identical to v1. New integrations and routers should use V2.
+
+### `WithdrawPnl` — 17 (+1 optional) → 10 accounts (⚠️ hard breaking, no compatibility path)
+
+`amm_open_orders` and all six market accounts are removed. The new fixed 10-account, admin-only layout has **no** compatibility parsing; the old layout misaligns and fails with errors such as `InvalidCoinVault`.
+
+### `SetParams` — reduced to `[amm, admin]` (⚠️ hard breaking) + renumbered params
+
+The authority, open-orders, target-orders, vault, and all market accounts are removed. The `param` enum is renumbered and trimmed:
+
+| Param | Old value | New value |
+|---|---|---|
+| `Status` | 0 | 0 |
+| `State` | 1 | 1 |
+| `Fees` | 9 | **2** |
+| `SetOpenTime` | 11 | **3** |
+
+All order-book-grid params (`OrderNum`, `Depth`, `AmountWave`, `MinPriceMultiplier`, `MaxPriceMultiplier`, `MinSize`, `VolMaxCutRatio`, `InitOrderDepth`, `SetSwitchTime`, `ClearOpenTime`, `Seperate`) plus `AmmOwner`, `LastOrderDistance`, and `UpdateOpenOrder` are removed. The `SetParamsInstruction` struct drops `new_pubkey` and `last_order_distance`.
+
+### No longer callable (revert at runtime; builders removed)
+
+| Instruction | tag | Replacement |
+|---|---|---|
+| `Initialize` | 0 | `Initialize2` |
+| `MonitorStep` | 2 | none (order-book crank, retired) |
+| `MigrateToOpenBook` | 5 | none |
+| `WithdrawSrm` | 8 | none (SRM fee discount, retired) |
+| `PreInitialize` | 10 | `Initialize2` |
+| `SimulateInfo` | 12 | off-chain / SDK quoting |
+| `AdminCancelOrders` | 13 | none |
+
+## Reserve / state changes
+
+- **Pool-asset formula.** Total pool assets are now `vault balances − pending PnL (need_take_pnl)`; the OpenBook open-order term — already zero in practice — is dropped. Quoting code can read straight from the vault balances.
+- **Deprecated state fields.** `StateData.total_pnl_pc`, `total_pnl_coin`, `orderbook_to_init_time`, `swap_coin_in_amount`, `swap_pc_out_amount`, `swap_acc_pc_fee`, `swap_pc_in_amount`, `swap_coin_out_amount`, and `swap_acc_coin_fee` are retained for layout compatibility but **no longer updated**. Consumers relying on the `swap_*` volume counters should switch to trade logs.
+- **`AmmInfo` init.** `coin_lot_size`, `pc_lot_size`, and `min_size` are now initialized to `0`.
+- **Removed dependency and CPIs.** The `serum_dex` crate is dropped from `Cargo.toml`; all Serum DEX CPIs (`invoke_dex_new_order_v3`, `invoke_dex_cancel_order_v2`, `invoke_dex_settle_funds`, `invoke_dex_init_open_orders`, …) are removed from `invokers.rs`. Removed data structs: `LastOrderDistance`, `SimulateParams`, `RunCrankData`, `GetPoolData`, `GetSwapBaseInData`, `GetSwapBaseOutData`.
