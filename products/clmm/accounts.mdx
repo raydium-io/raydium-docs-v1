@@ -24,6 +24,7 @@ A live CLMM pool is described by the following account families. All are owned b
 | `DynamicFeeConfig` | Reusable parameter set for the dynamic-fee mechanism. Pools created via `create_customizable_pool` can opt in. Admin-managed. | shared (per index) |
 | `LimitOrderState` | One per open limit order. Records owner, tick, side, total amount, settled-output snapshot. | 1 per order |
 | `LimitOrderNonce` | Per-`(wallet, nonce_index)` counter that derives unique order PDAs. | 1 per (wallet, index) |
+| `Permission` | Grants its authority the right to call `CreatePermissionedPool`. Existence of the PDA **is** the grant. Admin-managed. | 1 per authorized creator |
 
 ## `PoolState`
 
@@ -73,7 +74,12 @@ pub struct PoolState {
     //   1 = Token0Only (always deduct fee from token0 vault)
     //   2 = Token1Only (always deduct fee from token1 vault)
     pub fee_on: u8,
-    pub padding: [u8; 6],
+
+    // Client-supplied index (u16 LE) folded into the pool PDA seeds by
+    // create_permissioned_pool. [0, 0] for pools created via CreatePool /
+    // CreateCustomizablePool (the seed component collapses to empty).
+    pub seed_index: [u8; 2],
+    pub padding: [u8; 4],
 
     // Live reward streams (up to REWARD_NUM = 3).
     pub reward_infos: [RewardInfo; 3],
@@ -108,6 +114,7 @@ Fields you will actually touch:
 - **`tick_spacing`** is locked to the `AmmConfig` at initialization and never changes. It determines which tick indices are even allowed to be position endpoints.
 - **`tick_array_bitmap`** is an **inline** bitmap covering the commonly used tick range around spot price. For pools whose positions reach far out, overflow tracking lives in the separate `TickArrayBitmapExtension`.
 - **`fee_on`** is fixed at pool creation. `0` (FromInput) reproduces classic Uniswap-V3 behavior. `1` and `2` route the swap fee to a single side of the book — see [`products/clmm/fees`](/products/clmm/fees) for trade-offs.
+- **`seed_index`** is `[0, 0]` for every pool created through `CreatePool` / `CreateCustomizablePool` (one canonical pool per pair). A **non-zero** value means the pool was created via `CreatePermissionedPool` and the index is part of the pool's PDA seeds, letting several pools coexist for the same `(config, mint0, mint1)`. To re-derive such a pool's address you must know its `seed_index`.
 - **`dynamic_fee_info`** carries volatility state for the dynamic-fee surcharge. When enabled, every swap recomputes a `dynamic_fee_component` on top of `AmmConfig.trade_fee_rate`. Layout is documented under `DynamicFeeInfo` below; pools without dynamic fee leave the entire struct zero.
 
 ## `AmmConfig`
@@ -370,6 +377,20 @@ pub struct LimitOrderNonce {
 
 PDA seed: `[user_wallet.as_ref(), &[nonce_index]]`. Most clients use `nonce_index = 0` and let `order_nonce` carry the cardinality.
 
+## `Permission`
+
+A capability account whose **existence is the grant**: if a `Permission` PDA is derived for a given authority, that authority may call `CreatePermissionedPool`. It stores nothing beyond the authority it was created for.
+
+```rust
+// programs/amm/src/states/permission.rs
+pub struct Permission {
+    pub authority: Pubkey,       // the account this PDA authorizes
+    pub padding:   [u64; 30],
+}
+```
+
+PDA seed: `["permission", authority.as_ref()]`. Created by an admin via `CreatePermissionPda` and torn down via `ClosePermissionPda` (rent refunds to the caller). Both admin instructions accept either the program `admin` or a dedicated `permission_pda_admin` key. Closing the PDA revokes the grant — the authority can no longer create additional pools, but pools it already created are unaffected.
+
 ## Deriving the key accounts
 
 ```ts
@@ -395,6 +416,8 @@ export function deriveClmmAccounts(
      token0Mint.toBuffer(), token1Mint.toBuffer()],
     CLMM_PROGRAM_ID,
   );
+  // NOTE: pools created via CreatePermissionedPool append a non-zero u16
+  // seed_index (LE) as a 5th seed — see derivePermissionedPool below.
   const [observation] = PublicKey.findProgramAddressSync(
     [Buffer.from("observation"), poolState.toBuffer()],
     CLMM_PROGRAM_ID,
@@ -422,6 +445,30 @@ export function deriveDynamicFeeConfig(index: number) {
   idx.writeUInt16BE(index);
   const [pda] = PublicKey.findProgramAddressSync(
     [Buffer.from("dynamic_fee_config"), idx],
+    CLMM_PROGRAM_ID,
+  );
+  return pda;
+}
+
+export function derivePermissionedPool(
+  ammConfig: PublicKey,
+  token0Mint: PublicKey,           // must already be sorted
+  token1Mint: PublicKey,
+  seedIndex: number,               // non-zero u16
+) {
+  const idx = Buffer.alloc(2);
+  idx.writeUInt16LE(seedIndex);    // little-endian, unlike the u16 seeds above
+  const [pool] = PublicKey.findProgramAddressSync(
+    [Buffer.from("pool"), ammConfig.toBuffer(),
+     token0Mint.toBuffer(), token1Mint.toBuffer(), idx],
+    CLMM_PROGRAM_ID,
+  );
+  return pool;
+}
+
+export function derivePermission(authority: PublicKey) {
+  const [pda] = PublicKey.findProgramAddressSync(
+    [Buffer.from("permission"), authority.toBuffer()],
     CLMM_PROGRAM_ID,
   );
   return pda;
@@ -480,6 +527,8 @@ The exact seed strings should always be double-checked against the on-chain IDL 
 | `CloseLimitOrder` | — | `limitOrderState` (rent → `owner`) |
 | `CreateDynamicFeeConfig` | `dynamicFeeConfig` | — |
 | `CreateCustomizablePool` | `poolState`, `observation`, vaults — same as `CreatePool`. Snapshots `dynamicFeeConfig` if `enable_dynamic_fee = true`. | — |
+| `CreatePermissionedPool` | `poolState` (at a `seed_index`-derived address), `observation`, vaults — like `CreateCustomizablePool`. Requires an existing `permission`. | — |
+| `CreatePermissionPda` / `ClosePermissionPda` | `permission` (admin grant) | `permission` (admin revoke, rent → caller) |
 | `CollectRewards` | — | — |
 | `UpdateRewardInfos` | — | — |
 | `CloseProtocolPosition` (admin) | — | Vestigial `protocolPositionState` (rent → admin) |

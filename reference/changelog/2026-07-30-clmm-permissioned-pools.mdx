@@ -1,0 +1,72 @@
+---
+title: "2026-07-30 — CLMM: permissioned multi-pools and limit-order frozen-account guard"
+description: "Two CLMM program updates: CreatePermissionedPool lets a whitelisted authority create multiple pools per pair via a seed_index folded into the pool PDA, and OpenLimitOrder now takes the output-side accounts to reject orders with a frozen input or output token account."
+---
+
+<Info>
+  A documentation changelog entry. For the index of all updates, see [`reference/changelog`](/reference/changelog). For the protocol's own historical timeline, see [`introduction/history-and-milestones`](/introduction/history-and-milestones).
+</Info>
+
+This release documents two CLMM program changes. Both are additive and backwards-compatible: existing pools, positions, and open orders are unaffected, and the classic `CreatePool` / `CreateCustomizablePool` paths are unchanged.
+
+## TL;DR for integrators
+
+- **Pool IDs can now be non-canonical, behind a permission gate.** Historically there was exactly one CLMM pool address per `(amm_config, token_mint_0, token_mint_1)` — the PDA seeds pinned it. A new instruction, **`CreatePermissionedPool`**, folds a client-supplied non-zero `seed_index: u16` into the pool PDA seeds, so a whitelisted operator can stand up **several pools for the same pair and fee tier**, each at its own address. Because arbitrary pool addresses are a privileged capability, the payer must hold a **`Permission`** PDA granted by the admin. Two admin instructions, **`CreatePermissionPda`** and **`ClosePermissionPda`**, manage those grants.
+- **`OpenLimitOrder` now validates the output side.** The instruction takes three additional accounts — `output_token_account`, `output_vault`, `output_vault_mint` — and rejects the order with `NotApproved` if the owner's **input or output** token account is frozen. This guarantees the eventual fill can be delivered, which matters for allow-list / default-frozen Token-2022 mints (permissioned tokens). Clients built against the old single-sided account list must add the three output accounts.
+
+## What changed in the program
+
+### New instruction: `CreatePermissionedPool`
+
+Same shape and parameters as `CreateCustomizablePool` (it takes the same `CreateCustomizableParams`, so single-sided fee and the dynamic-fee opt-in are available), plus:
+
+- A `seed_index: u16` argument, which **must be non-zero**. It is appended (little-endian) to the pool PDA seeds:
+  `["pool", amm_config, token_mint_0, token_mint_1, seed_index.to_le_bytes()]`.
+- A `permission` account: the PDA `["permission", payer]`. Anchor rejects the call if it does not exist or is not owned by the program — its mere existence is the authorization.
+- A `pool_creator` account recorded as `pool_state.owner`, which may differ from the fee-paying `payer`.
+
+`seed_index = 0` remains reserved for legacy pools: for those the seed component collapses to empty, reproducing the classic four-seed address, so no existing pool address changes.
+
+See [Instructions → CreatePermissionedPool](/products/clmm/instructions).
+
+### New account: `Permission`
+
+A capability account whose existence **is** the grant. It stores only the `authority` it was created for (plus padding). PDA seeds: `["permission", authority]`. It confers the right to call `CreatePermissionedPool` and nothing else — it cannot move funds, change fees, or mutate any pool. See [Accounts → Permission](/products/clmm/accounts).
+
+### New admin instructions: `CreatePermissionPda` / `ClosePermissionPda`
+
+- `CreatePermissionPda` initializes a `Permission` PDA for a given `permission_authority`.
+- `ClosePermissionPda` closes it and refunds rent to the caller, revoking the grant. Pools already created under that grant are unaffected.
+
+Both accept either the program `admin` pubkey **or** a dedicated `permission_pda_admin` key (a distinct constant on mainnet vs devnet). See [Admin keys and multisig → CLMM](/security/admin-and-multisig).
+
+### `PoolState`: `seed_index` field
+
+Two bytes were carved out of an existing padding region (`padding: [u8; 6]` → `seed_index: [u8; 2]` + `padding: [u8; 4]`) directly after `fee_on`. **The total account size is unchanged, and no indexer migration is required.** For pools created via `CreatePool` / `CreateCustomizablePool`, `seed_index` is `[0, 0]`; for permissioned pools it carries the creator's chosen index and is required to re-derive the pool address off-chain.
+
+### `OpenLimitOrder`: output-side accounts and frozen-account guard
+
+The `OpenLimitOrder` account list gains `output_token_account`, `output_vault`, and `output_vault_mint`. They are used only for validation — no output is debited on open. The handler now requires that **neither** the input nor the output token account is frozen, returning `NotApproved` otherwise (the same code already returned when the pool has swap or limit-order disabled). This closes a gap where an order could be opened against a token account that could never receive the fill (e.g. a not-yet-thawed account for a default-frozen Token-2022 mint).
+
+See [Instructions → OpenLimitOrder](/products/clmm/instructions).
+
+## Error codes
+
+No new error codes. The existing `6000 NotApproved` now additionally covers the frozen input/output token account and the swap/limit-order-disabled cases on `OpenLimitOrder`, and the "signer is neither `admin` nor `permission_pda_admin`" case on the permission instructions. The error-code table and numbering are otherwise unchanged from the [2026-05-18 release](/reference/changelog/2026-05-18-clmm-limit-orders). See [Error codes → CLMM](/reference/error-codes).
+
+## Migration notes
+
+- **Reading pool addresses**: do not assume one pool per `(config, mint0, mint1)`. A pair may now have a canonical pool plus one or more permissioned pools at `seed_index`-derived addresses. Enumerate pools from the API / indexer rather than deriving a single PDA, and store `seed_index` when you need to re-derive a permissioned pool.
+- **Placing limit orders**: add the three output-side accounts to your `OpenLimitOrder` transaction, and surface a clear message when `NotApproved` is returned for a frozen account.
+- **No account-size or layout break**: `PoolState` is the same size; the retired padding bytes now hold `seed_index`.
+
+## Pages updated
+
+- `products/clmm/overview` — "What's new" note on permissioned multi-pools and the limit-order guard.
+- `products/clmm/instructions` — new `CreatePermissionedPool` section, `CreatePermissionPda` / `ClosePermissionPda` in the instruction table and admin-gating note, and the updated `OpenLimitOrder` account list / preconditions / errors.
+- `products/clmm/accounts` — `Permission` in the inventory and its own section, the `PoolState.seed_index` field, PDA-derivation helpers (`derivePermissionedPool`, `derivePermission`), and the lifecycle quick reference.
+- `security/admin-and-multisig` — new `permission_pda_admin` row and permission-scope explainer in the CLMM roles table.
+- `reference/error-codes` — broadened `NotApproved` description.
+
+**Verified against**:
+- `raydium-clmm` source (`create_permissioned_pool.rs`, `admin/create_permission_pda.rs`, `admin/close_permission_pda.rs`, `states/permission.rs`, `states/pool.rs`, `limit_order/open_limit_order.rs`, `lib.rs`).

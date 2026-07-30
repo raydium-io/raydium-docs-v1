@@ -19,8 +19,11 @@ description: "Complete CLMM instruction reference: pool lifecycle, position mana
 | Admin | `UpdateOperationAccount` | Modify the operation-account whitelist. |
 | Admin | `CreateDynamicFeeConfig` | Create a reusable dynamic-fee parameter set under a u16 index. |
 | Admin | `UpdateDynamicFeeConfig` | Modify an existing `DynamicFeeConfig`. Pools that already snapshotted it are unaffected. |
+| Admin | `CreatePermissionPda` | Grant an authority the right to call `CreatePermissionedPool` by initializing its `Permission` PDA. |
+| Admin | `ClosePermissionPda` | Revoke a previously-granted permission by closing its `Permission` PDA; rent refunds to the caller. |
 | Pool | `CreatePool` | Initialize a CLMM pool bound to an `AmmConfig`. Standard, FromInput-fee path. Coexists with `CreateCustomizablePool`. |
 | Pool | `CreateCustomizablePool` | Recommended for new pools. Same shape as `CreatePool` plus `collect_fee_on` and an opt-in `enable_dynamic_fee` flag. |
+| Pool | `CreatePermissionedPool` | Create an **additional** pool for a pair that already has one, using a client-supplied `seed_index` folded into the pool PDA. Payer must hold a `Permission` PDA. |
 | Position | `OpenPosition` / `OpenPositionV2` / `OpenPositionWithToken22Nft` | Mint a position NFT. `OpenPositionV2` supersedes V1 (newer account layout with the bitmap-extension slot); `OpenPositionWithToken22Nft` issues the position NFT as Token-2022 instead of SPL Token. New code should use V2 or the Token-2022 variant. |
 | Position | `IncreaseLiquidity` / `IncreaseLiquidityV2` | Add liquidity to an existing position. |
 | Position | `DecreaseLiquidity` / `DecreaseLiquidityV2` | Remove liquidity; collects owed fees. |
@@ -42,7 +45,7 @@ description: "Complete CLMM instruction reference: pool lifecycle, position mana
 | Rewards | `CollectRemainingRewards` | After a reward stream's `end_time`, sweep any unallocated tokens back to the funder. |
 | Utility | `InitTickArray` | Initialize a tick-array account (often bundled with `OpenPosition`). |
 
-Most admin-only instructions (`CreateAmmConfig`, `UpdateAmmConfig`, `UpdatePoolStatus`, `CreateSupportMintAssociated`, `CreateOperationAccount`, `UpdateOperationAccount`, `CloseProtocolPosition`) are gated by the program's hardcoded `admin` pubkey. Reward-stream admin instructions (`TransferRewardOwner`, `CollectRemainingRewards`) are gated by the reward funder, not the program admin.
+Most admin-only instructions (`CreateAmmConfig`, `UpdateAmmConfig`, `UpdatePoolStatus`, `CreateSupportMintAssociated`, `CreateOperationAccount`, `UpdateOperationAccount`, `CloseProtocolPosition`) are gated by the program's hardcoded `admin` pubkey. `CreatePermissionPda` / `ClosePermissionPda` accept either the `admin` pubkey **or** a dedicated `permission_pda_admin` key. Reward-stream admin instructions (`TransferRewardOwner`, `CollectRemainingRewards`) are gated by the reward funder, not the program admin.
 
 V2 suffix means "supports Token-2022 on vaults / NFT, requires bitmap-extension slot". The SDK picks V2 by default for new pools.
 
@@ -114,6 +117,45 @@ pub struct CreateCustomizableParams {
 - Otherwise: `pool_state.dynamic_fee_info` is zeroed (= dynamic fee inactive forever for this pool).
 
 `fee_on` and the dynamic-fee enablement bit are set **only** at pool creation. There is no in-place upgrade — pools created via legacy `CreatePool` cannot retroactively gain dynamic fee or single-sided fee. New deployments should default to this instruction.
+
+## `CreatePermissionedPool`
+
+Both `CreatePool` and `CreateCustomizablePool` derive the pool PDA from `["pool", amm_config, token_mint_0, token_mint_1]`, so there is exactly **one** canonical pool address per `(config, mint0, mint1)` triple — a second `init` at the same seeds fails. `CreatePermissionedPool` lifts that restriction by folding a client-supplied `seed_index: u16` into the pool PDA seeds, allowing **multiple pools for the same pair and fee tier** — each at its own address. Because an arbitrary pool address is a privileged capability, the payer must hold a `Permission` PDA that authorizes it.
+
+Everything else about the pool is identical to `CreateCustomizablePool`: it takes the same `CreateCustomizableParams` and supports single-sided fee and the dynamic-fee opt-in.
+
+**Arguments**
+
+```rust
+customizable_params: CreateCustomizableParams   // same struct as CreateCustomizablePool
+seed_index:          u16                          // must be non-zero; folded into the pool PDA seeds
+```
+
+**Accounts (abridged)** — same as `CreateCustomizablePool` plus, at the front:
+
+| # | Name | W | S | Notes |
+|---|------|---|---|-------|
+| 1 | `payer` | W | S | Pays rent. Must be the authority of the `permission` PDA below. |
+| 2 | `pool_creator` |   |   | Recorded as `pool_state.owner`. May differ from `payer`. |
+| 3 | `permission` |   |   | PDA `["permission", payer]`. Anchor rejects the call if it does not exist / is not owned by the program. |
+| … | (`amm_config`, `pool_state`, mints, vaults, `observation_state`, `tick_array_bitmap`, token/system programs) | | | As in `CreateCustomizablePool`. |
+
+The `pool_state` PDA is derived from `["pool", amm_config, token_mint_0, token_mint_1, seed_index.to_le_bytes()]`.
+
+**Preconditions**
+
+- `seed_index != 0`. A `seed_index` of `0` is reserved for legacy pools and is rejected here; the `[0, 0]` seed component is what makes a legacy pool address collapse to the classic four-seed form.
+- The `permission` PDA for `payer` exists (created by an admin via `CreatePermissionPda`).
+- Same mint / allow-list rules as `CreatePool`.
+
+**Postconditions**
+
+- A new `pool_state` exists at the `seed_index`-derived address, with `pool_state.seed_index = seed_index`.
+- All other post-state matches `CreateCustomizablePool` (fee mode, optional dynamic fee).
+
+<Note>
+  This instruction does **not** widen general pool-creation access — permissionless creation continues through `CreatePool` / `CreateCustomizablePool`, which remain one-pool-per-pair. `CreatePermissionedPool` exists for the specific case where a whitelisted operator needs several pools for the same pair (e.g. differing initial prices or launch cohorts) and holds a `Permission` PDA granted by the admin.
+</Note>
 
 ## `OpenPositionV2` / `OpenPositionWithToken22Nft`
 
@@ -305,17 +347,25 @@ amount:         u64      // input-token amount
 | 3 | `tick_array` | W |   | The tick array containing `tick_index`. |
 | 4 | `limit_order_nonce` | W |   | PDA. `init_if_needed` — created on the user's first order under this `nonce_index`. |
 | 5 | `limit_order` | W |   | PDA. `init` here. |
-| 6 | `input_token_account` | W |   | User's input ATA. |
-| 7 | `input_vault` | W |   | Pool input vault. |
-| 8 | `input_vault_mint` |   |   | Token-2022 fee handling. |
-| 9 | `input_token_program` |   |   | SPL or Token-2022. |
-| 10 | `system_program`, `rent` |   |   | |
+| 6 | `input_token_account` | W |   | User's input ATA. Checked for `frozen`. |
+| 7 | `output_token_account` | W |   | User's **output** ATA. Not debited on open — required only so the program can confirm it is not `frozen` (i.e. the fill can be delivered later). |
+| 8 | `input_vault` | W |   | Pool input vault. |
+| 9 | `output_vault` | W |   | Pool output vault. Identifies the output mint for the `output_token_account` / `output_vault_mint` checks. |
+| 10 | `input_vault_mint` |   |   | Token-2022 fee handling. |
+| 11 | `output_vault_mint` |   |   | Mint of the output side (frozen-check pairing). |
+| 12 | `input_token_program` |   |   | SPL or Token-2022. |
+| 13 | `system_program`, `rent` |   |   | |
+
+<Note>
+  **Account-list change (2026-07 release).** `OpenLimitOrder` now also takes the **output-side** accounts — `output_token_account`, `output_vault`, and `output_vault_mint` — in addition to the input side. They are used only for validation: the program rejects the order if the owner's input **or** output token account is frozen. This guarantees that a fill can actually be settled to the owner's output ATA, which matters for allow-list / default-frozen Token-2022 mints (e.g. permissioned tokens) where an account may not yet be thawed. Clients built against the older single-sided account list must add the three output accounts.
+</Note>
 
 **Preconditions**
 
+- Neither `input_token_account` nor `output_token_account` is frozen (else `NotApproved`).
+- `pool_state.status` allows both the swap (bit 4) and limit-order (bit 5) operations (else `NotApproved`).
 - `tick_index % pool.tick_spacing == 0` and within `[MIN_TICK, MAX_TICK]`.
 - `tick_index` is on the **right side of `pool.tick_current`** for the chosen direction (selling token0 → tick must be above current, and vice versa). Selling at a tick already crossed would be matched immediately and is rejected.
-- `pool_state.status` allows the limit-order operation (bit 5).
 
 **Postconditions**
 
@@ -324,7 +374,7 @@ amount:         u64      // input-token amount
 - `limit_order_nonce.order_nonce += 1`.
 - `OpenLimitOrderEvent` emitted.
 
-**Common errors** — `InvalidLimitOrderAmount` (zero or below the pool's minimum), `InvalidTickIndex` (out of `[MIN_TICK, MAX_TICK]`, or on the wrong side of `tick_current` for the chosen direction), `TickAndSpacingNotMatch` (`tick_index % pool.tick_spacing != 0`), `OrderPhaseSaturated`.
+**Common errors** — `NotApproved` (input or output token account frozen, or the pool has swap / limit-order disabled), `InvalidLimitOrderAmount` (zero or below the pool's minimum), `InvalidTickIndex` (out of `[MIN_TICK, MAX_TICK]`, or on the wrong side of `tick_current` for the chosen direction), `TickAndSpacingNotMatch` (`tick_index % pool.tick_spacing != 0`), `OrderPhaseSaturated`.
 
 ## `IncreaseLimitOrder`
 
