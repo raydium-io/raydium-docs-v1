@@ -24,10 +24,10 @@ description: "Complete CLMM instruction reference: pool lifecycle, position mana
 | Pool | `CreatePool` | Initialize a CLMM pool bound to an `AmmConfig`. Standard, FromInput-fee path. Coexists with `CreateCustomizablePool`. |
 | Pool | `CreateCustomizablePool` | Recommended for new pools. Same shape as `CreatePool` plus `collect_fee_on` and an opt-in `enable_dynamic_fee` flag. |
 | Pool | `CreatePermissionedPool` | Create an **additional** pool for a pair that already has one, using a client-supplied `seed_index` folded into the pool PDA. Payer must hold a `Permission` PDA. |
-| Position | `OpenPosition` / `OpenPositionV2` / `OpenPositionWithToken22Nft` | Mint a position NFT. `OpenPositionV2` supersedes V1 (newer account layout with the bitmap-extension slot); `OpenPositionWithToken22Nft` issues the position NFT as Token-2022 instead of SPL Token. New code should use V2 or the Token-2022 variant. |
+| Position | `OpenPosition` / `OpenPositionV2` / `OpenPositionWithToken22Nft` | Mint a position NFT. `OpenPositionV2` supersedes V1; `OpenPositionWithToken22Nft` issues the NFT as Token-2022. V2 paths freeze the NFT account only when an underlying vault mint's freeze authority matches the restricted-issuer list. Otherwise the account stays unfrozen. |
 | Position | `IncreaseLiquidity` / `IncreaseLiquidityV2` | Add liquidity to an existing position. |
 | Position | `DecreaseLiquidity` / `DecreaseLiquidityV2` | Remove liquidity; collects owed fees. |
-| Position | `ClosePosition` | Burn the NFT and close the `PersonalPositionState`. |
+| Position | `ClosePosition` | Burn the NFT and close the `PersonalPositionState`. If the NFT account is frozen, first thaws it with the pool PDA supplied as a remaining account. |
 | Position | `CloseProtocolPosition` | Admin-only sweep for legacy `ProtocolPositionState` PDAs. The current program no longer creates or reads `ProtocolPositionState` — this instruction exists solely to reclaim rent on accounts created by older program versions. |
 | Swap | `Swap` / `SwapV2` | Constant-liquidity swap. Both variants apply dynamic fee, single-sided fee routing, and limit-order matching; the only difference is that `SwapV2` accepts Token-2022 mints (the V1 variant requires both vaults to be classic SPL Token). |
 | Swap | `SwapRouterBaseIn` | Multi-hop, used by the router. |
@@ -211,8 +211,14 @@ base_flag: Option<bool>       // true = fit to amount0; false = fit to amount1
 - `personal_position` exists, `liquidity` set, `fee_growth_inside_last` snapshotted.
 - Tick-array entries at `tick_lower` and `tick_upper` updated (`liquidity_gross += L`, `liquidity_net ± L`, fee-growth snapshots maintained).
 - `pool_state.liquidity += L` if position is in range (`tick_lower ≤ tick_current < tick_upper`).
+- The position NFT mint records `pool_state` as freeze authority. Mint authority is removed after the single NFT is minted. Recording the freeze authority does not change the NFT token account's state.
+- The NFT token account remains unfrozen unless the instruction is `OpenPositionV2` or `OpenPositionWithToken22Nft` **and** either vault mint's freeze authority matches CLMM's restricted-issuer list. Only that matching V2 path freezes the account. `OpenPosition` V1 does not freeze.
 
 **Common errors** — `InvalidTickIndex`, `NotApproved`, `ZeroAmountSpecified`, `TransactionTooLarge` (if too many tick arrays).
+
+<Note>
+  Position freezing does not add declared instruction accounts or arguments. Clients can open these positions with the existing V2 layouts. The behavior is selected on-chain from `vault_0_mint` and `vault_1_mint`.
+</Note>
 
 ## `IncreaseLiquidityV2`
 
@@ -262,6 +268,22 @@ amount_1_min: u64
 
 Burn the position NFT and close `PersonalPositionState`.
 
+**Declared accounts**
+
+| # | Name | W | S | Notes |
+|---|------|---|---|-------|
+| 1 | `nft_owner` | W | S | Must own the NFT token account holding amount `1`. |
+| 2 | `position_nft_mint` | W |   | Must match `personal_position.nft_mint`. |
+| 3 | `position_nft_account` | W |   | NFT owner's account; may be classic SPL Token or Token-2022. |
+| 4 | `personal_position` | W |   | Closed to `nft_owner`. |
+| 5 | `system_program` |   |   | Closes position state. |
+| 6 | `token_program` |   |   | Must own the NFT mint and token account. |
+
+**Remaining accounts**
+
+- Unfrozen NFT: none required; an extra pool account is harmless because the handler does not read it.
+- Frozen NFT: append `personal_position.pool_id` as the first remaining account. The program loads it as `PoolState` and uses its PDA seeds to sign the thaw.
+
 **Preconditions**
 
 - `personal_position.liquidity == 0`.
@@ -272,8 +294,13 @@ Burn the position NFT and close `PersonalPositionState`.
 
 **Effect**
 
+- If the NFT token account is frozen, verifies the first remaining account equals `personal_position.pool_id`, then thaws it with the pool PDA.
 - Burns the NFT.
-- Closes the NFT mint account and the `personal_position` account, refunding rent to the `payer`.
+- Closes the NFT token account and `personal_position`, refunding rent to `nft_owner`. If the position NFT uses Token-2022, it also closes the NFT mint; classic SPL Token mints cannot be closed and remain with supply zero.
+
+The thaw, burn, and close are atomic. The NFT cannot become transferable between those steps.
+
+**Conditional client break** — the declared IDL layout is unchanged, so legacy clients continue to close existing and unfrozen positions. A legacy builder that omits the pool remaining account fails with `AccountLack` when closing a frozen position. Passing the pool for every close is the simplest compatible strategy.
 
 ## `SwapV2`
 
