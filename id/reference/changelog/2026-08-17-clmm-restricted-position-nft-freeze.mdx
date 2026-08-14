@@ -1,0 +1,108 @@
+---
+title: "2026-08-17 — CLMM: pembekuan NFT posisi restricted-issuer"
+description: "CLMM secara kondisional membekukan akun NFT posisi baru hanya ketika jalur V2 open menemukan mint yang freeze authority-nya cocok dengan daftar restricted-issuer."
+---
+
+<Info>
+  **Halaman ini diterjemahkan secara otomatis oleh AI. Versi bahasa Inggris adalah acuan resmi.**
+
+  [Lihat versi bahasa Inggris →](/reference/changelog/2026-08-17-clmm-restricted-position-nft-freeze)
+</Info>
+
+Rilis ini menambahkan jalur non-transferability kondisional untuk pool issuer KYC-restricted yang dipilih. Ini tidak membekukan setiap posisi baru, membekukan aset pool, atau mencegah pemilik posisi mengelola likuiditas. Pool PDA CLMM menjadi freeze authority untuk setiap mint NFT posisi baru, tetapi akun token NFT tetap tidak dibekukan secara default. Program hanya membekukannya ketika posisi menggunakan `OpenPositionV2` atau `OpenPositionWithToken22Nft` dan salah satu mint vault yang mendasar membawa freeze authority dari daftar restricted-issuer yang dikodekan.
+
+## TL;DR untuk integrator
+
+- **Mint NFT posisi baru memiliki freeze authority, tetapi tidak dibekukan secara default.** `OpenPosition`, `OpenPositionV2`, dan `OpenPositionWithToken22Nft` menetapkan `pool_state` posisi sebagai mint freeze authority. Mint authority masih dihapus setelah NFT tunggal dimint.
+- **Pembekuan memerlukan jalur V2 plus kecocokan issuer.** `OpenPositionV2` dan `OpenPositionWithToken22Nft` memeriksa `vault_0_mint.freeze_authority` dan `vault_1_mint.freeze_authority`. Akun NFT baru hanya dibekukan jika setidaknya satu cocok dengan daftar program. Tanpa kecocokan, tetap tidak dibekukan dan dapat ditransfer.
+- **Dibekukan berarti terikat pada pemilik.** SPL Token menolak transfer NFT dan perubahan pemilik akun token dengan error native `AccountFrozen`. Peningkatan/penurunan likuiditas dan pengumpulan biaya/reward terus berfungsi ketika pemilik NFT menandatangani.
+- **Close tetap tersedia.** `ClosePosition` mendeteksi akun NFT yang dibekukan, menggunakan pool PDA untuk mencairkannya, kemudian membakar NFT dan menutup posisi secara atomik.
+- **Close yang dibekukan memerlukan satu akun sisa.** Klien harus menambahkan `personal_position.pool_id` sebagai akun sisa pertama. Jika hilang mengembalikan CLMM `AccountLack`; melewatkan pool yang salah mengembalikan `NotApproved`.
+- **Posisi yang ada tidak terpengaruh.** Update tidak secara retroaktif mengubah mint authority NFT atau membekukan akun token yang ada.
+- **Tidak ada perubahan layout state CLMM atau daftar akun IDL yang dideklarasikan.** `PoolState`, `PersonalPositionState`, dan argumen instruksi tetap kompatibel byte. Persyaratan jalur close dibawa melalui `remaining_accounts`.
+
+## Logika pemicu
+
+Program mengevaluasi dua mint vault pada waktu open:
+
+```rust
+must_freeze = restricted_ids.contains(vault_0_mint.freeze_authority)
+           || restricted_ids.contains(vault_1_mint.freeze_authority)
+```
+
+Freeze authority yang hilang tidak cocok. Satu sisi yang cocok sudah cukup. Daftar awal berisi authority issuer yang sama yang digunakan oleh deteksi aset Superstate CLMM. Kunci match mainnet-beta dan devnet saat ini berada di [`reference/program-addresses`](/id/reference/program-addresses#clmm-restricted-issuer-freeze-authorities).
+
+Pemeriksaan berjalan di handler open-position bersama hanya ketika akun mint vault disediakan. Ini berarti:
+
+| Jalur Open | Program NFT Posisi | Perilaku pembekuan restricted-issuer |
+|-----------|----------------------|-----------------------------------|
+| `OpenPosition` V1 | SPL Token | Tidak membekukan. V1 tidak dapat melayani aset issuer Token-2022 yang ditargetkan oleh daftar yang dikirim. |
+| `OpenPositionV2` | SPL Token | Memeriksa kedua mint vault dan membekukan pada kecocokan. |
+| `OpenPositionWithToken22Nft` | Token-2022 | Memeriksa kedua mint vault dan membekukan pada kecocokan. |
+
+## Perubahan authority NFT posisi
+
+Sebelum update ini, mint NFT posisi SPL klasik yang baru dibuat tidak mempertahankan freeze authority. Setelah update, setiap mint NFT posisi baru menamai poolnya sebagai freeze authority, termasuk posisi di pool biasa. Pengaturan authority ini saja tidak membekukan akun token NFT; posisi biasa dan non-matching tetap tidak dibekukan.
+
+Menggunakan pool PDA alih-alih kunci admin global atau issuer mempersempit authority ke satu pool. Pihak eksternal tidak dapat menandatangani sebagai PDA, dan CLMM tidak mengekspos instruksi tujuan umum untuk membekukan atau mencairkan akun posisi arbitrer. Kode baru menggunakan authority di dua tempat saja:
+
+1. Bekukan segera setelah minting ketika pemeriksaan issuer yang mendasar cocok.
+2. Cairkan selama `ClosePosition` segera sebelum burn.
+
+## Migrasi `ClosePosition`
+
+Enam akun yang dideklarasikan tidak berubah. Untuk NFT yang dibekukan, tambahkan pool sebagai akun sisa pertama:
+
+```text
+declared: nft_owner, position_nft_mint, position_nft_account,
+          personal_position, system_program, token_program
+remaining[0]: personal_position.pool_id   // read-only, non-signer
+```
+
+Handler memverifikasi kunci sebelum memuat `PoolState`, menurunkan seed signer pool, dan melakukan:
+
+```text
+thaw NFT account → burn NFT → close NFT token account / position state
+```
+
+Semua langkah berjalan dalam satu instruksi Solana dan oleh karena itu commit atau revert bersama. Melewatkan pool pada setiap close aman: handler mengabaikan remaining accounts ketika akun NFT tidak dibekukan.
+
+<Warning>
+  **Conditional client break.** Klien yang lebih lama dapat berhasil membuka posisi setelah upgrade karena layout akun open V2 tidak berubah. Jika posisi itu dibekukan, klien yang sama mungkin kemudian gagal menutupnya karena builder `ClosePosition`-nya menghilangkan akun sisa pool. Perbarui builder close sebelum memungkinkan pengguna membuka posisi di pool yang terpengaruh.
+</Warning>
+
+## Matriks kompatibilitas
+
+| Skenario | Transfer NFT | Kelola likuiditas | Builder close legacy | Builder close yang diperbarui |
+|----------|--------------|------------------|----------------------|-----------------------|
+| Posisi yang ada | tidak berubah | ya | ya | ya |
+| Posisi baru, pool biasa | ya | ya | ya | ya |
+| Posisi V2 baru, pool restricted-issuer | tidak | ya | gagal dengan `AccountLack` | ya; atomic thaw dan burn |
+
+Tidak ada varian error custom CLMM baru atau pergeseran numerik yang diperkenalkan. Error native `AccountFrozen` SPL Token menolak upaya transfer atau perubahan pemilik.
+
+## Halaman yang diperbarui
+
+- `products/clmm/overview` — ringkasan rilis dan caveat transferability terbatas.
+- `products/clmm/ticks-and-positions` — model authority, pemicu, kemampuan pemilik, dan peringatan migrasi close.
+- `products/clmm/accounts` — perilaku mint dan lifecycle NFT posisi.
+- `products/clmm/instructions` — postconditions open dan jalur remaining-account `ClosePosition` yang dibekukan.
+- `products/clmm/code-demos` — contoh close Anchor langsung dan peringatan SDK yang disematkan.
+- `user-flows/add-remove-liquidity` — perilaku posisi restricted yang menghadap pengguna.
+- `user-flows/burn-and-earn` — posisi yang dibekukan tidak dapat ditransfer ke lock escrow.
+- `security/oracle-and-token-risks` / `security/attack-vectors` — batas risiko issuer dan transfer.
+- `reference/token-2022-support` — perbedaan antara allow-listing pool dan custody posisi.
+- `reference/error-codes` — penyebab `AccountLack` dan `NotApproved` yang diperluas.
+- `reference/program-addresses` — kunci match authority restricted-issuer.
+- `reference/fee-comparison` / `reference/glossary` — pengecualian transferability.
+
+**Diverifikasi 2026-08-13 terhadap**:
+
+- Cabang pre-release CLMM `feat/position-nft-freeze` di `ecb157760776f83f97507fa78c6e32cfb30d92a9`.
+- Commits `2e95310` (pembekuan NFT restricted-issuer) dan `ecb1577` (freeze authority scoped-pool), dibandingkan dengan `master` di `51fdba2`.
+- Sumber program di bawah `instructions/{open_position,open_position_v2,open_position_with_token22_nft,close_position}.rs` dan `util/token.rs`.
+- `position-nft-freeze.test.ts`, mencakup transferability biasa, penolakan transfer/perubahan pemilik yang dibekukan, dan alur thaw-before-close V2 plus Token-2022.
+
+<Warning>
+  Verifikasi ini mencakup cabang sumber pre-release, bukan deployment mainnet-beta atau rilis SDK yang dipublikasikan. Konfirmasi program yang di-deploy, daftar restricted-authority produksi, dan builder close SDK sebelum mengaktifkan alur.
+</Warning>
