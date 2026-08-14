@@ -1,0 +1,108 @@
+---
+title: "2026-08-14 — CLMM : gel des NFT de position à émetteur restreint"
+description: "CLMM gèle conditionnellement un nouveau compte NFT de position uniquement lorsqu'un chemin d'ouverture V2 trouve un mint sous-jacent dont l'autorité de gel correspond à la liste des émetteurs restreints."
+---
+
+<Info>
+  **Cette page est traduite automatiquement par IA. La version anglaise fait foi.**
+
+  [Voir la version anglaise →](/reference/changelog/2026-08-14-clmm-restricted-position-nft-freeze)
+</Info>
+
+Cette version ajoute un chemin de non-transférabilité conditionnel pour les pools d'émetteurs restreints sélectionnés avec KYC. Elle ne gèle pas chaque nouvelle position, ne gèle pas les actifs du pool, et n'empêche pas les propriétaires de positions de gérer leur liquidité. Le PDA du pool CLMM devient autorité de gel pour chaque nouveau mint NFT de position, mais le compte de token NFT reste dégelé par défaut. Le programme le gèle uniquement lorsque la position utilise `OpenPositionV2` ou `OpenPositionWithToken22Nft` et qu'au moins un des mints de coffre sous-jacents porte une autorité de gel de la liste des émetteurs restreints codée en dur.
+
+## TL;DR pour les intégrateurs
+
+- **Les nouveaux mints NFT de position ont une autorité de gel, mais ne sont pas gelés par défaut.** `OpenPosition`, `OpenPositionV2` et `OpenPositionWithToken22Nft` définissent le `pool_state` de la position comme autorité de gel du mint. L'autorité de mint est toujours supprimée après la création du seul NFT.
+- **Le gel nécessite un chemin V2 plus une correspondance d'émetteur.** `OpenPositionV2` et `OpenPositionWithToken22Nft` inspectent `vault_0_mint.freeze_authority` et `vault_1_mint.freeze_authority`. Le nouveau compte NFT est gelé uniquement si au moins l'un d'eux correspond à la liste du programme. Sans correspondance, il reste dégelé et transférable.
+- **Gelé signifie lié au propriétaire.** SPL Token rejette le transfert de NFT et les changements de propriétaire du compte de token avec son erreur native `AccountFrozen`. L'augmentation/diminution de liquidité et la collecte de frais/récompenses continuent de fonctionner lorsque le propriétaire du NFT signe.
+- **La fermeture reste disponible.** `ClosePosition` détecte un compte NFT gelé, utilise le PDA du pool pour le dégeler, puis brûle le NFT et ferme la position de manière atomique.
+- **La fermeture gelée nécessite un compte restant.** Le client doit ajouter `personal_position.pool_id` comme premier compte restant. Son absence retourne `AccountLack` de CLMM ; passer le mauvais pool retourne `NotApproved`.
+- **Les positions existantes ne sont pas affectées.** La mise à jour ne change pas rétroactivement les autorités de mint NFT ni ne gèle les comptes de token existants.
+- **Aucun changement de disposition d'état CLMM ou de liste de comptes IDL déclarée.** `PoolState`, `PersonalPositionState` et les arguments d'instruction restent compatibles au niveau des octets. L'exigence du chemin de fermeture est portée via `remaining_accounts`.
+
+## Logique de déclenchement
+
+Le programme évalue les deux mints de coffre au moment de l'ouverture :
+
+```rust
+must_freeze = restricted_ids.contains(vault_0_mint.freeze_authority)
+           || restricted_ids.contains(vault_1_mint.freeze_authority)
+```
+
+Une autorité de gel manquante ne correspond pas. Une correspondance d'un seul côté est suffisante. La liste initiale contient la même autorité d'émetteur utilisée par la détection d'actifs Superstate de CLMM. Les clés de correspondance actuelles sur mainnet-beta et devnet se trouvent dans [`reference/program-addresses`](/fr/reference/program-addresses#clmm-restricted-issuer-freeze-authorities).
+
+La vérification s'exécute dans le gestionnaire de position d'ouverture partagé uniquement lorsque les comptes de mint de coffre sont fournis. Cela signifie :
+
+| Chemin d'ouverture | Programme NFT de position | Comportement de gel à émetteur restreint |
+|-----------|----------------------|-----------------------------------|
+| `OpenPosition` V1 | SPL Token | Ne gèle pas. V1 ne peut pas servir les actifs d'émetteur Token-2022 ciblés par la liste fournie. |
+| `OpenPositionV2` | SPL Token | Inspecte les deux mints de coffre et gèle en cas de correspondance. |
+| `OpenPositionWithToken22Nft` | Token-2022 | Inspecte les deux mints de coffre et gèle en cas de correspondance. |
+
+## Changements d'autorité du NFT de position
+
+Avant cette mise à jour, un mint NFT de position SPL classique nouvellement créé ne conservait pas d'autorité de gel. Après la mise à jour, chaque nouveau mint NFT de position nomme son pool comme autorité de gel, y compris les positions dans les pools ordinaires. Ce paramètre d'autorité seul ne gèle pas le compte de token NFT ; les positions ordinaires et non correspondantes restent dégelées.
+
+L'utilisation du PDA du pool au lieu d'une clé d'administrateur global ou d'émetteur limite l'autorité à un seul pool. Une partie externe ne peut pas signer en tant que PDA, et CLMM n'expose aucune instruction à usage général pour geler ou dégeler des comptes de position arbitraires. Le nouveau code utilise l'autorité en deux endroits seulement :
+
+1. Geler immédiatement après la création du mint lorsque la vérification de l'émetteur sous-jacent correspond.
+2. Dégeler pendant `ClosePosition` immédiatement avant la destruction.
+
+## Migration de `ClosePosition`
+
+Les six comptes déclarés ne changent pas. Pour un NFT gelé, ajoutez le pool comme premier compte restant :
+
+```text
+declared: nft_owner, position_nft_mint, position_nft_account,
+          personal_position, system_program, token_program
+remaining[0]: personal_position.pool_id   // read-only, non-signer
+```
+
+Le gestionnaire vérifie la clé avant de charger `PoolState`, dérive les graines du signataire du pool, et effectue :
+
+```text
+thaw NFT account → burn NFT → close NFT token account / position state
+```
+
+Toutes les étapes s'exécutent dans une seule instruction Solana et s'engagent ou se rétractent donc ensemble. Passer le pool à chaque fermeture est sûr : le gestionnaire ignore les comptes restants lorsque le compte NFT n'est pas gelé.
+
+<Warning>
+  **Rupture client conditionnelle.** Un client plus ancien peut ouvrir avec succès une position après la mise à niveau car les dispositions de compte d'ouverture V2 sont inchangées. Si cette position est gelée, le même client peut échouer ultérieurement à la fermer car son générateur `ClosePosition` omet le compte restant du pool. Mettez à jour le générateur de fermeture avant de permettre aux utilisateurs d'ouvrir des positions dans les pools affectés.
+</Warning>
+
+## Matrice de compatibilité
+
+| Scénario | Transférer NFT | Gérer la liquidité | Générateur de fermeture hérité | Générateur de fermeture mis à jour |
+|----------|--------------|------------------|----------------------|-----------------------|
+| Position existante | inchangé | oui | oui | oui |
+| Nouvelle position, pool ordinaire | oui | oui | oui | oui |
+| Nouvelle position V2, pool à émetteur restreint | non | oui | échoue avec `AccountLack` | oui ; dégel et destruction atomiques |
+
+Aucune nouvelle variante d'erreur personnalisée CLMM ou décalage numérique n'est introduit. L'erreur native `AccountFrozen` de SPL Token rejette les tentatives de transfert ou de changement de propriétaire.
+
+## Pages mises à jour
+
+- `products/clmm/overview` — résumé de la version et mise en garde sur la transférabilité restreinte.
+- `products/clmm/ticks-and-positions` — modèle d'autorité, déclencheur, capacités du propriétaire et avertissement de migration de fermeture.
+- `products/clmm/accounts` — comportement du mint NFT de position et du cycle de vie.
+- `products/clmm/instructions` — postconditions d'ouverture et chemin de compte restant `ClosePosition` gelé.
+- `products/clmm/code-demos` — exemple de fermeture Anchor direct et avertissement SDK épinglé.
+- `user-flows/add-remove-liquidity` — comportement de position restreinte côté utilisateur.
+- `user-flows/burn-and-earn` — les positions gelées ne peuvent pas être transférées dans l'escrow de verrouillage.
+- `security/oracle-and-token-risks` / `security/attack-vectors` — limites d'émetteur et de risque de transfert.
+- `reference/token-2022-support` — distinction entre la liste blanche du pool et la garde de position.
+- `reference/error-codes` — causes élargies de `AccountLack` et `NotApproved`.
+- `reference/program-addresses` — clés de correspondance d'autorité à émetteur restreint.
+- `reference/fee-comparison` / `reference/glossary` — exceptions de transférabilité.
+
+**Vérifié le 2026-08-13 par rapport à** :
+
+- Branche de pré-version CLMM `feat/position-nft-freeze` à `ecb157760776f83f97507fa78c6e32cfb30d92a9`.
+- Commits `2e95310` (gel NFT à émetteur restreint) et `ecb1577` (autorité de gel à portée de pool), comparés avec `master` à `51fdba2`.
+- Sources du programme sous `instructions/{open_position,open_position_v2,open_position_with_token22_nft,close_position}.rs` et `util/token.rs`.
+- `position-nft-freeze.test.ts`, couvrant la transférabilité ordinaire, le rejet de transfert/changement de propriétaire gelé, et les flux de dégel V2 plus Token-2022 avant fermeture.
+
+<Warning>
+  Cette vérification couvre la branche source de pré-version, pas un déploiement mainnet-beta ou une version SDK publiée. Confirmez le programme déployé, la liste d'autorité restreinte de production et le générateur de fermeture SDK avant d'activer le flux.
+</Warning>
