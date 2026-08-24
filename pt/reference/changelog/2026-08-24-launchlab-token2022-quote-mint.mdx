@@ -1,0 +1,146 @@
+---
+title: "2026-08-24 — LaunchLab: quote mints Token-2022"
+description: "LaunchLab agora aceita quote mints Token-2022 em config, criação de pool, swaps, reivindicações de taxa e migração CPMM. Os limites de slippage de swap agora precificam a taxa de transferência do lado quote, o bit1 de PoolState.token_program_flag torna-se significativo, e MigrateToCpswap renomeia suas duas contas de token-program."
+---
+
+<Info>
+  **Esta página foi traduzida automaticamente por IA. A versão em inglês é a fonte oficial.**
+
+  [Ver versão em inglês →](/reference/changelog/2026-08-24-launchlab-token2022-quote-mint)
+</Info>
+
+<Info>
+  Esta entrada cobre uma atualização futura do programa LaunchLab. Foi verificada contra o branch de lançamento local antes da implantação. Confirme o programa implantado e o IDL publicado antes de ativar os novos caminhos em produção.
+</Info>
+
+Este lançamento permite que um launch seja cotado em um mint Token-2022. Até agora o lado quote era fixo no programa SPL Token legado, então apenas o mint base podia ser Token-2022. Em todos os lugares onde o mint quote é tocado — criação de `GlobalConfig`, inicialização de pool, as quatro instruções de swap, todas as reivindicações de taxa e migração CPMM — agora aceita qualquer programa de token, e as instruções de swap contabilizam a taxa de transferência do mint quote.
+
+## TL;DR para integradores
+
+- **Quote mints podem ser Token-2022.** `CreateConfig` aceita um `quote_token_mint` Token-2022, e `InitializeV2` / `InitializeWithToken2022` aceitam qualquer programa de token no slot quote-program. A ordem das contas não muda — o valor que você passa naquele slot é que muda.
+- **O `Initialize` descontinuado ainda é apenas legado.** Sua conta quote-program ainda é tipada para SPL Token, então uma config cujo mint quote é Token-2022 só pode ser lançada através de `InitializeV2` ou `InitializeWithToken2022`.
+- **Os limites de slippage se movem para o que o pagador realmente paga e recebe.** `minimum_amount_out` e `maximum_amount_in` agora são comparados contra o valor líquido da taxa de transferência do mint quote, não o valor que o vault moveu. A lógica de cotação existente subestima o custo e superestima o resultado em um mint quote com taxa.
+- **`PoolState.token_program_flag` bit1 torna-se significativo.** Era sempre `0` enquanto os quote mints eram apenas legados. Clientes que comparam o byte inteiro contra `0` agora lerão um mint base legado como Token-2022 sempre que o mint quote for Token-2022. Esta é a quebra silenciosa mais provável neste lançamento.
+- **`MigrateToCpswap` renomeia suas duas contas de token-program.** `base_token_program` / `quote_token_program` tornam-se `token_program` / `token_program_2022`. Ambas são sempre obrigatórias, e o programa escolhe a correta por mint.
+- **Pares mint/programa agora são validados.** Ambos os mints de swap ganharam uma restrição `mint::token_program`, assim como o mint quote de `ClaimPlatformFee`, então um par incompatível reverte em vez de ser ignorado.
+- **Novo erro `6023` `CalculateOverflow`.** Os códigos `6000`–`6022` não mudam. `6023` foi liberado pela versão anterior e agora é reutilizado.
+- **Vaults de taxa seguem o mint quote.** Vaults de taxa do criador e plataforma, e a conta de token do receptor de taxa de compartilhamento, vivem em qualquer programa que possua o mint quote.
+
+## Quais contas mudaram de tipo
+
+Nenhuma dessas muda de posição em sua lista de contas. Apenas o valor permitido muda.
+
+| Instrução | Conta | Antes | Depois |
+|---|---|---|---|
+| `CreateConfig` | `quote_token_mint` | mint SPL Token | mint de qualquer programa |
+| `InitializeV2` | `quote_token_program` | SPL Token | qualquer programa |
+| `InitializeWithToken2022` | `quote_token_program` | SPL Token | qualquer programa |
+| `BuyExactIn` / `BuyExactOut` / `SellExactIn` / `SellExactOut` | `quote_token_program` | SPL Token | qualquer programa |
+| `CollectFee` / `CollectMigrateFee` | `token_program` | SPL Token | qualquer programa |
+| `ClaimCreatorFee` / `ClaimPlatformFee` / `ClaimPlatformFeeFromVault` | `token_program` | SPL Token | qualquer programa |
+
+`Initialize` (o caminho V1 descontinuado) intencionalmente não está nesta tabela. Sua conta quote-program permanece tipada para SPL Token.
+
+Vários desses também aprimoraram suas restrições de mint, então um par mint/programa incompatível agora reverte onde era previamente aceito ou não verificado:
+
+- As quatro instruções de swap restringem tanto `base_token_mint` quanto `quote_token_mint` ao programa passado no slot correspondente. Nenhum carregava essa restrição antes, então um programa base errado era silenciosamente aceito.
+- `ClaimPlatformFee` adiciona a mesma restrição em `quote_mint`.
+- `ClaimPlatformFeeFromVault` corrige sua restrição de uma forma de conta de token para a forma de mint no que é uma conta de mint.
+
+## Contabilidade de taxa de transferência do lado quote
+
+Esta é a parte que muda números em vez de listas de contas. Em um mint quote sem `TransferFeeConfig` cada fórmula abaixo colapsa para o comportamento anterior, então pools legados e pools Token-2022 sem taxa são bit-por-bit inalterados.
+
+| Instrução | O que o argumento significa agora |
+|---|---|
+| `BuyExactIn` | `amount_in` é o débito bruto. A curva é precificada em `amount_in − transfer_fee(amount_in)`, que é o que chega ao vault. Em um preenchimento completo o pagador é cobrado exatamente `amount_in`; em um preenchimento parcial a cobrança é o valor do vault consumido grossado de volta. |
+| `BuyExactOut` | `maximum_amount_in` é comparado contra o valor do vault **mais** a taxa de transferência inversa — o débito real — em vez de apenas o valor do vault. |
+| `SellExactIn` | `minimum_amount_out` é comparado contra o que o vendedor fica após o mint reter sua taxa, não contra o valor bruto liberado do vault. |
+| `SellExactOut` | `amount_out` é o que o vendedor acaba recebendo. A curva visa `amount_out` mais a taxa de transferência inversa, então o valor solicitado chega exatamente. |
+
+Duas consequências que valem a pena ser declaradas claramente:
+
+- Um limite computado de um pool equivalente sem taxa não é mais aceitável. `BuyExactOut` com o custo sem taxa como `maximum_amount_in` agora reverte com `ExceededSlippage`, e o mesmo acontece com `SellExactIn` com o resultado sem taxa como `minimum_amount_out`. Esse é o comportamento pretendido — a comparação anterior deixava o pagador ser debitado da taxa de transferência além de um limite que já havia concordado.
+- O pool registra apenas o que chegou ao vault. Após um `BuyExactIn` de `amount_in` em um mint quote de 5%, `real_quote` avança por `amount_in × 0.95`, não `amount_in`.
+
+`get_transfer_inverse_fee` também descartou seu caso especial para um mint com taxa de 100%: em vez de voltar para `maximum_fee`, agora retorna o novo erro `CalculateOverflow` quando a taxa inversa não pode ser computada. Um mint quote em `10000` basis points portanto falha nos caminhos exact-out em vez de transacionar silenciosamente no limite de taxa.
+
+## `token_program_flag` bit1
+
+`PoolState.token_program_flag` é um campo de bits, e sempre foi:
+
+```text
+bit0  mint base   0 = SPL Token, 1 = Token-2022
+bit1  mint quote  0 = SPL Token, 1 = Token-2022
+```
+
+O campo, as posições de bit e o código que escreve ambos os bits todos antecedem este lançamento. O que muda é que bit1 agora pode realmente ser `1`, porque um mint quote agora pode ser um mint Token-2022. Os quatro valores são:
+
+| Valor | Mint base | Mint quote |
+|---|---|---|
+| `0` | SPL Token | SPL Token |
+| `1` | Token-2022 | SPL Token |
+| `2` | SPL Token | Token-2022 |
+| `3` | Token-2022 | Token-2022 |
+
+Leia o programa de cada mint com `(token_program_flag >> bit) & 1`. Qualquer cliente que trate o byte como um booleano para o mint base — `flag === 0 ? Token : Token-2022` — resolve o valor `2` para um mint base Token-2022 e construirá a conta de token do lado base e transferência contra o programa errado. Nenhuma mudança de tamanho de conta ou offset de campo, então indexadores não precisam de migração de armazenamento, apenas uma correção de decodificação.
+
+## Renomeação de conta de migração CPMM
+
+`MigrateToCpswap` anteriormente levava um programa de token por mint, e o chamador decidia qual era qual. Agora leva ambos os programas incondicionalmente e deriva o mapeamento dos próprios mints:
+
+| Posição | Antes | Depois |
+|---|---|---|
+| primeiro programa de token | `base_token_program` — qualquer programa que possuísse o mint base | `token_program` — sempre o programa SPL Token legado |
+| segundo programa de token | `quote_token_program` — sempre o programa SPL Token legado | `token_program_2022` — sempre o programa Token-2022 |
+
+As duas posições não mudam, então esta é uma mudança de valor, não uma mudança de layout — mas os valores estão próximos de invertidos, e um construtor que continua passando seu par antigo passará Token-2022 onde o programa legado é obrigatório assim que qualquer mint for um mint Token-2022.
+
+O programa legado ainda é obrigatório incondicionalmente independentemente de qualquer mint, porque o mint LP CPMM e o NFT Fee Key de liquidez bloqueada sempre vivem nele. O layout `remaining_accounts` do [lançamento de 2026-08-17](/pt/reference/changelog/2026-08-17-launchlab-cpmm-only-platform-config) não muda.
+
+## Quote mints são admitidos apenas por discrição do admin
+
+Diferentemente de CPMM e CLMM, LaunchLab executa **nenhuma** lista de permissão de extensão contra um mint quote. `CreateConfig` aceita a conta de mint como está, então o único portão é quais mints um admin vincula a um `GlobalConfig`. A verificação `NoSupportExtension` do programa se aplica apenas a mints base Token-2022 que o LaunchLab cria a si mesmo, onde apenas `MetadataPointer` e `TransferFeeConfig` são permitidos.
+
+Trate a vinculação de um mint quote Token-2022 como uma ação de alta confiança com o mesmo raciocínio das listas brancas estáticas CPMM/CLMM em [`reference/token-2022-support`](/pt/reference/token-2022-support). Um mint quote `TransferHook` ou `PermanentDelegate` seria admitido no momento da criação de config e então executaria em, ou seria capaz de varrer, cada pool cotado nele.
+
+## Portão de timestamp `amm_creator_fee_on`
+
+`InitializeV2` descarta o portão de timestamp que rejeitava qualquer `amm_creator_fee_on` diferente de `BothToken` antes do timestamp de atualização. O portão equivalente ainda está presente em `InitializeWithToken2022`. Na prática ambos os caminhos aceitam qualquer valor em mainnet-beta hoje, porque aquele timestamp (`1755522000`, 2025-08-18 13:00 UTC) está muito no passado — isto é limpeza, não uma mudança de comportamento para chamadores atuais.
+
+## Impacto de erro e IDL
+
+Os códigos `6000`–`6022` não mudam, incluindo `6022` `InvalidPlatformAllowConfig`.
+
+| Código | Nome | Significado |
+|---|---|---|
+| 6023 | `CalculateOverflow` | Um cálculo de taxa de transferência ou taxa de transferência inversa não pôde ser representado. |
+
+O lançamento anterior aposentou o antigo `6023` e o deixou vago; este lançamento reutiliza o número. Não decodifique `6023` com um IDL de qualquer versão anterior.
+
+Atualize o IDL do LaunchLab antes de passar um programa quote Token-2022, decodificar bit1 de `token_program_flag`, ou construir a lista de contas `MigrateToCpswap` renomeada.
+
+## Impacto do SDK
+
+O lado quote do módulo launchpad do SDK era hard-coded para `TOKEN_PROGRAM_ID` nos mesmos lugares que o programa estava. O branch que acompanha este lançamento resolve o proprietário do mint quote em vez disso, o passa através da criação de conta de token, a ATA do receptor de taxa de compartilhamento e o slot quote-program da instrução, e adiciona um `transferFeeConfigB` opcional aos quatro métodos `Curve` para que as cotações reflitam as fórmulas acima. Os resultados de `Curve` ganham um campo `transferFeeB`; `amountB` mantém seu significado — o que o pagador gasta ou o vendedor recebe — então um mint quote sem taxa produz números idênticos a antes.
+
+Essas mudanças do SDK não foram lançadas. O pin canônico nas páginas de demonstração de código neste conjunto de documentação não muda; verifique a versão publicada antes de confiar nos novos parâmetros.
+
+## Implementação de referência
+
+Uma nova demonstração se inscreve no programa LaunchLab sobre gRPC Yellowstone e registra, para cada atualização de `GlobalConfig` e `PoolState`, se cada mint é um mint Token ou Token-2022:
+
+[`raydium-sdk-V2-demo/src/grpc/launchpadPoolInfo.ts`](https://github.com/raydium-io/raydium-sdk-V2-demo/blob/master/src/grpc/launchpadPoolInfo.ts)
+
+É uma referência compacta para duas coisas que este lançamento torna necessárias. Pools são classificados diretamente de `token_program_flag`, decodificando ambos os bits sem nenhuma busca de mint — essa é a correção para a quebra de bit1 descrita acima. Configs não podem ser classificadas dessa forma, porque um `GlobalConfig` armazena apenas o endereço de seu mint quote e nenhum sinalizador de programa, então a demonstração lê a conta de mint do proprietário uma vez e a armazena em cache por mint. Ver ambos os caminhos lado a lado é a forma mais rápida de verificar seu próprio decodificador.
+
+Veja [`products/launchlab/code-demos`](/pt/products/launchlab/code-demos#watch-configs-and-pools-over-grpc) para o passo a passo.
+
+## Páginas atualizadas
+
+- `products/launchlab/accounts` — programa de token de mint quote, layout de bit de `token_program_flag` e propriedade de vault.
+- `products/launchlab/instructions` — contas quote-program, semântica de slippage de swap e contas de migração renomeadas.
+- `products/launchlab/global-config` — `quote_mint` pode ser um mint Token-2022, e o que faz e não faz portão.
+- `products/launchlab/code-demos` — o observador de config/pool gRPC.
+- `reference/token-2022-support` — linha LaunchLab e seção de mint quote.
+- `reference/error-codes` — `6023` `CalculateOverflow`.

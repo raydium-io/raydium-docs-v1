@@ -1,0 +1,142 @@
+---
+title: "2026-08-24 — LaunchLab: Token-2022 quote mints"
+description: "LaunchLab, Token-2022 quote mint'lerini config, pool oluşturma, swap'lar, ücret talepleri ve CPMM geçişi genelinde kabul eder. Swap slippage sınırları artık quote-side transfer ücretini fiyatlandırır, PoolState.token_program_flag bit1 anlamlı hale gelir ve MigrateToCpswap iki token-program hesabını yeniden adlandırır."
+---
+
+<Info>
+  **Bu sayfa yapay zekâ tarafından otomatik olarak çevrilmiştir. İngilizce sürüm esas alınır.**
+
+  [İngilizce sürümü görüntüle →](/reference/changelog/2026-08-24-launchlab-token2022-quote-mint)
+</Info>
+
+Bu sürüm, bir launch'ın Token-2022 mint'i ile fiyatlandırılmasını sağlar. Şimdiye kadar quote tarafı eski SPL Token programına sabitlenmişti, bu nedenle yalnızca base mint Token-2022 olabiliyordu. Quote mint'ine dokunulan her yer — `GlobalConfig` oluşturma, pool başlatma, dört swap talimatı, tüm ücret talepleri ve CPMM geçişi — artık her iki token programını kabul eder ve swap talimatları quote mint'inin transfer ücretini hesaba katar.
+
+## Entegratörler için TL;DR
+
+- **Quote mint'leri Token-2022 olabilir.** `CreateConfig` bir Token-2022 `quote_token_mint` kabul eder ve `InitializeV2` / `InitializeWithToken2022` quote-program yuvasında her iki token programını kabul eder. Hesap sırası değişmez — o yuvaya geçirdiğiniz değer değişir.
+- **Eski `Initialize` hala legacy-only'dir.** Quote-program hesabı hala SPL Token'a yazılıdır, bu nedenle quote mint'i Token-2022 olan bir config yalnızca `InitializeV2` veya `InitializeWithToken2022` aracılığıyla başlatılabilir.
+- **Slippage sınırları ödeyenin gerçekten ödediği ve aldığı miktara taşınır.** `minimum_amount_out` ve `maximum_amount_in` artık vault'un hareket ettirdiği miktara değil, quote mint'inin transfer ücretinin net miktarına karşı karşılaştırılır. Ücret taşıyan bir quote mint'inde mevcut alıntı mantığı maliyeti az alıntılar ve gelirleri fazla alıntılar.
+- **`PoolState.token_program_flag` bit1 anlamlı hale gelir.** Quote mint'leri legacy-only olduğu sürece her zaman `0` idi. Tüm baytı `0` ile karşılaştıran istemciler, quote mint Token-2022 olduğunda legacy base mint'i Token-2022 olarak okuyacaktır. Bu, bu sürümdeki en olası sessiz kırılmadır.
+- **`MigrateToCpswap` iki token-program hesabını yeniden adlandırır.** `base_token_program` / `quote_token_program` `token_program` / `token_program_2022` olur. Her ikisi de her zaman gereklidir ve program mint başına doğru olanı seçer.
+- **Mint/program çiftleri artık doğrulanır.** Her iki swap mint'i bir `mint::token_program` kısıtlaması kazandı, `ClaimPlatformFee`'nin quote mint'i de öyle, bu nedenle uyumsuz bir çift yoksayılmak yerine geri döner.
+- **Yeni hata `6023` `CalculateOverflow`.** Kodlar `6000`–`6022` değişmez. `6023` önceki sürüm tarafından boşaltıldı ve şimdi yeniden kullanılıyor.
+- **Ücret vault'ları quote mint'ini takip eder.** Yaratıcı ve platform ücret vault'ları ve share-fee alıcısının token hesabı, quote mint'ine sahip olan program üzerinde yaşar.
+
+## Hangi hesaplar tür değiştirdi
+
+Bunların hiçbiri hesap listesindeki konumunu değiştirmez. Yalnızca izin verilen değer değişir.
+
+| Talimat | Hesap | Önce | Sonra |
+|---|---|---|---|
+| `CreateConfig` | `quote_token_mint` | SPL Token mint | her iki programın mint'i |
+| `InitializeV2` | `quote_token_program` | SPL Token | her iki program |
+| `InitializeWithToken2022` | `quote_token_program` | SPL Token | her iki program |
+| `BuyExactIn` / `BuyExactOut` / `SellExactIn` / `SellExactOut` | `quote_token_program` | SPL Token | her iki program |
+| `CollectFee` / `CollectMigrateFee` | `token_program` | SPL Token | her iki program |
+| `ClaimCreatorFee` / `ClaimPlatformFee` / `ClaimPlatformFeeFromVault` | `token_program` | SPL Token | her iki program |
+
+`Initialize` (eski V1 yolu) kasıtlı olarak bu tabloda değildir. Quote-program hesabı SPL Token'a yazılı kalır.
+
+Bunların birçoğu ayrıca mint kısıtlamalarını sıkılaştırdı, bu nedenle uyumsuz bir mint/program çifti artık daha önce kabul edilen veya kontrol edilmeyen yerde geri döner:
+
+- Dört swap talimatı hem `base_token_mint` hem de `quote_token_mint`'i eşleşen yuvaya geçirilen programa kısıtlar. Hiçbiri daha önce bu kısıtlamayı taşımadı, bu nedenle yanlış bir base program sessizce kabul edildi.
+- `ClaimPlatformFee` `quote_mint` üzerinde aynı kısıtlamayı ekler.
+- `ClaimPlatformFeeFromVault` kısıtlamasını bir token-account formundan mint hesabı olan şeyde mint formuna düzeltir.
+
+## Quote-side transfer-fee muhasebesi
+
+Bu, hesap listeleri yerine sayıları değiştiren kısımdır. Transfer-fee `TransferFeeConfig`'i olmayan bir quote mint'inde aşağıdaki her formül önceki davranışa çöker, bu nedenle legacy pool'lar ve fee-free Token-2022 pool'ları bit-for-bit değişmez.
+
+| Talimat | Argümanın şimdi anlamı |
+|---|---|
+| `BuyExactIn` | `amount_in` brüt borçtur. Eğri `amount_in − transfer_fee(amount_in)` üzerinde fiyatlandırılır, bu da vault'a inen şeydir. Tam bir doldurma üzerinde ödeyici tam olarak `amount_in` ile ücretlendirilir; kısmi bir doldurma üzerinde ücret tüketilen vault miktarı brüt olarak geri yukarı çıkarılır. |
+| `BuyExactOut` | `maximum_amount_in` vault miktarı yerine vault miktarı **artı** ters transfer ücreti — gerçek borç — ile karşılaştırılır. |
+| `SellExactIn` | `minimum_amount_out` vault'tan serbest bırakılan brüt miktara karşı değil, satıcının mint'inin ücretini kestikten sonra kaldığı şeye karşı karşılaştırılır. |
+| `SellExactOut` | `amount_out` satıcının sonunda kaldığı şeydir. Eğri `amount_out` artı ters transfer ücreti hedefler, bu nedenle istenen miktar tam olarak ulaşır. |
+
+Açıkça belirtmeye değer iki sonuç:
+
+- Fee-free pool'dan hesaplanan bir sınır artık kabul edilebilir değildir. Fee-free maliyeti `maximum_amount_in` olarak kullanan `BuyExactOut` artık `ExceededSlippage` ile geri döner ve `SellExactIn` de fee-free gelirleri `minimum_amount_out` olarak kullanan geri döner. Bu amaçlanan davranıştır — eski karşılaştırma ödeyenin zaten kabul ettiği bir sınırın üstüne transfer ücreti ile borçlandırılmasına izin verdi.
+- Pool yalnızca vault'a ulaşanı kaydeder. %5 quote mint'inde `amount_in` `BuyExactIn`'den sonra, `real_quote` `amount_in` yerine `amount_in × 0.95` ile ilerler.
+
+`get_transfer_inverse_fee` ayrıca %100 ücretli mint için özel durumunu düşürdü: `maximum_fee`'ye geri dönmek yerine, ters ücret hesaplanamadığında yeni `CalculateOverflow` hatasını döndürür. `10000` basis puan'da bir quote mint bu nedenle sessizce ücret sınırında işlem yapmak yerine tam-out yollarında başarısız olur.
+
+## `token_program_flag` bit1
+
+`PoolState.token_program_flag` bir bitfield'dir ve her zaman olmuştur:
+
+```text
+bit0  base mint  0 = SPL Token, 1 = Token-2022
+bit1  quote mint 0 = SPL Token, 1 = Token-2022
+```
+
+Alan, bit konumları ve her iki biti yazan kod bu sürümden önce tarihlidir. Değişen şey, quote mint artık Token-2022 mint olabildiğinden bit1 artık gerçekten `1` olabilir. Dört değer:
+
+| Değer | Base mint | Quote mint |
+|---|---|---|
+| `0` | SPL Token | SPL Token |
+| `1` | Token-2022 | SPL Token |
+| `2` | SPL Token | Token-2022 |
+| `3` | Token-2022 | Token-2022 |
+
+Her mint'inin programını `(token_program_flag >> bit) & 1` ile okuyun. Base mint için baytı boolean olarak ele alan herhangi bir istemci — `flag === 0 ? Token : Token-2022` — değer `2`'yi Token-2022 base mint'ine çözer ve base-side token hesabını ve transferini yanlış programa karşı oluşturacaktır. Hesap boyutu veya alan ofset değişikliği olmadığından, indexer'lar depolama geçişine ihtiyaç duymaz, yalnızca bir decode düzeltmesine.
+
+## CPMM geçişi hesap yeniden adlandırması
+
+`MigrateToCpswap` daha önce mint başına bir token program aldı ve çağıran hangisinin hangisi olduğuna karar verdi. Şimdi her iki programı koşulsuz olarak alır ve eşlemeyi mint'lerden türetir:
+
+| Konum | Önce | Sonra |
+|---|---|---|
+| ilk token program | `base_token_program` — base mint'ine sahip olan program | `token_program` — her zaman eski SPL Token programı |
+| ikinci token program | `quote_token_program` — her zaman eski SPL Token programı | `token_program_2022` — her zaman Token-2022 programı |
+
+İki konum değişmez, bu nedenle bu bir değer değişikliğidir, layout değişikliği değil — ancak değerler neredeyse ters çevrilmiştir ve eski çiftini geçirmeye devam eden bir oluşturucu, her iki mint de Token-2022 mint olur olmaz Token-2022'yi eski programın gerekli olduğu yere geçirecektir.
+
+Eski program, her iki mint de ne olursa olsun koşulsuz olarak gereklidir, çünkü CPMM LP mint'i ve locked-liquidity Fee Key NFT her zaman onun üzerinde yaşar. [2026-08-17 sürümü](/tr/reference/changelog/2026-08-17-launchlab-cpmm-only-platform-config) `remaining_accounts` düzeni değişmez.
+
+## Quote mint'leri yalnızca admin takdiri ile kabul edilir
+
+CPMM ve CLMM'nin aksine, LaunchLab quote mint'ine karşı **hiçbir** extension allow-list çalıştırmaz. `CreateConfig` mint hesabını olduğu gibi kabul eder, bu nedenle tek kapı, bir yöneticinin `GlobalConfig`'e bağladığı mint'lerdir. Programın `NoSupportExtension` kontrolü yalnızca LaunchLab'ın kendisinin oluşturduğu Token-2022 base mint'lerine uygulanır, burada yalnızca `MetadataPointer` ve `TransferFeeConfig` izin verilir.
+
+Token-2022 quote mint'i bağlamayı, [`reference/token-2022-support`](/tr/reference/token-2022-support) içindeki CPMM/CLMM statik whitelist'leriyle aynı akıl yürütme ile yüksek güven eylemi olarak ele alın. `TransferHook` veya `PermanentDelegate` quote mint'i config-creation zamanında kabul edilir ve daha sonra içinde fiyatlandırılan her pool'da çalışır veya taraması yapabilir.
+
+## `amm_creator_fee_on` timestamp kapısı
+
+`InitializeV2` upgrade timestamp'inden önce `BothToken` dışında herhangi bir `amm_creator_fee_on` reddeden timestamp kapısını düşürür. Eşdeğer kapı hala `InitializeWithToken2022` içinde mevcuttur. Pratikte her iki yol da mainnet-beta'da bugün her iki değeri kabul eder, çünkü bu timestamp (`1755522000`, 2025-08-18 13:00 UTC) çok geçmiştedir — bu temizliktir, mevcut çağıranlar için davranış değişikliği değildir.
+
+## Hata ve IDL etkisi
+
+Kodlar `6000`–`6022` değişmez, `6022` `InvalidPlatformAllowConfig` dahil.
+
+| Kod | Ad | Anlamı |
+|---|---|---|
+| 6023 | `CalculateOverflow` | Bir transfer-fee veya inverse-transfer-fee hesaplaması temsil edilemedi. |
+
+Önceki sürüm eski `6023`'ü emekli aldı ve boş bıraktı; bu sürüm numarayı yeniden kullanır. `6023`'ü her iki önceki sürümün IDL'si ile çözmeyin.
+
+Token-2022 quote program geçirmeden, `token_program_flag` bit1'i çözmeden veya yeniden adlandırılan `MigrateToCpswap` hesap listesini oluşturmadan önce LaunchLab IDL'sini yenileyin.
+
+## SDK etkisi
+
+SDK'nın launchpad modülünün quote tarafı, programın olduğu aynı yerlerde `TOKEN_PROGRAM_ID`'ye sabitlenmişti. Bu sürümü eşlik eden dal, quote mint'inin sahibini çözer, token-account oluşturma, share-fee alıcısının ATA'sı ve talimatın quote-program yuvası aracılığıyla iletir ve dört `Curve` yöntemine isteğe bağlı bir `transferFeeConfigB` ekler, böylece alıntılar yukarıdaki formülleri yansıtır. `Curve` sonuçları bir `transferFeeB` alanı kazanır; `amountB` anlamını korur — ödeyenin harcadığı veya satıcının aldığı şey — bu nedenle fee-free quote mint öncekiyle aynı sayıları üretir.
+
+Bu SDK değişiklikleri yayınlanmamıştır. Bu dokümantasyon setindeki code-demo sayfalarındaki kanonik pin değişmez; yeni parametrelere güvenmeden önce yayınlanan sürümü kontrol edin.
+
+## Referans uygulaması
+
+Yeni bir demo, LaunchLab programına Yellowstone gRPC üzerinden abone olur ve her `GlobalConfig` ve `PoolState` güncellemesi için, her mint'inin bir Token veya Token-2022 mint olup olmadığını kaydeder:
+
+[`raydium-sdk-V2-demo/src/grpc/launchpadPoolInfo.ts`](https://github.com/raydium-io/raydium-sdk-V2-demo/blob/master/src/grpc/launchpadPoolInfo.ts)
+
+Bu sürümün gerekli kıldığı iki şey için kompakt bir referanstır. Pool'lar doğrudan `token_program_flag`'den sınıflandırılır, mint getirişi olmadan her iki biti de çözer — bu yukarıda açıklanan bit1 kırılması için düzeltmedir. Config'ler bu şekilde sınıflandırılamaz, çünkü `GlobalConfig` yalnızca quote mint'inin adresini ve program flag'ini depolamaz, bu nedenle demo mint hesabının sahibini bir kez okur ve mint başına önbelleğe alır. Her iki yolu yan yana görmek, kendi decoder'ınızı kontrol etmenin en hızlı yoludur.
+
+Walkthrough için [`products/launchlab/code-demos`](/tr/products/launchlab/code-demos#watch-configs-and-pools-over-grpc) bölümüne bakın.
+
+## Güncellenen sayfalar
+
+- `products/launchlab/accounts` — quote-mint token program, `token_program_flag` bit düzeni ve vault sahipliği.
+- `products/launchlab/instructions` — quote-program hesapları, swap slippage semantiği ve yeniden adlandırılan geçiş hesapları.
+- `products/launchlab/global-config` — `quote_mint` Token-2022 mint olabilir ve neyi kapılar ve neyi kapılamaz.
+- `products/launchlab/code-demos` — gRPC config/pool watcher'ı.
+- `reference/token-2022-support` — LaunchLab satırı ve quote-mint bölümü.
+- `reference/error-codes` — `6023` `CalculateOverflow`.

@@ -1,0 +1,146 @@
+---
+title: "2026-08-24 — LaunchLab: Token-2022 quote mints"
+description: "LaunchLab chấp nhận Token-2022 quote mints trên toàn bộ config, pool creation, swaps, fee claims, và CPMM migration. Swap slippage bounds giờ đây tính giá transfer fee phía quote, PoolState.token_program_flag bit1 trở nên có ý nghĩa, và MigrateToCpswap đổi tên hai token-program accounts."
+---
+
+<Info>
+  **Trang này được dịch tự động bằng AI. Phiên bản tiếng Anh là bản chính thức.**
+
+  [Xem bản tiếng Anh →](/reference/changelog/2026-08-24-launchlab-token2022-quote-mint)
+</Info>
+
+<Info>
+  Mục này bao gồm một bản cập nhật LaunchLab program sắp tới. Nó đã được xác minh so với nhánh phát hành cục bộ trước khi triển khai. Hãy xác nhận program đã triển khai và IDL được công bố trước khi bật các đường dẫn mới trong production.
+</Info>
+
+Bản phát hành này cho phép một launch được định giá bằng Token-2022 mint. Cho đến nay, phía quote bị cố định với legacy SPL Token program, vì vậy chỉ base mint mới có thể là Token-2022. Mọi nơi quote mint được sử dụng — tạo `GlobalConfig`, khởi tạo pool, bốn swap instructions, tất cả fee claims, và CPMM migration — giờ đây chấp nhận bất kỳ token program nào, và swap instructions tính đến transfer fee của quote mint.
+
+## TL;DR cho các nhà tích hợp
+
+- **Quote mints có thể là Token-2022.** `CreateConfig` chấp nhận Token-2022 `quote_token_mint`, và `InitializeV2` / `InitializeWithToken2022` chấp nhận bất kỳ token program nào trong quote-program slot. Thứ tự account không thay đổi — giá trị bạn truyền vào slot đó thay đổi.
+- **`Initialize` không dùng nữa vẫn chỉ hỗ trợ legacy.** Quote-program account của nó vẫn được gõ thành SPL Token, vì vậy config có quote mint là Token-2022 chỉ có thể được khởi chạy thông qua `InitializeV2` hoặc `InitializeWithToken2022`.
+- **Slippage bounds chuyển sang những gì người trả thực tế trả và nhận.** `minimum_amount_out` và `maximum_amount_in` giờ đây được so sánh với số tiền ròng sau transfer fee của quote mint, không phải số tiền vault di chuyển. Logic quoting hiện tại dưới-định giá chi phí và quá-định giá lợi nhuận trên quote mint có phí.
+- **`PoolState.token_program_flag` bit1 trở nên có ý nghĩa.** Nó luôn là `0` khi quote mints chỉ là legacy. Các client so sánh toàn bộ byte với `0` sẽ đọc legacy base mint là Token-2022 bất cứ khi nào quote mint là Token-2022. Đây là lỗi im lặng có khả năng xảy ra nhất trong bản phát hành này.
+- **`MigrateToCpswap` đổi tên hai token-program accounts.** `base_token_program` / `quote_token_program` trở thành `token_program` / `token_program_2022`. Cả hai luôn được yêu cầu, và program chọn cái đúng cho mỗi mint.
+- **Cặp Mint/program giờ đây được xác thực.** Cả hai swap mints đều có `mint::token_program` constraint, như `ClaimPlatformFee`'s quote mint, vì vậy cặp không khớp sẽ revert thay vì bị bỏ qua.
+- **Error `6023` `CalculateOverflow` mới.** Codes `6000`–`6022` không thay đổi. `6023` được giải phóng bởi bản phát hành trước và giờ đây được sử dụng lại.
+- **Fee vaults theo quote mint.** Creator và platform fee vaults, và token account của share-fee receiver, nằm trên bất kỳ program nào sở hữu quote mint.
+
+## Những account nào thay đổi loại
+
+Không có account nào thay đổi vị trí trong danh sách account của chúng. Chỉ giá trị được phép thay đổi.
+
+| Instruction | Account | Trước | Sau |
+|---|---|---|---|
+| `CreateConfig` | `quote_token_mint` | SPL Token mint | mint của bất kỳ program nào |
+| `InitializeV2` | `quote_token_program` | SPL Token | bất kỳ program nào |
+| `InitializeWithToken2022` | `quote_token_program` | SPL Token | bất kỳ program nào |
+| `BuyExactIn` / `BuyExactOut` / `SellExactIn` / `SellExactOut` | `quote_token_program` | SPL Token | bất kỳ program nào |
+| `CollectFee` / `CollectMigrateFee` | `token_program` | SPL Token | bất kỳ program nào |
+| `ClaimCreatorFee` / `ClaimPlatformFee` / `ClaimPlatformFeeFromVault` | `token_program` | SPL Token | bất kỳ program nào |
+
+`Initialize` (đường dẫn V1 không dùng nữa) cố ý không có trong bảng này. Quote-program account của nó vẫn được gõ thành SPL Token.
+
+Một số trong số này cũng siết chặt mint constraints của chúng, vì vậy cặp mint/program không khớp giờ đây sẽ revert nơi nó trước đây được chấp nhận hoặc không được kiểm tra:
+
+- Bốn swap instructions ràng buộc cả `base_token_mint` và `quote_token_mint` với program được truyền vào slot phù hợp. Trước đây không có constraint nào, vì vậy base program sai đã được chấp nhận im lặng.
+- `ClaimPlatformFee` thêm constraint tương tự trên `quote_mint`.
+- `ClaimPlatformFeeFromVault` sửa constraint của nó từ dạng token-account thành dạng mint trên những gì là mint account.
+
+## Kế toán transfer-fee phía quote
+
+Đây là phần thay đổi số thay vì danh sách account. Trên quote mint không có `TransferFeeConfig`, mọi công thức dưới đây sẽ sụp đổ thành hành vi trước đó, vì vậy legacy pools và fee-free Token-2022 pools không thay đổi từng bit.
+
+| Instruction | Ý nghĩa của argument bây giờ |
+|---|---|
+| `BuyExactIn` | `amount_in` là debit brutto. Curve được định giá trên `amount_in − transfer_fee(amount_in)`, đó là những gì hạ cánh vào vault. Trên fill đầy đủ, người trả được tính chính xác `amount_in`; trên fill một phần, khoản phí là số tiền vault được tiêu thụ được tính lại. |
+| `BuyExactOut` | `maximum_amount_in` được so sánh với vault amount **cộng** inverse transfer fee — debit thực tế — thay vì chỉ vault amount. |
+| `SellExactIn` | `minimum_amount_out` được so sánh với những gì người bán còn lại sau khi mint tính phí, không phải số tiền brutto được phát hành từ vault. |
+| `SellExactOut` | `amount_out` là những gì người bán kết thúc với. Curve nhắm mục tiêu `amount_out` cộng inverse transfer fee, vì vậy số tiền được yêu cầu đến chính xác. |
+
+Hai hệ quả đáng nêu rõ:
+
+- Bound được tính từ fee-free pool tương đương không còn được chấp nhận. `BuyExactOut` với chi phí fee-free như `maximum_amount_in` giờ đây revert với `ExceededSlippage`, và `SellExactIn` với lợi nhuận fee-free như `minimum_amount_out` cũng vậy. Đó là hành vi dự định — so sánh cũ cho phép người trả bị tính transfer fee trên top của bound họ đã đồng ý.
+- Pool chỉ ghi lại những gì đến vault. Sau `BuyExactIn` của `amount_in` trên 5% quote mint, `real_quote` tăng thêm `amount_in × 0.95`, không phải `amount_in`.
+
+`get_transfer_inverse_fee` cũng bỏ trường hợp đặc biệt của nó cho 100%-fee mint: thay vì quay lại `maximum_fee`, nó giờ đây trả về error `CalculateOverflow` mới khi không thể tính inverse fee. Quote mint ở `10000` basis points do đó thất bại các exact-out paths thay vì im lặng giao dịch ở fee cap.
+
+## `token_program_flag` bit1
+
+`PoolState.token_program_flag` là bitfield, và luôn luôn như vậy:
+
+```text
+bit0  base mint  0 = SPL Token, 1 = Token-2022
+bit1  quote mint 0 = SPL Token, 1 = Token-2022
+```
+
+Field, vị trí bit, và code viết cả hai bits đều có từ trước bản phát hành này. Những gì thay đổi là bit1 giờ đây có thể thực sự là `1`, vì quote mint giờ đây có thể là Token-2022 mint. Bốn giá trị là:
+
+| Giá trị | Base mint | Quote mint |
+|---|---|---|
+| `0` | SPL Token | SPL Token |
+| `1` | Token-2022 | SPL Token |
+| `2` | SPL Token | Token-2022 |
+| `3` | Token-2022 | Token-2022 |
+
+Đọc program của mỗi mint với `(token_program_flag >> bit) & 1`. Bất kỳ client nào coi byte là boolean cho base mint — `flag === 0 ? Token : Token-2022` — sẽ giải quyết giá trị `2` thành Token-2022 base mint và sẽ xây dựng base-side token account và transfer chống lại program sai. Không có thay đổi kích thước account hoặc offset field, vì vậy indexers không cần migration storage, chỉ cần sửa decode.
+
+## CPMM migration account rename
+
+`MigrateToCpswap` trước đây lấy một token program cho mỗi mint, và caller quyết định cái nào là cái nào. Giờ đây nó lấy cả hai programs vô điều kiện và lấy mapping từ mints:
+
+| Vị trí | Trước | Sau |
+|---|---|---|
+| token program đầu tiên | `base_token_program` — bất kỳ program nào sở hữu base mint | `token_program` — luôn là legacy SPL Token program |
+| token program thứ hai | `quote_token_program` — luôn là legacy SPL Token program | `token_program_2022` — luôn là Token-2022 program |
+
+Hai vị trí không thay đổi, vì vậy đây là thay đổi giá trị, không phải thay đổi layout — nhưng các giá trị gần như bị đảo ngược, và builder giữ truyền cặp cũ của nó sẽ truyền Token-2022 nơi legacy program được yêu cầu ngay khi bất kỳ mint nào là Token-2022 mint.
+
+Legacy program vẫn được yêu cầu vô điều kiện bất kể mint nào, vì CPMM LP mint và locked-liquidity Fee Key NFT luôn nằm trên nó. Layout `remaining_accounts` từ [bản phát hành 2026-08-17](/vi/reference/changelog/2026-08-17-launchlab-cpmm-only-platform-config) không thay đổi.
+
+## Quote mints được chấp nhận chỉ theo quyết định của admin
+
+Không giống CPMM và CLMM, LaunchLab chạy **không** extension allow-list chống lại quote mint. `CreateConfig` chấp nhận mint account như-là, vì vậy cổng duy nhất là mints nào admin ràng buộc với `GlobalConfig`. Check `NoSupportExtension` của program áp dụng chỉ cho Token-2022 base mints mà LaunchLab tạo ra chính nó, nơi chỉ `MetadataPointer` và `TransferFeeConfig` được phép.
+
+Coi ràng buộc Token-2022 quote mint là hành động tin tưởng cao với lý do tương tự như CPMM/CLMM static whitelists trong [`reference/token-2022-support`](/vi/reference/token-2022-support). Quote mint `TransferHook` hoặc `PermanentDelegate` sẽ được chấp nhận tại thời điểm tạo config và sau đó sẽ chạy trên, hoặc có thể quét, mọi pool được định giá trong nó.
+
+## `amm_creator_fee_on` timestamp gate
+
+`InitializeV2` bỏ timestamp gate từng từ chối bất kỳ `amm_creator_fee_on` nào khác `BothToken` trước timestamp nâng cấp. Gate tương đương vẫn có trong `InitializeWithToken2022`. Trong thực tế, cả hai đường dẫn chấp nhận giá trị bất kỳ trên mainnet-beta hôm nay, vì timestamp đó (`1755522000`, 2025-08-18 13:00 UTC) đã lâu rồi — đây là dọn dẹp, không phải thay đổi hành vi cho callers hiện tại.
+
+## Error và IDL impact
+
+Codes `6000`–`6022` không thay đổi, bao gồm `6022` `InvalidPlatformAllowConfig`.
+
+| Code | Tên | Ý nghĩa |
+|---|---|---|
+| 6023 | `CalculateOverflow` | Tính toán transfer-fee hoặc inverse-transfer-fee không thể được biểu diễn. |
+
+Bản phát hành trước đó đã loại bỏ `6023` cũ và để nó trống; bản phát hành này sử dụng lại số. Không giải mã `6023` với IDL từ bất kỳ phiên bản trước đó nào.
+
+Làm mới LaunchLab IDL trước khi truyền Token-2022 quote program, giải mã `token_program_flag` bit1, hoặc xây dựng danh sách `MigrateToCpswap` account được đổi tên.
+
+## SDK impact
+
+Phía quote của SDK's launchpad module được hard-coded thành `TOKEN_PROGRAM_ID` ở những nơi tương tự program. Nhánh đi kèm với bản phát hành này giải quyết chủ sở hữu quote mint thay thế, luồng nó thông qua token-account creation, ATA của share-fee receiver, và quote-program slot của instruction, và thêm `transferFeeConfigB` tùy chọn vào bốn `Curve` methods để quotes phản ánh các công thức trên. Kết quả `Curve` đạt được `transferFeeB` field; `amountB` giữ ý nghĩa của nó — những gì người trả chi tiêu hoặc người bán nhận — vì vậy fee-free quote mint tạo ra số giống hệt như trước.
+
+Những thay đổi SDK này chưa được phát hành. Pin chính tắc trên code-demo pages trong bộ tài liệu này không thay đổi; kiểm tra phiên bản được công bố trước khi dựa vào các tham số mới.
+
+## Reference implementation
+
+Demo mới đăng ký LaunchLab program qua Yellowstone gRPC và ghi nhật ký, cho mọi `GlobalConfig` và `PoolState` update, liệu mỗi mint là Token hay Token-2022 mint:
+
+[`raydium-sdk-V2-demo/src/grpc/launchpadPoolInfo.ts`](https://github.com/raydium-io/raydium-sdk-V2-demo/blob/master/src/grpc/launchpadPoolInfo.ts)
+
+Nó là reference nhỏ gọn cho hai điều bản phát hành này làm cần thiết. Pools được phân loại thẳng từ `token_program_flag`, giải mã cả hai bits mà không cần fetch mint — đó là sửa cho bit1 breakage được mô tả ở trên. Configs không thể được phân loại theo cách đó, vì `GlobalConfig` chỉ lưu trữ địa chỉ quote mint của nó và không có program flag, vì vậy demo đọc chủ sở hữu mint account một lần và lưu nó vào cache cho mỗi mint. Thấy cả hai đường dẫn cạnh nhau là cách nhanh nhất để kiểm tra decoder của riêng bạn.
+
+Xem [`products/launchlab/code-demos`](/vi/products/launchlab/code-demos#watch-configs-and-pools-over-grpc) cho walkthrough.
+
+## Pages updated
+
+- `products/launchlab/accounts` — quote-mint token program, `token_program_flag` bit layout, và vault ownership.
+- `products/launchlab/instructions` — quote-program accounts, swap slippage semantics, và renamed migration accounts.
+- `products/launchlab/global-config` — `quote_mint` có thể là Token-2022 mint, và cái gì làm và không làm gate nó.
+- `products/launchlab/code-demos` — gRPC config/pool watcher.
+- `reference/token-2022-support` — LaunchLab row và quote-mint section.
+- `reference/error-codes` — `6023` `CalculateOverflow`.

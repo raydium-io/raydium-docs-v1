@@ -1,0 +1,146 @@
+---
+title: "2026-08-24 — LaunchLab: Token-2022 Quote-Mints"
+description: "LaunchLab akzeptiert Token-2022 Quote-Mints in Config, Pool-Erstellung, Swaps, Fee-Claims und CPMM-Migration. Swap-Slippage-Grenzen berücksichtigen nun die Transfer-Gebühr der Quote-Seite, PoolState.token_program_flag Bit1 wird aussagekräftig, und MigrateToCpswap benennt seine zwei Token-Program-Konten um."
+---
+
+<Info>
+  **Diese Seite wurde mit KI automatisch übersetzt. Maßgeblich ist stets die englische Version.**
+
+  [Englische Version ansehen →](/reference/changelog/2026-08-24-launchlab-token2022-quote-mint)
+</Info>
+
+<Info>
+  Dieser Eintrag behandelt ein bevorstehendes LaunchLab-Programm-Update. Er wurde vor der Bereitstellung gegen den lokalen Release-Branch verifiziert. Bestätigen Sie das bereitgestellte Programm und die veröffentlichte IDL, bevor Sie die neuen Pfade in der Produktion aktivieren.
+</Info>
+
+Dieses Release ermöglicht es, einen Launch in einem Token-2022 Mint zu quotieren. Bisher war die Quote-Seite fest an das Legacy-SPL-Token-Programm gebunden, sodass nur der Base-Mint Token-2022 sein konnte. An jeder Stelle, wo der Quote-Mint berührt wird — `GlobalConfig`-Erstellung, Pool-Initialisierung, die vier Swap-Instruktionen, alle Fee-Claims und CPMM-Migration — wird nun entweder Token-Programm akzeptiert, und die Swap-Instruktionen berücksichtigen die Transfer-Gebühr des Quote-Mints.
+
+## TL;DR für Integratoren
+
+- **Quote-Mints können Token-2022 sein.** `CreateConfig` akzeptiert einen Token-2022 `quote_token_mint`, und `InitializeV2` / `InitializeWithToken2022` akzeptieren entweder Token-Programm im Quote-Program-Slot. Die Kontenreihenfolge ändert sich nicht — nur der Wert, den Sie in diesen Slot übergeben.
+- **Das veraltete `Initialize` ist weiterhin nur Legacy.** Sein Quote-Program-Konto ist weiterhin auf SPL Token typisiert, daher kann eine Config, deren Quote-Mint Token-2022 ist, nur über `InitializeV2` oder `InitializeWithToken2022` gestartet werden.
+- **Slippage-Grenzen beziehen sich auf das, was der Zahler tatsächlich zahlt und erhält.** `minimum_amount_out` und `maximum_amount_in` werden nun gegen den Betrag netto der Transfer-Gebühr des Quote-Mints verglichen, nicht gegen den Betrag, den der Vault bewegt hat. Bestehende Quoting-Logik unterschätzt Kosten und überschätzt Erlöse bei einem gebührenbelasteten Quote-Mint.
+- **`PoolState.token_program_flag` Bit1 wird aussagekräftig.** Es war immer `0`, während Quote-Mints nur Legacy waren. Clients, die das ganze Byte gegen `0` vergleichen, lesen einen Legacy-Base-Mint als Token-2022, wenn der Quote-Mint Token-2022 ist. Dies ist der wahrscheinlichste stille Fehler in diesem Release.
+- **`MigrateToCpswap` benennt seine zwei Token-Program-Konten um.** `base_token_program` / `quote_token_program` werden zu `token_program` / `token_program_2022`. Beide sind immer erforderlich, und das Programm wählt das richtige pro Mint.
+- **Mint/Program-Paare werden nun validiert.** Beide Swap-Mints erhielten eine `mint::token_program`-Constraint, ebenso der Quote-Mint von `ClaimPlatformFee`, daher wird ein nicht übereinstimmendes Paar zurückgewiesen statt ignoriert.
+- **Neuer Fehler `6023` `CalculateOverflow`.** Codes `6000`–`6022` sind unverändert. `6023` wurde vom vorherigen Release freigegeben und wird nun wiederverwendet.
+- **Fee-Vaults folgen dem Quote-Mint.** Creator- und Platform-Fee-Vaults sowie das Token-Konto des Share-Fee-Empfängers befinden sich auf dem Programm, das den Quote-Mint besitzt.
+
+## Welche Konten änderten ihren Typ
+
+Keine dieser Änderungen verschiebt die Position in ihrer Kontenliste. Nur der zulässige Wert ändert sich.
+
+| Instruktion | Konto | Vorher | Nachher |
+|---|---|---|---|
+| `CreateConfig` | `quote_token_mint` | SPL Token Mint | Mint eines beliebigen Programms |
+| `InitializeV2` | `quote_token_program` | SPL Token | Beliebiges Programm |
+| `InitializeWithToken2022` | `quote_token_program` | SPL Token | Beliebiges Programm |
+| `BuyExactIn` / `BuyExactOut` / `SellExactIn` / `SellExactOut` | `quote_token_program` | SPL Token | Beliebiges Programm |
+| `CollectFee` / `CollectMigrateFee` | `token_program` | SPL Token | Beliebiges Programm |
+| `ClaimCreatorFee` / `ClaimPlatformFee` / `ClaimPlatformFeeFromVault` | `token_program` | SPL Token | Beliebiges Programm |
+
+`Initialize` (der veraltete V1-Pfad) ist absichtlich nicht in dieser Tabelle. Sein Quote-Program-Konto bleibt auf SPL Token typisiert.
+
+Mehrere dieser Instruktionen verschärften auch ihre Mint-Constraints, daher wird ein nicht übereinstimmendes Mint/Program-Paar nun zurückgewiesen, wo es zuvor akzeptiert oder nicht überprüft wurde:
+
+- Die vier Swap-Instruktionen constrainen sowohl `base_token_mint` als auch `quote_token_mint` auf das Programm, das im entsprechenden Slot übergeben wird. Keines trug diese Constraint zuvor, daher wurde ein falsches Base-Programm stillschweigend akzeptiert.
+- `ClaimPlatformFee` fügt die gleiche Constraint auf `quote_mint` hinzu.
+- `ClaimPlatformFeeFromVault` korrigiert seine Constraint von einer Token-Account-Form zur Mint-Form auf dem, was ein Mint-Konto ist.
+
+## Accounting für Transfer-Gebühren auf der Quote-Seite
+
+Dies ist der Teil, der Zahlen statt Kontenlisten ändert. Bei einem Quote-Mint ohne `TransferFeeConfig` kollabiert jede Formel unten zum vorherigen Verhalten, daher sind Legacy-Pools und gebührenfreie Token-2022-Pools bitweise unverändert.
+
+| Instruktion | Was das Argument jetzt bedeutet |
+|---|---|
+| `BuyExactIn` | `amount_in` ist die Brutto-Belastung. Die Kurve wird auf `amount_in − transfer_fee(amount_in)` bepreist, was im Vault ankommt. Bei vollständiger Ausführung wird der Zahler genau `amount_in` berechnet; bei teilweiser Ausführung ist die Belastung der verbrauchte Vault-Betrag brutto zurückgerechnet. |
+| `BuyExactOut` | `maximum_amount_in` wird gegen den Vault-Betrag **plus** die inverse Transfer-Gebühr — die echte Belastung — verglichen, nicht nur gegen den Vault-Betrag. |
+| `SellExactIn` | `minimum_amount_out` wird gegen das verglichen, was dem Verkäufer nach Abzug der Mint-Gebühr bleibt, nicht gegen den Brutto-Betrag, der aus dem Vault freigegeben wird. |
+| `SellExactOut` | `amount_out` ist das, was der Verkäufer am Ende erhält. Die Kurve zielt auf `amount_out` plus die inverse Transfer-Gebühr ab, daher kommt der angeforderte Betrag genau an. |
+
+Zwei Konsequenzen, die es wert sind, klar ausgesprochen zu werden:
+
+- Eine Grenze, die aus einem äquivalenten gebührenfreien Pool berechnet wird, ist nicht mehr akzeptabel. `BuyExactOut` mit den gebührenfreien Kosten als `maximum_amount_in` wird nun mit `ExceededSlippage` zurückgewiesen, ebenso `SellExactIn` mit den gebührenfreien Erlösen als `minimum_amount_out`. Das ist das beabsichtigte Verhalten — der alte Vergleich ließ den Zahler die Transfer-Gebühr zusätzlich zu einer Grenze belasten, der sie bereits zugestimmt hatten.
+- Das Pool-Buch bucht nur das, was im Vault ankam. Nach einem `BuyExactIn` von `amount_in` bei einem 5%-Quote-Mint rückt `real_quote` um `amount_in × 0.95` vor, nicht um `amount_in`.
+
+`get_transfer_inverse_fee` ließ auch seinen Spezialfall für einen 100%-Gebühren-Mint fallen: Statt auf `maximum_fee` zurückzufallen, gibt es nun den neuen `CalculateOverflow`-Fehler zurück, wenn die inverse Gebühr nicht berechnet werden kann. Ein Quote-Mint bei `10000` Basispunkten schlägt daher die Exact-Out-Pfade fehl, statt stillschweigend bei der Gebührengrenze zu transagieren.
+
+## `token_program_flag` Bit1
+
+`PoolState.token_program_flag` ist ein Bitfeld und war es schon immer:
+
+```text
+Bit0  Base-Mint  0 = SPL Token, 1 = Token-2022
+Bit1  Quote-Mint 0 = SPL Token, 1 = Token-2022
+```
+
+Das Feld, die Bit-Positionen und der Code, der beide Bits schreibt, stammen alle aus der Zeit vor diesem Release. Was sich ändert, ist, dass Bit1 nun tatsächlich `1` sein kann, weil ein Quote-Mint nun ein Token-2022 Mint sein kann. Die vier Werte sind:
+
+| Wert | Base-Mint | Quote-Mint |
+|---|---|---|
+| `0` | SPL Token | SPL Token |
+| `1` | Token-2022 | SPL Token |
+| `2` | SPL Token | Token-2022 |
+| `3` | Token-2022 | Token-2022 |
+
+Lesen Sie jedes Mint-Programm mit `(token_program_flag >> bit) & 1`. Jeder Client, der das Byte als Boolean für den Base-Mint behandelt — `flag === 0 ? Token : Token-2022` — löst Wert `2` zu einem Token-2022 Base-Mint auf und wird das Base-Seiten-Token-Konto und die Übertragung gegen das falsche Programm aufbauen. Keine Kontogrößen- oder Feldoffset-Änderungen, daher benötigen Indexer keine Speichermigration, nur eine Dekodierungskorrektur.
+
+## CPMM-Migrations-Konto-Umbenennung
+
+`MigrateToCpswap` nahm zuvor ein Token-Programm pro Mint, und der Aufrufer entschied, welches welches war. Es nimmt nun beide Programme bedingungslos und leitet die Zuordnung aus den Mints selbst ab:
+
+| Position | Vorher | Nachher |
+|---|---|---|
+| Erstes Token-Programm | `base_token_program` — das Programm, das den Base-Mint besaß | `token_program` — immer das Legacy-SPL-Token-Programm |
+| Zweites Token-Programm | `quote_token_program` — immer das Legacy-SPL-Token-Programm | `token_program_2022` — immer das Token-2022-Programm |
+
+Die zwei Positionen sind unverändert, daher ist dies eine Wertänderung, keine Layout-Änderung — aber die Werte sind fast invertiert, und ein Builder, der sein altes Paar weitergibt, wird Token-2022 übergeben, wo das Legacy-Programm erforderlich ist, sobald einer der Mints ein Token-2022 Mint ist.
+
+Das Legacy-Programm ist weiterhin bedingungslos erforderlich, unabhängig von einem der Mints, da der CPMM-LP-Mint und das gesperrte Liquiditäts-Fee-Key-NFT immer darauf leben. Das `remaining_accounts`-Layout aus dem [2026-08-17 Release](/de/reference/changelog/2026-08-17-launchlab-cpmm-only-platform-config) ist unverändert.
+
+## Quote-Mints werden nur nach Admin-Ermessen zugelassen
+
+Im Gegensatz zu CPMM und CLMM führt LaunchLab **keine** Extension-Allow-List gegen einen Quote-Mint aus. `CreateConfig` akzeptiert das Mint-Konto wie es ist, daher ist das einzige Gate, welche Mints ein Admin an eine `GlobalConfig` bindet. Die `NoSupportExtension`-Prüfung des Programms gilt ausschließlich für Token-2022 Base-Mints, die LaunchLab selbst erstellt, wobei nur `MetadataPointer` und `TransferFeeConfig` zulässig sind.
+
+Behandeln Sie das Binden eines Token-2022 Quote-Mints als eine Aktion mit hohem Vertrauen mit der gleichen Begründung wie die statischen Whitelists von CPMM/CLMM in [`reference/token-2022-support`](/de/reference/token-2022-support). Ein `TransferHook`- oder `PermanentDelegate`-Quote-Mint würde zum Zeitpunkt der Config-Erstellung zugelassen und würde dann auf jedem Pool, der darin quotiert ist, ausgeführt oder in der Lage sein, zu fegen.
+
+## `amm_creator_fee_on` Zeitstempel-Gate
+
+`InitializeV2` lässt das Zeitstempel-Gate fallen, das jeden `amm_creator_fee_on` außer `BothToken` vor dem Upgrade-Zeitstempel ablehnte. Das äquivalente Gate ist weiterhin in `InitializeWithToken2022` vorhanden. In der Praxis akzeptieren beide Pfade heute auf mainnet-beta jeden Wert, da dieser Zeitstempel (`1755522000`, 2025-08-18 13:00 UTC) lange vorbei ist — dies ist Aufräumen, keine Verhaltensänderung für aktuelle Aufrufer.
+
+## Fehler- und IDL-Auswirkungen
+
+Codes `6000`–`6022` sind unverändert, einschließlich `6022` `InvalidPlatformAllowConfig`.
+
+| Code | Name | Bedeutung |
+|---|---|---|
+| 6023 | `CalculateOverflow` | Eine Transfer-Gebühren- oder inverse-Transfer-Gebühren-Berechnung konnte nicht dargestellt werden. |
+
+Das vorherige Release zog das alte `6023` zurück und ließ es leer; dieses Release verwendet die Nummer erneut. Dekodieren Sie `6023` nicht mit einer IDL aus einer der früheren Versionen.
+
+Aktualisieren Sie die LaunchLab-IDL, bevor Sie ein Token-2022 Quote-Programm übergeben, `token_program_flag` Bit1 dekodieren oder die umbenannte `MigrateToCpswap`-Kontenliste aufbauen.
+
+## SDK-Auswirkungen
+
+Die Quote-Seite des SDK-Launchpad-Moduls war an den gleichen Stellen wie das Programm fest auf `TOKEN_PROGRAM_ID` codiert. Der Branch, der dieses Release begleitet, löst stattdessen den Besitzer des Quote-Mints auf, leitet ihn durch Token-Account-Erstellung, die ATA des Share-Fee-Empfängers und den Quote-Program-Slot der Instruktion weiter und fügt ein optionales `transferFeeConfigB` zu den vier `Curve`-Methoden hinzu, damit Quotes die obigen Formeln widerspiegeln. `Curve`-Ergebnisse erhalten ein `transferFeeB`-Feld; `amountB` behält seine Bedeutung — was der Zahler ausgibt oder der Verkäufer erhält — daher erzeugt ein gebührenfreier Quote-Mint identische Zahlen wie zuvor.
+
+Diese SDK-Änderungen sind nicht veröffentlicht. Der kanonische Pin auf den Code-Demo-Seiten in diesem Dokumentationssatz ist unverändert; überprüfen Sie die veröffentlichte Version, bevor Sie sich auf die neuen Parameter verlassen.
+
+## Referenzimplementierung
+
+Eine neue Demo abonniert das LaunchLab-Programm über Yellowstone gRPC und protokolliert für jedes `GlobalConfig`- und `PoolState`-Update, ob jeder Mint ein Token- oder Token-2022 Mint ist:
+
+[`raydium-sdk-V2-demo/src/grpc/launchpadPoolInfo.ts`](https://github.com/raydium-io/raydium-sdk-V2-demo/blob/master/src/grpc/launchpadPoolInfo.ts)
+
+Es ist eine kompakte Referenz für zwei Dinge, die dieses Release notwendig macht. Pools werden direkt aus `token_program_flag` klassifiziert, wobei beide Bits ohne Mint-Abruf dekodiert werden — das ist die Korrektur für den oben beschriebenen Bit1-Fehler. Configs können auf diese Weise nicht klassifiziert werden, da eine `GlobalConfig` nur die Adresse ihres Quote-Mints und kein Programm-Flag speichert, daher liest die Demo das Besitzer-Konto des Mint-Kontos einmal und cached es pro Mint. Beide Pfade nebeneinander zu sehen ist der schnellste Weg, um Ihren eigenen Decoder zu überprüfen.
+
+Siehe [`products/launchlab/code-demos`](/de/products/launchlab/code-demos#watch-configs-and-pools-over-grpc) für die Anleitung.
+
+## Aktualisierte Seiten
+
+- `products/launchlab/accounts` — Quote-Mint Token-Programm, `token_program_flag` Bit-Layout und Vault-Besitz.
+- `products/launchlab/instructions` — Quote-Program-Konten, Swap-Slippage-Semantik und die umbenannten Migrations-Konten.
+- `products/launchlab/global-config` — `quote_mint` kann ein Token-2022 Mint sein, und was es gatet und nicht.
+- `products/launchlab/code-demos` — der gRPC Config/Pool-Watcher.
+- `reference/token-2022-support` — LaunchLab-Zeile und ein Quote-Mint-Abschnitt.
+- `reference/error-codes` — `6023` `CalculateOverflow`.
