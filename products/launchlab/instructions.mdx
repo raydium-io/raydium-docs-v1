@@ -12,8 +12,8 @@ description: "Initialize, Buy, Sell, Graduate, CollectFees, SetParams — argume
 | Group | Instruction | Callable by |
 |-------|-------------|-------------|
 | Global config | `CreateConfig` / `UpdateConfig` | Program admin; the delegated create-config authority may also call `CreateConfig` |
-| Launch lifecycle | `Initialize` / `InitializeV2` | Anyone (creator) — SPL Token launches; V2 records `amm_creator_fee_on` for the eventual CPMM graduation |
-| Launch lifecycle | `InitializeWithToken2022` | Anyone (creator) — Token-2022 launch, optional `TransferFeeConfig` |
+| Launch lifecycle | `Initialize` / `InitializeV2` | Anyone (creator) — SPL Token base mint; V2 records `amm_creator_fee_on` for the eventual CPMM graduation. Only V2 accepts a Token-2022 quote mint. |
+| Launch lifecycle | `InitializeWithToken2022` | Anyone (creator) — Token-2022 base mint, optional `TransferFeeConfig`; accepts either quote token program |
 | Trade | `BuyExactIn` / `BuyExactOut` | Anyone — exact-input / exact-output buy on the bonding curve |
 | Trade | `SellExactIn` / `SellExactOut` | Anyone — exact-input / exact-output sell on the bonding curve |
 | Graduation | `MigrateToAmm` | Migration wallet — legacy AMM v4 graduation for pools initialized before CPMM-only creation was enforced. |
@@ -34,6 +34,12 @@ The "ExactIn/ExactOut" split mirrors CPMM's `SwapBaseInput` / `SwapBaseOutput` �
 **Graduation path selection.** Every new `Initialize`, `InitializeV2`, and `InitializeWithToken2022` call must set `migrate_type = 1` (`CPSWAP`). Any attempt to initialize a new AMM v4-bound pool returns `MigrateTypeNotMatch`. `amm_creator_fee_on` only selects whether the resulting CPMM creator fee applies to the quote token or both tokens; it does not select the target program.
 
 `MigrateToAmm` remains callable for an existing `PoolState` that was initialized with `migrate_type = 0` before this restriction. The release does not rewrite existing pool state or remove the legacy instruction.
+
+**Quote-side token program.** The quote mint may be owned by either the SPL Token program or Token-2022. Every instruction that touches it — `CreateConfig`, `InitializeV2`, `InitializeWithToken2022`, all four trade instructions, `CollectFee`, `CollectMigrateFee`, `ClaimCreatorFee`, `ClaimPlatformFee`, and `ClaimPlatformFeeFromVault` — takes the owning program in its quote-program account slot. Account positions did not change; only the accepted value did. Pass the program that actually owns `GlobalConfig.quote_mint`, which you can read from `PoolState.token_program_flag` bit1 for an existing launch (see [`accounts`](/products/launchlab/accounts#poolstate)) or from the mint account's owner otherwise.
+
+The deprecated `Initialize` is the exception: its quote-program account is still typed to SPL Token, so a config whose quote mint is Token-2022 must be launched through `InitializeV2` or `InitializeWithToken2022`.
+
+`MigrateToCpswap` is the other exception, in the opposite direction — it takes **both** programs unconditionally rather than one per mint. See [the migration accounts below](#cpmm-migration-token-programs).
 
 ## `Initialize`
 
@@ -82,7 +88,7 @@ launch_params: {
 | 8 | `quote_vault` | W |   | ATA of `launch_authority` on `quote_mint`. |
 | 9 | `metadata` | W |   | Metaplex metadata PDA. |
 | 10 | `metaplex_program` |   |   | |
-| 11 | `token_program` |   |   | SPL Token only. |
+| 11 | `token_program` |   |   | SPL Token for the base mint. `InitializeV2` and `InitializeWithToken2022` take a separate quote-program account that may be either program. |
 | 12 | `system_program` |   |   | |
 | 13 | `rent` |   |   | |
 
@@ -174,6 +180,26 @@ Mirror of `Buy`. User returns `base_in` to the curve and receives `quote_out`. T
 
 **Effect** — symmetrical to `Buy`. `base_sold` decreases, `quote_reserve_real` decreases. Fees still accrue.
 
+### Quote-side transfer fees
+
+When the quote mint carries a `TransferFeeConfig`, the amount the vault moves and the amount the payer is debited or credited differ, and the slippage bound is checked against the payer's side. On a quote mint without the extension every case below is identical to a plain legacy mint.
+
+| Instruction | Argument | Checked against |
+|---|---|---|
+| `BuyExactIn` | `amount_in` | The curve is priced on `amount_in − transfer_fee(amount_in)` — what reaches the vault. A full fill debits exactly `amount_in`; a partial fill debits the consumed vault amount plus its inverse fee. |
+| `BuyExactOut` | `maximum_amount_in` | The vault amount **plus** the inverse transfer fee — the real debit. |
+| `SellExactIn` | `minimum_amount_out` | What the seller keeps after the mint withholds its fee, not the gross amount leaving the vault. |
+| `SellExactOut` | `amount_out` | Delivered exactly. The curve targets `amount_out` plus the inverse transfer fee. |
+
+Two consequences for quoting:
+
+- A bound computed as if the mint were fee-free is rejected. Passing the fee-free cost as `maximum_amount_in`, or the fee-free proceeds as `minimum_amount_out`, reverts with `ExceededSlippage`.
+- `real_quote` advances only by what reached the vault. A `BuyExactIn` of `amount_in` on a 5% quote mint moves `real_quote` by `amount_in × 0.95`.
+
+A 100%-fee quote mint (`10000` basis points) cannot be inverted and reverts with `CalculateOverflow` on the exact-out paths.
+
+Both trade-side mints are also constrained to the program passed in their matching slot, so a mismatched `base_token_program` now fails rather than being ignored. See [`algorithms/token-2022-transfer-fees`](/algorithms/token-2022-transfer-fees) for the underlying fee math.
+
 ## `MigrateToAmm` / `MigrateToCpswap`
 
 Graduate a launch into a tradeable pool once the curve has hit `total_quote_fund_raising`. New launches are CPMM-only. `MigrateToAmm` is retained for existing pools whose stored `migrate_type` is `0`.
@@ -228,6 +254,19 @@ Clients building `MigrateToCpswap` must use these fixed `remaining_accounts` ind
 
 The instruction requires at least ten remaining accounts on the upgraded path. The support-mint accounts are read-only CPI inputs. Derive both addresses even when the mint has no initialized support record. Older builders that still append creator-lock accounts or omit indices 8–9 must be updated.
 
+### CPMM migration token programs
+
+`MigrateToCpswap` takes both token programs unconditionally and works out which one owns each mint itself. Its two token-program accounts were renamed accordingly:
+
+| Position | Account | Value |
+|---|---|---|
+| first | `token_program` | Always the legacy SPL Token program |
+| second | `token_program_2022` | Always the Token-2022 program |
+
+They replace the former `base_token_program` (whichever program owned the base mint) and `quote_token_program` (always legacy). Positions are unchanged, so this is a value change rather than a layout change — but the two values are close to inverted, and a builder that keeps passing its old pair will supply Token-2022 where the legacy program is required as soon as either mint is a Token-2022 mint.
+
+The legacy program is required even when neither mint uses it, because the CPMM LP mint and the locked-liquidity Fee Key NFT always live on it.
+
 ## Platform `GlobalConfig` allowlist
 
 `PlatformConfig.restrict_global_config` controls the check:
@@ -254,7 +293,7 @@ Admin sweep of the protocol's accrued trade fees on a single launch.
 | 5 | `quote_vault` | W |   | Drained by `quote_protocol_fee`. |
 | 6 | `recipient_token_account` | W |   | ATA of `protocol_fee_owner` on `quote_mint`. |
 | 7 | `quote_mint` |   |   | |
-| 8 | `token_program` |   |   | SPL Token (the quote mint is always SPL Token). |
+| 8 | `token_program` |   |   | The program that owns the quote mint — SPL Token or Token-2022. |
 
 **Effect** — transfer `pool_state.quote_protocol_fee` from `quote_vault` to `recipient_token_account`, then zero the counter. Callable any time after the first buy.
 

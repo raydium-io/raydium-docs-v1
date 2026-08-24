@@ -18,10 +18,10 @@ description: "PoolState (per-launch root), the base and quote vaults, the author
 | `PoolState` | LaunchLab program | Per-launch root state: mints, vaults, curve params, sold counters, fee counters, vesting schedule, graduation status. |
 | `authority` | LaunchLab program | Single PDA at seed `[b"vault_auth_seed"]` that owns vaults across all launches and signs the post-graduation CPI. |
 | `base_vault` | SPL Token / Token-2022 | Per-launch vault holding the unsold base tokens. |
-| `quote_vault` | SPL Token | Per-launch vault holding accumulated quote tokens. |
+| `quote_vault` | SPL Token / Token-2022 | Per-launch vault holding accumulated quote tokens. Follows whichever program owns the quote mint. |
 | [`VestingRecord`](/products/launchlab/vesting) | LaunchLab program | Per-beneficiary cliff + linear-unlock record. Optional. |
-| `creator_fee_vault` | SPL Token | Per-creator + per-quote-mint vault holding accrued creator fees, swept by `ClaimCreatorFee`. |
-| `platform_fee_vault` | SPL Token | Per-platform + per-quote-mint vault holding accrued platform fees, swept by `ClaimPlatformFeeFromVault`. |
+| `creator_fee_vault` | SPL Token / Token-2022 | Per-creator + per-quote-mint vault holding accrued creator fees, swept by `ClaimCreatorFee`. Follows the quote mint's program. |
+| `platform_fee_vault` | SPL Token / Token-2022 | Per-platform + per-quote-mint vault holding accrued platform fees, swept by `ClaimPlatformFeeFromVault`. Follows the quote mint's program. |
 | [`PlatformAllowConfig`](/products/launchlab/platform-config) | LaunchLab program | Optional platform-managed permission for one `(PlatformConfig, GlobalConfig)` pair. Checked only when the platform enables restriction. |
 | (post-graduation) `cpmm_pool_state` | CPMM program | Pool created by `MigrateToCpswap` for every new launch. Legacy state can still reference an AMM v4 graduation. |
 | (post-graduation) Fee Key NFT | LP-Lock program | Before the 2026-08-17 upgrade, platform and creator scales could produce separate Fee Keys. Migrations executed afterward combine both scales into one platform Fee Key. |
@@ -63,7 +63,7 @@ pub struct PoolState {
     pub quote_vault:               Pubkey,
 
     pub amm_creator_fee_on:        u8,         // 0 = QuoteToken, 1 = BothToken (CPMM-only)
-    pub token_program_flag:        u8,         // bit flags for SPL Token vs Token-2022
+    pub token_program_flag:        u8,         // bit0 = base mint, bit1 = quote mint; 0 = SPL Token, 1 = Token-2022
     pub padding:                   [u8; 54],
 }
 
@@ -92,6 +92,7 @@ Integrator-facing fields:
 - **`total_base_sell`** vs `real_base` — "progress toward graduation" ratio for UIs.
 - **`migrate_type`** — new initialization requires `1` (`CPSWAP`). A stored `0` remains meaningful only for an existing launch created before CPMM-only enforcement.
 - **`amm_creator_fee_on`** — picks `creator_fee_on = OnlyQuoteToken` (`0`) or `BothToken` (`1`) on the post-graduation CPMM pool. It does not choose the migration target. See [`creator-fees`](/products/launchlab/creator-fees).
+- **`token_program_flag`** — a bitfield, not a boolean. Bit0 is the base mint and bit1 is the quote mint, each `0` for SPL Token and `1` for Token-2022, so the byte takes four values: `0` (both legacy), `1` (Token-2022 base), `2` (Token-2022 quote), `3` (both Token-2022). Read one mint with `(token_program_flag >> bit) & 1`. Comparing the whole byte against `0` to classify the base mint resolves `2` to the wrong program. Bit1 was constant `0` until Token-2022 quote mints were supported.
 - **`quote_protocol_fee` / `platform_fee` / `migrate_fee`** — three independent fee counters. Each has its own claim instruction; see [`instructions`](/products/launchlab/instructions).
 - **`vesting_schedule`** — present on every `PoolState` but inactive when `total_locked_amount == 0`. See [`vesting`](/products/launchlab/vesting) for the full lifecycle.
 
@@ -144,11 +145,13 @@ Created inline by `Initialize` with:
 
 Because the full supply is pre-minted, `base_mint.supply` is constant for the life of the launch. Curve buys move tokens from `base_vault` to the buyer, but do not call `mint_to`.
 
-`Initialize` / `InitializeV2` create SPL Token launches. The dedicated `InitializeWithToken2022` instruction lets the base mint be a Token-2022 mint (with optional `TransferFeeConfig`); the quote mint is still SPL Token. All three initialization paths require CPMM graduation.
+`Initialize` / `InitializeV2` create SPL Token base mints. The dedicated `InitializeWithToken2022` instruction lets the base mint be a Token-2022 mint (with optional `TransferFeeConfig`). All three initialization paths require CPMM graduation.
+
+The quote mint is independent of the base mint and may itself be a Token-2022 mint — `InitializeV2` and `InitializeWithToken2022` accept either program in their quote-program slot. The deprecated `Initialize` does not: its quote-program account is still typed to SPL Token, so a config whose quote mint is Token-2022 can only be launched through the other two. The quote mint is never created by LaunchLab; it is whatever `GlobalConfig.quote_mint` names. See [`global-config`](/products/launchlab/global-config#token-2022-quote-mints) and [`reference/token-2022-support`](/reference/token-2022-support#launchlab-quote-mints).
 
 ## Vaults
 
-Both `base_vault` and `quote_vault` are standard SPL Token accounts owned by the LaunchLab `authority` PDA. Addresses are stored on `PoolState` and can also be derived:
+Both `base_vault` and `quote_vault` are token accounts owned by the LaunchLab `authority` PDA, each created on the program that owns its own mint — so a launch can have a legacy base vault and a Token-2022 quote vault, or any other combination. `token_program_flag` records which is which. Addresses are stored on `PoolState` and can also be derived:
 
 ```ts
 const [baseVault] = PublicKey.findProgramAddressSync(
@@ -169,6 +172,8 @@ Two PDAs aggregate fees across launches:
 
 - **Creator fee vault** — PDA at seeds `[creator, quote_mint]`. Every launch that earns the same creator fees on the same quote mint pours into the same vault. The creator sweeps it via `ClaimCreatorFee`.
 - **Platform fee vault** — PDA at seeds `[platform_config, quote_mint]`. Every launch routed through the same platform that uses the same quote mint pours into the same vault. The platform's `platform_fee_wallet` sweeps it via `ClaimPlatformFeeFromVault`. There is also a per-launch sweep variant (`ClaimPlatformFee`) that pulls from the launch's `quote_vault` directly without going through the aggregated vault.
+
+Both are created lazily on the first swap that accrues a fee, on whichever program owns the quote mint. A creator or platform that runs launches against both a legacy and a Token-2022 quote mint ends up with one vault per mint, as it already did for two different legacy mints.
 
 The aggregated-vault pattern is what lets a high-volume creator or platform amortize the rent cost of fee accumulation across many launches.
 

@@ -1,0 +1,140 @@
+---
+title: "2026-08-24 — LaunchLab: Token-2022 quote mints"
+description: "LaunchLab accepts Token-2022 quote mints across config, pool creation, swaps, fee claims, and CPMM migration. Swap slippage bounds now price the quote-side transfer fee, PoolState.token_program_flag bit1 becomes meaningful, and MigrateToCpswap renames its two token-program accounts."
+---
+
+<Info>
+  This entry covers an upcoming LaunchLab program update. It was verified against the local release branch before deployment. Confirm the deployed program and published IDL before enabling the new paths in production.
+</Info>
+
+This release lets a launch be quoted in a Token-2022 mint. Until now the quote side was hard-wired to the legacy SPL Token program, so only the base mint could be Token-2022. Every place the quote mint is touched — `GlobalConfig` creation, pool initialization, the four swap instructions, all fee claims, and CPMM migration — now accepts either token program, and the swap instructions account for the quote mint's transfer fee.
+
+## TL;DR for integrators
+
+- **Quote mints can be Token-2022.** `CreateConfig` accepts a Token-2022 `quote_token_mint`, and `InitializeV2` / `InitializeWithToken2022` accept either token program in the quote-program slot. The account order does not change — the value you pass in that slot does.
+- **The deprecated `Initialize` is still legacy-only.** Its quote-program account is still typed to SPL Token, so a config whose quote mint is Token-2022 can only be launched through `InitializeV2` or `InitializeWithToken2022`.
+- **Slippage bounds move to what the payer actually pays and receives.** `minimum_amount_out` and `maximum_amount_in` are now compared against the amount net of the quote mint's transfer fee, not the amount the vault moved. Existing quoting logic under-quotes cost and over-quotes proceeds on a fee-bearing quote mint.
+- **`PoolState.token_program_flag` bit1 becomes meaningful.** It was always `0` while quote mints were legacy-only. Clients that compare the whole byte against `0` will now read a legacy base mint as Token-2022 whenever the quote mint is Token-2022. This is the most likely silent breakage in this release.
+- **`MigrateToCpswap` renames its two token-program accounts.** `base_token_program` / `quote_token_program` become `token_program` / `token_program_2022`. Both are always required, and the program picks the right one per mint.
+- **Mint/program pairs are now validated.** Both swap mints gained a `mint::token_program` constraint, as did `ClaimPlatformFee`'s quote mint, so a mismatched pair reverts instead of being ignored.
+- **New error `6023` `CalculateOverflow`.** Codes `6000`–`6022` are unchanged. `6023` was vacated by the previous release and is now reused.
+- **Fee vaults follow the quote mint.** Creator and platform fee vaults, and the share-fee receiver's token account, live on whichever program owns the quote mint.
+
+## Which accounts changed type
+
+None of these change position in their account list. Only the permitted value changes.
+
+| Instruction | Account | Before | After |
+|---|---|---|---|
+| `CreateConfig` | `quote_token_mint` | SPL Token mint | either program's mint |
+| `InitializeV2` | `quote_token_program` | SPL Token | either program |
+| `InitializeWithToken2022` | `quote_token_program` | SPL Token | either program |
+| `BuyExactIn` / `BuyExactOut` / `SellExactIn` / `SellExactOut` | `quote_token_program` | SPL Token | either program |
+| `CollectFee` / `CollectMigrateFee` | `token_program` | SPL Token | either program |
+| `ClaimCreatorFee` / `ClaimPlatformFee` / `ClaimPlatformFeeFromVault` | `token_program` | SPL Token | either program |
+
+`Initialize` (the deprecated V1 path) is deliberately not in this table. Its quote-program account stays typed to SPL Token.
+
+Several of these also tightened their mint constraints, so a mismatched mint/program pair now reverts where it was previously accepted or unchecked:
+
+- The four swap instructions constrain both `base_token_mint` and `quote_token_mint` to the program passed in the matching slot. Neither carried that constraint before, so a wrong base program was silently accepted.
+- `ClaimPlatformFee` adds the same constraint on `quote_mint`.
+- `ClaimPlatformFeeFromVault` corrects its constraint from a token-account form to the mint form on what is a mint account.
+
+## Quote-side transfer-fee accounting
+
+This is the part that changes numbers rather than account lists. On a quote mint with no `TransferFeeConfig` every formula below collapses to the previous behavior, so legacy pools and fee-free Token-2022 pools are bit-for-bit unchanged.
+
+| Instruction | What the argument means now |
+|---|---|
+| `BuyExactIn` | `amount_in` is the gross debit. The curve is priced on `amount_in − transfer_fee(amount_in)`, which is what lands in the vault. On a full fill the payer is charged exactly `amount_in`; on a partial fill the charge is the consumed vault amount grossed back up. |
+| `BuyExactOut` | `maximum_amount_in` is compared against the vault amount **plus** the inverse transfer fee — the real debit — instead of the vault amount alone. |
+| `SellExactIn` | `minimum_amount_out` is compared against what the seller is left with after the mint withholds its fee, not against the gross amount released from the vault. |
+| `SellExactOut` | `amount_out` is what the seller ends up with. The curve targets `amount_out` plus the inverse transfer fee, so the requested amount arrives exactly. |
+
+Two consequences worth stating plainly:
+
+- A bound computed from an equivalent fee-free pool is no longer acceptable. `BuyExactOut` with the fee-free cost as `maximum_amount_in` now reverts with `ExceededSlippage`, and so does `SellExactIn` with the fee-free proceeds as `minimum_amount_out`. That is the intended behavior — the old comparison let the payer be debited the transfer fee on top of a bound they had already agreed to.
+- The pool books only what reached the vault. After a `BuyExactIn` of `amount_in` on a 5% quote mint, `real_quote` advances by `amount_in × 0.95`, not `amount_in`.
+
+`get_transfer_inverse_fee` also dropped its special case for a 100%-fee mint: instead of falling back to `maximum_fee`, it now returns the new `CalculateOverflow` error when the inverse fee cannot be computed. A quote mint at `10000` basis points therefore fails the exact-out paths rather than silently transacting at the fee cap.
+
+## `token_program_flag` bit1
+
+`PoolState.token_program_flag` is a bitfield, and always has been:
+
+```text
+bit0  base mint  0 = SPL Token, 1 = Token-2022
+bit1  quote mint 0 = SPL Token, 1 = Token-2022
+```
+
+The field, the bit positions, and the code that writes both bits all predate this release. What changes is that bit1 can now actually be `1`, because a quote mint can now be a Token-2022 mint. The four values are:
+
+| Value | Base mint | Quote mint |
+|---|---|---|
+| `0` | SPL Token | SPL Token |
+| `1` | Token-2022 | SPL Token |
+| `2` | SPL Token | Token-2022 |
+| `3` | Token-2022 | Token-2022 |
+
+Read each mint's program with `(token_program_flag >> bit) & 1`. Any client that treats the byte as a boolean for the base mint — `flag === 0 ? Token : Token-2022` — resolves value `2` to a Token-2022 base mint and will build the base-side token account and transfer against the wrong program. No account size or field offset changes, so indexers need no storage migration, only a decode fix.
+
+## CPMM migration account rename
+
+`MigrateToCpswap` previously took one token program per mint, and the caller decided which was which. It now takes both programs unconditionally and derives the mapping from the mints themselves:
+
+| Position | Before | After |
+|---|---|---|
+| first token program | `base_token_program` — whichever program owned the base mint | `token_program` — always the legacy SPL Token program |
+| second token program | `quote_token_program` — always the legacy SPL Token program | `token_program_2022` — always the Token-2022 program |
+
+The two positions are unchanged, so this is a value change, not a layout change — but the values are close to inverted, and a builder that keeps passing its old pair will pass Token-2022 where the legacy program is required as soon as either mint is a Token-2022 mint.
+
+The legacy program is still required unconditionally regardless of either mint, because the CPMM LP mint and the locked-liquidity Fee Key NFT always live on it. The `remaining_accounts` layout from the [2026-08-17 release](/reference/changelog/2026-08-17-launchlab-cpmm-only-platform-config) is unchanged.
+
+## Quote mints are admitted by admin discretion only
+
+Unlike CPMM and CLMM, LaunchLab runs **no** extension allow-list against a quote mint. `CreateConfig` accepts the mint account as-is, so the only gate is which mints an admin binds to a `GlobalConfig`. The program's `NoSupportExtension` check applies solely to Token-2022 base mints that LaunchLab creates itself, where only `MetadataPointer` and `TransferFeeConfig` are permitted.
+
+Treat binding a Token-2022 quote mint as a high-trust action with the same reasoning as the CPMM/CLMM static whitelists in [`reference/token-2022-support`](/reference/token-2022-support). A `TransferHook` or `PermanentDelegate` quote mint would be admitted at config-creation time and would then run on, or be able to sweep, every pool quoted in it.
+
+## `amm_creator_fee_on` timestamp gate
+
+`InitializeV2` drops the timestamp gate that rejected any `amm_creator_fee_on` other than `BothToken` before the upgrade timestamp. The equivalent gate is still present in `InitializeWithToken2022`. In practice both paths accept either value on mainnet-beta today, because that timestamp (`1755522000`, 2025-08-18 13:00 UTC) is long past — this is cleanup, not a behavior change for current callers.
+
+## Error and IDL impact
+
+Codes `6000`–`6022` are unchanged, including `6022` `InvalidPlatformAllowConfig`.
+
+| Code | Name | Meaning |
+|---|---|---|
+| 6023 | `CalculateOverflow` | A transfer-fee or inverse-transfer-fee calculation could not be represented. |
+
+The previous release retired the old `6023` and left it vacant; this release reuses the number. Do not decode `6023` with an IDL from either earlier version.
+
+Refresh the LaunchLab IDL before passing a Token-2022 quote program, decoding `token_program_flag` bit1, or building the renamed `MigrateToCpswap` account list.
+
+## SDK impact
+
+The quote side of the SDK's launchpad module was hard-coded to `TOKEN_PROGRAM_ID` in the same places the program was. The branch that accompanies this release resolves the quote mint's owner instead, threads it through token-account creation, the share-fee receiver's ATA, and the instruction's quote-program slot, and adds an optional `transferFeeConfigB` to the four `Curve` methods so quotes reflect the formulas above. `Curve` results gain a `transferFeeB` field; `amountB` keeps its meaning — what the payer spends or the seller receives — so a fee-free quote mint produces identical numbers to before.
+
+These SDK changes are unreleased. The canonical pin on the code-demo pages in this documentation set is unchanged; check the published version before relying on the new parameters.
+
+## Reference implementation
+
+A new demo subscribes to the LaunchLab program over Yellowstone gRPC and logs, for every `GlobalConfig` and `PoolState` update, whether each mint is a Token or a Token-2022 mint:
+
+[`raydium-sdk-V2-demo/src/grpc/launchpadPoolInfo.ts`](https://github.com/raydium-io/raydium-sdk-V2-demo/blob/master/src/grpc/launchpadPoolInfo.ts)
+
+It is a compact reference for two things this release makes necessary. Pools are classified straight from `token_program_flag`, decoding both bits with no mint fetch at all — that is the fix for the bit1 breakage described above. Configs cannot be classified that way, because a `GlobalConfig` stores only its quote mint's address and no program flag, so the demo reads the mint account's owner once and caches it per mint. Seeing both paths next to each other is the quickest way to check your own decoder.
+
+See [`products/launchlab/code-demos`](/products/launchlab/code-demos#watch-configs-and-pools-over-grpc) for the walkthrough.
+
+## Pages updated
+
+- `products/launchlab/accounts` — quote-mint token program, `token_program_flag` bit layout, and vault ownership.
+- `products/launchlab/instructions` — quote-program accounts, swap slippage semantics, and the renamed migration accounts.
+- `products/launchlab/global-config` — `quote_mint` may be a Token-2022 mint, and what does and does not gate it.
+- `products/launchlab/code-demos` — the gRPC config/pool watcher.
+- `reference/token-2022-support` — LaunchLab row and a quote-mint section.
+- `reference/error-codes` — `6023` `CalculateOverflow`.
