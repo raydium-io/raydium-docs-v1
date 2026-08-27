@@ -109,7 +109,7 @@ This documentation set draws from the Raydium SDK v2 source, the Anchor IDLs pub
 
 ## Useful links
 
-- Live docs site: _add the deployed URL once published_
+- Live docs site: <https://docs.raydium.io>
 - Raydium app: <https://raydium.io>
 - Raydium SDK v2: <https://github.com/raydium-io/raydium-sdk-V2>
 - Raydium SDK v2 demos: <https://github.com/raydium-io/raydium-sdk-V2-demo>
