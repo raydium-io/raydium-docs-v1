@@ -1,0 +1,103 @@
+---
+title: "2026-08-31 — LaunchLab: platform curve rules replace the curve-parameter whitelist"
+description: "Launch-parameter restrictions move from PlatformConfig.curve_params into per-config PlatformCurveRule accounts with (field, op, value) constraints, value bands, ORed check groups, and a delegated manager wallet. PlatformConfig keeps its 944-byte size; the legacy field and its two instructions are removed, and seven error codes are appended."
+---
+
+<Info>
+  This entry covers an upcoming LaunchLab program update. It was verified against the local release branch before deployment. Confirm the deployed program before relying on the new accounts or instructions.
+</Info>
+
+A platform could already restrict which launch shapes its creators may pick, through `PlatformConfig.curve_params`. That mechanism tested **exact equality only**: an entry either pinned a field to one value or wildcarded it with a sentinel. It also held at most 10 entries across every `GlobalConfig` a platform supported, and it lived on the `PlatformConfig` account itself, growing it by 491 bytes per entry.
+
+Those three properties collided as the protocol added configs. Expressing "a fund-raising target between 50 and 200 SOL" needed one entry per permitted value and was therefore impossible. `GlobalConfig`'s own floors had meanwhile been opened wide — 1 bps rates, 99999 supply bounds — precisely so that every platform fits under them, which left platforms with no way to narrow them.
+
+This release replaces the whitelist with **curve rules**: one `PlatformCurveRule` account per (platform, config) pair, holding up to 10 check groups, each holding up to 25 `(field, op, value)` constraints over 19 launch parameters, with `Eq`, `Gte`, `Lte`, and `Neq`. Constraints inside a group are ANDed, groups are ORed. A range is a `Gte` plus an `Lte` on the same field.
+
+The full model and nine worked playbooks are on the new page: [`products/launchlab/curve-rules`](/products/launchlab/curve-rules).
+
+## TL;DR for integrators
+
+- **`PlatformConfig` keeps its size and every existing field offset.** It is a fixed 944 bytes. `curve_params` is gone; `restrict_curve_param` (`u8`), `curve_rule_manager` (`Pubkey`), and the 4 bytes the vec's length prefix occupied all come out of the padding, which shrinks from 107 to 78.
+- **Decoders must drop the trailing vec.** A decoder that still expects `Vec<PlatformCurveParam>` after the padding will read the two new fields as vec bytes. Everything before the padding is unaffected, so a decoder that only reads fee wallets and rates keeps working untouched.
+- **Launch builders need one more account when the flag is on.** While `restrict_curve_param` is `1`, `InitializeV2` and `InitializeWithToken2022` require the rule PDA in `remaining_accounts` — *including when the account does not exist*, so that omitting it cannot skip the check. Derivation: `[b"platform_curve_rule", platform_config, global_config]`.
+- **No platform is restricted by default.** `restrict_curve_param` is `0` on every existing account, and `0` means the program does not read rules at all.
+- **Two instructions are removed:** `UpdatePlatformCurveParam` and `RemovePlatformCurveParam`. Four are added: `CreatePlatformCurveRule`, `UpdatePlatformCurveRule`, `RemovePlatformCurveRule`, `ClosePlatformCurveRule`.
+- **`UpdatePlatformConfig` gains two variants:** `RestrictCurveParam(u64)` at dispatch index 13 and `CurveRuleManager(Pubkey)` at 14. Existing indices 0–12 are unchanged.
+- **Seven error codes are appended,** `6024`–`6030`. `6020` `CurveParamIsNotExist` is retained as a placeholder even though its last caller is gone, so nothing after it shifts. See [`reference/error-codes`](/reference/error-codes).
+- **An IDL refresh is required.** New account type, four new instructions, two removed, two new dispatch variants, seven new error codes.
+- **Check rules off-chain before you send anything.** The SDK exposes `checkLaunchAgainstCurveRule` (mirrors the launch-time check, fail-closed behaviour included) and `checkCurveRuleGroupWritable` (mirrors the write-time validation). Both are pure functions. See [Check before you send](/products/launchlab/curve-rules#check-before-you-send).
+- **Rehearse on devnet before enabling on mainnet.** Turning `restrict_curve_param` on changes what your creators can do immediately. The recommended sequence — including launching one token that should be rejected, to prove your builder really passes the rule account — is in [Test on devnet first](/products/launchlab/curve-rules#test-on-devnet-first).
+
+## What a rule can express that the whitelist could not
+
+| Intent | Whitelist | Curve rule |
+|---|---|---|
+| One exact launch shape | One entry | One group with `Eq` constraints |
+| A fund-raising target in a range | Not expressible | Two constraints: `Gte` + `Lte` |
+| Three launch tiers | Three entries, exact only | Three groups |
+| A graduation-valuation band independent of supply | Not expressible | Two constraints on the derived `FundRaisingRateB` |
+| A floor on what reaches the graduated pool | Not expressible | One constraint on the derived `MigrateRateA` |
+| SPL Token only, or Token-2022 only | Not expressible | One constraint on `BaseTokenProgram` |
+| "If a transfer fee is set, cap it at 1%" | Not expressible | Two groups, gated on `TransferFeeEnabled` |
+| A rule that switches over on a date, unattended | Not expressible | Two groups, gated on `UnixTimestamp` |
+
+The 19 fields include the four derived rates — `SellRateA`, `LockRate`, `MigrateRateA`, `FundRaisingRateB` — which is what makes a rule portable across supplies instead of pinned to one.
+
+## Delegated management
+
+`PlatformConfig.curve_rule_manager` is a hot wallet that may create, update, remove, and close this platform's rule accounts. Editing rules is routine and a platform admin key is usually a multisig; this is the field that keeps the multisig out of the loop. Set it once through `UpdatePlatformConfig::CurveRuleManager`.
+
+The platform admin retains the same power in parallel — the program accepts it by re-deriving the `PlatformConfig` PDA from the signer — so a lost manager key is recoverable by rotating the field. `Pubkey::default()` means admin-only.
+
+A compromised manager key can loosen or delete parameter rules and reclaim a rule account's rent. It cannot flip `restrict_curve_param`, touch any fee wallet, vesting field, or CPMM config, or break a `GlobalConfig` limit.
+
+## Rent and size
+
+A rule account is created holding no group and resized on every change, so a platform pays for the rules it actually wrote, and removing a group refunds the difference to the signer.
+
+| Rule content | Size | Rent |
+|---|---|---|
+| Empty | 150 bytes | ~0.0019 SOL |
+| 1 group, 2 constraints | 200 bytes | ~0.0023 SOL |
+| 3 groups, 4 constraints each | 408 bytes | ~0.0037 SOL |
+| 10 groups, 25 constraints each | 4 790 bytes | ~0.034 SOL |
+
+Because the size is dynamic, decoders must read the account's actual length rather than assume a constant.
+
+## Compute cost at launch
+
+The check runs on every launch while it is enabled. Measured end to end — PDA derivation, `remaining_accounts` scan, deserialization, evaluation:
+
+| Rule content | Direct fields | Derived fields |
+|---|---|---|
+| Enabled, no rule account | 1 936 | — |
+| 1 group, 2 constraints | 2 576 | 2 926 |
+| 3 groups, 4 constraints each | 3 624 | 5 724 |
+| 10 groups, 25 constraints each | 24 344 | 68 094 |
+
+A derived constraint costs about 223 CU against about 48 for a direct field read. Even a fully-loaded rule stays inside a third of the default 200 000 CU per-instruction budget. Groups are evaluated until one matches, so the most-used tier belongs first.
+
+## The one-off migration
+
+Platforms that used the whitelist were migrated by the protocol in a single pass, before the flag was available to turn on. A dedicated authority ran one transaction per platform that translated every legacy entry into the check groups of the rule account of the config it named, cleared the entries from `PlatformConfig`, and shrank that account back to 944 bytes.
+
+The translation preserved the old semantics exactly: each entry became one group, each non-sentinel field became one `Eq` constraint, and an all-sentinel entry — which matched every launch — became a group with no constraints, which also matches every launch.
+
+The migration wrote rules but did not enable them. A migrated platform stayed unrestricted until it set `restrict_curve_param` to `1` itself. The migration instruction has been removed from the program now that the pass is complete, along with the legacy field it read.
+
+## What did not change
+
+- **`GlobalConfig`.** Same layout, same limits, same instructions. Rules narrow those limits and are checked alongside them; they can never widen one.
+- **The launch instructions' account lists and arguments.** `InitializeV2` and `InitializeWithToken2022` take the same fixed accounts and the same arguments. Only `remaining_accounts` gains an entry, and only while the flag is on.
+- **Trade, graduation, fee, and vesting paths.** Untouched.
+- **`PlatformAllowConfig`.** Unchanged and unrelated: it decides *which configs* a platform's launches may use, while a rule decides *which parameters* within a config. The two flags are independent.
+- **Error codes `6000`–`6023`.** Unchanged, `6020` included.
+- **`PlatformConfig`'s size and pre-padding offsets.** Unchanged, so existing accounts need no migration of their own.
+
+## Pages updated
+
+- `products/launchlab/curve-rules` — **new page.** The three-level model, the 19-field and 4-operator tables, nine playbooks, the curve-type restriction, the two off-chain check helpers, the devnet rehearsal sequence, delegated management, rent, rollout order, and compute cost.
+- `products/launchlab/platform-config` — "Curve-parameter whitelist" replaced by "Launch-parameter rules"; layout updated for `restrict_curve_param`, `curve_rule_manager`, and the 78-byte padding; update-path table, read-path snippet, and pitfalls rewritten.
+- `products/launchlab/instructions` — new "Platform launch-parameter rules" section covering the four instructions, their accounts, arguments, and errors; inventory row replaced.
+- `products/launchlab/accounts` — `PlatformCurveRule` added to the inventory and given its own section with the full layout and the variable-size warning.
+- `reference/error-codes` — `6024`–`6030` documented; `6018` and `6020` annotated.

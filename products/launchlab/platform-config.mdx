@@ -1,10 +1,10 @@
 ---
 title: "LaunchLab PlatformConfig"
-description: "Per-platform configuration that customizes branding, fee splits, NFT migration shares, vesting allocation, and the whitelist of permitted curve shapes for any launch routed through that platform."
+description: "Per-platform configuration that customizes branding, fee splits, NFT migration shares, vesting allocation, and the launch-parameter rules for any launch routed through that platform."
 ---
 
 <Info>
-  `PlatformConfig` is the **platform-level** overlay that sits on top of [`GlobalConfig`](/products/launchlab/global-config). Where `GlobalConfig` defines the protocol-wide rules ("trade fee is 1%, supply must be at least 10M, only this wallet can graduate"), `PlatformConfig` is what each launch platform — pump.fun, Raydium's own UI, third-party launchpads — uses to add their fee, claim their slice of post-graduation LP, restrict which curve shapes their launches can pick, and surface their branding (name, website, image) on-chain.
+  `PlatformConfig` is the **platform-level** overlay that sits on top of [`GlobalConfig`](/products/launchlab/global-config). Where `GlobalConfig` defines the protocol-wide rules ("trade fee is 1%, supply must be at least 10M, only this wallet can graduate"), `PlatformConfig` is what each launch platform — pump.fun, Raydium's own UI, third-party launchpads — uses to add their fee, claim their slice of post-graduation LP, restrict which launch parameters their launches can pick, and surface their branding (name, website, image) on-chain.
 </Info>
 
 ## What it is
@@ -14,7 +14,7 @@ A `PlatformConfig` account owns five cross-cutting concerns for a platform:
 1. **Branding** — name, website, image link, all stored inline so any explorer or aggregator can display the platform that launched a token.
 2. **Platform fee** — an extra trade fee (`fee_rate`) on top of the protocol's `trade_fee_rate`. Accrues to the platform's `platform_fee_wallet`. Capped at 500 bps (`50000`) on both the create and the update path, raised from 100 bps (`10000`) on 2026-08-26 — see [Rate caps](#rate-caps).
 3. **LP migration split** — three stored integers (`platform_scale`, `creator_scale`, `burn_scale`) that sum to `1_000_000`. Before the 2026-08-17 upgrade, the creator scale produced a separate creator Fee Key. Migrations executed after the upgrade combine the first two into one platform-owned locked-LP share; the remainder is burned.
-4. **Curve-parameter whitelist** — a `Vec<PlatformCurveParam>` listing exactly which `(supply, total_base_sell, total_quote_fund_raising, migrate_type, migrate_cpmm_fee_on, vesting_params...)` combinations are permitted on this platform. If the vector is empty or all entries are invalid, **any** combination is allowed; otherwise launches must match one of the entries exactly.
+4. **Launch-parameter rules** — an opt-in restriction (`restrict_curve_param`) that requires a launch to satisfy the [`PlatformCurveRule`](/products/launchlab/curve-rules) account of the `GlobalConfig` it selected. Rules support value bands, alternative tiers, and token-type gating; they live in their own accounts, not on `PlatformConfig`.
 5. **Global-config allowlist** — an opt-in restriction that requires a platform-created `PlatformAllowConfig` for the selected `GlobalConfig`.
 
 PDA derivation:
@@ -41,7 +41,6 @@ pub const WEB_SIZE:  usize = 256;
 pub const IMG_SIZE:  usize = 256;
 pub const MAX_CREATOR_FEE_RATE: u64 = 5000;       // 50 bps (denominator 1_000_000)
 pub const MAX_TRANSFER_FEE_RATE: u16 = 500;       // 5%   (denominator 10_000)
-pub const MAX_CURVE_PARAMS: usize = 10;
 
 #[account]
 pub struct PlatformConfig {
@@ -62,10 +61,13 @@ pub struct PlatformConfig {
     pub platform_vesting_scale:      u64,               // platform's slice of total_locked_amount
     pub platform_cp_creator:         Pubkey,            // optional creator-of-record on the post-graduation CPMM pool
     pub restrict_global_config:      u8,                // 0 = unrestricted, 1 = require allow PDA
-    pub padding:                     [u8; 107],
-    pub curve_params:                Vec<PlatformCurveParam>, // whitelist of permitted curve shapes
+    pub restrict_curve_param:        u8,                // 0 = unrestricted, 1 = enforce the PlatformCurveRule
+    pub curve_rule_manager:          Pubkey,            // hot wallet allowed to manage rule accounts
+    pub padding:                     [u8; 78],
 }
 ```
+
+The account is a fixed 944 bytes. It held a trailing `Vec<PlatformCurveParam>` until the 2026-08-31 release moved launch parameters into [`PlatformCurveRule`](/products/launchlab/curve-rules) accounts; `restrict_curve_param`, `curve_rule_manager`, and the 4 bytes that vec's length prefix occupied all come out of the padding, so the byte count and every earlier field offset are unchanged. See [the changelog entry](/reference/changelog/2026-08-31-launchlab-platform-curve-rules) for what decoders must change.
 
 `platform_scale + creator_scale + burn_scale` must equal `1_000_000`. Before the 2026-08-17 upgrade, `creator_scale` was locked separately and its Fee Key went to the token creator. For migrations executed after the upgrade, it is added to `platform_scale` and its locked-LP rights go to the platform instead. Example outcomes under the updated logic:
 
@@ -150,46 +152,23 @@ The burn slice is burned directly, so no account can withdraw it or claim the LP
 
 Existing launches with stored `migrate_type = 0` can still use the legacy AMM v4 path. New initialization rejects that migrate type.
 
-## Curve-parameter whitelist
+## Launch-parameter rules
 
-`curve_params: Vec<PlatformCurveParam>` is the platform's mechanism for restricting which curve shapes its launches can pick. If the vector is non-empty and at least one entry is valid, the program enforces at `Initialize` that the launch's parameters match at least one entry exactly.
+`restrict_curve_param` is the switch. At `0` the program does not read rules at all. At `1`, every launch routed through this platform must satisfy the [`PlatformCurveRule`](/products/launchlab/curve-rules) account of the `GlobalConfig` it selected, and the launch builder must append that account to `remaining_accounts`.
 
 ```rust
-#[derive(AnchorSerialize, AnchorDeserialize, Clone)]
-pub struct PlatformCurveParam {
-    pub epoch:                u64,
-    pub index:                u8,           // ordinal within this platform's whitelist
-    pub global_config:        Pubkey,       // which GlobalConfig this entry applies to
-    pub bonding_curve_param:  BondingCurveParam,
-    pub padding:              [u64; 50],
-}
-
-#[derive(AnchorSerialize, AnchorDeserialize, Clone)]
-pub struct BondingCurveParam {
-    pub migrate_type:               u8,    // new launches require 1 = CPMM; u8::MAX = wildcard
-    pub migrate_cpmm_fee_on:        u8,    // 0 = quote-only, 1 = both. u8::MAX = wildcard
-    pub supply:                     u64,   // 0 = wildcard
-    pub total_base_sell:            u64,   // 0 = wildcard
-    pub total_quote_fund_raising:   u64,   // 0 = wildcard
-    pub total_locked_amount:        u64,   // u64::MAX = wildcard
-    pub cliff_period:               u64,   // u64::MAX = wildcard
-    pub unlock_period:              u64,   // u64::MAX = wildcard
-}
+pub restrict_curve_param: u8,   // 0 = unrestricted, 1 = enforce the rule of the used config
+pub curve_rule_manager:   Pubkey, // may manage rule accounts; the platform admin always may too
 ```
 
-Each field has a sentinel value that means **wildcard** (any value matches): `u64::MAX` for the `u64` fields, `u8::MAX` for the `u8` fields, `0` for the supply / sell / fund-raising fields. A `BondingCurveParam` with all sentinels is "allow anything" — equivalent to the empty-whitelist behaviour.
+A rule is a menu of permitted launch shapes: constraints inside one check group are ANDed, groups are ORed, and each constraint is a `(field, op, value)` triple supporting `Eq`, `Gte`, `Lte`, and `Neq`. That covers value bands, alternative tiers, graduation-valuation caps, migration floors, token-type gating, and time-boxed groups — the full model, the field table, and nine worked playbooks are in [`products/launchlab/curve-rules`](/products/launchlab/curve-rules).
 
-The matching algorithm at `Initialize`:
+Two things belong here rather than on that page:
 
-1. Filter `curve_params` to entries whose `global_config` matches the launch's chosen `GlobalConfig`.
-2. If the filtered list is empty, allow any params (the platform did not whitelist anything for this `GlobalConfig`).
-3. If every entry in the filtered list has `all_is_invalid()` (every field is the wildcard), allow any params.
-4. Otherwise iterate entries; for each entry, check the launch's params against every non-wildcard field. If all non-wildcard fields match, accept and return.
-5. If no entry matched, revert with `InvalidInput`.
+- **`curve_rule_manager` is a delegation, not a transfer.** Set it through `UpdatePlatformConfig::CurveRuleManager` and that wallet can create, update, remove, and close this platform's rule accounts without the admin key. The platform admin keeps the same power in parallel, so rotating or clearing the field recovers control. `Pubkey::default()` means only the admin can manage rules. It cannot flip `restrict_curve_param`, which stays an admin-only call.
+- **Rules are enforced on top of `GlobalConfig`, never instead of it.** The rule check runs before the config's own limits and can only narrow them.
 
-This lets a platform say "we only allow the standard 1B-supply / 800M-sold / 30k-USDC-raise / no-vesting shape" by writing a single entry with concrete values for those four fields and wildcards everywhere else. Or a stricter platform might enumerate three or four discrete shapes, one per supported launch tier.
-
-`MAX_CURVE_PARAMS = 10` caps the whitelist size.
+This replaces the former `curve_params: Vec<PlatformCurveParam>` whitelist, which could only test exact equality, held at most 10 entries across all configs, and grew the `PlatformConfig` account itself. Platforms that used it were migrated by the protocol in a one-off pass; the legacy field, its two instructions, and `MAX_CURVE_PARAMS` are gone.
 
 ## `PlatformAllowConfig` — restricting a platform
 
@@ -225,7 +204,8 @@ console.log("NFT split:",
   platformConfig.creatorScale,
   platformConfig.burnScale,
 );
-console.log("Curve whitelist size:", platformConfig.curveParams.length);
+console.log("Restrict launch params:", platformConfig.restrictCurveParam);
+console.log("Rule manager:", platformConfig.curveRuleManager.toBase58());
 ```
 
 For a UI showing "where did this token launch from", `PoolState.platform_config` points at the originating `PlatformConfig` directly — fetch it once and cache the branding.
@@ -237,8 +217,8 @@ For a UI showing "where did this token launch from", `PoolState.platform_config`
 | `CreatePlatformConfig` | platform admin (one-time) | Initializes the account with `PlatformParams`. |
 | `UpdatePlatformConfig` | platform admin | Generic dispatch keyed by a `param: u8`; mutates one field per call, or every field at once via `AllInfo`. Branding fields, fee rates, vesting wallet, and the various wallets are all settable through this. Both fee rates are re-validated against the caps in [Rate caps](#rate-caps) on every variant that touches them. |
 | `CreatePlatformAllowConfig` / `ClosePlatformAllowConfig` | platform admin | Add or remove one allowed `GlobalConfig` for this platform. |
-| `UpdatePlatformCurveParam` | platform admin | Add or replace one `PlatformCurveParam` entry by `(global_config, index)`. |
-| `RemovePlatformCurveParam` | platform admin | Clear one entry (sets it to all-sentinel = wildcard). |
+| `CreatePlatformCurveRule` / `ClosePlatformCurveRule` | `curve_rule_manager` or platform admin | Create or close the rule account of one `GlobalConfig`. |
+| `UpdatePlatformCurveRule` / `RemovePlatformCurveRule` | `curve_rule_manager` or platform admin | Add, replace, or remove one check group. The account is resized, so rent follows the content. |
 | `ClaimPlatformFee` | `platform_fee_wallet` | Sweep the per-pool platform fee from `PoolState.quote_vault`. |
 | `ClaimPlatformFeeFromVault` | `platform_fee_wallet` | Sweep the per-platform fee vault (PDA at `[platform_config, quote_mint]`). |
 
@@ -246,7 +226,8 @@ Wallet rotations (`platform_fee_wallet`, `platform_nft_wallet`, `platform_vestin
 
 ## Common pitfalls
 
-- **Whitelist sentinels mis-set.** A `BondingCurveParam` with `total_locked_amount = 0` *is not* a wildcard — it matches launches that explicitly opt out of vesting. The wildcard for that field is `u64::MAX`. The same trap exists for `cliff_period` and `unlock_period`. Use `clear()` (which the program exposes) to set sentinels correctly.
+- **`restrict_curve_param` enabled before the builder was updated.** While it is `1` the rule PDA must be in `remaining_accounts` on every launch, even for a config with no rule account — an absent account is `NotEnoughRemainingAccounts`, not a pass. Ship the builder change first, then flip the flag.
+- **`restrict_curve_param` enabled with an empty rule.** A rule holding zero groups, or a group holding zero constraints, allows everything. Enabling the flag is not by itself a restriction; write the groups first, verify them with [the SDK check](/products/launchlab/curve-rules#check-before-you-send), and rehearse the whole sequence on devnet.
 - **NFT-split rounding.** The three scales must sum to exactly `1_000_000`. Off-by-one errors at `CreatePlatformConfig` revert; off-by-one at runtime would mint or burn one extra LP unit, which is what the strict-equality check is there to prevent.
 - **Platform vesting double-allocation.** If `platform_vesting_scale > 0`, the platform must call `CreatePlatformVestingAccount` once after the launch's fundraising ends; if it forgets, that share remains unallocated and dormant forever (the launch's `total_locked_amount` budget is consumed but the platform never claims).
 - **`platform_cp_creator` ambiguity.** When set to `Pubkey::default()`, the launch creator is recorded as the post-graduation CPMM pool's `pool_creator`; when set to a real key, that key is recorded instead. This determines the beneficiary of post-graduation CPMM creator fees and who can sign the original `CPMM::CollectCreatorFee` path. The permissionless collection path still pays this recorded key's canonical ATAs. Decide at platform-config creation time which model you want.
@@ -262,7 +243,8 @@ Wallet rotations (`platform_fee_wallet`, `platform_nft_wallet`, `platform_vestin
 
 Sources:
 
-- `raydium-launch/programs/launchpad/src/states/platform_config.rs` — `PlatformConfig`, `PlatformParams`, `MigrateNftInfo`, `PlatformCurveParam`, `BondingCurveParam`, `is_valid_curve_param`.
+- `raydium-launch/programs/launchpad/src/states/platform_config.rs` — `PlatformConfig`, `PlatformParams`, `MigrateNftInfo`, `is_curve_rule_manager`, `is_platform_admin`.
+- `raydium-launch/programs/launchpad/src/states/platform_curve_rule.rs` — `PlatformCurveRule`, `CurveRuleGroup`, `ParamConstraint`.
 - `raydium-launch/programs/launchpad/src/states/platform_allow_config.rs` — `PlatformAllowConfig`.
 - `raydium-launch/programs/launchpad/src/instructions/platform/update_platform_config.rs` — `PlatformConfigParam` dispatch and the per-field setters that enforce the update-time rate caps.
 - `raydium-launch/programs/launchpad/src/lib.rs` — platform config and allow-config entrypoints.

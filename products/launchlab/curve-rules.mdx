@@ -1,0 +1,375 @@
+---
+title: "LaunchLab curve rules"
+description: "How a platform constrains the launch parameters its creators may pick: check groups, the (field, op, value) constraint model, and nine playbooks — exact tiers, value bands, graduation-valuation caps, migration floors, token-type gating, and time-boxed promos."
+---
+
+<Info>
+  A **curve rule** is a platform's answer to "which launches am I willing to host?". [`GlobalConfig`](/products/launchlab/global-config) sets the protocol floor — supply at least 10M, at least 20% of supply sold on the curve, and so on — and those floors are deliberately wide so that every kind of platform fits under them. A curve rule is where your platform narrows them to the shape your product actually supports.
+
+  Rules live in their own `PlatformCurveRule` account, one per (platform, [`GlobalConfig`](/products/launchlab/global-config)) pair. They can only narrow what the config already allows; a rule can never widen a protocol limit.
+</Info>
+
+## The mental model
+
+Three levels, from the outside in:
+
+```
+GlobalConfig       protocol floor      "supply >= 10M, sell rate >= 20%, ..."
+  └─ PlatformCurveRule   your rule     "and on my platform: one of these shapes"
+       └─ check group    one shape     "supply = 1B AND fund raising in [80, 90] SOL"
+            └─ constraint one check    "(Supply, Eq, 1_000_000_000)"
+```
+
+The two levels of nesting are what make this expressive:
+
+- **Constraints inside one group are ANDed.** All of them must hold.
+- **Groups inside one rule are ORed.** A launch is allowed as soon as it satisfies any single group.
+
+So a group is one permitted *shape*, and the rule is the menu of shapes you offer. A rule holds up to 10 groups, and a group up to 25 constraints.
+
+Two boundary cases are worth memorising:
+
+| State | Meaning |
+|---|---|
+| No rule account, or a rule with zero groups | The platform does not restrict launch parameters for that config. |
+| A group with zero constraints | That group matches every launch, so the whole rule allows everything. |
+
+A rule takes effect only while `PlatformConfig.restrict_curve_param` is `1`. At `0` the program does not read rules at all, which is also the switch you use to roll a rule out and to roll it back.
+
+## Constraints
+
+A constraint is a `(field, op, value)` triple. Nothing else — no expressions, no nesting.
+
+```rust
+pub struct ParamConstraint {
+    pub field: u8,    // which launch parameter, see the table below
+    pub op:    u8,    // 0 Eq, 1 Gte (min), 2 Lte (max), 3 Neq
+    pub value: u128,
+}
+```
+
+A **range is two constraints** on the same field inside one group: a `Gte` for the floor and an `Lte` for the ceiling. The same `(field, op)` pair may not appear twice in one group, which is what stops you from writing two contradictory minimums.
+
+### Fields
+
+<Info>
+  Field ids are permanent. New fields are only ever appended, so an id never changes meaning once a rule account holds it.
+</Info>
+
+| id | Field | Unit | Notes |
+|---|---|---|---|
+| 0 | `CurveType` | enum | 0 constant product, 1 fixed price, 2 linear price |
+| 1 | `MigrateType` | enum | New launches must be `1` (CPMM) anyway |
+| 2 | `MigrateCpmmFeeOn` | enum | 0 quote-only, 1 both tokens |
+| 3 | `Supply` | base units | The full token supply |
+| 4 | `TotalSellA` | base units | Sold on the curve. Constant-product configs only — see [Curve-type restrictions](#curve-type-restrictions) |
+| 5 | `TotalFundRaisingB` | quote units | The graduation target |
+| 6 | `TotalLockedAmount` | base units | Vesting budget |
+| 7 | `CliffPeriod` | seconds | Wait before unlocking starts |
+| 8 | `UnlockPeriod` | seconds | Unlocking duration |
+| 9 | `BaseTokenProgram` | enum | 0 SPL Token, 1 Token-2022 |
+| 10 | `TransferFeeEnabled` | bool | 1 when the base mint carries `TransferFeeConfig` |
+| 11 | `TransferFeeBasisPoints` | 1/10 000 | 0 without the extension |
+| 12 | `TransferFeeMaximumFee` | base units | 0 without the extension |
+| 13 | `SellRateA` | 1/1 000 000 | Derived: `TotalSellA / Supply`. Constant-product only |
+| 14 | `LockRate` | 1/1 000 000 | Derived: `TotalLockedAmount / Supply` |
+| 15 | `MigrateAmountA` | base units | Derived: `Supply − TotalSellA − TotalLockedAmount`. Constant-product only |
+| 16 | `MigrateRateA` | 1/1 000 000 | Derived: `MigrateAmountA / Supply`. Constant-product only |
+| 17 | `FundRaisingRateB` | 1/1 000 000 | Derived: `TotalFundRaisingB / Supply` |
+| 18 | `UnixTimestamp` | seconds | Block time of the launch |
+
+The derived fields are the ones that make rules portable. Pinning `Supply` and `TotalFundRaisingB` to exact numbers fixes one launch shape; constraining `FundRaisingRateB` fixes the *relationship* between them and lets a creator pick any supply that keeps it.
+
+<Warning>
+  Rate fields are only comparable within one `GlobalConfig`, because their denominators depend on that config's quote mint and its decimals. That is not a limitation in practice: a rule is scoped to one config by construction.
+</Warning>
+
+## The nine playbooks
+
+Each playbook below is one rule. Constraints are written as `(field, op, value)`.
+
+### 1. One standard tier
+
+The simplest rule, and the exact behaviour the retired curve-parameter whitelist offered: one shape, pinned.
+
+| Group | Constraints |
+|---|---|
+| 0 | `(Supply, Eq, 1_000_000_000e6)`, `(TotalSellA, Eq, 800_000_000e6)`, `(TotalFundRaisingB, Eq, 85e9)` |
+
+Any launch that deviates in any of the three is rejected with `CurveParamNotMatchPlatformRule`.
+
+### 2. A band instead of a number
+
+The reason bands exist: a creator picks a fund-raising target you are comfortable with, without you enumerating every value.
+
+| Group | Constraints |
+|---|---|
+| 0 | `(Supply, Eq, 1_000_000_000e6)`, `(TotalFundRaisingB, Gte, 50e9)`, `(TotalFundRaisingB, Lte, 200e9)` |
+
+One group, four constraints, and the creator has a 50–200 SOL corridor. Under the old whitelist this needed one entry per permitted value, and the cap of ten entries made it impossible.
+
+### 3. Tiers side by side
+
+Groups are ORed, so each tier is a group.
+
+| Group | Constraints | Tier |
+|---|---|---|
+| 0 | `(Supply, Eq, 1_000_000_000e6)`, `(TotalFundRaisingB, Eq, 85e9)` | Standard |
+| 1 | `(Supply, Eq, 100_000_000e6)`, `(TotalFundRaisingB, Eq, 30e9)` | Small |
+| 2 | `(Supply, Eq, 10_000_000_000e6)`, `(TotalFundRaisingB, Gte, 500e9)` | Whale |
+
+Order matters for compute, not for semantics: evaluation stops at the first group that matches, so put your most-used tier first.
+
+### 4. A graduation-valuation band
+
+`FundRaisingRateB` is `TotalFundRaisingB / Supply` in millionths. Constraining it caps how richly a token can graduate regardless of the supply the creator chose.
+
+| Group | Constraints |
+|---|---|
+| 0 | `(FundRaisingRateB, Gte, 60_000)`, `(FundRaisingRateB, Lte, 120_000)` |
+
+With a 1e12 supply and a 9-decimal quote mint, `85e9 / 1e12 × 1e6 = 85_000` sits inside that band. A creator who doubles the supply must roughly double the target to stay in it — which is the point. Two constraints replace what would otherwise be a table of `(supply, target)` pairs.
+
+### 5. A migration floor
+
+`MigrateRateA` is the share of supply that actually lands in the CPMM pool at graduation: `Supply − TotalSellA − TotalLockedAmount`, over supply. It is the depth of the graduated pool, and it is the one protocol knob with no platform-side equivalent before rules existed.
+
+| Group | Constraints |
+|---|---|
+| 0 | `(MigrateRateA, Gte, 150_000)` |
+
+At least 15% of supply reaches the pool. A creator cannot sell 95% on the curve and leave a shallow book behind.
+
+<Note>
+  If the parameters do not add up — a locked amount larger than what is left after the curve sale — the derived value cannot be computed and the constraint fails closed, so the launch is rejected rather than silently allowed.
+</Note>
+
+### 6. Vesting you actually enforce
+
+`GlobalConfig.max_lock_rate` caps vesting from above. A rule can put a floor under it, and require a real cliff.
+
+| Group | Constraints |
+|---|---|
+| 0 | `(LockRate, Gte, 50_000)`, `(LockRate, Lte, 200_000)`, `(CliffPeriod, Gte, 2_592_000)` |
+
+Between 5% and 20% of supply vested, with at least a 30-day cliff. Useful for a platform whose pitch is "no instant-unlock launches".
+
+### 7. Token-type gating
+
+`BaseTokenProgram` and `TransferFeeEnabled` are independent, which matters: a Token-2022 mint without `TransferFeeConfig` reports `TransferFeeEnabled = 0` just like an SPL Token mint does.
+
+| Intent | Group | Constraints |
+|---|---|---|
+| SPL Token only | 0 | `(BaseTokenProgram, Eq, 0)` |
+| Token-2022 only | 0 | `(BaseTokenProgram, Eq, 1)` |
+| Token-2022, no transfer fee | 0 | `(BaseTokenProgram, Eq, 1)`, `(TransferFeeEnabled, Eq, 0)` |
+| No transfer fee, either program | 0 | `(TransferFeeEnabled, Eq, 0)` |
+
+### 8. A conditional transfer-fee cap
+
+There is no "if" operator, and none is needed — two groups express the condition.
+
+| Group | Constraints | Reads as |
+|---|---|---|
+| 0 | `(TransferFeeEnabled, Eq, 0)` | No transfer fee: fine |
+| 1 | `(TransferFeeEnabled, Eq, 1)`, `(TransferFeeBasisPoints, Lte, 100)`, `(TransferFeeMaximumFee, Gte, 1_000)` | With a fee: at most 1%, and a maximum fee that is actually set |
+
+A zero-rate `TransferFeeConfig` does not slip through group 0: the extension is present, so `TransferFeeEnabled` is `1` and only group 1 can accept it.
+
+### 9. A time-boxed promo, scheduled up front
+
+`UnixTimestamp` is the block time of the launch, so a group can carry its own validity window. You write both groups today and the switchover happens on its own.
+
+| Group | Constraints | Window |
+|---|---|---|
+| 0 | `(UnixTimestamp, Lte, 1_767_225_600)`, `(TotalFundRaisingB, Gte, 30e9)` | Promo period: 30 SOL minimum |
+| 1 | `(UnixTimestamp, Gte, 1_767_225_601)`, `(TotalFundRaisingB, Gte, 80e9)` | Afterwards: 80 SOL minimum |
+
+No transaction is needed at the boundary. The cost is two group slots instead of one.
+
+## Curve-type restrictions
+
+Four fields read `TotalSellA`: `TotalSellA`, `SellRateA`, `MigrateAmountA`, and `MigrateRateA`. On a constant-product config the creator supplies that number. On a fixed-price or linear-price config the curve derives it instead, and the value the program compares against is `0`, which would reject every launch.
+
+Rather than let you write a rule that silently blocks your own config, the program refuses those four fields at write time on a non-constant-product config, with `CurveRuleFieldNotSupportedByCurve`. Only constant-product configs exist today, so in practice you will not meet this error.
+
+## Check before you send
+
+Both directions of the on-chain check are available off-chain, so neither a creator nor a platform has to learn a rule by watching transactions revert.
+
+<Info>
+  **Version banner.**
+
+  - SDK: `@raydium-io/raydium-sdk-v2@0.2.42-alpha` is the version every other code demo on this site is pinned to. The two helpers below arrive with the SDK release that ships curve-rule support; until then, port them from the program's `platform_curve_rule.rs` or call the program and read the error code.
+  - Cluster: test on Solana `devnet` first — see [Test on devnet first](#test-on-devnet-first).
+  - Program ID: see [`reference/program-addresses`](/reference/program-addresses)
+
+  Both helpers are pure functions. They touch no RPC, so they are safe to run on every keystroke in a form.
+</Info>
+
+### Before a launch: will these parameters pass?
+
+`checkLaunchAgainstCurveRule` mirrors the program's launch-time check exactly, including its fail-closed behaviour. Run it in your launch form and you can disable the submit button with a reason instead of letting the creator pay for a reverted transaction.
+
+```ts
+import {
+  checkLaunchAgainstCurveRule,
+  getPdaPlatformCurveRule,
+  LaunchpadCurveRuleBaseTokenProgram,
+  LaunchpadCurveRuleField,
+  PlatformCurveRule,
+} from "@raydium-io/raydium-sdk-v2";
+import BN from "bn.js";
+
+const platformConfig = await raydium.launchpad.getPlatformConfig(platformConfigId);
+
+// at 0 the program does not read rules at all, so there is nothing to check
+if (platformConfig.restrictCurveParam !== 0) {
+  const ruleId = getPdaPlatformCurveRule(programId, platformConfigId, configId).publicKey;
+  const ruleAccount = await connection.getAccountInfo(ruleId);
+
+  const result = checkLaunchAgainstCurveRule({
+    // undefined when the account does not exist — the platform wrote no rule for this config
+    rule: ruleAccount === null ? undefined : PlatformCurveRule.decode(ruleAccount.data),
+    context: {
+      curveType: globalConfig.curveType,
+      migrateType: 1,
+      migrateCpmmFeeOn: 0,
+      supply: new BN("1000000000000000"),
+      totalSellA: new BN("793100000000000"),
+      totalFundRaisingB: new BN("85000000000"),
+      totalLockedAmount: new BN(0),
+      cliffPeriod: new BN(0),
+      unlockPeriod: new BN(0),
+      baseTokenProgram: LaunchpadCurveRuleBaseTokenProgram.SplToken,
+      // omit transferFee entirely when the base mint carries no transfer-fee extension
+      unixTimestamp: new BN(Math.floor(Date.now() / 1000)),
+    },
+  });
+
+  if (!result.ok) {
+    // every group rejected the launch; each entry lists all of that group's failing constraints
+    for (const group of result.groupFailures) {
+      for (const c of group.unsatisfied) {
+        console.log(
+          `group ${group.groupId}: ${LaunchpadCurveRuleField[c.field]} is ${c.actual ?? "not computable"},`,
+          `rule wants op ${c.op} ${c.value.toString()}`,
+        );
+      }
+    }
+  }
+}
+```
+
+Three things the helper reproduces rather than approximates:
+
+- **A missing rule account, and a rule with no group, both pass.** So does a group with no constraints. Pass `rule: undefined` for a non-existent account; do not treat it as a rejection.
+- **Uncomputable values fail closed.** A zero supply has no rates, and a locked amount larger than what the curve sale leaves has no migrate amount. `actual` comes back `undefined` and the constraint counts as unsatisfied, exactly as on-chain.
+- **All failing constraints are reported, not just the first.** The program short-circuits because it only needs a verdict; the helper collects everything so your form can list every problem at once.
+
+The one thing it cannot know is the block time your transaction will actually land at. If a rule uses `UnixTimestamp` near a boundary, treat a pass as provisional.
+
+### Before writing a rule: is this group valid?
+
+`checkCurveRuleGroupWritable` mirrors the write-time validation of `UpdatePlatformCurveRule` — constraint ids, the duplicate `(field, op)` rule, both count limits, and the curve-type restriction. Run it in your platform admin tool before signing.
+
+```ts
+import {
+  checkCurveRuleGroupWritable,
+  LaunchpadCurveRuleField,
+  LaunchpadCurveRuleOp,
+} from "@raydium-io/raydium-sdk-v2";
+
+const constraints = [
+  { field: LaunchpadCurveRuleField.Supply, op: LaunchpadCurveRuleOp.Eq, value: new BN("1000000000000000") },
+  { field: LaunchpadCurveRuleField.TotalFundRaisingB, op: LaunchpadCurveRuleOp.Gte, value: new BN("50000000000") },
+  { field: LaunchpadCurveRuleField.TotalFundRaisingB, op: LaunchpadCurveRuleOp.Lte, value: new BN("200000000000") },
+];
+
+const writable = checkCurveRuleGroupWritable({
+  groupId: 0,
+  constraints,
+  curveType: globalConfig.curveType,
+  // the ids the rule already holds, so replacing a group is not mistaken for adding one
+  existingGroupIds: existingRule?.groups.map((g) => g.groupId) ?? [],
+});
+
+// each error carries the program error code the transaction would have failed with
+if (!writable.ok) console.log(writable.errors);
+```
+
+<Note>
+  Passing this check means the transaction will not be rejected for being malformed. It says nothing about whether the rule is what you meant — a group can be perfectly valid and still reject every launch your UI can produce. That is what the launch-side check above is for: after writing a group, run every shape your product offers through `checkLaunchAgainstCurveRule` and confirm each one still finds a group.
+</Note>
+
+### Test on devnet first
+
+Enabling `restrict_curve_param` on mainnet changes what your creators can do, immediately, for every launch. Rehearse the whole sequence on devnet before you touch mainnet:
+
+1. Create a platform config and a rule on devnet, and write the same groups you intend to ship.
+2. Run every launch shape your UI can produce through `checkLaunchAgainstCurveRule`, and confirm the verdicts are the ones you expect — both the shapes that should pass and the shapes that should be rejected.
+3. Enable `restrict_curve_param`, then actually launch a token that should pass and one that should be rejected. The second should fail with `CurveParamNotMatchPlatformRule` (`6025`), not with `NotEnoughRemainingAccounts` (`6018`) — the latter means your builder is not appending the rule PDA and the check is not really being exercised.
+4. Only then repeat on mainnet, in the same order.
+
+Point the SDK at devnet with `cluster: "devnet"` when you load it, and take the devnet program ID from [`reference/program-addresses`](/reference/program-addresses).
+
+Step 3 is the one worth insisting on. The off-chain helper and the on-chain program are two implementations of the same rules, and a devnet launch is what proves they agree for your rule — including that your launch builder passes the account at all.
+
+## Operating a rule
+
+### The delegated manager
+
+Editing rules is routine work; a platform admin key is usually a multisig. `PlatformConfig.curve_rule_manager` exists for exactly that: set it once through `UpdatePlatformConfig::CurveRuleManager`, and that hot wallet can then create, update, remove, and close rule accounts on its own. The platform admin retains the same power in parallel, so a lost manager key is recoverable — rotate it with another admin call.
+
+Scope of a compromised manager key: it can loosen or delete your parameter rules, and it can reclaim a rule account's rent. It cannot touch fee wallets, vesting, the CPMM config, cannot flip `restrict_curve_param`, and cannot break a `GlobalConfig` limit. Treat it as a configuration key, not a treasury key.
+
+### Rent follows the content
+
+A rule account is created holding no group and resized on every change, so you pay for the rules you actually wrote. Removing a group refunds the difference to the signer.
+
+| Rule content | Account size | Rent |
+|---|---|---|
+| Empty (just created) | 150 bytes | ~0.0019 SOL |
+| 1 group, 2 constraints | 200 bytes | ~0.0023 SOL |
+| 3 groups, 4 constraints each | 408 bytes | ~0.0037 SOL |
+| 10 groups, 25 constraints each | 4 790 bytes | ~0.034 SOL |
+
+### Rollout order
+
+1. Rehearse the whole sequence on devnet — see [Test on devnet first](#test-on-devnet-first).
+2. Create the rule account and write its groups. Nothing changes yet — with `restrict_curve_param` still `0` the program does not read them.
+3. Check the rule off-chain with [`checkLaunchAgainstCurveRule`](#before-a-launch-will-these-parameters-pass): for every launch shape your UI can produce, confirm some group accepts it.
+4. Set `restrict_curve_param` to `1`. From that moment your creators' launches are checked.
+5. To roll back, set it to `0` again. The rule account is left intact.
+
+<Warning>
+  Your launch builder must append the rule PDA to `remaining_accounts` while `restrict_curve_param` is `1`. The program requires the account to be present even when it does not exist yet, so that a creator cannot skip the check by omitting it — a missing account is `NotEnoughRemainingAccounts`, not a pass. Derivation is `[b"platform_curve_rule", platform_config, global_config]`.
+</Warning>
+
+## Cost at launch time
+
+The check runs on every launch while it is enabled, so its compute cost is a per-launch tax. Measured end to end — PDA derivation, the `remaining_accounts` scan, deserialization, and evaluation:
+
+| Rule content | Cheap fields | Derived fields |
+|---|---|---|
+| Enabled, no rule account | 1 936 | — |
+| 1 group, 2 constraints | 2 576 | 2 926 |
+| 3 groups, 4 constraints each | 3 624 | 5 724 |
+| 10 groups, 25 constraints each | 24 344 | 68 094 |
+
+"Cheap" is a direct field read such as `Supply`; "derived" is a computed one such as `MigrateRateA`, which costs about 223 CU per constraint against about 48. Even a fully-loaded rule of derived constraints stays inside a third of the default 200 000 CU per-instruction budget, and a realistic three-group rule is under 6 000. Groups are evaluated until one matches, so ordering your common tier first is free savings.
+
+## Where to go next
+
+- [`products/launchlab/platform-config`](/products/launchlab/platform-config) — the `PlatformConfig` fields that gate and delegate rules.
+- [`products/launchlab/global-config`](/products/launchlab/global-config) — the protocol floors a rule narrows.
+- [`products/launchlab/instructions`](/products/launchlab/instructions) — the four rule instructions and their accounts.
+- [`products/launchlab/accounts`](/products/launchlab/accounts) — `PlatformCurveRule` in the account inventory.
+- [`sdk-api/typescript-sdk`](/sdk-api/typescript-sdk) — the SDK surface the two check helpers live in.
+- [`reference/changelog/2026-08-31-launchlab-platform-curve-rules`](/reference/changelog/2026-08-31-launchlab-platform-curve-rules) — what replaced the curve-parameter whitelist, and what decoders must change.
+
+Sources:
+
+- `raydium-launch/programs/launchpad/src/states/platform_curve_rule.rs` — `PlatformCurveRule`, `CurveRuleGroup`, `ParamConstraint`, the field and op id spaces, and `CurveRuleContext::value_of`.
+- `raydium-launch/programs/launchpad/src/utils/platform_curve_rule.rs` — the launch-time check.
+- `raydium-launch/programs/launchpad/src/instructions/platform/` — `create`, `update`, `remove`, and `close_platform_curve_rule`.
