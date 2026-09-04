@@ -1,0 +1,274 @@
+---
+title: "Rent and reclaimable rent"
+description: "Solana is cutting the rent-exempt minimum by 90% across five steps under SIMD-0437. Accounts funded before each step now hold more than they need — what that excess is, which programs hand it back, and how to find and reclaim it."
+---
+
+<Info>
+  Rent is a refundable deposit, not a fee. SIMD-0437 lowers the deposit every account must hold, in five independently gated steps. Accounts created before a step keep the balance they were funded with, so each step leaves them over-funded. The SPL Token and Token-2022 programs can return that difference through `WithdrawExcessLamports` without closing the account or touching its token balance. Nothing expires — the excess sits in your own accounts until you choose to move it.
+</Info>
+
+Read [Account model](/solana-fundamentals/account-model) first if you are new to how Solana accounts are funded.
+
+## What rent actually is
+
+Every account on Solana holds a SOL deposit sized by the space it occupies. It is not spent — it is returned in full when the account is closed. The formula is:
+
+```
+minimum_balance(data_len) = (ACCOUNT_STORAGE_OVERHEAD + data_len) × lamports_per_byte
+```
+
+`ACCOUNT_STORAGE_OVERHEAD` is a fixed 128 bytes that every account pays for regardless of its payload. `lamports_per_byte` is the network-wide constant that SIMD-0437 changes.
+
+A standard 165-byte SPL token account has therefore always cost `(128 + 165) × 6,960 = 2,039,280` lamports — the ~0.00203928 SOL you see deducted whenever a wallet opens an associated token account.
+
+## What SIMD-0437 changes
+
+SIMD-0437 cuts `lamports_per_byte` from 6,960 to 696 — a 90% reduction — rolled out through five separate feature gates so validators can absorb the state-growth effect one step at a time.
+
+| Step | `lamports_per_byte` | Cut from original | Rent for a 165-byte token account |
+|---|---|---|---|
+| — (original) | 6,960 | — | 2,039,280 lamports |
+| 1 | 6,333 | 9% | 1,855,569 lamports |
+| 2 | 5,080 | 27% | 1,488,440 lamports |
+| 3 | 2,575 | 63% | 754,475 lamports |
+| 4 | 1,322 | 81% | 387,346 lamports |
+| 5 | 696 | 90% | 203,928 lamports |
+
+Step 1 activated on mainnet on 3 September 2026. The remaining steps land as their feature gates are enabled; treat the schedule as subject to change and read the live value from the cluster rather than hardcoding it.
+
+<Note>
+  SIMD-0437 depends on SIMD-0194, which deprecates the rent exemption threshold "to avoid unnecessary floating point math when setting the rent params on feature activation". In practice the `Rent` sysvar now carries `lamports_per_byte_year = 6,333` with `exemption_threshold = 1.0`, rather than the old `3,480 × 2` split that produced 6,960. Do not multiply those two fields yourself — call `getMinimumBalanceForRentExemption` and let the cluster answer.
+</Note>
+
+## Why existing accounts hold too much
+
+Lowering the constant changes what an account *needs*. It does not change what an account *has*. An account funded at 6,960 lamports per byte keeps that balance after step 1 activates, so it is over-funded by:
+
+```
+excess = (128 + data_len) × (old_rate − new_rate)
+```
+
+For a 165-byte SPL token account after step 1 that is `293 × (6,960 − 6,333) = 183,711` lamports, or ~0.000184 SOL per account. A Token-2022 account carrying extensions is larger, so it holds proportionally more — a 182-byte account is over-funded by `310 × 627 = 194,370` lamports.
+
+Individually that is dust. A wallet that has interacted with a few hundred tokens over the years is holding a meaningful multiple of it, and by step 5 each 165-byte account has 1,835,352 lamports (~0.00184 SOL) sitting above its minimum.
+
+## Which accounts can hand it back
+
+Excess lamports in a program-owned account can only be moved by that program. Whether you can reclaim rent without closing the account therefore depends entirely on which program owns it.
+
+<CardGroup cols={2}>
+  <Card title="SPL Token and Token-2022" icon="circle-check">
+    Both expose `WithdrawExcessLamports`. The account stays open, keeps its token balance, and simply drops to the current minimum.
+  </Card>
+  <Card title="Everything else" icon="circle-xmark">
+    No equivalent instruction. The rent is released only when the account is closed — a destructive operation with its own preconditions, not a rent sweep.
+  </Card>
+</CardGroup>
+
+Concretely, for the account types Raydium users hold:
+
+| Account | Owner | Can return excess in place? |
+|---|---|---|
+| SPL token account | `TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA` | Yes — `WithdrawExcessLamports` |
+| Token-2022 token account | `TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb` | Yes — `WithdrawExcessLamports` |
+| Wrapped SOL (native) token account | either token program | No — see below |
+| CLMM position | Raydium CLMM | No — rent returns when the position is closed |
+| OpenBook v1 open orders | OpenBook v1 | No — `CloseOpenOrders` only |
+| OpenBook v2 open orders | OpenBook v2 | No — `close_open_orders_account` only |
+| Stake account | Stake program | No — SIMD-0490 pins `rent_exempt_reserve` at 2,282,880 lamports |
+
+Wrapped SOL accounts are the one token-program exception: their lamport balance *is* their token balance, so both programs reject them with `TokenError::NativeNotSupported`. Token-2022 added `UnwrapLamports` (discriminant 45) for that case; `@solana/spl-token` ships `createUnwrapLamportsInstruction` for it as of 0.4.15. Skip native accounts in a rent sweep and handle them deliberately.
+
+## The `WithdrawExcessLamports` instruction
+
+Discriminant **38** in both token programs' instruction enums. From `spl-token-interface`:
+
+```rust
+/// This instruction is to be used to rescue SOL sent to any TokenProgram
+/// owned account by sending them to any other account, leaving behind only
+/// lamports for rent exemption.
+///
+/// 0. `[writable]` Source Account owned by the token program
+/// 1. `[writable]` Destination account
+/// 2. `[signer]` Authority
+/// 3. `..3+M` `[signer]` M signer accounts
+WithdrawExcessLamports,
+```
+
+Three properties make it safe to fire at every account in a wallet:
+
+- **It takes no amount.** The program computes `source.lamports − rent.minimum_balance(source.data_len())` itself, so it can never take an account below the current minimum, and it stays correct as later steps activate.
+- **It does not close anything.** The account keeps its data, its owner, and its token balance.
+- **It is idempotent.** Running it against an account already at the minimum moves zero lamports and succeeds.
+
+A frozen token account is still eligible: freezing restricts token movement, not lamports.
+
+### Building the instruction
+
+`@solana/spl-token` does not export a builder for it. As of `0.4.15` the enum entry is still commented out:
+
+```ts
+// packages/spl-token/src/instructions/types.ts
+export enum TokenInstruction {
+    // ...
+    TransferHookExtension = 36,
+    // ConfidentialTransferFeeExtension = 37,
+    // WithdrawalExcessLamports = 38,   // ← not exposed
+    MetadataPointerExtension = 39,
+    // ...
+}
+```
+
+Encode it directly. The payload is a single discriminant byte:
+
+```ts
+import { PublicKey, TransactionInstruction } from "@solana/web3.js";
+
+export function createWithdrawExcessLamportsInstruction(params: {
+  source: PublicKey;        // the token account holding excess lamports
+  destination: PublicKey;   // where the excess goes — usually the wallet itself
+  authority: PublicKey;     // owner of `source`, or the multisig account
+  multiSigners?: PublicKey[];
+  programId: PublicKey;     // TOKEN_PROGRAM_ID or TOKEN_2022_PROGRAM_ID
+}): TransactionInstruction {
+  const { source, destination, authority, multiSigners = [], programId } = params;
+  return new TransactionInstruction({
+    programId,
+    keys: [
+      { pubkey: source, isSigner: false, isWritable: true },
+      { pubkey: destination, isSigner: false, isWritable: true },
+      { pubkey: authority, isSigner: !multiSigners.length, isWritable: false },
+      ...multiSigners.map((pubkey) => ({ pubkey, isSigner: true, isWritable: false })),
+    ],
+    data: Buffer.from([38]),
+  });
+}
+```
+
+Pass each account's own `programId`. SPL Token and Token-2022 instructions can share a transaction, but each one must be addressed to the program that owns its source account.
+
+Measured on mainnet, the instruction costs 270 compute units on the SPL Token program and 1,414 on Token-2022 — negligible either way. The real constraint is transaction size, not compute.
+
+## Finding reclaimable accounts
+
+Do not derive the excess from a hardcoded rate. Ask the cluster what each account needs right now, so the same code keeps working through all five steps:
+
+```ts
+const [tokenResp, token2022Resp] = await Promise.all([
+  connection.getTokenAccountsByOwner(owner, { programId: TOKEN_PROGRAM_ID }),
+  connection.getTokenAccountsByOwner(owner, { programId: TOKEN_2022_PROGRAM_ID }),
+]);
+const raw = [...tokenResp.value, ...token2022Resp.value];
+
+// one lookup per distinct account size — a wallet normally has two or three
+const spaces = Array.from(new Set(raw.map(({ account }) => account.data.length)));
+const minimums = new Map(
+  await Promise.all(
+    spaces.map(async (space) => [space, await connection.getMinimumBalanceForRentExemption(space)] as const),
+  ),
+);
+
+const reclaimable = raw.filter(({ account }) => {
+  // wrapped SOL carries its token balance as lamports — both programs refuse it.
+  // The `is_native` COption tag sits at offset 109 in the token account layout,
+  // which Token-2022 preserves before its extension data.
+  if (account.data.readUInt32LE(109) === 1) return false;
+  return account.lamports > minimums.get(account.data.length)!;
+});
+```
+
+`getMinimumBalanceForRentExemption(0)` is a useful side-channel: it returns exactly `128 × lamports_per_byte`, so dividing by 128 tells you which rollout step the cluster is on without parsing the `Rent` sysvar.
+
+## Batching: how many fit in one transaction
+
+Each `WithdrawExcessLamports` instruction contributes one unique writable account key — 32 bytes in the compiled message — plus about 7 bytes of instruction encoding. Destination, authority and fee payer are all the same wallet, so they cost one key between them.
+
+Against the 1,232-byte transaction limit, roughly 26 instructions fit once compute-budget instructions and the blockhash are counted. **Twenty per transaction** is the safe working number, and it is what Raydium's own implementation uses. A wallet with 116 reclaimable accounts therefore sweeps in six transactions, at one 5,000-lamport base fee each.
+
+Note the economics: the fee is charged per transaction, not per account. Reclaiming fewer accounts does not cost less, which is why a partial sweep is rarely worth the extra round trips.
+
+## Reclaiming through Raydium
+
+The [raydium.io/reclaim-rent](https://raydium.io/reclaim-rent) page scans the connected wallet's SPL Token and Token-2022 accounts, shows the total split by program, and sweeps everything in batched transactions. The scan is read-only — no signature until you press **Reclaim all rent**.
+
+The page deliberately covers token accounts only. Account types that can release rent only by closing are excluded rather than listed as unavailable, because closing an account is a different, destructive action.
+
+## Reclaiming from the SDK demo
+
+<Info>
+  **Version banner.** Demos target `@raydium-io/raydium-sdk-v2@0.2.42-alpha` against Solana mainnet-beta, verified 2026-09. `WithdrawExcessLamports` is encoded by hand and is independent of the SDK version; the SDK is used only for transaction building and batching.
+</Info>
+
+Two scripts in [`raydium-sdk-V2-demo/src/rent`](https://github.com/raydium-io/raydium-sdk-V2-demo/tree/master/src/rent):
+
+```bash
+# read-only: what can this wallet reclaim, and what would it be worth after all five steps
+yarn dev src/rent/checkReclaimableRent.ts
+yarn dev src/rent/checkReclaimableRent.ts <any wallet address>
+
+# build, simulate (DRY_RUN = true by default), then send the batched sweep
+yarn dev src/rent/reclaimRent.ts
+```
+
+`reclaimRent.ts` batches at 20 accounts per transaction and signs all batches in one pass:
+
+```ts
+const batches = chunk(report.accounts, ACCOUNTS_PER_TX);
+
+const builtTxs = await Promise.all(
+  batches.map(async (batch) => {
+    const builder = new TxBuilder({
+      connection,
+      feePayer: owner.publicKey,
+      cluster: raydium.cluster,
+      owner: raydium.owner,
+    });
+    builder.addInstruction({
+      instructions: batch.map((account) =>
+        createWithdrawExcessLamportsInstruction({
+          source: account.pubkey,
+          destination: owner.publicKey,
+          authority: owner.publicKey,
+          programId: account.programId,
+        }),
+      ),
+    });
+    return builder.versionBuild({ txVersion });
+  }),
+);
+
+// versionMultiBuild puts the calling builder's transaction first and appends
+// extraPreBuildData after it, so batch 1 drives and batches 2..n follow in order
+const [firstTx, ...restTxs] = builtTxs;
+const { execute } = await firstTx.builder.versionMultiBuild({ txVersion, extraPreBuildData: restTxs });
+const { txIds } = await execute({ sequentially: true });
+```
+
+Simulate before you send. `simulateTransaction` with `accounts.addresses` returns post-execution lamport balances, which is the cheapest way to confirm the arithmetic matches what the cluster will actually do.
+
+## Should you reclaim now or wait?
+
+Both are fine, and the difference is small either way:
+
+- **The excess is not going anywhere.** It sits in your own accounts. Nothing expires, nothing is swept, no deadline applies.
+- **Waiting compounds.** Each step releases more from the same accounts, and one sweep after step 5 costs the same in fees as one sweep today.
+- **Reclaiming now does not forfeit later steps.** An account you sweep today is simply at the current minimum; the next step makes it over-funded again and you can sweep it again.
+
+The only real cost of reclaiming early is the base fee, and the only real cost of waiting is that the lamports stay immobile a while longer.
+
+## Further reading
+
+<CardGroup cols={2}>
+  <Card title="SIMD-0437" icon="file-code" href="https://github.com/solana-foundation/solana-improvement-documents/blob/main/proposals/0437-incremental-rent-reduction.md">
+    The proposal itself — the five feature gates and the rationale for stepping the reduction.
+  </Card>
+  <Card title="Reduced rent" icon="book" href="https://solana.com/upgrades/reduced-rent">
+    Solana's rollout page: current step, schedule, and what changes for new accounts.
+  </Card>
+  <Card title="Rent reduction: a data-backed analysis" icon="chart-line" href="https://solana.com/news/rent-reduction-deep-dive">
+    The economics, and the state-growth risk the stepped rollout is designed to manage.
+  </Card>
+  <Card title="Account model" icon="database" href="/solana-fundamentals/account-model">
+    How Solana accounts are funded, owned, and closed — the background for everything above.
+  </Card>
+</CardGroup>
