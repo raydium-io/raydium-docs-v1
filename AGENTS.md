@@ -26,7 +26,7 @@
 - Use sentence case for headings.
 - Bold for UI elements: Click **Settings**.
 - Code formatting for file names, commands, paths, program IDs, and code references.
-- Every code block that targets the SDK or a program ID should pin a version (SDK version, program ID, Solana cluster, last-verified date) per the convention in `ARCHITECTURE.mdx`. The current canonical pin is `@raydium-io/raydium-sdk-v2@0.2.42-alpha`; if you bump it, run a global search to keep every code-demo page in lock-step.
+- Every code block that targets the SDK or a program ID should pin a version (SDK version, program ID, Solana cluster, last-verified date) per the convention in `ARCHITECTURE.mdx`. The current canonical pin is `@raydium-io/raydium-sdk-v2@0.2.64-alpha` (advanced from `0.2.42-alpha` on 2026-09-09); if you bump it, run a global search to keep every code-demo page in lock-step, and leave historical changelog entries on the pin they were verified against.
 
 ## Cross-reference conventions
 

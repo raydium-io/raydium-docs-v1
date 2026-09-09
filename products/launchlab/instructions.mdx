@@ -5,6 +5,8 @@ description: "Initialize, Buy, Sell, Graduate, CollectFees, SetParams — argume
 
 <Info>
   LaunchLab exposes a tight instruction set: six user-facing calls plus a handful of admin primitives. The SDK wraps all of them; this page documents the raw surface for aggregators, monitoring tools, and programs that need CPI.
+
+  The 2026-09 program upgrade rebuilt LaunchLab on Anchor 1.0.2 / Solana 3.1.10 and cleared out three transition mechanisms: the deprecated `Initialize` now always fails, `MigrateToAmm` lost its three arguments and every OpenBook account, and the `get_upgrade_timestamp` gate that made several checks conditional on the clock is gone. It also adds one admin instruction, `CollectExcessLamports`. See the [2026-09-09 changelog entry](/reference/changelog/2026-09-09-launchlab-anchor-1-and-excess-lamports).
 </Info>
 
 ## Instruction inventory
@@ -12,11 +14,12 @@ description: "Initialize, Buy, Sell, Graduate, CollectFees, SetParams — argume
 | Group | Instruction | Callable by |
 |-------|-------------|-------------|
 | Global config | `CreateConfig` / `UpdateConfig` | Program admin; the delegated create-config authority may also call `CreateConfig` |
-| Launch lifecycle | `Initialize` / `InitializeV2` | Anyone (creator) — SPL Token base mint; V2 records `amm_creator_fee_on` for the eventual CPMM graduation. Only V2 accepts a Token-2022 quote mint. |
+| Launch lifecycle | `Initialize` | **Nobody — it always fails with `NotApproved`.** Retained only so the discriminator stays occupied and the IDL stays stable. Use `InitializeV2`. |
+| Launch lifecycle | `InitializeV2` | Anyone (creator) — SPL Token base mint; records `amm_creator_fee_on` for the eventual CPMM graduation, and accepts a Token-2022 quote mint. |
 | Launch lifecycle | `InitializeWithToken2022` | Anyone (creator) — Token-2022 base mint, optional `TransferFeeConfig`; accepts either quote token program |
 | Trade | `BuyExactIn` / `BuyExactOut` | Anyone — exact-input / exact-output buy on the bonding curve |
 | Trade | `SellExactIn` / `SellExactOut` | Anyone — exact-input / exact-output sell on the bonding curve |
-| Graduation | `MigrateToAmm` | Migration wallet — legacy AMM v4 graduation for pools initialized before CPMM-only creation was enforced. |
+| Graduation | `MigrateToAmm` | Migration wallet — legacy AMM v4 graduation for pools initialized before CPMM-only creation was enforced. Takes no arguments and no OpenBook accounts since 2026-09. |
 | Graduation | `MigrateToCpswap` | Migration wallet — graduate to CPMM. All newly initialized launches use this path. Wraps `InitializeWithPermission` on CPMM. |
 | Fees | `CollectFee` | Admin — sweep protocol fees from a launch |
 | Fees | `CollectMigrateFee` | Admin — sweep accrued migration fees |
@@ -28,22 +31,31 @@ description: "Initialize, Buy, Sell, Graduate, CollectFees, SetParams — argume
 | Platform config | `CreatePlatformCurveRule` / `UpdatePlatformCurveRule` / `RemovePlatformCurveRule` / `ClosePlatformCurveRule` | `PlatformConfig.curve_rule_manager` or the platform admin — manage the launch-parameter rule of one `GlobalConfig` |
 | Platform fees | `ClaimPlatformFee` / `ClaimPlatformFeeFromVault` | Platform admin |
 | Platform access | `CreatePlatformAllowConfig` / `ClosePlatformAllowConfig` | Platform admin — maintain the `GlobalConfig` allowlist used when that platform enables restriction |
+| Rent | `CollectExcessLamports` | Program admin or the dedicated collect-lamports wallet — sweep lamports above the rent-exempt minimum from LaunchLab-controlled vaults and PDAs. Added 2026-09. |
 
 The "ExactIn/ExactOut" split mirrors CPMM's `SwapBaseInput` / `SwapBaseOutput` — on-chain they are separate instruction discriminators with slightly different rounding.
 
-**Graduation path selection.** Every new `Initialize`, `InitializeV2`, and `InitializeWithToken2022` call must set `migrate_type = 1` (`CPSWAP`). Any attempt to initialize a new AMM v4-bound pool returns `MigrateTypeNotMatch`. `amm_creator_fee_on` only selects whether the resulting CPMM creator fee applies to the quote token or both tokens; it does not select the target program.
+**Graduation path selection.** Every new `InitializeV2` and `InitializeWithToken2022` call must set `migrate_type = 1` (`CPSWAP`). Any attempt to initialize a new AMM v4-bound pool returns `MigrateTypeNotMatch`. `amm_creator_fee_on` only selects whether the resulting CPMM creator fee applies to the quote token or both tokens; it does not select the target program. The legacy `Initialize` cannot create a launch at all any more (see below).
 
 `MigrateToAmm` remains callable for an existing `PoolState` that was initialized with `migrate_type = 0` before this restriction. The release does not rewrite existing pool state or remove the legacy instruction.
 
 **Quote-side token program.** The quote mint may be owned by either the SPL Token program or Token-2022. Every instruction that touches it — `CreateConfig`, `InitializeV2`, `InitializeWithToken2022`, all four trade instructions, `CollectFee`, `CollectMigrateFee`, `ClaimCreatorFee`, `ClaimPlatformFee`, and `ClaimPlatformFeeFromVault` — takes the owning program in its quote-program account slot. Account positions did not change; only the accepted value did. Pass the program that actually owns `GlobalConfig.quote_mint`, which you can read from `PoolState.token_program_flag` bit1 for an existing launch (see [`accounts`](/products/launchlab/accounts#poolstate)) or from the mint account's owner otherwise.
 
-The deprecated `Initialize` is the exception: its quote-program account is still typed to SPL Token, so a config whose quote mint is Token-2022 must be launched through `InitializeV2` or `InitializeWithToken2022`.
+The deprecated `Initialize` is moot here: its quote-program account is still typed to SPL Token, and since the 2026-09 upgrade the instruction fails before it reads any account. Launch through `InitializeV2` or `InitializeWithToken2022`.
 
 `MigrateToCpswap` is the other exception, in the opposite direction — it takes **both** programs unconditionally rather than one per mint. See [the migration accounts below](#cpmm-migration-token-programs).
 
 ## `Initialize`
 
-Create a new launch.
+<Warning>
+  **Removed in effect as of the 2026-09 upgrade — this instruction always fails.** `initialize`'s handler is now nothing but a log of `Not supported. Please use initialize_v2 instruction` and `NotApproved` (`6000`). It is retained purely so its discriminator stays occupied and the IDL keeps a stable shape. (The `Accounts` struct is unchanged, so Anchor's generated validation still runs first; the transaction reverts regardless.)
+
+  Previously it was gated on the clock: it worked until three days after the `get_upgrade_timestamp` cut-over and failed after. That timestamp helper is gone, so the failure is now unconditional. Existing launches created through it are unaffected — they trade and graduate normally through `MigrateToAmm` or `MigrateToCpswap` depending on their stored `migrate_type`.
+
+  The arguments and account list below are kept for decoding historical transactions. Use `InitializeV2` for anything new — it takes the same shape plus `amm_creator_fee_on` and a separate quote-token-program account.
+</Warning>
+
+Create a new launch. `InitializeV2` shares the shape below and adds `amm_creator_fee_on` plus a separate quote-token-program account.
 
 **Arguments**
 
@@ -201,6 +213,21 @@ A 100%-fee quote mint (`10000` basis points) cannot be inverted and reverts with
 
 Both trade-side mints are also constrained to the program passed in their matching slot, so a mismatched `base_token_program` now fails rather than being ignored. See [`algorithms/token-2022-transfer-fees`](/algorithms/token-2022-transfer-fees) for the underlying fee math.
 
+### Trade remaining accounts
+
+All four trade instructions take their fee plumbing through `remaining_accounts`, in this order:
+
+| Index | Account | When |
+|---|---|---|
+| 0 | `share_fee_receiver` | Only when `share_fee_rate > 0`. Shifts every index below by one when present. |
+| next | `system_program` | Always. Funds fee-vault creation. |
+| next | `platform_fee_vault` | Always. PDA at seeds `[platform_config, quote_token_mint]`, created on first use. |
+| next | `creator_fee_vault` | Always. PDA at seeds `[creator, quote_token_mint]`, created on first use. |
+
+<Note>
+  **Changed in 2026-09: the last three are now unconditional, and `system_program` is validated.** Before this release the program only read them when `unix_timestamp >= get_upgrade_timestamp()`, and skipped the platform/creator fee split entirely before that moment. The timestamp is long past, so behaviour on mainnet is unchanged in practice — but the branch is gone from the code, and a builder that still omits the three accounts now always fails with `NotEnoughRemainingAccounts` (`6018`) instead of only after the cut-over. The `system_program` slot is additionally checked against `System::id()` and returns `InvalidInput` (`6002`) if it holds anything else, where previously any account was accepted in that position.
+</Note>
+
 ## `MigrateToAmm` / `MigrateToCpswap`
 
 Graduate a launch into a tradeable pool once the curve has hit `total_quote_fund_raising`. New launches are CPMM-only. `MigrateToAmm` is retained for existing pools whose stored `migrate_type` is `0`.
@@ -214,15 +241,19 @@ These wallets are typically held by the Raydium-operated graduation crank; in pr
 
 **Arguments**
 
-`MigrateToAmm` takes three (mainly OpenBook market parameters that the program forwards to AMM v4):
+Neither takes any.
 
-```
-base_lot_size:               u64
-quote_lot_size:              u64
-market_vault_signer_nonce:   u8
-```
+<Warning>
+  **Breaking change (migration wallet only, 2026-09).** `MigrateToAmm` dropped all three arguments — `base_lot_size`, `quote_lot_size`, `market_vault_signer_nonce` — **and nine accounts**. Its instruction data is now the bare discriminator, so an old builder both sends 17 unexpected argument bytes and supplies an account list that no longer aligns.
 
-`MigrateToCpswap` takes none.
+  This follows AMM v4's own [OpenBook removal](/reference/changelog/2026-07-22-amm-v4-openbook-removal): AMM v4's `Initialize2` no longer takes `market_program` or `amm_open_orders`, so LaunchLab had nothing left to forward. The program also stopped CPI-ing `initialize_openbook_market`, which is what the three arguments configured.
+
+  Accounts removed: `openbook_program`, `request_queue`, `event_queue`, `bids`, `asks`, `market_vault_signer`, `market_base_vault`, `market_quote_vault`, and `amm_open_orders`. The `market` account **stays** in its position — AMM v4 still records it as a reference field — but it is now declared as a bare `#[account(mut)]`: no owner, address or seeds constraint. It is entirely unvalidated, it is forwarded straight into AMM v4's `Initialize2` CPI, and the program no longer initializes it. A caller that wants the market account to be a real initialized market has to create it itself beforehand.
+
+  The remaining 23-account list is, in order: `payer`, `base_mint`, `quote_mint`, `market`, `amm_program`, `amm_pool`, `amm_authority`, `amm_lp_mint`, `amm_base_vault`, `amm_quote_vault`, `amm_target_orders`, `amm_config`, `amm_create_fee_destination`, `authority`, `pool_state`, `global_config`, `base_vault`, `quote_vault`, `pool_lp_token`, `spl_token_program`, `associated_token_program`, `system_program`, `rent_program`.
+
+  `MigrateToCpswap` is unaffected — it never had arguments.
+</Warning>
 
 **Effect (common to both)**
 
@@ -233,7 +264,7 @@ market_vault_signer_nonce:   u8
    - `quote_amount_out = quote_vault.amount − quote_protocol_fee − migrate_fee − platform_fee`
 4. CPI into the target program (`AMM v4 Initialize2` or `CPMM InitializeWithPermission`) with those reserves to create the post-graduation pool.
 5. For CPMM migrations executed after the 2026-08-17 upgrade, combine `platform_scale + creator_scale` into one platform-owned locked-LP share and mint at most one Fee Key NFT to `platform_nft_wallet`. Burn the `burn_scale` remainder. Before the upgrade, `creator_scale` was locked separately and its Fee Key went to the token creator. Completed historical migrations are not modified. For legacy AMM v4 graduation, the LP disposition follows that instruction's existing flow.
-6. Revoke `base_mint.mint_authority` (set to `None`).
+6. (No mint-authority step. `base_mint.mint_authority` was already set to `None` at launch creation — see the note below.)
 7. Flip `pool_state.status = Migrated`, set `vesting_schedule.start_time = block_time + cliff_period`.
 
 **Token-2022 transfer-fee authority handover** — when the base mint is a Token-2022 mint carrying `TransferFeeConfig` **and** `PlatformConfig.transfer_fee_extension_auth` is non-default, migration also reassigns that extension's authorities to the platform key:
@@ -242,6 +273,10 @@ market_vault_signer_nonce:   u8
 - `WithheldWithdraw` is reassigned **only when the `authority` PDA still holds it**. Launches created from 2026-08-27 onward already carry `transfer_fee_extension_auth` on that authority from mint creation, so the step is skipped. The guard is what keeps migration from reverting on those mints — the PDA cannot sign away an authority it no longer holds.
 
 If `transfer_fee_extension_auth` is `Pubkey::default()` at migration time, neither authority moves and both stay with the `authority` PDA permanently. See [`platform-config`](/products/launchlab/platform-config#token-2022-transfer-fee-authorities).
+
+<Note>
+  **The base mint's supply is fixed from creation, not from graduation.** `InitializeV2` and `InitializeWithToken2022` mint the entire supply into the base vault and then immediately revoke `MintTokens` in the same instruction, so `base_mint.mint_authority` is `None` for the whole life of the launch. Migration does not touch it. (Earlier revisions of this page placed the revocation at graduation; that was wrong.) The only authorities migration can move are the Token-2022 transfer-fee ones described below.
+</Note>
 
 **Postconditions** — `BuyExactIn`, `BuyExactOut`, `SellExactIn`, `SellExactOut` will reject from this point on with `PoolMigrated`. The resulting AMM pool is canonical and trades like any other AMM v4 / CPMM pool.
 
@@ -260,7 +295,14 @@ Clients building `MigrateToCpswap` must use these fixed `remaining_accounts` ind
 | 8 | CPMM support-mint PDA for sorted `mint0`, derived from `[b"support_mint", mint0]` |
 | 9 | CPMM support-mint PDA for sorted `mint1`, derived from `[b"support_mint", mint1]` |
 
-The instruction requires at least ten remaining accounts on the upgraded path. The support-mint accounts are read-only CPI inputs. Derive both addresses even when the mint has no initialized support record. Older builders that still append creator-lock accounts or omit indices 8–9 must be updated.
+The instruction requires at least ten remaining accounts. The support-mint accounts are read-only CPI inputs. Derive both addresses even when the mint has no initialized support record. Older builders that still append creator-lock accounts or omit indices 8–9 must be updated.
+
+<Note>
+  **Changed in 2026-09.** Two clean-ups, neither of which changes a correct builder:
+
+  - **The permissioned CPMM path is now the only path.** `MigrateToCpswap` used to choose between `InitializeCpSwap` and `InitializeCpSwapWithPermission` based on `unix_timestamp >= get_upgrade_timestamp()`. The timestamp helper and the legacy CPI are both gone, so the permissioned path — and therefore the ten-account minimum — applies unconditionally.
+  - **Three address constraints moved from the account struct into the instruction body.** `platform_config`, `base_vault`, and `quote_vault` are still required to match the values stored on `PoolState`, but the mismatch is now raised by `require_keys_eq!` rather than by Anchor's `address =` constraint. The check is equivalent; only the error surface differs — you get Anchor's generic `RequireKeysEqViolated` (`2502`) instead of `ConstraintAddress` (`2012`), and it is reported without an account name. Update any error handling that matched on `2012` for these three accounts.
+</Note>
 
 ### CPMM migration token programs
 
@@ -397,6 +439,58 @@ Per-platform aggregated sweep. Drains the platform's per-quote-mint fee vault th
 
 **Effect** — transfer the full balance of `platform_fee_vault` to `recipient_token_account`. Reverts if the vault is empty.
 
+## `CollectExcessLamports`
+
+Admin sweep of lamports sitting above the rent-exempt minimum on accounts LaunchLab controls. Added in the 2026-09 upgrade so the protocol can reclaim the over-funding that the [SIMD-0437 rent reduction](/solana-fundamentals/rent-and-reclaimable-rent) leaves behind on accounts created before each step.
+
+Only the excess moves. Token balances, account data, owners, curve state and vesting are untouched, and the instruction is a no-op against an account already at its minimum — so it is safe to re-run after each rollout step.
+
+**Arguments** — none.
+
+**Accounts**
+
+| # | Name | W | S | Notes |
+|---|------|---|---|-------|
+| 1 | `collect_lamports_wallet` | W | S | Destination for every swept lamport. Must be either the LaunchLab program admin or the dedicated collect-lamports wallet — see [`reference/program-addresses`](/reference/program-addresses#excess-lamports-collection-wallets). Any other signer fails with `InvalidOwner` (`6001`). |
+| 2 | `authority` |   |   | **One** of LaunchLab's three vault authority PDAs (see below). Signs the token-program CPIs for every token account in this call. |
+| 3 | `token_program` |   |   | SPL Token. |
+| 4 | `token_program_2022` |   |   | Token-2022. Both are required unconditionally; the program picks per source account. |
+| 5.. | `remaining_accounts` | W |   | `M` source accounts to sweep, any number, any order. |
+
+**Picking `authority`**
+
+The account is passed unchecked and resolved by the program, which re-derives all three of LaunchLab's authority PDAs and matches:
+
+| Seed | Owns |
+|---|---|
+| `[b"vault_auth_seed"]` | Every launch's base and quote pool vault |
+| `[b"platform_fee_vault_auth_seed"]` | Every platform fee vault |
+| `[b"creator_fee_vault_auth_seed"]` | Every creator fee vault |
+
+A key matching none of the three fails the whole instruction with `InvalidOwner` (`6001`).
+
+<Warning>
+  **Group your source accounts by authority.** One call carries one `authority`, and the token program requires the account's actual owner to sign. A token account owned by a different one of the three PDAs than the `authority` you passed makes the CPI fail and takes the whole transaction with it. Sweep pool vaults, platform fee vaults and creator fee vaults in separate transactions.
+
+  Program-owned PDAs are the exception — they are debited directly, so they can ride along with any authority.
+</Warning>
+
+**How each source account is handled**
+
+| Source account owner | Handling |
+|---|---|
+| SPL Token or Token-2022, non-native token account | CPI `WithdrawExcessLamports` (token-program discriminant `38`), signed by `authority`. |
+| SPL Token or Token-2022, **native** (wSOL) token account | `WithdrawExcessLamports` rejects native accounts. The program CPIs `SyncNative`, measures how much the wrapped `amount` grew, `UnwrapLamports` (discriminant `45`) for exactly that delta, then requires the wrapped balance to equal its pre-sync value — otherwise `LamportsCalculateError` (`6031`). A SOL-quoted launch therefore keeps its full quote reserve. |
+| The LaunchLab program itself — `PoolState`, `GlobalConfig`, `PlatformConfig`, `VestingRecord`, `PlatformCurveRule`, `PlatformAllowConfig` | The program debits the account directly down to `rent.minimum_balance(data_len)`. |
+| Anything else | **Skipped silently.** No error, no lamports moved. |
+
+**Base mints cannot be swept.** `InitializeV2` and `InitializeWithToken2022` revoke `MintTokens` on the base mint in the same instruction that mints the supply, so no key can sign a `WithdrawExcessLamports` for it — the mint's rent stays where it is permanently.
+
+**Common errors** — `InvalidOwner` (`6001`, wrong signer or an `authority` that is none of the three PDAs), `LamportsCalculateError` (`6031`, the wSOL round-trip did not net to zero), and `InsufficientFunds` from the program-owned path when an account holds less than its own rent minimum.
+
+**No SDK builder.** `@raydium-io/raydium-sdk-v2` does not ship a builder for this instruction, and neither does the `raydium-sdk-V2-demo` repo — it is an admin path. Encode it by hand, the way the wallet-side sweep in [`solana-fundamentals/rent-and-reclaimable-rent`](/solana-fundamentals/rent-and-reclaimable-rent#building-the-instruction) does for the token-program instruction.
+
+
 ## Vesting and platform-config instructions
 
 These are documented on dedicated pages because each has its own state model:
@@ -415,6 +509,7 @@ These are documented on dedicated pages because each has its own state model:
 | `SellExactIn(b_in)` | Funding | −∆ | −∆q_before_fee | (same) | — |
 | Threshold reached | → Migrate | — | — | — | — |
 | `MigrateToCpswap` / legacy `MigrateToAmm` | → Migrated | (frozen) | (frozen) | `migrate_fee` set | created; CPMM LP split into platform lock and burn |
+| `CollectExcessLamports` | — | — | — | — | — |
 | `CollectFee` / `CollectMigrateFee` | any | — | — | counter zeroed | — |
 | `ClaimCreatorFee` / `ClaimPlatformFee*` | any | — | — | drains vault | — |
 | `CreateVestingAccount` | Funding | — | — | — | bumps `allocated_share_amount` |

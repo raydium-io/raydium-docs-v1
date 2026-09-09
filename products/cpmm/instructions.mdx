@@ -5,6 +5,8 @@ description: "Every instruction on the CPMM program, with its arguments, account
 
 <Info>
   This page is the authoritative instruction reference. For code that actually composes these instructions, see [`products/cpmm/code-demos`](/products/cpmm/code-demos). For error-code meanings see [`reference/error-codes`](/reference/error-codes).
+
+  The 2026-09 program upgrade rebuilt CPMM on Anchor 1.0.2 / Solana 3.1.10, added the admin instruction `CollectExcessLamports`, removed the hardcoded Token-2022 mint whitelist, and changed what `CreateAmmConfig` writes into `protocol_owner` / `fund_owner`. No user-facing instruction changed its accounts, arguments or math. See the [2026-09-09 changelog entry](/reference/changelog/2026-09-09-cpmm-anchor-1-and-excess-lamports).
 </Info>
 
 ## Instruction summary
@@ -25,7 +27,10 @@ description: "Every instruction on the CPMM program, with its arguments, account
 | `UpdateAmmConfig` | `admin` | Change fee rates or the protocol/fund owner on an `AmmConfig`. |
 | `CreateAmmConfig` | `admin` | Create a new fee tier (new `AmmConfig` account). |
 | `CreatePermissionPda` | `admin` or delegated permission-PDA creator | Mint a `Permission` PDA that allows a specific authority to call `InitializeWithPermission`. |
-| `ClosePermissionPda` | `admin` | Revoke a previously-issued `Permission` PDA. |
+| `ClosePermissionPda` | `admin` or the dedicated permission-PDA creator | Revoke a previously-issued `Permission` PDA. Since the 2026-09 upgrade the dedicated creator authority may also close a grant it issued; it was admin-only before. |
+| `CreateSupportMintAssociated` | `admin` or the dedicated support-mint owner | Register a Token-2022 mint that would otherwise fail the extension allow-list, by creating its `SupportMintAssociated` PDA. |
+| `CloseSupportMintAssociated` | `admin` or the dedicated support-mint owner | Remove a mint's registration. |
+| `CollectExcessLamports` | `admin` or the dedicated collect-lamports wallet | Sweep lamports above the rent-exempt minimum from CPMM-controlled vaults, LP mints and PDAs. Added 2026-09. |
 
 Status bitmask: each pool's `status` is a `u8` where bit 0 = deposit disabled, bit 1 = withdraw disabled, bit 2 = swap disabled (`PoolStatusBitIndex { Deposit, Withdraw, Swap }` in the program). A clear bit means the operation is allowed; a set bit means it is paused. `UpdatePoolStatus` takes a raw `u8` and overwrites the existing value.
 
@@ -73,7 +78,7 @@ open_time:     u64   // Unix timestamp; swaps rejected before this
 **Preconditions**
 
 - Mints are sorted (`token_0_mint < token_1_mint` by byte order).
-- Neither mint uses an extension outside the CPMM allow-list (`TransferFeeConfig`, `MetadataPointer`, `TokenMetadata`, `InterestBearingConfig`, `ScaledUiAmount`) — see [`products/cpmm/accounts`](/products/cpmm/accounts#vaults-and-token-2022). A small per-mint allow-list inside the program bypasses the check for case-by-case onboarding.
+- Neither mint uses an extension outside the CPMM allow-list (`TransferFeeConfig`, `MetadataPointer`, `TokenMetadata`, `InterestBearingConfig`, `ScaledUiAmount`) — see [`products/cpmm/accounts`](/products/cpmm/accounts#vaults-and-token-2022). A mint with a `SupportMintAssociated` PDA (seed `[b"support_mint", mint]`) skips the check; that registry is the only bypass since the 2026-09 upgrade removed the hardcoded four-mint whitelist.
 - `creator` has at least `init_amount_0` and `init_amount_1` in the respective ATAs.
 - `amm_config.disable_create_pool == false`.
 
@@ -260,8 +265,8 @@ Sweep accrued protocol fees from the vaults to the protocol destination.
 
 **Accounts**
 
-| # | Name | W | S |
-|---|------|---|---|
+| # | Name | W | S | Notes |
+|---|------|---|---|-------|
 | 1 | `owner` |   | S | Must match `amm_config.protocol_owner`. |
 | 2 | `authority` |   |   |
 | 3 | `pool_state` | W |   |
@@ -347,8 +352,8 @@ status: u8      // new bitmask
 
 **Accounts**
 
-| # | Name | W | S |
-|---|------|---|---|
+| # | Name | W | S | Notes |
+|---|------|---|---|-------|
 | 1 | `authority` |   | S | Must match the admin key on the CPMM program. |
 | 2 | `pool_state` | W |   |
 
@@ -366,12 +371,13 @@ trade_fee_rate:    u64
 protocol_fee_rate: u64
 fund_fee_rate:     u64
 create_pool_fee:   u64
+creator_fee_rate:  u64
 ```
 
 **Accounts**
 
-| # | Name | W | S |
-|---|------|---|---|
+| # | Name | W | S | Notes |
+|---|------|---|---|-------|
 | 1 | `owner` | W | S | Admin. |
 | 2 | `amm_config` | W |   | `init`ed here. |
 | 3 | `system_program` |   |   |
@@ -380,6 +386,12 @@ create_pool_fee:   u64
 
 - No existing `AmmConfig` with the same `index`.
 - `protocol_fee_rate + fund_fee_rate <= FEE_RATE_DENOMINATOR_VALUE`.
+
+<Note>
+  **Changed in 2026-09: the new config's fee owners no longer come from the signer.** `create_amm_config` now writes the program's hardcoded `protocol_fee_owner::ID` into `protocol_owner` and `fund_fee_owner::ID` into `fund_owner`, instead of copying the admin signer's key into both. Addresses are in [`reference/program-addresses`](/reference/program-addresses#cpmm-fee-owner-wallets).
+
+  Consequences: a newly created `AmmConfig` is immediately swept by the dedicated fee wallets rather than by the admin key, and the admin can no longer collect from a config it just created without first rotating the field. **Existing `AmmConfig` accounts are not rewritten** — whatever is stored on them still governs, so always read `protocol_owner` / `fund_owner` off the account instead of assuming either value. `UpdateAmmConfig` params `3` and `4` still rotate them.
+</Note>
 
 ## `UpdateAmmConfig`
 
@@ -394,6 +406,42 @@ Change fee rates or ownership on an existing `AmmConfig`. Takes a `param: u8` (d
 - `param = 6` → `disable_create_pool`
 
 Changes are signed by the admin and affect **every pool bound to this `AmmConfig`** on the next swap. No migration; pools simply read the new values.
+
+## `CollectExcessLamports`
+
+Admin sweep of lamports sitting above the rent-exempt minimum on accounts CPMM controls. Added in the 2026-09 upgrade so the protocol can reclaim the over-funding that the [SIMD-0437 rent reduction](/solana-fundamentals/rent-and-reclaimable-rent) leaves behind on accounts created before each step.
+
+Only the excess moves. Token balances, account data, owners, pool state and the curve are untouched, and the instruction is a no-op against an account already at its minimum — so it is safe to re-run after each rollout step.
+
+**Arguments** — none.
+
+**Accounts**
+
+| # | Name | W | S | Notes |
+|---|------|---|---|-------|
+| 1 | `collect_lamports_wallet` | W | S | Destination for every swept lamport. Must be either the CPMM program admin or the dedicated collect-lamports wallet — see [`reference/program-addresses`](/reference/program-addresses#excess-lamports-collection-wallets). Any other signer fails with `InvalidOwner`. |
+| 2 | `authority` |   |   | The CPMM vault-and-LP-mint authority PDA at seed `[b"vault_and_lp_mint_auth_seed"]`. It signs the token-program CPIs. |
+| 3 | `token_program` |   |   | SPL Token. |
+| 4 | `token_program_2022` |   |   | Token-2022. Both are required unconditionally; the program picks per source account. |
+| 5.. | `remaining_accounts` | W |   | `M` source accounts to sweep, any number, any order. |
+
+**How each source account is handled**
+
+The program dispatches on the source account's `owner`:
+
+| Source account owner | Handling |
+|---|---|
+| SPL Token or Token-2022, non-native token account or mint — pool vaults and LP mints | CPI `WithdrawExcessLamports` (token-program discriminant `38`), signed by `authority`. |
+| SPL Token or Token-2022, **native** (wSOL) token account | `WithdrawExcessLamports` rejects native accounts. The program CPIs `SyncNative`, measures how much the wrapped `amount` grew, `UnwrapLamports` (discriminant `45`) for exactly that delta, then requires the wrapped balance to equal its pre-sync value — otherwise `LamportsCalculateError` (`6015`). A SOL-side pool vault therefore keeps its full liquidity. |
+| The CPMM program itself — `PoolState`, `AmmConfig`, `ObservationState`, `Permission`, `SupportMintAssociated` | The program debits the account directly down to `rent.minimum_balance(data_len)`. |
+| Anything else | **Skipped silently.** No error, no lamports moved. |
+
+Because it takes an unbounded `remaining_accounts` list, transaction size is the real limit — the same constraint as the wallet-side sweep described in [`solana-fundamentals/rent-and-reclaimable-rent`](/solana-fundamentals/rent-and-reclaimable-rent#batching-how-many-fit-in-one-transaction).
+
+**Common errors** — `InvalidOwner` (`6001`, wrong signer), `LamportsCalculateError` (`6015`, the wSOL round-trip did not net to zero), and `InsufficientFunds` from the program-owned path when an account holds less than its own rent minimum.
+
+**No SDK builder.** `@raydium-io/raydium-sdk-v2` does not ship a builder for this instruction, and neither does the `raydium-sdk-V2-demo` repo — it is an admin path. Encode it by hand, the way the wallet-side sweep in [`solana-fundamentals/rent-and-reclaimable-rent`](/solana-fundamentals/rent-and-reclaimable-rent#building-the-instruction) does for the token-program instruction.
+
 
 ## State-change matrix
 
@@ -410,6 +458,7 @@ Changes are signed by the admin and affect **every pool bound to this `AmmConfig
 | `CollectCreatorFee` | — | − (by creator buckets) | `creator_*` → 0 | — |
 | `CollectCreatorFeePermissionless` | — | − (by creator buckets) | `creator_*` → 0 | — |
 | `UpdatePoolStatus` | — | — | — | — |
+| `CollectExcessLamports` | — | — (token balances unchanged) | — | — |
 
 ## Where to go next
 

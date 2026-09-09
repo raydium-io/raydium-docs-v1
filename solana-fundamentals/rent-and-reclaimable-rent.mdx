@@ -34,7 +34,7 @@ SIMD-0437 cuts `lamports_per_byte` from 6,960 to 696 — a 90% reduction — rol
 | 4 | 1,322 | 81% | 387,346 lamports |
 | 5 | 696 | 90% | 203,928 lamports |
 
-Step 1 activated on mainnet on 3 September 2026. The remaining steps land as their feature gates are enabled; treat the schedule as subject to change and read the live value from the cluster rather than hardcoding it.
+Step 1 activated on mainnet on 3 September 2026. Step 2 reached testnet the same day and is expected on mainnet in mid-September 2026; steps 3–5 are held for Agave 4.4, expected around November 2026. Treat the schedule as subject to change — the Foundation has said it will pause the rollout if state growth misbehaves — and read the live value from the cluster rather than hardcoding it.
 
 <Note>
   SIMD-0437 depends on SIMD-0194, which deprecates the rent exemption threshold "to avoid unnecessary floating point math when setting the rent params on feature activation". In practice the `Rent` sysvar now carries `lamports_per_byte_year = 6,333` with `exemption_threshold = 1.0`, rather than the old `3,480 × 2` split that produced 6,960. Do not multiply those two fields yourself — call `getMinimumBalanceForRentExemption` and let the cluster answer.
@@ -77,7 +77,7 @@ Concretely, for the account types Raydium users hold:
 | OpenBook v2 open orders | OpenBook v2 | No — `close_open_orders_account` only |
 | Stake account | Stake program | No — SIMD-0490 pins `rent_exempt_reserve` at 2,282,880 lamports |
 
-Wrapped SOL accounts are the one token-program exception: their lamport balance *is* their token balance, so both programs reject them with `TokenError::NativeNotSupported`. Token-2022 added `UnwrapLamports` (discriminant 45) for that case; `@solana/spl-token` ships `createUnwrapLamportsInstruction` for it as of 0.4.15. Skip native accounts in a rent sweep and handle them deliberately.
+Wrapped SOL accounts are the one token-program exception: their lamport balance *is* their token balance, so both programs reject them with `TokenError::NativeNotSupported`. **Both** programs instead expose `UnwrapLamports` (discriminant 45) for that case — it is in `spl-token-interface` alongside `WithdrawExcessLamports`, so the legacy program has it too, not just Token-2022 — and `@solana/spl-token` ships `createUnwrapLamportsInstruction` for it as of 0.4.15. Skip native accounts in a plain rent sweep and handle them deliberately; the pattern for doing that safely is the one Raydium's own programs use, [below](#what-the-raydium-programs-sweep-on-their-own-side).
 
 ## The `WithdrawExcessLamports` instruction
 
@@ -196,7 +196,7 @@ The page deliberately covers token accounts only. Account types that can release
 ## Reclaiming from the SDK demo
 
 <Info>
-  **Version banner.** Demos target `@raydium-io/raydium-sdk-v2@0.2.42-alpha` against Solana mainnet-beta, verified 2026-09. `WithdrawExcessLamports` is encoded by hand and is independent of the SDK version; the SDK is used only for transaction building and batching.
+  **Version banner.** These demos target `@raydium-io/raydium-sdk-v2@0.2.64-alpha` against Solana mainnet-beta, verified 2026-09; the `raydium-sdk-V2-demo` repo itself currently installs `0.2.62-alpha`, and the two are interchangeable here. `WithdrawExcessLamports` is encoded by hand and is independent of the SDK version — the SDK is used only for transaction building and batching.
 </Info>
 
 Two scripts in [`raydium-sdk-V2-demo/src/rent`](https://github.com/raydium-io/raydium-sdk-V2-demo/tree/master/src/rent):
@@ -245,6 +245,42 @@ const { txIds } = await execute({ sequentially: true });
 ```
 
 Simulate before you send. `simulateTransaction` with `accounts.addresses` returns post-execution lamport balances, which is the cheapest way to confirm the arithmetic matches what the cluster will actually do.
+
+## What the Raydium programs sweep on their own side
+
+Your wallet is not the only place the reduction frees lamports. Every pool holds rent too — vaults, LP mints, and the program-owned state accounts that were all funded at the old rate. That rent belongs to the protocol, not to LPs: it was paid by whoever created the account, it is not part of any pool's reserves, and it never entered the curve.
+
+Three programs gained an admin instruction on 2026-09-09 to return it:
+
+| Program | Instruction | Signer |
+|---|---|---|
+| AMM v4 | `WithdrawExcessLamports` (tag 18) | A dedicated collect-lamports wallet only |
+| CPMM | `CollectExcessLamports` | The program admin or a dedicated collect-lamports wallet |
+| LaunchLab | `CollectExcessLamports` | The program admin or a dedicated collect-lamports wallet |
+
+Addresses are in [`reference/program-addresses`](/reference/program-addresses#excess-lamports-collection-wallets). CLMM and Stable AMM were not part of that release.
+
+**Nothing here affects an LP or a trader.** These instructions move lamports and only lamports. Token balances, account data, owners, pool status, LP supply, fee counters and the curve are all untouched, and none of them can close an account. A pool's quote of a swap is identical before and after a sweep. There is no user-side action, no opt-in, and no deadline.
+
+### The three account shapes each program handles
+
+All three follow the same dispatch, on the source account's owner:
+
+- **A token account or mint owned by a program authority PDA** — the program CPIs the token program's `WithdrawExcessLamports` (discriminant 38), signing as that PDA.
+- **A wrapped-SOL vault** — `WithdrawExcessLamports` refuses native accounts, so the program `SyncNative`s first (which folds the donated excess into the wrapped `amount`), measures exactly how much the wrapped amount grew, `UnwrapLamports` for that delta, and then asserts the wrapped balance is back to its pre-sync value. If that check fails the whole instruction reverts with a `LamportsCalculateError`. This is why a SOL-side pool vault keeps its full liquidity through a sweep.
+- **A program-owned state account** — `AmmInfo`, `PoolState`, `AmmConfig`, `ObservationState`, a `PlatformConfig`, and so on. A program can debit its own accounts directly, so it moves the balance down to `rent.minimum_balance(data_len)` with no CPI at all.
+
+Accounts owned by anything else are skipped silently, so passing an unrelated account is harmless rather than fatal.
+
+The wrapped-SOL sequence is worth copying if you hold native accounts of your own: it is the only way to take the excess off a wSOL account without changing what the account reports as its token balance.
+
+<Note>
+  **These paths depend on the deployed token program, not on a crate version.** All three programs hand-encode the token instructions — a single `38` byte for `WithdrawExcessLamports`, `45` plus a `COption<u64>` for `UnwrapLamports` — and send them to whichever token program owns the source account. Both instructions exist in the current mainnet SPL Token and Token-2022 programs. A local validator or test harness running an older bundled SPL Token build does not implement them, and a sweep against it fails on an unknown discriminator rather than on anything in the Raydium program. Test these paths against a mainnet-cloned token program.
+</Note>
+
+### What still cannot be reclaimed in place
+
+A CLMM position's rent is unchanged by all of this — it comes back when the position is closed, as the table above says. Same for the LaunchLab base mint: the initialize instruction revokes `MintTokens` in the same call that mints the supply, so no key can ever sign a `WithdrawExcessLamports` for that mint and its rent is stranded by design.
 
 ## Should you reclaim now or wait?
 
