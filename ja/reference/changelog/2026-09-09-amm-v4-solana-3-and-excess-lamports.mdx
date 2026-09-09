@@ -1,0 +1,91 @@
+---
+title: "2026-09-09 — AMM v4: Solana 3.0 依存関係と過剰ラムポート回収"
+description: "AMM v4 は solana-program 3.0、spl-token 9.0、新しい solana-system-interface クレートに対して再構築され、SIMD-0437 によって解放されたレント分を返す管理者専用の WithdrawExcessLamports 命令（タグ 18）を追加します。CreateConfigAccount は末尾のレント sysvar の読み込みを停止し、互換性を保ちます。何も破損せず、アカウントレイアウトは変更されていません。"
+---
+
+<Info>
+  **このページは AI による自動翻訳です。すべての内容は英語版を正とします。**
+
+  [英語版を表示 →](/reference/changelog/2026-09-09-amm-v4-solana-3-and-excess-lamports)
+</Info>
+
+<Info>
+  このエントリは、今後の AMM v4 プログラム更新をカバーしています。デプロイ前にローカルリリースブランチに対して検証されました。新しい命令に依存する前に、デプロイされたプログラムを確認してください。
+</Info>
+
+2 つの無関係な変更が 1 つの再構築で一緒に到着します。
+
+1 つ目はハウスキーピングです。AMM v4 は 2.1 アップグレード以来 `solana-program` `=2.1.0` にピン留めされており、このピン留めがブロッキングになっていました。システムプログラムのヘルパーは Solana 3.0 で独自の `solana-system-interface` クレートに移動され、`spl-token` は 9.0 に到達し、`spl-associated-token-account` は 8.0 に到達しました。このリリースはこれら 3 つすべてを採用します。
+
+2 つ目はプロトコルが受け取るべきお金です。[SIMD-0437](/ja/solana-fundamentals/rent-and-reclaimable-rent) はレント免除最小値を 5 段階で 90% 削減しており、ステップ 1 は 2026 年 9 月 3 日にメインネットに到着しました。その前に AMM v4 が作成したすべてのアカウント（数百のプールボルト、LP ミント、`AmmInfo` および `TargetOrders` アカウント）は現在過剰資金化されており、プログラム所有アカウント内のラムポートはそのプログラムによってのみ移動できます。したがって新しい命令が必要です。
+
+## インテグレーター向け TL;DR
+
+- **トレーダーまたは LP が呼び出すものは何も変更されていません。** `Initialize2`、`Deposit`、`Withdraw`、`SwapBaseIn`、`SwapBaseOut`、`SwapBaseInV2`、`SwapBaseOutV2`、`WithdrawPnl`、`SetParams` はアカウントリスト、引数レイアウト、数学を保持します。アカウントレイアウトは変更されていません。既存のエラーコードは移動していません。
+- **1 つの命令が追加されます：`WithdrawExcessLamports`、タグ `18`。** 管理者専用、引数なし、可変長アカウントリスト。AMM v4 制御アカウントからレント免除最小値を超えるラムポートを返し、他には何も触れません。[`products/amm-v4/instructions`](/ja/products/amm-v4/instructions#withdrawexcesslamports) を参照してください。
+- **1 つのエラーコードが追加されます：`60` `LamportsCalculateError`。** `AmmError` は Anchor 番号付けではなく、`0` から始まるため、これは `custom program error: 0x3c` です。コード `0`–`59` は変更されていません。
+- **`CreateConfigAccount`（タグ 14）はレント sysvar の読み込みを停止しました**。現在は 4 アカウント命令として文書化されています。**このリリースの何も破損していません**。これが含まれます：アカウントはリストの最後にあり、ハンドラーは長さチェックなしで位置的に読み込むため、それでも渡す管理者ツールは機能し続けます。
+- **IDL リフレッシュが必要です**（クライアントを生成する場合）。1 つの新しい命令、1 つの新しいエラーバリアント、1 つの変更されたアカウントリスト。
+
+## `WithdrawExcessLamports`
+
+命令は唯一の署名者および宛先としてラムポート収集ウォレット、AMM v4 権限 PDA、SPL Token プログラム、その後任意の数のソースアカウントを取ります。各ソースアカウントの所有者に基づいてディスパッチします：
+
+| ソースアカウント所有者 | 処理 |
+|---|---|
+| SPL Token、165 バイト、非ネイティブ | トークンプログラムの `WithdrawExcessLamports`（判別式 `38`）を CPI、権限 PDA で署名 |
+| SPL Token、165 バイト、ネイティブ（wSOL） | `SyncNative`、ラップされた `amount` がどれだけ増加したかを測定、その差分に対して正確に `UnwrapLamports`（判別式 `45`）、その後ラップされた残高が変更されていないことを確認 |
+| SPL Token、その他のサイズ（LP ミント） | `WithdrawExcessLamports` を CPI |
+| AMM v4 プログラム自体 | アカウントを `rent.minimum_balance(data_len)` に直接デビット |
+| その他 | 静かにスキップ |
+
+wSOL ブランチが興味深いものです。ラップされた SOL アカウントのラムポート残高は*その*トークン残高であるため、トークンプログラムはそれに対して `WithdrawExcessLamports` を完全に拒否します。`SyncNative` を通じた往復と差分サイズの `UnwrapLamports` は寄付された過剰分のみを抽出し、ラップされた残高をまったく同じ場所に残します。これは後で確認され、算術が一致しない場合は `LamportsCalculateError` が発生します。**SOL 側プールボルトはスイープを通じて完全な流動性を保持し**、LP は流動性の価格変更を見ません。
+
+署名者は、既存の AMM 所有者およびプール作成手数料アドレスと同じ `config_feature` モジュール下でハードコードされたクラスタごとの専用キーです。CPMM および LaunchLab とは異なり、AMM v4 は**その**ウォレット*のみ*を受け入れます。管理者フォールバックはありません。アドレスは [`reference/program-addresses`](/ja/reference/program-addresses#excess-lamports-collection-wallets) にあります。
+
+## `CreateConfigAccount` はレント sysvar の読み込みを停止しました
+
+Solana 3.0 は `Rent::get()` をレントパラメータを読み込む自然な方法にするものであるため、リリースはプログラム内のすべての 4 つの `Rent::from_account_info(...)` 呼び出しを置き換えました。3 つの場合（`Initialize2` 中にプールのトークンアカウント、LP ミント、PDA アカウントを作成するヘルパー）では、sysvar アカウントはまだ渡され、トークンプログラム CPI に転送されるため、そのアカウントリストについて何も変わりません。`CreateConfigAccount` では sysvar に他の目的がなく、リストの最後のアカウントであったため、文書化されたリストから削除されました：
+
+| | 前（5 アカウント） | 後（4 アカウント） |
+|---|---|---|
+| 1 | `admin` (W, S) | `admin` (W, S) |
+| 2 | `amm_config` (W) | `amm_config` (W) |
+| 3 | `pnl_owner` | `pnl_owner` |
+| 4 | `system_program` | `system_program` |
+| 5 | `rent` | — |
+
+**古い 5 アカウントリストを送信することはまだ機能します。** 削除されたアカウントは最後にあり、`process_create_config` は `next_account_info` を通じて 4 つのアカウントを位置的に読み込み、合計数をチェックするものがないため、末尾のレントアカウントは見られません。管理者ツールは明確性のために更新する必要がありますが、緊急ではありません。ユーザー向けビルダーはこの命令をまったく構築しません。
+
+`Initialize2` は過剰読み込みしない場合です：また `Rent::from_account_info` の呼び出しを停止しましたが、そのレントアカウント**は**位置 3 に留まり、まだ本当に使用されています。プログラムはそれをプールのボルトと LP ミントを作成する `spl_token::initialize_account` および `initialize_mint` CPI に転送します。そのアカウントリストから削除するとプール作成が破損します。
+
+## 依存関係の変更
+
+| クレート | 前 | 後 |
+|---|---|---|
+| `solana-program` | `=2.1.0` | `=3.0.0` |
+| `solana-system-interface` | — | `=3.0.0`、`bincode` フィーチャー |
+| `spl-token` | `=7.0.0` | `9.0.0` |
+| `spl-associated-token-account` | `6.0.0` | `8.0.0` |
+
+プログラムが使用するシステムプログラムの部分（`system_instruction::create_account`、`transfer`、`allocate`、`assign`、およびプログラム ID 自体）は、`solana_program::system_program` および `solana_program::system_instruction` ではなく `solana-system-interface` から来るようになりました。プログラム ID はバイト同一であるため、これはオンチェーン結果を持たないコンパイル時の移動です。これに対して比較する `InvalidSysProgramAddress` チェックを含みます。
+
+2 つの不要なモジュールも削除されました：`srm_token` および `msrm_token`、[OpenBook 削除](/ja/reference/changelog/2026-07-22-amm-v4-openbook-removal)から残された Serum/MSRM ミント宣言。何も参照していませんでした。
+
+## 変更されなかったもの
+
+- **すべてのアカウントレイアウト。** `AmmInfo`、`StateData`、`TargetOrders`、`AmmConfig` — 同じサイズ、同じフィールドオフセット。インデクサーまたはデコーダーの変更はありません。
+- **エラーコード `0`–`59`。** `LamportsCalculateError` は `60` で追加されるため、何もシフトしません。
+- **AMM 権限 PDA。** プログラム全体で 1 つの PDA、シード `["amm authority"]`、ノンス `254`。
+- **手数料、PnL 会計、および曲線。** 変更されていません。`WithdrawExcessLamports` はプールの準備金の一部ではなかったラムポートを移動します。
+- **Token-2022。** まだサポートされていません。新しい命令はレガシー SPL Token プログラムのみと通信します。
+- **プログラム ID。** 変更されていません。[`reference/program-addresses`](/ja/reference/program-addresses) を参照してください。
+
+## 更新されたページ
+
+- `products/amm-v4/instructions` — `WithdrawExcessLamports` がアカウントリストと所有者ごとのディスパッチテーブルで追加されました。レント sysvar 削除をカバーする新しい `CreateConfigAccount` / `UpdateConfigAccount` セクション。インベントリテーブルと状態変更マトリックス行が追加されました。
+- `products/amm-v4/overview` — リリースバナー。
+- `reference/error-codes` — コード `60` と `0` ベースの番号付けを文書化する新しい「AMM v4：`AmmError` は Anchor 番号付けではない」セクション。
+- `reference/program-addresses` — 新しい「過剰ラムポート収集ウォレット」セクション。
+- `solana-fundamentals/rent-and-reclaimable-rent` — 新しい「Raydium プログラムが自分たちの側でスイープするもの」セクション。ラップされた SOL ノートが両方のトークンプログラムが `UnwrapLamports` を公開することを言うように修正されました。
+- `solana-fundamentals/toolchain` — Agave 3.1.10、`release.anza.xyz`、Rust 1.91.0。

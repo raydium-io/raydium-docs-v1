@@ -1,0 +1,133 @@
+---
+title: "2026-09-09 — LaunchLab: Anchor 1.0, recuperação de lamports excedentes e fim dos gates de transição"
+description: "LaunchLab migra para Anchor 1.0.2 no Agave 3.1.10 e adiciona uma instrução admin CollectExcessLamports para aluguel liberado pelo SIMD-0437. Três mecanismos de transição são descontinuados: o Initialize deprecado agora sempre falha, MigrateToAmm perde três argumentos e nove contas OpenBook, e o gate baseado em clock get_upgrade_timestamp é deletado. Erro 6031 é adicionado."
+---
+
+<Info>
+  **Esta página foi traduzida automaticamente por IA. A versão em inglês é a fonte oficial.**
+
+  [Ver versão em inglês →](/reference/changelog/2026-09-09-launchlab-anchor-1-and-excess-lamports)
+</Info>
+
+<Info>
+  Esta entrada cobre uma atualização futura do programa LaunchLab. Foi verificada contra o branch de release local antes da implantação. Confirme o programa implantado antes de depender da nova instrução ou do layout alterado de `MigrateToAmm`.
+</Info>
+
+Este é o release onde LaunchLab para de carregar seu scaffolding de transição.
+
+Três mecanismos separados existiam para fazer upgrades anteriores funcionarem suavemente: `get_upgrade_timestamp`, uma data de corte hardcoded que vários checks comparavam contra o clock; um `Initialize` deprecado que continuava funcionando por três dias após essa data; e a plumbing OpenBook de `MigrateToAmm`, que não tinha nada para conversar após AMM v4 [remover sua própria dependência OpenBook](/pt/reference/changelog/2026-07-22-amm-v4-openbook-removal) em julho. Todos os três desapareceram. Na mainnet o corte está meses no passado, então o efeito comportamental é nulo — mas os *modos de falha* mudaram, e uma lista de contas mudou drasticamente.
+
+O framework se moveu ao mesmo tempo: Anchor `0.32.1` para `=1.0.2`, Agave 2.3.0 para 3.1.10. E, como em AMM v4 e CPMM, há uma nova instrução admin para recuperar aluguel.
+
+Trading, taxas, vesting, regras de curva e configuração de plataforma não foram alterados.
+
+## TL;DR para integradores
+
+- **Nenhuma instrução de trade mudou suas contas, argumentos ou matemática.** `BuyExactIn`, `BuyExactOut`, `SellExactIn`, `SellExactOut` são byte-idênticas. Nenhum layout de conta mudou.
+- **`Initialize` (o deprecado) agora sempre falha com `NotApproved` (`6000`),** antes de ler qualquer conta. Use `InitializeV2`. Launches já criados através dele fazem trade e se formam normalmente.
+- **`MigrateToAmm` é uma quebra severa para a carteira de migração.** Perdeu todos os três argumentos (`base_lot_size`, `quote_lot_size`, `market_vault_signer_nonce`) e nove contas. Veja abaixo.
+- **As três `remaining_accounts` de trade agora são incondicionalmente obrigatórias,** e o slot `system_program` é validado. Um builder que as omite agora sempre falha com `NotEnoughRemainingAccounts` (`6018`) em vez de apenas após o corte.
+- **Uma instrução é adicionada: `CollectExcessLamports`.** Apenas admin. Veja [`products/launchlab/instructions`](/pt/products/launchlab/instructions#collectexcesslamports).
+- **Um código de erro é adicionado: `6031` `LamportsCalculateError`.** Códigos `6000`–`6030` não mudam.
+- **Três constraints de endereço de `MigrateToCpswap` se moveram para o corpo da instrução,** mudando seu erro de `ConstraintAddress` (`2012`) para `RequireKeysEqViolated` (`2502`).
+- **Um refresh de IDL é necessário.** Uma nova instrução, um conjunto de argumentos removido, nove contas removidas, uma nova variante de erro.
+
+## `MigrateToAmm` perdeu sua metade OpenBook
+
+Esta é a mudança mais provável de quebrar algo. Dados de instrução antigos carregavam 17 bytes de argumentos após o discriminador; dados novos são o discriminador puro. Listas de contas antigas carregavam nove contas que não existem mais na struct, então tudo após a primeira remoção fica desalinhado.
+
+**Argumentos removidos:** `base_lot_size: u64`, `quote_lot_size: u64`, `market_vault_signer_nonce: u8`. Todos os três existiam apenas para configurar o mercado OpenBook que o programa costumava inicializar por CPI. Esse CPI — `initialize_openbook_market` — desapareceu, junto com o check `gen_vault_signer_key` que validava o nonce.
+
+**Contas removidas:** `openbook_program`, `request_queue`, `event_queue`, `bids`, `asks`, `market_vault_signer`, `market_base_vault`, `market_quote_vault`, e `amm_open_orders`. A última desapareceu porque `Initialize2` do AMM v4 não a leva mais.
+
+**A conta `market` permanece**, em sua posição original. AMM v4 ainda registra o mercado como um campo de referência em `AmmInfo`, então LaunchLab ainda o encaminha. Duas coisas sobre ela mudaram: o programa não a inicializa mais, e agora é **completamente não validada** — sua declaração é um `#[account(mut)]` puro sem constraint de owner, endereço ou seeds, porque `owner = openbook_program.key()` saiu junto com a conta `openbook_program` e nada a substituiu. Qualquer coisa que a carteira de migração passar lá é encaminhada direto para o CPI `Initialize2` do AMM v4 e registrada no novo pool. Um chamador que quer um mercado genuinamente inicializado atrás desse campo tem que criá-lo de antemão, e o programa não dirá o contrário.
+
+A lista resultante de 23 contas é documentada completamente em [`products/launchlab/instructions`](/pt/products/launchlab/instructions#migratetoamm-/-migratetocpswap).
+
+`MigrateToCpswap` não é afetado — nunca teve argumentos, e sua lista de contas não mudou.
+
+## O `Initialize` deprecado sempre falha
+
+`initialize` anteriormente executava uma deprecação suave: funcionava até `get_upgrade_timestamp() + 3 days`, depois retornava `NotApproved`. Com o helper de timestamp deletado, a falha é incondicional — o handler agora é um `msg!` e `err!(NotApproved)` e nada mais.
+
+Um detalhe se você está lendo logs: a struct `Accounts` não mudou e ainda carrega quatro constraints `init`, então o prólogo de validação de conta gerado por Anchor executa — e cria essas contas — antes do handler retornar. A transação reverte de qualquer forma, então nada é realmente criado, mas a falha aparece após validação de conta em vez de antes.
+
+A instrução é retida em vez de removida para que seu discriminador permaneça ocupado e o IDL mantenha uma forma estável. Suas definições de argumento e conta ainda valem a pena ter documentadas para decodificar transações históricas, e a página as mantém atrás de um aviso.
+
+## O gate `get_upgrade_timestamp` desapareceu
+
+O helper retornava `0` sob as features `local` e `devnet` e o timestamp mainnet hardcoded `1755522000` (2025-08-18 13:00 UTC) caso contrário. Quatro instruções comparavam o clock contra ele, em cinco referências no source. Cada uma se torna o branch pós-corte incondicionalmente:
+
+| Local de chamada | Antes | Depois |
+|---|---|---|
+| `distribute_trade_fee` (todos os quatro caminhos de trade) | Lê `system_program`, `platform_fee_vault`, `creator_fee_vault` de `remaining_accounts` apenas após o corte; pulava a divisão de taxa de plataforma/criador antes | Sempre lê todos os três, **e** requer que o slot `system_program` seja igual a `System::id()` ou retorna `InvalidInput` (`6002`) |
+| `migrate_to_cpswap` | Escolhia `InitializeCpSwap` antes, `InitializeCpSwapWithPermission` depois | Sempre o CPI com permissão; o helper legado `initialize_cpswap` é deletado, e o mínimo de dez remaining accounts é incondicional |
+| `initialize_with_token_2022` | Requeria `amm_fee_on == BothToken` antes do corte; executava o check de regra de curva de plataforma apenas após | Sem restrição `amm_fee_on`; o check de regra de curva executa sempre que `restrict_curve_param` está definido |
+| `initialize` (deprecado) | Falhava apenas após o corte mais três dias | Sempre falha |
+
+O timestamp mainnet está mais de um ano no passado, então um builder correto e atualizado não vê mudança de comportamento. O que mudou é que um builder **obsoleto** agora falha deterministicamente em vez de parecer funcionar contra um build devnet. A nova validação `system_program` é genuinamente nova: esse slot anteriormente aceitava qualquer conta.
+
+## `CollectExcessLamports`
+
+Passo 1 de [SIMD-0437](/pt/solana-fundamentals/rent-and-reclaimable-rent) chegou na mainnet em 3 de setembro de 2026, cortando o mínimo isento de aluguel em 9% com mais quatro passos por vir. Cada vault de pool LaunchLab, vault de taxa e PDA de propriedade do programa criado antes de um passo agora está sobre-financiado.
+
+A instrução leva quatro contas fixas — a carteira signatária/destino, **uma** PDA de autoridade de vault, e ambos os programas de token — depois qualquer número de contas de origem em `remaining_accounts`.
+
+O slot `authority` é a parte que vale a pena ler cuidadosamente. LaunchLab tem três PDAs de autoridade de vault (`vault_auth_seed`, `platform_fee_vault_auth_seed`, `creator_fee_vault_auth_seed`), e a instrução resolve qual você passou re-derivando todos os três e combinando; uma chave que não combina nenhum falha com `InvalidOwner` (`6001`). Porque uma chamada carrega uma autoridade e o programa de token requer que o owner real de cada conta assine, **contas de origem devem ser agrupadas por autoridade** — vaults de pool, vaults de taxa de plataforma e vaults de taxa de criador varrem em transações separadas. PDAs de propriedade do programa são debitados diretamente e podem andar junto com qualquer autoridade.
+
+Wrapped SOL segue a mesma sequência `SyncNative` → `UnwrapLamports` de tamanho delta → assert-unchanged que CPMM e AMM v4 usam, com `LamportsCalculateError` (`6031`) se a volta não resultar em zero. Um launch com quote em SOL mantém sua reserva de quote completa.
+
+**Mints base não podem ser varridos.** `InitializeV2` e `InitializeWithToken2022` revogam `MintTokens` na mesma instrução que minta o supply, então nenhuma chave pode assinar um `WithdrawExcessLamports` para um mint base. Seu aluguel é retido por design.
+
+O signatário pode ser tanto o admin de programa compartilhado quanto uma carteira dedicada de coleta de lamports; endereços estão em [`reference/program-addresses`](/pt/reference/program-addresses#excess-lamports-collection-wallets).
+
+## Relocação de constraint de `MigrateToCpswap`
+
+Três constraints de conta se moveram para fora da struct `Accounts` e para o corpo da instrução:
+
+```rust
+require_keys_eq!(ctx.accounts.platform_config.key(), ctx.accounts.pool_state.platform_config);
+require_keys_eq!(ctx.accounts.base_vault.key(),      ctx.accounts.pool_state.base_vault);
+require_keys_eq!(ctx.accounts.quote_vault.key(),     ctx.accounts.pool_state.quote_vault);
+```
+
+O requisito é idêntico — todos os três ainda devem corresponder aos valores armazenados em `PoolState`. Apenas a superfície de erro difere: `RequireKeysEqViolated` (`2502`) genérico do Anchor, reportado sem um nome de conta, em vez de `ConstraintAddress` (`2012`) nomeando a conta ofensora. Atualize qualquer tratamento de erro que correspondesse a `2012` para essas três contas.
+
+## Mudanças de toolchain e dependências
+
+| Item | Antes | Depois |
+|---|---|---|
+| `anchor-lang` / `anchor-spl` | `0.32.1` | `=1.0.2` |
+| `Anchor.toml` `solana_version` | `2.3.0` | `3.1.10` |
+| README: `rustup default` | `1.81.0` | `1.91.0` |
+| README: Instalador Solana | `release.anza.xyz/v2.1.0` | `release.anza.xyz/v3.1.10` |
+| README: `avm install` | `0.31.0` | `1.0.2` (mais `avm use 1.0.2`) |
+| README: Repo Anchor | `coral-xyz/anchor` | `solana-foundation/anchor` |
+| `@coral-xyz/anchor` | `^0.32.1` | substituído por `@anchor-lang/core` `1.0.2` |
+| `@solana/spl-token` | `^0.4.0` | `^0.4.14` |
+| `typescript` | `^4.3.5` | `^5.6.3` |
+| `tsconfig` target / lib | `es6` / `es2015` | `ES2020` / `es2020`, `skipLibCheck` |
+
+As duas mudanças de local de chamada do Anchor 1.0 se aplicam aqui também: `Context` colapsa de quatro parâmetros de lifetime para um, e `CpiContext::new` leva a `Pubkey` do programa em vez de sua `AccountInfo`. Veja [`sdk-api/rust-cpi`](/pt/sdk-api/rust-cpi#cargo-dependencies).
+
+Dois detalhes de sistema de build sem efeito on-chain: a feature `local` foi substituída por `localnet`, que compila a carteira local como `admin` de uma variável de ambiente `LAUNCHPAD_LOCALNET_ADMIN` (`yarn test:local-admin` a conecta), e o bloco `[profile.release]` duplicado em `programs/launchpad/Cargo.toml` foi deletado — Cargo ignora `[profile]` fora da raiz do workspace, então o bloco raiz já era o em efeito, incluindo o fato de que o `panic = "abort"` do bloco de nível de programa nunca foi aplicado.
+
+## O que não mudou
+
+- **Cada layout de conta.** `PoolState`, `GlobalConfig`, `PlatformConfig`, `PlatformCurveRule`, `PlatformAllowConfig`, registros de vesting — mesmos tamanhos, mesmos offsets.
+- **Códigos de erro `6000`–`6030`,** incluindo o `6020` deliberadamente retido.
+- **Matemática de curva, taxas, acúmulo de taxa, cronogramas de vesting e divisão de LP de graduação.**
+- **Regras de curva de plataforma e allowlist de `GlobalConfig`.** Mesmas instruções, mesmas contas, mesma semântica; apenas o gate de clock ao redor do check de regra de curva desapareceu.
+- **Lista de contas de `MigrateToCpswap` e índices de `remaining_accounts`.**
+- **A transferência de autoridade de taxa de transferência Token-2022 na graduação.**
+- **ID do programa.** Inalterado.
+
+## Páginas atualizadas
+
+- `products/launchlab/instructions` — `CollectExcessLamports` adicionado com sua lista de contas, tabela de resolução de autoridade e aviso de agrupamento; remoções de argumento e conta de `MigrateToAmm` documentadas com a lista nova completa; `Initialize` fronteado com aviso de sempre-falha; nova seção "Trade remaining accounts" cobrindo as três contas agora-incondicionais e o check `system_program`; nota de `MigrateToCpswap` no caminho apenas com permissão e constraints relocadas; linhas de inventário e matriz de mudança de estado.
+- `products/launchlab/overview` — banner de release; invariantes "apenas CPMM" e mint base corrigidas.
+- `products/launchlab/accounts` — timing de revogação de mint-authority corrigido para criação de launch (foi documentado em graduação); linha de `CollectExcessLamports` adicionada.
+- `reference/error-codes` — `6031` documentado.
+- `reference/program-addresses` — nova seção "Excess-lamports collection wallets".
+- `solana-fundamentals/rent-and-reclaimable-rent` — nova seção "What the Raydium programs sweep on their own side".
+- `sdk-api/rust-cpi`, `solana-fundamentals/toolchain` — pins do Anchor 1.0 e notas de migração de CPI.

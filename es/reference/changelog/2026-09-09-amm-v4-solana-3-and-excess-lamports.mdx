@@ -1,0 +1,91 @@
+---
+title: "2026-09-09 — AMM v4: dependencias de Solana 3.0 y recuperación de lamports excedentes"
+description: "AMM v4 se reconstruye contra solana-program 3.0, spl-token 9.0 y el nuevo crate solana-system-interface, y añade una instrucción WithdrawExcessLamports (tag 18) solo para administrador que devuelve rent liberado por SIMD-0437. CreateConfigAccount deja de leer su sysvar de rent final, de forma compatible. Nada se rompe y ningún layout de cuenta cambió."
+---
+
+<Info>
+  **Esta página fue traducida automáticamente por IA. La versión en inglés es la fuente autorizada.**
+
+  [Ver versión en inglés →](/reference/changelog/2026-09-09-amm-v4-solana-3-and-excess-lamports)
+</Info>
+
+<Info>
+  Esta entrada cubre una próxima actualización del programa AMM v4. Fue verificada contra la rama de lanzamiento local antes del despliegue. Confirma el programa desplegado antes de confiar en la nueva instrucción.
+</Info>
+
+Dos cosas no relacionadas llegan juntas en una reconstrucción.
+
+La primera es mantenimiento: AMM v4 había estado fijado a `solana-program` `=2.1.0` desde la actualización 2.1, y ese pin era un obstáculo. Los helpers del programa del sistema se movieron a su propio crate `solana-system-interface` en Solana 3.0, `spl-token` llegó a 9.0, y `spl-associated-token-account` llegó a 8.0. Este lanzamiento toma los tres.
+
+La segunda es dinero que el protocolo debe. [SIMD-0437](/es/solana-fundamentals/rent-and-reclaimable-rent) está reduciendo el mínimo exento de rent en un 90% en cinco pasos, y el paso 1 llegó a mainnet el 3 de septiembre de 2026. Cada cuenta que AMM v4 creó antes — cientos de bóvedas de pool, mints de LP, cuentas `AmmInfo` y `TargetOrders` — ahora está sobre-financiada, y los lamports en una cuenta propiedad del programa solo pueden ser movidos por ese programa. De ahí una nueva instrucción.
+
+## TL;DR para integradores
+
+- **Nada que un trader o LP llame ha cambiado.** `Initialize2`, `Deposit`, `Withdraw`, `SwapBaseIn`, `SwapBaseOut`, `SwapBaseInV2`, `SwapBaseOutV2`, `WithdrawPnl` y `SetParams` mantienen sus listas de cuentas, layouts de argumentos y matemática. Ningún layout de cuenta cambió. Ningún código de error existente se movió.
+- **Una instrucción se añade: `WithdrawExcessLamports`, tag `18`.** Solo para administrador, sin argumentos, lista de cuentas variádica. Devuelve lamports por encima del mínimo exento de rent desde cuentas controladas por AMM v4 y no toca nada más. Ver [`products/amm-v4/instructions`](/es/products/amm-v4/instructions#withdrawexcesslamports).
+- **Un código de error se añade: `60` `LamportsCalculateError`.** `AmmError` no está numerado por Anchor — comienza en `0` — así que esto es `custom program error: 0x3c`. Los códigos `0`–`59` no cambian.
+- **`CreateConfigAccount` (tag 14) dejó de leer la sysvar de rent** y ahora está documentada como una instrucción de 4 cuentas. **Nada en este lanzamiento es un cambio disruptivo**, esto incluido: la cuenta estaba al final de la lista y el handler lee posicionalmente sin verificación de longitud, así que las herramientas de administrador que aún la pasan siguen funcionando.
+- **Se requiere una actualización de IDL** si generas clientes desde uno. Una nueva instrucción, una nueva variante de error, una lista de cuentas cambiada.
+
+## `WithdrawExcessLamports`
+
+La instrucción toma la billetera de recolección de lamports como el único firmante y destino, el PDA de autoridad de AMM v4, el programa SPL Token, y luego cualquier número de cuentas de origen. Se distribuye según el propietario de cada cuenta de origen:
+
+| Propietario de cuenta de origen | Manejo |
+|---|---|
+| SPL Token, 165 bytes, no nativo | CPI al `WithdrawExcessLamports` del programa token (discriminante `38`), firmado por el PDA de autoridad |
+| SPL Token, 165 bytes, nativo (wSOL) | `SyncNative`, mide cuánto creció el `amount` envuelto, `UnwrapLamports` (discriminante `45`) para exactamente ese delta, luego aserta que el balance envuelto no cambió |
+| SPL Token, otros tamaños (un mint de LP) | CPI `WithdrawExcessLamports` |
+| El programa AMM v4 mismo | Debita la cuenta directamente a `rent.minimum_balance(data_len)` |
+| Cualquier otra cosa | Omitida silenciosamente |
+
+La rama de wSOL es la interesante. El balance de lamports de una cuenta de SOL envuelto *es* su balance de token, así que el programa token rechaza `WithdrawExcessLamports` en ella completamente. El viaje de ida y vuelta a través de `SyncNative` y un `UnwrapLamports` de tamaño delta extrae solo el exceso donado y deja el balance envuelto exactamente donde comenzó — lo cual es asertado después, con `LamportsCalculateError` si la aritmética no está de acuerdo. **Una bóveda de pool del lado de SOL por lo tanto mantiene su liquidez completa a través de un barrido**, y ningún LP ve un cambio de precio a través de uno.
+
+El firmante es una clave dedicada por cluster, codificada bajo el mismo módulo `config_feature` que las direcciones existentes del propietario de AMM y la tarifa de creación de pool. A diferencia de CPMM y LaunchLab, AMM v4 acepta **solo** esa billetera — no hay fallback de administrador. Las direcciones están en [`reference/program-addresses`](/es/reference/program-addresses#excess-lamports-collection-wallets).
+
+## `CreateConfigAccount` dejó de leer la sysvar de rent
+
+Solana 3.0 es lo que hace que `Rent::get()` sea la forma natural de leer parámetros de rent, así que el lanzamiento reemplazó las cuatro llamadas `Rent::from_account_info(...)` en el programa. En tres de ellas — los helpers que crean las cuentas de token del pool, mint de LP y cuentas PDA durante `Initialize2` — la cuenta sysvar aún se pasa y aún se reenvía a los CPIs del programa token, así que nada sobre esa lista de cuentas cambia. En `CreateConfigAccount` la sysvar no tenía otro propósito y era la última cuenta en la lista, así que salió de la lista documentada:
+
+| | Antes (5 cuentas) | Después (4 cuentas) |
+|---|---|---|
+| 1 | `admin` (W, S) | `admin` (W, S) |
+| 2 | `amm_config` (W) | `amm_config` (W) |
+| 3 | `pnl_owner` | `pnl_owner` |
+| 4 | `system_program` | `system_program` |
+| 5 | `rent` | — |
+
+**Enviar la lista antigua de cinco cuentas aún funciona.** La cuenta removida estaba al final, y `process_create_config` lee sus cuatro cuentas posicionalmente a través de `next_account_info` sin nada verificando el conteo total, así que una cuenta de rent final nunca es mirada. Las herramientas de administrador deben ser actualizadas por claridad, no por urgencia. Ningún constructor de cara al usuario construye esta instrucción en absoluto.
+
+`Initialize2` es el caso a no sobre-leer: también dejó de llamar `Rent::from_account_info`, pero su cuenta de rent **permanece** en la posición 3 y aún es genuinamente usada — el programa la reenvía a los CPIs `spl_token::initialize_account` e `initialize_mint` que crean las bóvedas del pool y el mint de LP. Dejarla caer de esa lista de cuentas rompería la creación de pool.
+
+## Cambios de dependencias
+
+| Crate | Antes | Después |
+|---|---|---|
+| `solana-program` | `=2.1.0` | `=3.0.0` |
+| `solana-system-interface` | — | `=3.0.0`, feature `bincode` |
+| `spl-token` | `=7.0.0` | `9.0.0` |
+| `spl-associated-token-account` | `6.0.0` | `8.0.0` |
+
+Las piezas del programa del sistema que el programa usa — `system_instruction::create_account`, `transfer`, `allocate`, `assign`, y el ID del programa mismo — ahora vienen de `solana-system-interface` en lugar de `solana_program::system_program` y `solana_program::system_instruction`. El ID del programa es byte-idéntico, así que esto es un movimiento de tiempo de compilación sin consecuencia en cadena, incluyendo para las verificaciones `InvalidSysProgramAddress` que comparan contra él.
+
+Dos módulos muertos también fueron eliminados: `srm_token` y `msrm_token`, las declaraciones de mint de Serum/MSRM dejadas de la [remoción de OpenBook](/es/reference/changelog/2026-07-22-amm-v4-openbook-removal). Nada las referenciaba.
+
+## Lo que no cambió
+
+- **Cada layout de cuenta.** `AmmInfo`, `StateData`, `TargetOrders`, `AmmConfig` — mismos tamaños, mismos offsets de campo. Ningún cambio de indexador o decodificador.
+- **Códigos de error `0`–`59`.** `LamportsCalculateError` se añade en `60`, así que nada se desplaza.
+- **El PDA de autoridad de AMM.** Aún un PDA para todo el programa, seed `["amm authority"]`, nonce `254`.
+- **Tarifas, contabilidad de PnL, y la curva.** Sin tocar. `WithdrawExcessLamports` mueve lamports que nunca fueron parte de las reservas de ningún pool.
+- **Token-2022.** Aún no soportado. La nueva instrucción habla solo al programa SPL Token heredado.
+- **ID del programa.** Sin cambios — ver [`reference/program-addresses`](/es/reference/program-addresses).
+
+## Páginas actualizadas
+
+- `products/amm-v4/instructions` — `WithdrawExcessLamports` añadida con su lista de cuentas y tabla de distribución por propietario; nueva sección `CreateConfigAccount` / `UpdateConfigAccount` cubriendo la remoción de sysvar de rent; filas de tabla de inventario y matriz de cambio de estado añadidas.
+- `products/amm-v4/overview` — banner de lanzamiento.
+- `reference/error-codes` — nueva sección "AMM v4: `AmmError` no está numerado por Anchor" documentando el código `60` y la numeración basada en `0`.
+- `reference/program-addresses` — nueva sección "Billeteras de recolección de lamports excedentes".
+- `solana-fundamentals/rent-and-reclaimable-rent` — nueva sección "Lo que los programas de Raydium barren en su propio lado"; la nota de SOL envuelto corregida para decir que ambos programas token exponen `UnwrapLamports`.
+- `solana-fundamentals/toolchain` — Agave 3.1.10, `release.anza.xyz`, Rust 1.91.0.

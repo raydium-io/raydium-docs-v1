@@ -1,0 +1,128 @@
+---
+title: "2026-09-09 — CPMM：Anchor 1.0、超额 lamports 回收和固定费用所有者"
+description: "CPMM 升级到 Anchor 1.0.2（基于 Agave 3.1.10），新增管理员 CollectExcessLamports 指令用于回收 SIMD-0437 释放的租金。CreateAmmConfig 现在写入硬编码的协议和基金费用所有者而非签名者，移除了四地址 Token-2022 mint 白名单，ClosePermissionPda 接受专用授权权限。新增错误代码 6015。"
+---
+
+<Info>
+  **本页内容由 AI 自动翻译，所有内容以英文版本为准。**
+
+  [查看英文版 →](/reference/changelog/2026-09-09-cpmm-anchor-1-and-excess-lamports)
+</Info>
+
+<Info>
+  本条目涵盖即将发布的 CPMM 程序更新。在部署前已针对本地发布分支进行验证。在依赖新指令或改变的 `CreateAmmConfig` 行为之前，请确认已部署的程序。
+</Info>
+
+CPMM 的主要变化是框架升级：Anchor 从 `0.32.1` 升至 `=1.0.2`，构建工具链从 Agave 2.3.0 升至 3.1.10。随之而来的是四项行为变化，其中三项仅影响管理工具，一项——mint 白名单移除——会改变哪些 Token-2022 mint 可用于**新**池。
+
+交易者、LP 或池创建者调用的所有内容都保持其账户列表、参数和数学逻辑不变。
+
+## 集成者速览
+
+- **没有面向用户的指令改变。** `Initialize`、`InitializeWithPermission`、`Deposit`、`Withdraw`、`SwapBaseInput`、`SwapBaseOutput` 和全部四个 `Collect*Fee` 路径在字节层面完全相同。没有账户布局改变。
+- **新增一条指令：`CollectExcessLamports`。** 仅限管理员，无参数，源账户通过 `remaining_accounts` 传递。它从 CPMM 控制的金库、LP mint 和 PDA 返回超过租金豁免最低值的 lamports，不涉及其他内容。详见 [`products/cpmm/instructions`](/zh/products/cpmm/instructions#collectexcesslamports)。
+- **新增一个错误代码：`6015` `LamportsCalculateError`。** 代码 `6000`–`6014` 保持不变。
+- **`CreateAmmConfig` 不再将签名者复制到费用所有者字段。** 新配置获得硬编码的 `protocol_fee_owner` 和 `fund_fee_owner` 密钥。**现有 `AmmConfig` 账户保持不变**——继续从账户读取 `protocol_owner` / `fund_owner`，而不是假设任一值。
+- **硬编码的四地址 Token-2022 `MINT_WHITELIST` 已移除。** `SupportMintAssociated` PDA 注册表现在是 CPMM 绕过扩展允许列表的唯一方式。现有池不受影响；检查仅在池创建时运行。
+- **`ClosePermissionPda` 接受专用权限 PDA 创建者权限，** 不仅仅是共享管理员。
+- **需要刷新 IDL。** 新增一条指令，一个新的错误变体。
+- **TypeScript 客户端包已重命名。** `@coral-xyz/anchor` 冻结在 `0.32.1`；Anchor 1.x 客户端发布为 `@anchor-lang/core`。
+
+## `CollectExcessLamports`
+
+[SIMD-0437](/zh/solana-fundamentals/rent-and-reclaimable-rent) 的第一步于 2026 年 9 月 3 日在主网上线，将租金豁免最低值降低 9%，还有四个步骤待来。在某个步骤之前创建的每个 CPMM 池金库、LP mint、`PoolState`、`AmmConfig`、`ObservationState`、`Permission` 和 `SupportMintAssociated` 账户现在都资金过剩，程序拥有的账户中的 lamports 只能由该程序移动。
+
+该指令接受四个固定账户——签名者/目标钱包、`vault_and_lp_mint_auth_seed` 权限 PDA 和**两个** token 程序——然后在 `remaining_accounts` 中接受任意数量的源账户。它根据每个源账户的所有者进行分发：对于 token 账户或 mint，向 token 程序的 `WithdrawExcessLamports`（判别式 `38`）进行 CPI；对于 CPMM 拥有的 PDA，直接扣款；对其他任何内容则静默跳过。
+
+Wrapped SOL 是值得理解的情况。原生 token 账户的 lamport 余额*就是*其 token 余额，所以两个 token 程序都拒绝对其进行 `WithdrawExcessLamports`。CPMM 改为 CPI `SyncNative`（将捐赠的超额折叠到 wrapped `amount` 中），测量金额增长了多少，对该增量执行 `UnwrapLamports`（判别式 `45`），然后要求 wrapped 余额等于其同步前的值——如果不相等则返回 `LamportsCalculateError`。**SOL 端池金库通过扫描保持其完整流动性**，没有 LP 看到跨扫描的价格变化。
+
+签名者可以是共享程序管理员或专用 collect-lamports 钱包；地址在 [`reference/program-addresses`](/zh/reference/program-addresses#excess-lamports-collection-wallets)。
+
+## `CreateAmmConfig` 写入固定费用所有者
+
+在此版本之前，`create_amm_config` 从调用签名者设置两个费用所有者字段：
+
+```rust
+amm_config.protocol_owner = ctx.accounts.owner.key();
+amm_config.fund_owner      = ctx.accounts.owner.key();
+```
+
+现在它写入程序自己的常量：
+
+```rust
+amm_config.protocol_owner = crate::protocol_fee_owner::ID;
+amm_config.fund_owner      = crate::fund_fee_owner::ID;
+```
+
+由于 `CreateAmmConfig` 受限于 `crate::admin::ID`，实际效果是新创建的费用层从一开始就由专用运营钱包扫描，而不是由管理员多签，管理员无法从其刚创建的配置中收集费用，除非首先通过 `UpdateAmmConfig` 参数 `3` 或 `4` 轮换该字段。
+
+两个常量遵循与程序其余地址相同的 devnet/mainnet `cfg` 模式，在 devnet 上两者都解析为同一密钥。详见 [`reference/program-addresses`](/zh/reference/program-addresses#cpmm-fee-owner-wallets)。
+
+<Warning>
+  **这不是迁移。** 每个已存在的 `AmmConfig` 保持其创建时的 `protocol_owner` 和 `fund_owner`。硬编码新常量的收集工具将在旧配置上失败，假设"管理员密钥"的工具将在新配置上失败。请读取这些字段。
+</Warning>
+
+## Token-2022 mint 白名单已移除
+
+`is_supported_mint` 曾在迭代 mint 的扩展之前在硬编码的四地址 `MINT_WHITELIST` 上短路。该数组——以及每次调用时从其构建的 `HashSet`——已删除。保留的是：
+
+1. 旧版 SPL Token mint 无条件通过。
+2. 在 `[b"support_mint", mint]` 处有初始化 `SupportMintAssociated` PDA 的 mint 无条件通过。
+3. 否则 mint 上的每个扩展必须是 `TransferFeeConfig`、`MetadataPointer`、`TokenMetadata`、`InterestBearingConfig`、`ScaledUiAmount` 之一。
+
+注册表 PDA 已在程序中存在一段时间，拥有自己的 `CreateSupportMintAssociated` / `CloseSupportMintAssociated` 对及其自己的专用权限（与共享管理员并行），并从 `Initialize` 和 `InitializeWithPermission` 中进行查询。移除静态数组意味着 mint 上线现在纯粹是链上操作，而不是程序升级——这正是目的。
+
+**现有池不受影响**，因为 mint 检查仅在池创建时运行。改变的是为四个曾经白名单中的 mint 之一创建*新* CPMM 池现在需要该 mint 拥有注册表 PDA——重要的那些在主网上已经拥有。完整图景，包括注册表做什么和不做什么，在 [`reference/token-2022-support`](/zh/reference/token-2022-support#bypass-paths)。
+
+## `ClosePermissionPda` 签名者扩展
+
+`CreatePermissionPda` 已接受共享管理员或专用权限 PDA 创建者权限，而 `ClosePermissionPda` 被固定为管理员，带有 `address =` 约束。关闭路径现在接受相同的对：
+
+```rust
+constraint = (owner.key() == crate::admin::ID
+           || owner.key() == crate::create_permission_pda_owner::ID) @ ErrorCode::InvalidOwner
+```
+
+所以发出授权的权限也可以撤销它，无需通过多签。任一方式上未授权签名者的错误都是 `InvalidOwner`（`6001`）——旧的 `address =` 约束已经携带该自定义错误——所以只有接受的签名者集合扩展了。
+
+## 工具链和依赖变化
+
+| 项目 | 之前 | 之后 |
+|---|---|---|
+| `anchor-lang` / `anchor-spl` | `0.32.1` | `=1.0.2` |
+| `Anchor.toml` `solana_version` | `2.3.0` | `3.1.10` |
+| `solana-sdk` / `-client` / `-account-decoder` / `-transaction-status`（客户端 crate） | `2.3.0` | `3.0` |
+| `anchor-client` / `-lang` / `-spl`（客户端 crate） | `0.32.1` | `=1.0.2` |
+| README：`rustup default` | `1.81.0` | `1.91.0` |
+| README：Solana 安装程序 | `release.anza.xyz/v2.1.0` | `release.anza.xyz/v3.1.10` |
+| README：`avm install` | `0.31.0` | `1.0.2`（加上 `avm use 1.0.2`） |
+| README：Anchor 仓库 | `coral-xyz/anchor` | `solana-foundation/anchor` |
+| Docker 镜像 | `solanafoundation/anchor:v0.32.1` | `solanafoundation/anchor:v1.0.2` |
+| `@coral-xyz/anchor` | `0.32.1` | 由 `@anchor-lang/core` `1.0.2` 替代 |
+| `@solana/spl-token` | `^0.4.8` | `^0.4.14` |
+| `typescript` | `^4.3.5` | `^5.6.3` |
+
+Anchor 1.0 在每个 CPI 调用点改变两件事，如果你从自己的程序集成 CPMM 这很重要：`CpiContext::new` 接受程序的 `Pubkey` 而不是其 `AccountInfo`，`Context` 有一个生命周期参数而不是四个。在客户端，`RequestBuilder::instructions()` 返回 `Vec<Instruction>` 而不是 `Result<...>`，`CommitmentConfig` 来自 `anchor_client` 而不是 `solana_sdk`，`spl-associated-token-account` 8.0 将其地址助手移到 `::address` 下，其程序 ID 移到 `::program::ID`。详见 [`sdk-api/rust-cpi`](/zh/sdk-api/rust-cpi#cargo-dependencies)。
+
+两个构建系统细节，都没有链上效果：程序 crate 声明一个 `localnet` 特性，从 `CPSWAP_LOCALNET_ADMIN` 环境变量将本地钱包编译为 `admin`（所以管理员门控测试可以实际签名——`yarn test:local-admin` 连接它），`programs/cp-swap/Cargo.toml` 中的重复 `[profile.release]` 块已删除。Cargo 忽略工作区根外的 `[profile]`，所以根块已是生效的那个——包括程序级块的 `panic = "abort"` 从未被应用的事实。
+
+## 未改变的内容
+
+- **每个账户布局。** `PoolState`、`AmmConfig`、`ObservationState`、`Permission`、`SupportMintAssociated`——相同大小、相同偏移。
+- **错误代码 `6000`–`6014`。**
+- **扩展允许列表本身。** 仍然是相同的五个扩展。
+- **费率、费用累积和曲线。** `CollectExcessLamports` 移动从未是任何池储备一部分的 lamports。
+- **`spl_memo`。** `Withdraw` 的 memo 程序约束从 `spl_memo::id()` 移到 `anchor_spl::memo::ID`——在重命名的 `anchor-spl` 导出下相同的地址。
+- **程序 ID。** 未改变。
+
+## 更新的页面
+
+- `products/cpmm/instructions` — 添加 `CollectExcessLamports` 及其账户列表和按所有者分发表；`CreateAmmConfig` 获得其 `creator_fee_rate` 参数和关于固定费用所有者的注释；为 `CollectExcessLamports`、`CreateSupportMintAssociated`、`CloseSupportMintAssociated` 添加指令摘要行；`ClosePermissionPda` 签名者已更正；`Initialize` 前置条件为仅注册表绕过重写；添加状态变化矩阵行。
+- `products/cpmm/accounts` — Token-2022 部分围绕注册表 PDA 重写，白名单移除被调出；`ClosePermissionPda` 签名者已更正。
+- `products/cpmm/overview` — 白名单句子重写。
+- `products/cpmm/code-demos` — Rust CPI 骨架为 Anchor 1.0 更新。
+- `reference/token-2022-support` — 绕过路径部分围绕注册表 PDA 重写，移除的 `MINT_WHITELIST` 移到"移除的绕过"部分。
+- `reference/error-codes` — `6015` 已记录。
+- `reference/program-addresses` — 新增"CPMM support-mint 注册表权限"、"CPMM 费用所有者钱包"和"超额 lamports 收集钱包"部分；`ClosePermissionPda` 注释已更正。
+- `sdk-api/rust-cpi`、`solana-fundamentals/toolchain`、`integration-guides/cpi-integration` — Anchor 1.0 固定和 CPI 迁移注释。
+- `solana-fundamentals/rent-and-reclaimable-rent` — 新增"Raydium 程序在其自身端扫描的内容"部分。

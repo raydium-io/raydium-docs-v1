@@ -1,0 +1,91 @@
+---
+title: "2026-09-09 — AMM v4：Solana 3.0 依赖和超额 lamports 回收"
+description: "AMM v4 针对 solana-program 3.0、spl-token 9.0 和新的 solana-system-interface crate 进行了重建，并添加了仅限管理员的 WithdrawExcessLamports 指令（标签 18），用于返回 SIMD-0437 释放的租金。CreateConfigAccount 停止读取其尾部租金 sysvar，兼容性保持。没有任何内容被破坏，账户布局也未改变。"
+---
+
+<Info>
+  **本页内容由 AI 自动翻译，所有内容以英文版本为准。**
+
+  [查看英文版 →](/reference/changelog/2026-09-09-amm-v4-solana-3-and-excess-lamports)
+</Info>
+
+<Info>
+  本条目涵盖即将推出的 AMM v4 程序更新。在部署前已针对本地发布分支进行了验证。在依赖新指令之前，请确认已部署的程序。
+</Info>
+
+两个不相关的事项在一次重建中一起到来。
+
+第一个是日常维护：AMM v4 自 2.1 升级以来一直被固定在 `solana-program` `=2.1.0`，这个固定版本造成了阻碍。系统程序的辅助函数在 Solana 3.0 中被移到了自己的 `solana-system-interface` crate，`spl-token` 达到了 9.0，`spl-associated-token-account` 达到了 8.0。本次发布采用了这三个版本。
+
+第二个是协议应得的资金。[SIMD-0437](/zh/solana-fundamentals/rent-and-reclaimable-rent) 正在分五步将租金豁免最低额度削减 90%，第一步于 2026 年 9 月 3 日在主网上线。AMM v4 在此之前创建的每个账户——数百个池金库、LP 铸币、`AmmInfo` 和 `TargetOrders` 账户——现在都资金过剩，而程序拥有的账户中的 lamports 只能由该程序移动。因此需要一条新指令。
+
+## 集成商速览
+
+- **交易者或 LP 调用的任何内容都未改变。** `Initialize2`、`Deposit`、`Withdraw`、`SwapBaseIn`、`SwapBaseOut`、`SwapBaseInV2`、`SwapBaseOutV2`、`WithdrawPnl` 和 `SetParams` 保持其账户列表、参数布局和数学运算。没有账户布局改变。没有现有错误代码移动。
+- **添加了一条指令：`WithdrawExcessLamports`，标签 `18`。** 仅限管理员，无参数，可变账户列表。它从 AMM v4 控制的账户返回超过租金豁免最低额度的 lamports，不涉及其他任何内容。参见 [`products/amm-v4/instructions`](/zh/products/amm-v4/instructions#withdrawexcesslamports)。
+- **追加了一个错误代码：`60` `LamportsCalculateError`。** `AmmError` 不是 Anchor 编号的——它从 `0` 开始——所以这是 `custom program error: 0x3c`。代码 `0`–`59` 保持不变。
+- **`CreateConfigAccount`（标签 14）停止读取租金 sysvar**，现在被记录为 4 账户指令。**本次发布中没有任何内容是破坏性的**，这包括：该账户是列表中的最后一个，处理程序按位置读取，没有长度检查，所以仍然传递它的管理工具继续工作。
+- **需要刷新 IDL**，如果你从中生成客户端。一条新指令、一个新错误变体、一个改变的账户列表。
+
+## `WithdrawExcessLamports`
+
+该指令将收集 lamports 的钱包作为唯一的签名者和目标，AMM v4 权限 PDA、SPL Token 程序，然后是任意数量的源账户。它根据每个源账户的所有者进行分派：
+
+| 源账户所有者 | 处理方式 |
+|---|---|
+| SPL Token，165 字节，非原生 | CPI token 程序的 `WithdrawExcessLamports`（判别式 `38`），由权限 PDA 签名 |
+| SPL Token，165 字节，原生（wSOL） | `SyncNative`，测量包装的 `amount` 增长了多少，`UnwrapLamports`（判别式 `45`）恰好增长那个增量，然后断言包装的余额未改变 |
+| SPL Token，其他大小（LP 铸币） | CPI `WithdrawExcessLamports` |
+| AMM v4 程序本身 | 直接将账户借记到 `rent.minimum_balance(data_len)` |
+| 其他任何内容 | 静默跳过 |
+
+wSOL 分支是有趣的那个。包装的 SOL 账户的 lamport 余额*就是*其代币余额，所以 token 程序完全拒绝对其进行 `WithdrawExcessLamports`。通过 `SyncNative` 和增量大小的 `UnwrapLamports` 的往返提取仅捐赠的超额，并使包装的余额完全保持原样——之后会进行断言，如果算术不一致则返回 `LamportsCalculateError`。**因此 SOL 端池金库在扫描中保持其完整流动性**，没有 LP 看到价格变化。
+
+签名者是每个集群的专用密钥，在与现有 AMM 所有者和创建池费用地址相同的 `config_feature` 模块下硬编码。与 CPMM 和 LaunchLab 不同，AMM v4 **仅**接受该钱包——没有管理员回退。地址在 [`reference/program-addresses`](/zh/reference/program-addresses#excess-lamports-collection-wallets)。
+
+## `CreateConfigAccount` 停止读取租金 sysvar
+
+Solana 3.0 使 `Rent::get()` 成为读取租金参数的自然方式，所以发布替换了程序中所有四个 `Rent::from_account_info(...)` 调用。在其中三个——在 `Initialize2` 期间创建池的代币账户、LP 铸币和 PDA 账户的辅助函数中——sysvar 账户仍然被传递并仍然被转发到 token 程序 CPI 中，所以该账户列表中没有任何内容改变。在 `CreateConfigAccount` 中，sysvar 没有其他目的，是列表中的最后一个账户，所以它从记录的列表中移除了：
+
+| | 之前（5 个账户） | 之后（4 个账户） |
+|---|---|---|
+| 1 | `admin` (W, S) | `admin` (W, S) |
+| 2 | `amm_config` (W) | `amm_config` (W) |
+| 3 | `pnl_owner` | `pnl_owner` |
+| 4 | `system_program` | `system_program` |
+| 5 | `rent` | — |
+
+**发送旧的五账户列表仍然有效。** 移除的账户是最后一个，`process_create_config` 通过 `next_account_info` 按位置读取其四个账户，没有任何内容检查总数，所以尾部租金账户永远不会被查看。管理工具应该为了清晰起见进行更新，不是紧急的。没有用户面向的构建器构造这条指令。
+
+`Initialize2` 是不要过度读取的情况：它也停止调用 `Rent::from_account_info`，但其租金账户**保持**在位置 3 并仍然被真正使用——程序将其转发到创建池的金库和 LP 铸币的 `spl_token::initialize_account` 和 `initialize_mint` CPI 中。从该账户列表中删除它会破坏池创建。
+
+## 依赖项更改
+
+| Crate | 之前 | 之后 |
+|---|---|---|
+| `solana-program` | `=2.1.0` | `=3.0.0` |
+| `solana-system-interface` | — | `=3.0.0`，`bincode` 特性 |
+| `spl-token` | `=7.0.0` | `9.0.0` |
+| `spl-associated-token-account` | `6.0.0` | `8.0.0` |
+
+程序使用的系统程序部分——`system_instruction::create_account`、`transfer`、`allocate`、`assign` 和程序 ID 本身——现在来自 `solana-system-interface` 而不是 `solana_program::system_program` 和 `solana_program::system_instruction`。程序 ID 在字节上是相同的，所以这是一个编译时移动，没有链上后果，包括对比较它的 `InvalidSysProgramAddress` 检查。
+
+还删除了两个死模块：`srm_token` 和 `msrm_token`，从 [OpenBook 移除](/zh/reference/changelog/2026-07-22-amm-v4-openbook-removal)遗留下来的 Serum/MSRM 铸币声明。没有任何内容引用它们。
+
+## 未改变的内容
+
+- **每个账户布局。** `AmmInfo`、`StateData`、`TargetOrders`、`AmmConfig`——相同的大小、相同的字段偏移。没有索引器或解码器更改。
+- **错误代码 `0`–`59`。** `LamportsCalculateError` 在 `60` 处追加，所以没有任何内容移动。
+- **AMM 权限 PDA。** 仍然是整个程序的一个 PDA，种子 `["amm authority"]`，nonce `254`。
+- **费用、PnL 会计和曲线。** 未触及。`WithdrawExcessLamports` 移动的 lamports 从未是任何池储备的一部分。
+- **Token-2022。** 仍然不支持。新指令仅与旧版 SPL Token 程序通信。
+- **程序 ID。** 未改变——参见 [`reference/program-addresses`](/zh/reference/program-addresses)。
+
+## 更新的页面
+
+- `products/amm-v4/instructions` — 添加了 `WithdrawExcessLamports` 及其账户列表和按所有者分派表；新的 `CreateConfigAccount` / `UpdateConfigAccount` 部分涵盖租金 sysvar 移除；清单表和状态变化矩阵行已添加。
+- `products/amm-v4/overview` — 发布横幅。
+- `reference/error-codes` — 新的"AMM v4：`AmmError` 不是 Anchor 编号"部分，记录代码 `60` 和基于 `0` 的编号。
+- `reference/program-addresses` — 新的"超额 lamports 收集钱包"部分。
+- `solana-fundamentals/rent-and-reclaimable-rent` — 新的"Raydium 程序在其自己一侧扫描的内容"部分；包装的 SOL 注释已更正为说两个 token 程序都公开 `UnwrapLamports`。
+- `solana-fundamentals/toolchain` — Agave 3.1.10、`release.anza.xyz`、Rust 1.91.0。

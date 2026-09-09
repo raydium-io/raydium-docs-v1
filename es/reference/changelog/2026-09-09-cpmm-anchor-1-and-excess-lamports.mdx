@@ -1,0 +1,128 @@
+---
+title: "2026-09-09 — CPMM: Anchor 1.0, recuperación de lamports excedentes y propietarios de comisiones fijos"
+description: "CPMM se migra a Anchor 1.0.2 en Agave 3.1.10 y añade una instrucción administrativa CollectExcessLamports para recuperar renta liberada por SIMD-0437. CreateAmmConfig ahora escribe propietarios de comisiones de protocolo y fondo codificados en lugar del firmante, se elimina la lista blanca de mints Token-2022 de cuatro direcciones, y ClosePermissionPda acepta la autoridad de concesión dedicada. Se añade el error 6015."
+---
+
+<Info>
+  **Esta página fue traducida automáticamente por IA. La versión en inglés es la fuente autorizada.**
+
+  [Ver versión en inglés →](/reference/changelog/2026-09-09-cpmm-anchor-1-and-excess-lamports)
+</Info>
+
+<Info>
+  Esta entrada cubre una actualización próxima del programa CPMM. Fue verificada contra la rama de lanzamiento local antes del despliegue. Confirma el programa desplegado antes de depender de la nueva instrucción o del comportamiento modificado de `CreateAmmConfig`.
+</Info>
+
+El cambio principal de CPMM es una migración de framework: Anchor `0.32.1` a `=1.0.2`, y la cadena de herramientas de compilación de Agave 2.3.0 a 3.1.10. Junto con esto vienen cuatro cambios de comportamiento, tres de los cuales solo importan para herramientas administrativas y uno —la eliminación de la lista blanca de mints— que cambia qué mints Token-2022 pueden usarse para un **nuevo** pool.
+
+Todo lo que un trader, un LP o un creador de pool llama mantiene su lista de cuentas, argumentos y matemáticas.
+
+## TL;DR para integradores
+
+- **Ninguna instrucción orientada al usuario cambió.** `Initialize`, `InitializeWithPermission`, `Deposit`, `Withdraw`, `SwapBaseInput`, `SwapBaseOutput` y las cuatro rutas `Collect*Fee` son idénticas byte a byte. Ningún diseño de cuenta cambió.
+- **Se añade una instrucción: `CollectExcessLamports`.** Solo para administrador, sin argumentos, las cuentas se pasan como `remaining_accounts`. Devuelve lamports por encima del mínimo exento de renta desde bóvedas controladas por CPMM, mints LP y PDAs, y no toca nada más. Ver [`products/cpmm/instructions`](/es/products/cpmm/instructions#collectexcesslamports).
+- **Se añade un código de error: `6015` `LamportsCalculateError`.** Los códigos `6000`–`6014` no cambian.
+- **`CreateAmmConfig` ya no copia el firmante en los campos de propietario de comisión.** Las nuevas configuraciones obtienen claves `protocol_fee_owner` y `fund_fee_owner` codificadas. **Las cuentas `AmmConfig` existentes no se tocan** — sigue leyendo `protocol_owner` / `fund_owner` de la cuenta en lugar de asumir ninguno de los valores.
+- **La `MINT_WHITELIST` Token-2022 de cuatro direcciones codificada se ha eliminado.** El registro PDA `SupportMintAssociated` es ahora el único bypass de CPMM de la lista de permitidos de extensiones. Los pools existentes no se ven afectados; la verificación se ejecuta solo en la creación del pool.
+- **`ClosePermissionPda` acepta la autoridad dedicada del creador de PDA de permisos,** no solo el administrador compartido.
+- **Se requiere una actualización de IDL.** Una nueva instrucción, una nueva variante de error.
+- **El paquete cliente de TypeScript se renombra.** `@coral-xyz/anchor` se congela en `0.32.1`; el cliente de Anchor 1.x se publica como `@anchor-lang/core`.
+
+## `CollectExcessLamports`
+
+El paso 1 de [SIMD-0437](/es/solana-fundamentals/rent-and-reclaimable-rent) se lanzó en mainnet el 3 de septiembre de 2026, reduciendo el mínimo exento de renta en un 9% con cuatro pasos más por venir. Cada bóveda de pool CPMM, mint LP, cuenta `PoolState`, `AmmConfig`, `ObservationState`, `Permission` y `SupportMintAssociated` creada antes de un paso ahora está sobre-financiada, y los lamports en una cuenta propiedad del programa solo pueden ser movidos por ese programa.
+
+La instrucción toma cuatro cuentas fijas —la cartera del firmante/destino, la PDA de autoridad `vault_and_lp_mint_auth_seed`, y **ambos** programas de token— luego cualquier número de cuentas fuente en `remaining_accounts`. Se distribuye según el propietario de cada cuenta fuente: un CPI al `WithdrawExcessLamports` del programa de token (discriminante `38`) para una cuenta de token o mint, un débito directo para una PDA propiedad de CPMM, y silenciosamente omite cualquier otra cosa.
+
+El SOL envuelto es el caso que vale la pena entender. El saldo de lamports de una cuenta de token nativa *es* su saldo de token, por lo que ambos programas de token rechazan `WithdrawExcessLamports` en uno. CPMM en su lugar hace un CPI a `SyncNative` (plegando el exceso donado en el `amount` envuelto), mide cuánto creció el amount, `UnwrapLamports` (discriminante `45`) para exactamente ese delta, y luego requiere que el saldo envuelto sea igual a su valor pre-sync — `LamportsCalculateError` si no lo es. **Una bóveda de pool del lado SOL mantiene su liquidez completa a través de un barrido**, y ningún LP ve un cambio de precio en uno.
+
+El firmante puede ser tanto el administrador del programa compartido como una cartera dedicada de recopilación de lamports; las direcciones están en [`reference/program-addresses`](/es/reference/program-addresses#excess-lamports-collection-wallets).
+
+## `CreateAmmConfig` escribe propietarios de comisiones fijos
+
+Antes de este lanzamiento, `create_amm_config` establecía ambos campos de propietario de comisión desde el firmante que llama:
+
+```rust
+amm_config.protocol_owner = ctx.accounts.owner.key();
+amm_config.fund_owner      = ctx.accounts.owner.key();
+```
+
+Ahora escribe las constantes del programa:
+
+```rust
+amm_config.protocol_owner = crate::protocol_fee_owner::ID;
+amm_config.fund_owner      = crate::fund_fee_owner::ID;
+```
+
+Dado que `CreateAmmConfig` está limitado a `crate::admin::ID`, el efecto práctico es que un nivel de comisión recién creado es barrido por carteras operacionales dedicadas desde el principio en lugar de por el multisig administrativo, y el administrador no puede recopilar de una configuración que acaba de crear sin antes rotar el campo a través del parámetro `3` o `4` de `UpdateAmmConfig`.
+
+Las dos constantes siguen el mismo patrón `cfg` devnet/mainnet que el resto de direcciones del programa, y en devnet ambas se resuelven a la misma clave. Ver [`reference/program-addresses`](/es/reference/program-addresses#cpmm-fee-owner-wallets).
+
+<Warning>
+  **Esto no es una migración.** Cada `AmmConfig` que ya existe mantiene cualquier `protocol_owner` y `fund_owner` con el que fue creado. Una herramienta de recopilación que comience a codificar las nuevas constantes fallará en configuraciones más antiguas, y una que asuma "la clave del administrador" fallará en las nuevas. Lee los campos.
+</Warning>
+
+## La lista blanca de mints Token-2022 se elimina
+
+`is_supported_mint` solía cortocircuitar en una `MINT_WHITELIST` codificada de cuatro direcciones antes de iterar las extensiones del mint. Ese array —y el `HashSet` construido a partir de él en cada llamada— se elimina. Lo que permanece es:
+
+1. Los mints SPL Token heredados pasan incondicionalmente.
+2. Un mint con una PDA `SupportMintAssociated` inicializada en `[b"support_mint", mint]` pasa incondicionalmente.
+3. De lo contrario, cada extensión en el mint debe ser una de `TransferFeeConfig`, `MetadataPointer`, `TokenMetadata`, `InterestBearingConfig`, `ScaledUiAmount`.
+
+La PDA del registro ha estado en el programa por un tiempo, con su propio par `CreateSupportMintAssociated` / `CloseSupportMintAssociated` y su propia autoridad dedicada junto al administrador compartido, y se consulta desde tanto `Initialize` como `InitializeWithPermission`. Eliminar el array estático significa que incorporar un mint es ahora puramente una acción en cadena en lugar de una actualización del programa — que es el punto.
+
+**Los pools existentes no se ven afectados**, porque la verificación de mint se ejecuta solo en la creación del pool. Lo que cambia es que crear un *nuevo* pool CPMM para uno de los cuatro mints anteriormente en la lista blanca requiere que ese mint tenga una PDA de registro — los que importan ya la tienen en mainnet. La imagen completa, incluyendo qué hace y no hace el registro, está en [`reference/token-2022-support`](/es/reference/token-2022-support#bypass-paths).
+
+## Ampliación del firmante de `ClosePermissionPda`
+
+`CreatePermissionPda` ya aceptaba tanto el administrador compartido como una autoridad dedicada del creador de PDA de permisos, mientras que `ClosePermissionPda` estaba fijado al administrador con una restricción `address =`. La ruta de cierre ahora toma el mismo par:
+
+```rust
+constraint = (owner.key() == crate::admin::ID
+           || owner.key() == crate::create_permission_pda_owner::ID) @ ErrorCode::InvalidOwner
+```
+
+Entonces la autoridad que emite una concesión también puede revocarla, sin enrutar a través del multisig. El error en un firmante no autorizado es `InvalidOwner` (`6001`) de cualquier forma — la restricción `address =` antigua ya llevaba ese error personalizado — así que solo el conjunto de firmantes aceptados se amplió.
+
+## Cambios de cadena de herramientas y dependencias
+
+| Elemento | Antes | Después |
+|---|---|---|
+| `anchor-lang` / `anchor-spl` | `0.32.1` | `=1.0.2` |
+| `Anchor.toml` `solana_version` | `2.3.0` | `3.1.10` |
+| `solana-sdk` / `-client` / `-account-decoder` / `-transaction-status` (crate cliente) | `2.3.0` | `3.0` |
+| `anchor-client` / `-lang` / `-spl` (crate cliente) | `0.32.1` | `=1.0.2` |
+| README: `rustup default` | `1.81.0` | `1.91.0` |
+| README: instalador de Solana | `release.anza.xyz/v2.1.0` | `release.anza.xyz/v3.1.10` |
+| README: `avm install` | `0.31.0` | `1.0.2` (más `avm use 1.0.2`) |
+| README: repositorio de Anchor | `coral-xyz/anchor` | `solana-foundation/anchor` |
+| Imagen Docker | `solanafoundation/anchor:v0.32.1` | `solanafoundation/anchor:v1.0.2` |
+| `@coral-xyz/anchor` | `0.32.1` | reemplazado por `@anchor-lang/core` `1.0.2` |
+| `@solana/spl-token` | `^0.4.8` | `^0.4.14` |
+| `typescript` | `^4.3.5` | `^5.6.3` |
+
+Anchor 1.0 cambia dos cosas en cada sitio de llamada CPI, lo que importa si integras CPMM desde tu propio programa: `CpiContext::new` toma el `Pubkey` del programa en lugar de su `AccountInfo`, y `Context` tiene un parámetro de vida útil en lugar de cuatro. En el lado del cliente `RequestBuilder::instructions()` devuelve `Vec<Instruction>` en lugar de `Result<...>`, `CommitmentConfig` viene de `anchor_client` en lugar de `solana_sdk`, y `spl-associated-token-account` 8.0 movió sus ayudantes de dirección bajo `::address` y su ID de programa a `::program::ID`. Ver [`sdk-api/rust-cpi`](/es/sdk-api/rust-cpi#cargo-dependencies).
+
+Dos detalles del sistema de compilación, ninguno con efecto en cadena: el crate del programa declara una característica `localnet` que compila la cartera local como `admin` desde una variable de entorno `CPSWAP_LOCALNET_ADMIN` (para que las pruebas limitadas por administrador puedan realmente firmar — `yarn test:local-admin` lo conecta), y el bloque duplicado `[profile.release]` en `programs/cp-swap/Cargo.toml` fue eliminado. Cargo ignora `[profile]` fuera de la raíz del espacio de trabajo, así que el bloque raíz era ya el que estaba en efecto — incluyendo el hecho de que el `panic = "abort"` del bloque a nivel de programa nunca fue aplicado.
+
+## Lo que no cambió
+
+- **Cada diseño de cuenta.** `PoolState`, `AmmConfig`, `ObservationState`, `Permission`, `SupportMintAssociated` — mismos tamaños, mismos desplazamientos.
+- **Códigos de error `6000`–`6014`.**
+- **La lista de permitidos de extensiones en sí.** Todavía las mismas cinco extensiones.
+- **Tasas de comisión, acumulación de comisiones y la curva.** `CollectExcessLamports` mueve lamports que nunca fueron parte de las reservas de ningún pool.
+- **`spl_memo`.** La restricción del programa de memo de `Withdraw` se movió de `spl_memo::id()` a `anchor_spl::memo::ID` — la misma dirección bajo una exportación `anchor-spl` renombrada.
+- **ID del programa.** Sin cambios.
+
+## Páginas actualizadas
+
+- `products/cpmm/instructions` — `CollectExcessLamports` añadido con su lista de cuentas y tabla de distribución por propietario; `CreateAmmConfig` gana su argumento `creator_fee_rate` y una nota sobre los propietarios de comisiones fijos; filas de resumen de instrucción añadidas para `CollectExcessLamports`, `CreateSupportMintAssociated`, `CloseSupportMintAssociated`; firmante de `ClosePermissionPda` corregido; precondición de `Initialize` reescrita para el bypass solo de registro; fila de matriz de cambio de estado añadida.
+- `products/cpmm/accounts` — sección Token-2022 reescrita alrededor de la PDA del registro, con la eliminación de la lista blanca llamada; firmante de `ClosePermissionPda` corregido.
+- `products/cpmm/overview` — oración de lista blanca reescrita.
+- `products/cpmm/code-demos` — esqueleto de CPI de Rust actualizado para Anchor 1.0.
+- `reference/token-2022-support` — sección de ruta de bypass reescrita alrededor de la PDA del registro, con la `MINT_WHITELIST` eliminada movida a una sección de "bypasses eliminados".
+- `reference/error-codes` — `6015` documentado.
+- `reference/program-addresses` — nuevas secciones "autoridad del registro de support-mint de CPMM", "carteras de propietarios de comisiones de CPMM" y "carteras de recopilación de lamports excedentes"; nota de `ClosePermissionPda` corregida.
+- `sdk-api/rust-cpi`, `solana-fundamentals/toolchain`, `integration-guides/cpi-integration` — pines de Anchor 1.0 y notas de migración de CPI.
+- `solana-fundamentals/rent-and-reclaimable-rent` — nueva sección "Lo que los programas de Raydium barren por su propia cuenta".

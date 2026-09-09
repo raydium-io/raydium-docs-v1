@@ -1,6 +1,6 @@
 ---
 title: "Rust CPI"
-description: "別の Solana プログラムから Raydium プログラムを呼び出す方法。アカウントリストの構築、署名者シード、コンピュートバジェット、CPMM・CLMM・farm v6・LaunchLab のエラー伝播パターンについて。AMM v4 は Anchor クレートがないため別途説明します。"
+description: "Raydium プログラムを別の Solana プログラムから CPI 経由で呼び出す：アカウントリスト構築、署名者シード、残りのアカウント、CPMM、CLMM、LaunchLab のエラー伝播。AMM v4（Anchor クレートなし）と Farm v6 は独自のセクションで説明します。"
 ---
 
 <Info>
@@ -9,26 +9,74 @@ description: "別の Solana プログラムから Raydium プログラムを呼�
   [英語版を表示 →](/sdk-api/rust-cpi)
 </Info>
 
-## Cargo の依存関係
+CPI（「クロスプログラム呼び出し」）は、1 つの Solana プログラムが別のプログラムを呼び出すメカニズムです。Raydium のほとんどのプログラムは Anchor CPI ラッパークレートを提供しており、呼び出し側は型付き関数呼び出しのように見え、検証されたフィールド名を持つアカウント構造体と `cpi::<ix>()` ヘルパーが含まれます。このページでは一般的なパターンを一度説明し、その後、プログラムごとの違いを説明します。実行可能な TypeScript については、各製品章の `code-demos` ページを参照してください。
 
-```toml
+## どのパターンがどのプログラムに適用されるか
+
+| プログラム | Anchor ベース | クレート | 場所 |
+|---|---|---|---|
+| CPMM | はい | `raydium-cp-swap`（公開リポジトリ；Rust `use` パスは `raydium_cp_swap`） | [一般的なパターン](#the-general-anchor-cpi-pattern)、実装例 |
+| CLMM | はい | `raydium-clmm`（公開リポジトリ；Rust `use` パスは `raydium_clmm`） | [パターンの適用：CLMM](#applying-the-pattern-clmm) |
+| LaunchLab | はい | 確認されたクレート名なし；プログラムソースはクローズドですが、オンチェーン IDL の内部メタデータ識別子は `raydium_launchpad` です。これは製品名ではなく技術名です（[パターンの適用：LaunchLab](#applying-the-pattern-launchlab) の注意を参照） | [パターンの適用：LaunchLab](#applying-the-pattern-launchlab) |
+| Farm v6 | 未確認；公開 IDL またはソースが見つかりません（[Farm v6](#farm-v6) の警告を参照） | n/a | [Farm v6](#farm-v6) |
+| AMM v4 | **いいえ**、Anchor より前の時代で CPI クレートなし | なし | [AMM v4：手動命令構築](#amm-v4-manual-instruction-construction) |
+
+CPMM、CLMM、または LaunchLab を統合する場合は、まず[一般的なパターン](#the-general-anchor-cpi-pattern)を読み、その後、プログラムのセクションにジャンプしてアカウントリストと違いを確認してください。Farm v6 と AMM v4 は十分に異なるため、それぞれのセクションを独立して読む価値があります。
+
+## Cargo 依存関係
+
+```toml icon="file-code"
+# プログラムごとに 2 つの Raydium CPI クレートのうち 1 つを選択してください — 以下の警告を参照してください。
 [dependencies]
-anchor-lang            = "0.29"
-anchor-spl             = "0.29"
-raydium_cp_swap        = { git = "https://github.com/raydium-io/raydium-cp-swap", features = ["cpi"] }
-raydium_amm_v3         = { git = "https://github.com/raydium-io/raydium-clmm",    features = ["cpi"] }
-# AMM v4 and farm v6: no published Anchor CPI crate. See "AMM v4 / farm v6" below.
+anchor-lang     = "=1.0.2"   # raydium-clmm をターゲットにする場合は =0.32.1
+anchor-spl      = "=1.0.2"   # 同様に
+raydium-cp-swap = { git = "https://github.com/raydium-io/raydium-cp-swap", branch = "master", features = ["cpi"] }
+# raydium-clmm  = { git = "https://github.com/raydium-io/raydium-clmm",    branch = "master", features = ["cpi"] }
+# LaunchLab: プログラムソースは公開されていません（reference/program-addresses を参照）。
+# 指す git 依存関係はありません。代わりに公開 IDL から CPI バインディングを生成してください。
+# 以下の「パターンの適用：LaunchLab」を参照してください。
+# AMM v4 には公開 Anchor CPI クレートがありません；独自のセクションを参照してください。
 ```
 
-`cpi` フィーチャーフラグを使用することで、プログラム全体ではなく CPI サーフェス（アカウント構造体とインボーカー）のみをコンパイルして、バイナリサイズを抑えることができます。
+<Warning>
+  **依存関係キーはターゲットリポジトリの `[package] name` と完全に一致する必要があります。ハイフンを含めて。** Cargo は *git* 依存関係を解決する際に `raydium_cp_swap` を `raydium-cp-swap` と同等として扱いません。
+</Warning>
 
-アカウント構造体を端から端まで結線した実動作 CPI 例は、[`raydium-io/raydium-cpi-example`](https://github.com/raydium-io/raydium-cpi-example)（AMM v4、CPMM、CLMM をカバー）を参照してください。
+`branch = "master"` は最新の公開ソースを追跡します；再現可能なビルドが必要な場合は、特定の `rev = "<commit>"` にピンしてください。プロトタイピングを過ぎたら推奨されます。上流の `master` でのアカウントレイアウト変更は、警告なしでビルドを破壊するためです。
 
-## アカウントリストの構築
+`cpi` フィーチャーフラグにより、クレートは完全なプログラムではなく CPI サーフェス（アカウント構造体 + インボーカー）のみにコンパイルされるため、バイナリは小さく保たれます。
 
-すべての Raydium CPI は、呼び出し元プログラム内の `Accounts` 構造体が必要です。フィールドはプログラムの命令アカウント順序に 1 対 1 で対応し、フィールドレベルのバリデーターを備えています。
+**`anchor-lang` / `anchor-spl` はターゲットクレートがピンしたものと一致する必要があります**。2026-09 現在、2 つの公開 Raydium クレートは**一致していません**：
 
-```rust
+| クレート | `anchor-lang` / `anchor-spl` をピン |
+|---|---|
+| `raydium-cp-swap` | `=1.0.2`（[2026-09-09 アップグレード](/ja/reference/changelog/2026-09-09-cpmm-anchor-1-and-excess-lamports)前は `0.32.1`） |
+| `raydium-clmm` | `=0.32.1` |
+
+<Warning>
+  **現在、1 つのプログラムから両方のクレートに依存することはできません。** それぞれが `=` で Anchor をピンしているため、Cargo は 1 つのバイナリに Anchor の特性の 2 つの互換性のないコピーをリンクする必要があり、ビルドが失敗します。プログラムが CPMM と CLMM の両方に CPI する場合は、2 つのプログラムに分割するか、そのうちの 1 つの型付き CPI クレートをドロップして、その命令を手動でエンコードする必要があります（[AMM v4](#amm-v4-manual-instruction-construction) に示されているパターンは任意のプログラムで機能します）。開始前に両方の `Cargo.toml` ファイルを再確認してください — CLMM が Anchor 1.x に移行すると、これは解決される予定です。
+</Warning>
+
+<Warning>
+  **Anchor 1.0 は、すべての CPI 呼び出しサイトが触れる 2 つのことを変更しました。** `0.3x` から動作する統合を移動する場合：
+
+  - **`CpiContext::new` は `AccountInfo` ではなく `Pubkey` を取ります。** `CpiContext::new(ctx.accounts.cpmm_program.to_account_info(), accts)` は `CpiContext::new(*ctx.accounts.cpmm_program.key, accts)` になります。`new_with_signer` も同じです。構造体フィールドは `program_id: Pubkey` になります。
+  - **`Context` は 1 つのライフタイムを持ち、4 つではありません。** `Context<'_, '_, 'info, 'info, MyProxySwap<'info>>` は `Context<'info, MyProxySwap<'info>>` になります。
+
+  クライアント側では、`anchor-client` の `RequestBuilder::instructions()` は `Result<Vec<Instruction>>` ではなく `Vec<Instruction>` を返すようになりました（`?` をドロップしてください）。`CommitmentConfig` は `solana-sdk` から移動しました — `anchor_client` から取得してください。`spl-associated-token-account` 8.0 もヘルパーを移動しました：`get_associated_token_address` は `::address` の下にあり、プログラム ID は `::program::ID` です。
+</Warning>
+
+実行可能な CPI 例については、[`raydium-io/raydium-cpi-example`](https://github.com/raydium-io/raydium-cpi-example)（AMM v4、CPMM、CLMM をカバー）を参照してください。
+
+## 一般的な Anchor CPI パターン
+
+このセクションでは、**CPMM** を実装例として最後まで説明します：`Accounts` 構造体、`CpiContext`、`cpi::<ix>()`。CLMM は同じ形状に従いますが、異なるアカウントリストと残りのアカウント要件があります。LaunchLab は同じメカニクスに従いますが、そのアカウントリストには CPMM/CLMM と同等のアカウントがいくつかあります（`global_config`、`platform_config`、`event_authority`、`program`）。したがって、これを同じ*パターン*として扱いますが、同じ*形状*ではありません。このチュートリアルのアカウントリストが直接転送されると仮定するのではなく、各プログラムの独自のセクションを参照してください。
+
+### アカウントリスト構築
+
+すべての Raydium CPI には、呼び出しプログラムの `Accounts` 構造体が必要です。そのフィールドは、*あなたの*命令が必要とするアカウントであり、フィールドレベルのバリデーターを持ちます。それらの宣言順序は Raydium 自身の命令アカウント順序と一致する必要はありません。あなた自身の IDL 生成クライアントは位置ではなく名前でそれらにアドレスするためです：
+
+```rust icon="rust"
 use anchor_lang::prelude::*;
 use anchor_spl::token::{Token, TokenAccount, Mint};
 
@@ -37,14 +85,14 @@ pub struct MyProxySwap<'info> {
     #[account(mut)]
     pub user: Signer<'info>,
 
-    /// CHECK: validated by CPMM
+    /// CHECK: CPMM によって検証
     #[account(mut)]
     pub pool_state: UncheckedAccount<'info>,
 
-    /// CHECK: ditto
+    /// CHECK: 同上
     pub amm_config: UncheckedAccount<'info>,
 
-    /// CHECK: ditto
+    /// CHECK: 同上
     pub pool_authority: UncheckedAccount<'info>,
 
     #[account(mut)]
@@ -60,22 +108,24 @@ pub struct MyProxySwap<'info> {
     #[account(mut)]
     pub user_output_ata: Account<'info, TokenAccount>,
 
+    /// `UncheckedAccount` ではなく `Program<RaydiumCpSwap>` として型付けされます：このアカウント
+    /// は Raydium が所有するデータではなく、呼び出されるプログラムです。したがって、Anchor の
+    /// `Program<T>` ラッパーは、呼び出し先に検証を任せるのではなく、自動的にそのアドレスをチェックします。
     pub cpmm_program: Program<'info, raydium_cp_swap::program::RaydiumCpSwap>,
     pub token_program: Program<'info, Token>,
-    pub token_program_2022: Program<'info, anchor_spl::token_2022::Token2022>,
     /// CHECK: observation PDA
     #[account(mut)]
     pub observation_state: UncheckedAccount<'info>,
 }
 ```
 
-Raydium 側のアカウントのほとんどが `UncheckedAccount` なのは、被呼び出し側（Raydium）がバリデーションを行うためです。呼び出し元プログラムは、あなたが所有するアカウント（ユーザー ATA、自分の PDA）だけを厳密にバリデーションします。`/// CHECK:` ドックコメントは、チェック不足についての Anchor の警告を抑制します。
+Raydium 側のほとんどのアカウントは `UncheckedAccount` です。呼び出し先（Raydium）が検証を所有しているためです。呼び出しプログラムは、ユーザー ATA やあなた自身の PDA など、*あなた*が所有するアカウントのみを厳密に検証します。`/// CHECK:` ドキュメントコメントは、チェックの欠落に関する Anchor の警告を抑制します。Raydium 側の 1 つの例外は `cpmm_program` 自体です：Raydium が内部で検証するデータアカウントではなく、呼び出されるプログラムです。したがって、`Program<T>` として型付けされ、手動の `/// CHECK:` ではなく Anchor の自動アドレスチェックを取得します。このほぼ `UncheckedAccount` の形状（Raydium が独自のアカウントを検証する）は、CLMM と LaunchLab でも同じです。この例は両方のミントが古典的な SPL Token であると仮定しています。どちらかが Token-2022 ミントである可能性がある場合は、`token_program_2022: Program<'info, anchor_spl::token_2022::Token2022>` フィールドを追加し、以下の CPI 呼び出しで `token_program` の代わりに `input_token_program`/`output_token_program` としてそれを渡してください。
 
-## CPI 呼び出しの構築
+### CPI 呼び出しの構築
 
-Anchor は命令ごとに 1 つのヘルパーを生成します。
+Anchor は命令ごとに 1 つのヘルパーを生成し、CPI アカウント構造体（`cpi::accounts::Swap`、以下では `CpmmSwap` としてエイリアス）と共に生成します。上記の独自の `MyProxySwap` 構造体とは異なり、このフィールド名と順序は `raydium-cp-swap` 自身の IDL によって固定され、完全に一致する必要があります：
 
-```rust
+```rust icon="rust"
 use raydium_cp_swap::cpi::{self, accounts::Swap as CpmmSwap};
 
 pub fn my_proxy_swap(
@@ -98,8 +148,9 @@ pub fn my_proxy_swap(
         output_token_mint:    ctx.accounts.output_mint.to_account_info(),
         observation_state:    ctx.accounts.observation_state.to_account_info(),
     };
+    // Anchor 1.0: 最初の引数は AccountInfo ではなく、プログラムの Pubkey です。
     let cpi_ctx = CpiContext::new(
-        ctx.accounts.cpmm_program.to_account_info(),
+        *ctx.accounts.cpmm_program.key,
         cpi_accounts,
     );
 
@@ -108,18 +159,18 @@ pub fn my_proxy_swap(
 }
 ```
 
-`cpi::swap_base_input` は IDL から生成されます。引数リストは Anchor 命令の引数リストを反映しています。
+`cpi::swap_base_input` は IDL から生成されます。その引数リストは Anchor 命令の引数リストを反映しています。確認されたすべての Anchor ベースの Raydium プログラム（CPMM、CLMM、LaunchLab）は同じ方法で `cpi::<ix>()` ヘルパーを生成し、関数名は snake_case の命令名と一致します。これが Farm v6 に拡張されるかどうかは未確認です。そのセクションを参照してください。
 
-## 署名者シード（PDA 署名付き CPI）
+### 署名者シード（PDA 署名 CPI）
 
-プログラムが PDA に代わって CPI に署名する場合（ボルト、エスクロー等で一般的）は、`CpiContext::new_with_signer` を使用します。
+プログラムが PDA に代わって CPI に署名する場合（ボルト、エスクロー等で一般的）、`CpiContext::new_with_signer` を使用します：
 
-```rust
+```rust icon="rust"
 let bump         = ctx.accounts.my_authority_bump;
 let signer_seeds: &[&[&[u8]]] = &[&[b"my_authority", &[bump]]];
 
 let cpi_ctx = CpiContext::new_with_signer(
-    ctx.accounts.cpmm_program.to_account_info(),
+    *ctx.accounts.cpmm_program.key,
     cpi_accounts,
     signer_seeds,
 );
@@ -127,68 +178,210 @@ let cpi_ctx = CpiContext::new_with_signer(
 cpi::swap_base_input(cpi_ctx, amount_in, minimum_amount_out)?;
 ```
 
-署名者シードは PDA の派生と一致する必要があります。`authority`（または類似の署名者ロール）として渡されるすべてのアカウントについて、Solana ランタイムは PDA がこれらのシードを通じて署名することを確認します。
+署名者シードは PDA の導出と一致する必要があります。`authority`（または同様の署名者ロール）として渡されるアカウントについて、Solana ランタイムは PDA がこれらのシードを介して署名することを確認します。
 
-## 残りのアカウント
+### 残りのアカウント
 
-一部の Raydium 命令は、固定されたアカウントの後に追加される可変長リストである**残りのアカウント**を取ります。標準的な例は以下の通りです。
+一部の Raydium 命令は**残りのアカウント**を取ります。これは固定アカウントの後に追加される可変長リストです。Anchor の CPI ヘルパーは残りのアカウントを型チェックしません。`.with_remaining_accounts(...)` 経由でそれらを渡してください：
 
-- **CLMM `SwapV2`**: スワップが横断する可能性があるティック配列に対応する 1 ～ 8 個の `TickArrayState` アカウントを追加します。
-- **Farm v6 `Deposit`**: 各ライブ報酬ストリームの `(reward_vault, user_reward_ata)` ペアを追加します。
-
-Anchor の CPI ヘルパーは残りのアカウントをタイプチェックしません。`.with_remaining_accounts(...)` で渡します。
-
-```rust
-let cpi_ctx = CpiContext::new(program, accounts)
+```rust icon="rust"
+let cpi_ctx = CpiContext::new(program_id, accounts)
     .with_remaining_accounts(ctx.remaining_accounts.to_vec());
 ```
 
-順序が重要です。受け取り元プログラムは、渡した順序で残りのアカウントを反復処理します。CLMM の場合、ティック配列は方向順に並べられる必要があります（スワップ方向内の最初の配列が最初）。farm v6 の場合、報酬スロットはスロットインデックス順に並びます。
+順序は常に重要です。受信プログラムは渡した順序で残りのアカウントを反復処理するためです。2 つの確認された順序：
+
+- **CLMM `SwapV2`**：[ティック配列](#applying-the-pattern-clmm)、方向順。
+- **Farm v6**：`(reward_vault, user_reward_ata)` ペア。ただし、2 番目の報酬ストリーム以降のみ。[Farm v6](#farm-v6) を参照して、実際のトランザクションのデコードが何を示すかを確認してください。
+
+## パターンの適用：CLMM
+
+`SwapV2` は[一般的なパターン](#the-general-anchor-cpi-pattern)に従いますが、異なるアカウントリストとティック配列の残りのアカウント要件があります。クレートの `#[program]` モジュールは `raydium_clmm` という名前で、これは Rust `use` パスでもあります。
+
+<Warning>
+  **CPI アカウント構造体は `SwapV2` ではなく `SwapSingleV2` という名前です。** `SwapV2` はオンチェーン*命令*名です。
+</Warning>
+
+```rust icon="rust"
+use raydium_clmm::cpi::{self, accounts::SwapSingleV2 as ClmmSwap};
+
+#[derive(Accounts)]
+pub struct MyProxyClmmSwap<'info> {
+    #[account(mut)]
+    pub payer: Signer<'info>,
+
+    /// CHECK: CLMM によって検証
+    pub amm_config: UncheckedAccount<'info>,
+    /// CHECK: 同上
+    #[account(mut)]
+    pub pool_state: UncheckedAccount<'info>,
+
+    #[account(mut)]
+    pub input_token_account: Account<'info, TokenAccount>,
+    #[account(mut)]
+    pub output_token_account: Account<'info, TokenAccount>,
+    #[account(mut)]
+    pub input_vault: Account<'info, TokenAccount>,
+    #[account(mut)]
+    pub output_vault: Account<'info, TokenAccount>,
+
+    /// CHECK: observation PDA
+    #[account(mut)]
+    pub observation_state: UncheckedAccount<'info>,
+
+    pub token_program: Program<'info, Token>,
+    pub token_program_2022: Program<'info, anchor_spl::token_2022::Token2022>,
+    /// CHECK: SPL memo プログラム、一部の Token-2022 パスに必要
+    pub memo_program: UncheckedAccount<'info>,
+
+    pub input_vault_mint: Account<'info, Mint>,
+    pub output_vault_mint: Account<'info, Mint>,
+
+    /// `UncheckedAccount` ではなく `Program<T>` として型付けされます。理由は上記の CPMM の
+    /// `cpmm_program` と同じです：呼び出されるプログラムであり、`Program<T>` は自動的に
+    /// そのアドレスをチェックします。
+    pub clmm_program: Program<'info, raydium_clmm::program::RaydiumClmm>,
+    // remaining_accounts: tick_array_bitmap_extension（ウォークが必要な場合）、その後
+    // スワップの予想価格範囲が及ぶティック配列アカウント。
+}
+```
+
+ティック配列リストを計算するには、SDK と同じ方法を使用します。固定数を推測するのではなく、現在のプール状態に対する見積もりを使用してください。渡した配列を超過するスワップは `TickArrayNotFound` で戻ります（完全なアカウントテーブルとエラーリストについては [`products/clmm/instructions`](/ja/products/clmm/instructions) を参照）。価格ウォークの方向で渡してください：スワップ方向の最初の配列が最初です。
+
+## パターンの適用：LaunchLab
+
+LaunchLab は Anchor ベースで IDL が公開されています：公開 `raydium-idl` リポジトリの [`raydium_launchpad/raydium_launchpad.json`](https://github.com/raydium-io/raydium-idl/blob/master/raydium_launchpad/raydium_launchpad.json)。その IDL の内部メタデータ識別子は `raydium_launchpad` で、製品の別名ではなく、基礎となるプログラムの技術名です。ただし、CPMM と CLMM とは異なり、**プログラム自身のソースは公開されていません**（[`reference/program-addresses`](/ja/reference/program-addresses) を参照）。Cargo が指す `git = "..."` 依存関係はなく、実際のクレートの Rust `use` パスが何であるかを確認するソースもありません。
+
+Anchor の `declare_program!` マクロを使用して、公開 IDL からバインディングを生成してください。IDL JSON を `idls/raydium_launchpad.json` としてクレートに保存してください（Cargo は `CARGO_MANIFEST_DIR` に相対的な `idls/` ディレクトリを探します）。その後、`declare_program!(raydium_launchpad);` は IDL から直接 `raydium_launchpad::cpi::accounts::<Ix>` 構造体と `cpi::<ix>()` 関数を生成します。プログラムソースは不要です。生成されたアカウント構造体名は常に PascalCase の命令名です（`buy_exact_in` → `BuyExactIn`）。フィールド名は IDL のアカウント名と完全に一致します。これは、以下の `MyProxyBuy` で既に使用されているアカウントリストと同じです。
+
+CPI の形状は[一般的なパターン](#the-general-anchor-cpi-pattern)に従います。以下のアカウントリストと引数は、`products/launchlab/instructions.mdx` ではなく、オンチェーン IDL の `buy_exact_in` 命令から取得されます：
+
+```rust icon="rust"
+use anchor_lang::prelude::*;
+use anchor_spl::token::{Token, TokenAccount, Mint};
+use raydium_launchpad::cpi::{self, accounts::BuyExactIn};
+
+#[derive(Accounts)]
+pub struct MyProxyBuy<'info> {
+    #[account(mut)]
+    pub payer: Signer<'info>,
+
+    /// CHECK: PDA、seeds = [b"vault_auth_seed"]、プログラムによって検証
+    pub authority: UncheckedAccount<'info>,
+
+    /// CHECK: プログラムによって検証
+    pub global_config: UncheckedAccount<'info>,
+    /// CHECK: プログラムによって検証
+    pub platform_config: UncheckedAccount<'info>,
+
+    /// CHECK: プログラムによって検証
+    #[account(mut)]
+    pub pool_state: UncheckedAccount<'info>,
+
+    #[account(mut)]
+    pub user_base_token: Account<'info, TokenAccount>,
+    #[account(mut)]
+    pub user_quote_token: Account<'info, TokenAccount>,
+    #[account(mut)]
+    pub base_vault: Account<'info, TokenAccount>,
+    #[account(mut)]
+    pub quote_vault: Account<'info, TokenAccount>,
+
+    pub base_token_mint: Account<'info, Mint>,
+    pub quote_token_mint: Account<'info, Mint>,
+
+    /// CHECK: ベースミントのトークンプログラム（ミントに応じて SPL Token または Token-2022）
+    pub base_token_program: UncheckedAccount<'info>,
+    /// `UncheckedAccount` ではなく `Program<Token>` として型付けされます：IDL はこれを
+    /// 古典的な SPL Token に固定しています（上記の base_token_program とは異なり）。
+    /// したがって、Anchor の組み込み `Program<Token>` アドレスチェックは単独で十分です。
+    pub quote_token_program: Program<'info, Token>,
+
+    /// CHECK: PDA、seeds = [b"__event_authority"]、プログラムの emit_cpi! パターンに必要
+    pub event_authority: UncheckedAccount<'info>,
+    /// CHECK: プログラム自身のアカウント、event_authority と共に必要
+    pub program: UncheckedAccount<'info>,
+}
+
+pub fn my_proxy_buy(
+    ctx: Context<MyProxyBuy>,
+    amount_in: u64,
+    minimum_amount_out: u64,
+    share_fee_rate: u64,
+) -> Result<()> {
+    let cpi_accounts = BuyExactIn {
+        payer:               ctx.accounts.payer.to_account_info(),
+        authority:           ctx.accounts.authority.to_account_info(),
+        global_config:       ctx.accounts.global_config.to_account_info(),
+        platform_config:     ctx.accounts.platform_config.to_account_info(),
+        pool_state:          ctx.accounts.pool_state.to_account_info(),
+        user_base_token:     ctx.accounts.user_base_token.to_account_info(),
+        user_quote_token:    ctx.accounts.user_quote_token.to_account_info(),
+        base_vault:          ctx.accounts.base_vault.to_account_info(),
+        quote_vault:         ctx.accounts.quote_vault.to_account_info(),
+        base_token_mint:     ctx.accounts.base_token_mint.to_account_info(),
+        quote_token_mint:    ctx.accounts.quote_token_mint.to_account_info(),
+        base_token_program:  ctx.accounts.base_token_program.to_account_info(),
+        quote_token_program: ctx.accounts.quote_token_program.to_account_info(),
+        event_authority:     ctx.accounts.event_authority.to_account_info(),
+        program:             ctx.accounts.program.to_account_info(),
+    };
+    // `program` は CPI ターゲットとしても機能します：LaunchLab 自身のアカウントは、
+    // その命令の必須アカウント（emit_cpi! パターン用）とも、CpiContext::new が
+    // 呼び出すプログラムとも両方です。
+    let cpi_ctx = CpiContext::new(
+        *ctx.accounts.program.key,
+        cpi_accounts,
+    );
+
+    cpi::buy_exact_in(cpi_ctx, amount_in, minimum_amount_out, share_fee_rate)?;
+    Ok(())
+}
+```
+
+卒業後、ターゲットプログラムは `pool_state.migrate_type` に応じて CPMM または AMM v4 です。`products/launchlab/accounts.mdx` によると、これは `Initialize` 時に設定されます。CPI アカウントリストは両方に対応するように準備するか、最初に `PoolState` から `migrate_type` を読み取り、分岐する必要があります。
 
 ## エラー伝播
 
-Raydium のプログラムは独自のエラー列挙型を返します。Anchor がそれをラップし、呼び出し元プログラムは `Err(ProgramError::Custom(code))` として見ます。特定のエラーを処理するには：
+各 Anchor ベースの Raydium プログラムは独自のエラー列挙型を返します。Anchor はそれらをラップするため、呼び出しプログラムは `Err(ProgramError::Custom(code))` として表示されます。特定のエラーを処理するには：
 
-```rust
+```rust icon="rust"
 use raydium_cp_swap::error::ErrorCode as CpmmErr;
 
 match cpi::swap_base_input(cpi_ctx, amount_in, minimum_amount_out) {
     Ok(_) => Ok(()),
     Err(e) => {
         msg!("CPMM swap failed: {:?}", e);
-        // 再スロー、または独自のエラータイプに変換します。
+        // 再発生させるか、独自のエラー型に変換します。
         Err(e)
     }
 }
 ```
 
-エラーコード番号は IDL ポリシー（[`sdk-api/anchor-idl`](/ja/sdk-api/anchor-idl)）に従って安定しています。数値と比較して特定のコードをテストできます。
+呼び出しているプログラムの関連エラー型を入れ替えてください（CLMM の場合は `raydium_clmm::error::ErrorCode` など）。エラーコード番号は IDL ポリシーに従って安定しています（[`sdk-api/anchor-idl`](/ja/sdk-api/anchor-idl#idl-change-policy)）。数値と比較することで特定のコードをテストできます。完全なエラーテーブル：[CPMM](/ja/reference/error-codes#cpmm-standard-amm-errors)、[CLMM](/ja/reference/error-codes#clmm-errors)、[AMM v4、Farm v6、LaunchLab](/ja/reference/error-codes#amm-v4-farm-v3-/-v5-/-v6-launchlab-errors)。
 
-## 構成された CPI のコンピュートバジェット
+## 構成 CPI のコンピュート予算
 
-各 CPI フレームはオーバーヘッド（呼び出し自体で約 1,500 CU）を持ち、被呼び出し側の CU 消費がその上に積み重なります。プログラム内から CPMM スワップを呼び出すトランザクションは以下を消費します。
+各 CPI フレームにはオーバーヘッドがあり、呼び出し先の独自の CU 消費がその上に積み重なるため、プログラム内から Raydium に呼び出すトランザクションには、200k CU デフォルトに依存するのではなく、明示的なコンピュート予算が必要です。
 
-```
-your_program_cu
-+ ~1_500       (CPI overhead)
-+ ~150_000     (CPMM swap, SPL-token variant)
-+ ~200_000     (if Token-2022 with transfer fee)
-+ ~10_000      (observation update)
-```
+<Note>
+  **単一の測定データポイント、ベンチマークではありません。** CPMM スワップ CPI の一般的な経験則の推定（大体 1,500 CU CPI オーバーヘッド + 150,000 CU スワップ自体 + 10,000 CU observation 更新、合計約 161,500 CU）は、実際の使用を大幅に過大評価しています。実際のスワップ CPI（`my_proxy_swap` が `swap_base_input` を呼び出し、SPL トークンミント、新しく作成された 2 トークンプール）は **合計約 47,700 CU** を消費しました。これは `connection.getTransaction(...).meta.computeUnitsConsumed` から読み取られ、その推定値の約 3 分の 1 です。これを 1 つのプール形状と 1 つのミント構成からの 1 つのデータポイントとして扱い、仕様ではありません。ドキュメントからコピーされた数値ではなく、独自の測定から予算を立ててください。
+</Note>
 
-スタックされたルーティング（プログラム → アグリゲーター → CPMM + CLMM + ファーム収穫）の場合、バジェットは ≥500k CU です。常にトランザクションで明示的な `ComputeBudgetProgram::set_compute_unit_limit(...)` 命令を設定してください。デフォルトの 200k CU リミットは静かに枯渇します。
+CLMM と LaunchLab CPI はより多くのコストがかかります（CLMM は特に `remaining_accounts` 経由で追加のティック配列を歩行し、配列ごとに CU を追加します）。ただし、上記の CPMM 図のみが測定値です。常に独自の測定から計算された明示的な `ComputeBudgetProgram::set_compute_unit_limit(...)` 命令を設定してください。ドキュメントからコピーされた数値ではなく、デフォルトの 200k CU 制限は静かに枯渇し、プログラムがアップグレードされると命令ごとのコストが変わるためです。
 
-## AMM v4 — 手動 Instruction 構築
+## AMM v4：手動命令構築
 
-AMM v4 には Anchor クレートがありません。`Instruction` を手動で構築します。
+AMM v4 は Anchor より前の時代で、CPI クレートがないため、このドキュメント内の唯一のプログラムで、上記の一般的なパターンに従いません。`Instruction` を手動で構築してください：
 
-```rust
+```rust icon="rust"
+use anchor_lang::prelude::*;
 use anchor_lang::solana_program::program::invoke_signed;
 use anchor_lang::solana_program::instruction::{Instruction, AccountMeta};
 
 const AMM_V4_PROGRAM_ID: Pubkey = pubkey!("675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8");
 
-// SwapBaseIn discriminator is 9.
+// SwapBaseIn ディスクリミネーターは 9 です。
 let mut data = vec![9u8];
 data.extend_from_slice(&amount_in.to_le_bytes());
 data.extend_from_slice(&minimum_amount_out.to_le_bytes());
@@ -199,58 +392,80 @@ let ix = Instruction {
         AccountMeta::new_readonly(token_program_id, false),
         AccountMeta::new(amm_id, false),
         AccountMeta::new_readonly(amm_authority, false),
-        // ... remaining accounts per products/amm-v4/instructions ...
+        // ... products/amm-v4/instructions に従う残りのアカウント ...
     ],
     data,
 };
 invoke_signed(&ix, &account_infos, signer_seeds)?;
 ```
 
-完全なアカウントリストは [`products/amm-v4/code-demos`](/ja/products/amm-v4/code-demos) を参照してください。
+完全なアカウントリストについては [`products/amm-v4/code-demos`](/ja/products/amm-v4/code-demos) を参照してください。
 
-## Farm v6 — 報酬ペアの残りのアカウント
+## Farm v6
 
-Farm v6 の `Deposit` / `Withdraw` / `Harvest` は、残りのアカウント内で `(reward_vault_i, user_reward_ata_i)` ペアパターンを使用します。正確なシーケンスは以下の通りです。
+**統合に TS SDK が選択肢である場合は、それを使用してください。** `raydium.farm.deposit(...)` （[`products/farm-staking/code-demos`](/ja/products/farm-staking/code-demos) を参照）は実際のデモで実行され、このプログラムに Rust Anchor クレートが存在するかどうかに依存しません。
 
-```
-remaining_accounts = [
-    reward_vault_0, user_reward_ata_0,
-    reward_vault_1, user_reward_ata_1,
-    ...
-]
-```
+<Warning>
+  **Farm v6 の Anchor CPI ステータスは未確認で、利用可能な証拠はそれに矛盾しています。** Farm v6 の公開 IDL またはソースは存在しません。これは `products/farm-staking/code-demos.mdx` の Anchor CPI クレート（`raydium_farm_v6`）と `Deposit` アカウント構造体の主張に矛盾しています。
+</Warning>
 
-**ライブ**（実行中または終了したが未請求）の報酬スロットごとに 1 ペア。未使用スロットを省略します。プログラムは `farm_state.reward_infos[i].reward_state` から分派します。
+**それでも Rust CPI が必要な場合**、例えば別のオンチェーンプログラムから構成する場合は、[AMM v4](#amm-v4-manual-instruction-construction) と同じ方法で `Instruction` を手動で構築してください：実際のアカウントリストと命令ディスクリミネーターを独立して導出してください。例えば、SDK の TypeScript レイアウト（`raydium-sdk-V2` のファームモジュール）をデコードしたり、実際のトランザクションを直接デコードしたり（以下を参照）、デプロイされたプログラムをダンプして逆アセンブルしたりすることで。
+
+ゼロ引数命令形状（ハーベストまたはクレーム呼び出しと一致）の場合、実際のアカウント順序は固定プレフィックス（`token_program`、ファームの状態アカウント、ボルト権限 PDA、その PDA の最初の報酬ボルト、2 番目の PDA、呼び出し元、その最初の報酬ミント用の呼び出し元の ATA）の後に、最初の後のすべての報酬ストリームの `remaining_accounts` の `(reward_vault_i, user_reward_ata_i)` ペアが続きます。ペアリング規則は実際ですが、2 番目の報酬ストリームからのみ開始されます：最初のストリームのボルトと ATA は固定アカウントで、互いに隣接しておらず、`remaining_accounts` の一部ではありません。
 
 ## CPI フローのテスト
 
-ローカル開発では、テストバリデーターで Raydium プログラムが利用可能である必要があります。オプションは以下の通りです。
+ローカル開発には、Raydium プログラムがテストバリデーターで利用可能である必要があります。3 つのオプション：
 
-1. **プログラムクローンを使用した `anchor test`** — `Anchor.toml` 内：
+1. **プログラムクローンを使用した `anchor test`。** デプロイされたメインネットバイトコードをローカルバリデーターにプルします。以下の [ローカルバリデーターへのプログラムのクローン](#cloning-programs-into-a-local-validator) で `Anchor.toml` 構成と、プール作成テストに特に引っかかる 2 つのことを参照してください。
+2. **Devnet。** Raydium はほとんどのプログラムを devnet にデプロイしますが、すべてのプログラムについてメインネットとは**異なるプログラム ID** です（CPMM、CLMM、AMM v4、Stable AMM、LaunchLab はそれぞれ異なる devnet アドレスを持ちます。[`reference/program-addresses`](/ja/reference/program-addresses) の Devnet テーブルを参照）。Farm v3/v5/v6 は devnet で確実に公開されていません。ライブ API（`https://api-v3-devnet.raydium.io/main/info`）が現在の状況を示しています。`raydium_clmm` のバンドルされた `DEVNET_PROGRAM_ID` 定数（または他のクレートの同等物）を使用する場合は、メインネット ID が devnet でも機能すると仮定しないでください。正しいアドレスを取得したら、`anchor test --provider.cluster devnet` を実行してライブコードにヒットしてください。
+3. **ローカルデプロイ。** Raydium リポジトリ（CPMM、CLMM；LaunchLab のソースはこのオプションでは利用できません）をクローンし、ローカルバリデーターに `anchor deploy` してください。テストサイクルのオーバーヘッドを追加しますが、デバッグのために呼び出し先を変更できます。
 
-   ```toml
-   [test.validator]
-   clone = [
-     { address = "CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK" },  # CPMM
-     { address = "CLMM...program-id..." },                          # CLMM
-     { address = "farm-v6-program-id..." },                         # farm v6
-   ]
-   ```
+`anchor test` で実行するか、プログラムを変更しない場合は最初に `anchor build` してから `anchor test --skip-build` を実行してください。テストファイルを反復処理する場合。
 
-   これはメインネットから展開されたバイトコードをローカルバリデーターに取得します。
+### ローカルバリデーターへのプログラムのクローン
 
-2. **Devnet** — Raydium はすべてのプログラムをメインネットと同じプログラム ID で devnet に展開します。`anchor test --provider.cluster devnet` を実行してライブコードを操作します。
+```toml icon="file-code"
+[test]
+# デフォルト（5 秒）は、複数のアカウントをクローンしている場合は十分ではありません。
+# バリデーター起動中に各アカウントが順序付きメインネット RPC ラウンドトリップであるためです。
+startup_wait = 60000
 
-3. **ローカル展開** — Raydium リポジトリをクローンしてローカルバリデーターに `anchor deploy` します。テストサイクルのオーバーヘッドを追加しますが、デバッグのため被呼び出し側を変更できます。
+[test.validator]
+url = "https://api.mainnet-beta.solana.com"
+
+[[test.validator.clone]]
+address = "CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK"  # CLMM
+
+[[test.validator.clone]]
+address = "CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C"  # CPMM
+
+[[test.validator.clone]]
+address = "LanMV9sAd7wArD4vJFi2qDdfnVhFxYSUg6eADduJ3uj"   # LaunchLab
+
+[[test.validator.clone]]
+address = "FarmqiPv5eAj3j1GMdMCMUGXqPUvmquZtMy86QH6rzhG"  # Farm v6
+```
+
+これはプログラム ID に関係なく機能するため、LaunchLab はソースが利用できない場合でも CPMM と CLMM と同じ方法でクローンされます。`reference/program-addresses` はここのすべてのアドレスの信頼できる情報源です。
+
+<Warning>
+  **プログラムのクローンは、テストが既存のプール（1 つに対してスワップするのではなく）を*作成*する場合は十分ではありません。** CPMM の `initialize` 命令は、その `amm_config` と `create_pool_fee` アカウントを実際のオンチェーンデータに対して検証するため、それらもクローンする必要があります。そうしないと、`initialize` は直ちに失敗します。CPMM 特有：希望するフィー層 `AmmConfig` をクローンしてください（`GET https://api-v3.raydium.io/main/cpmm-config` からそのアドレスを取得し、インデックス 0 は 0.25% 層）と[フィー受信トークンアカウント](/ja/reference/program-addresses#shared-config-/-pda-conventions)。これは作成時に検証されるため、既に存在する必要があります。
+</Warning>
+
+<Warning>
+  **テストが作成したばかりのプールは、同じ瞬間にスワップ可能ではありません。** CPMM の `initialize` は、厳密に将来にない要求された `open_time` を静かにオーバーライドします（`if open_time <= block_timestamp { open_time = block_timestamp + 1 }`）。したがって、`startTime: 0`（SDK に従う「すぐに開く」）でさえ、プールがスワップを受け入れる前に実際の ≥1 秒のギャップを残します。プールを作成し、ゼロ遅延でそれに対してスワップするテストは [`NotApproved`](/ja/reference/error-codes#cpmm-standard-amm-errors) にヒットします。プール作成と最初のスワップの間の短い `await`（1～2 秒）で十分です。これはテストに固有です。人間が 2 つの別々の手動コマンドを実行する場合、通常は気付きません。入力とプロセス起動は既に 1 秒以上を消費しているためです。
+</Warning>
 
 ## ポインター
 
-- [`products/cpmm/code-demos`](/ja/products/cpmm/code-demos)、[`products/clmm/code-demos`](/ja/products/clmm/code-demos)、[`products/amm-v4/code-demos`](/ja/products/amm-v4/code-demos)、[`products/farm-staking/code-demos`](/ja/products/farm-staking/code-demos) — 製品別 CPI 例。
-- [`sdk-api/anchor-idl`](/ja/sdk-api/anchor-idl) — IDL 取得およびクライアント再生成。
-- [`integration-guides/cpi-integration`](/ja/integration-guides/cpi-integration) — 高レベルパターン：エスクロー、ボルト、アグリゲーター構成。
+- [`products/cpmm/code-demos`](/ja/products/cpmm/code-demos)、[`products/clmm/code-demos`](/ja/products/clmm/code-demos)、[`products/amm-v4/code-demos`](/ja/products/amm-v4/code-demos)、[`products/farm-staking/code-demos`](/ja/products/farm-staking/code-demos)、[`products/launchlab/code-demos`](/ja/products/launchlab/code-demos)：製品固有の CPI と TypeScript の例。
+- [`sdk-api/anchor-idl`](/ja/sdk-api/anchor-idl)：IDL 取得とクライアント再生成。LaunchLab の IDL コードジェンパスを含む。
+- [`integration-guides/cpi-integration`](/ja/integration-guides/cpi-integration)：エスクロー、ボルト、アグリゲーター構成などの高レベルな統合パターン。
 
-参照元：
+ソース：
 
 - [raydium-cp-swap](https://github.com/raydium-io/raydium-cp-swap)
 - [raydium-clmm](https://github.com/raydium-io/raydium-clmm)
-- [Anchor CPI docs](https://www.anchor-lang.com/docs/cross-program-invocations)
+- [raydium-idl](https://github.com/raydium-io/raydium-idl)：LaunchLab IDL（プログラムソース自体はクローズド）
+- [Anchor CPI ドキュメント](https://www.anchor-lang.com/docs/cross-program-invocations)

@@ -1,0 +1,133 @@
+---
+title: "2026-09-09 — LaunchLab: Anchor 1.0, excess-lamports recovery, dan akhir dari transition gates"
+description: "LaunchLab berpindah ke Anchor 1.0.2 pada Agave 3.1.10 dan menambahkan instruksi admin CollectExcessLamports untuk rent yang dibebaskan oleh SIMD-0437. Tiga mekanisme transisi dihapus: Initialize yang sudah usang sekarang selalu gagal, MigrateToAmm kehilangan tiga argumen dan sembilan akun OpenBook, dan clock-based get_upgrade_timestamp gate dihapus. Error 6031 ditambahkan."
+---
+
+<Info>
+  **Halaman ini diterjemahkan secara otomatis oleh AI. Versi bahasa Inggris adalah acuan resmi.**
+
+  [Lihat versi bahasa Inggris →](/reference/changelog/2026-09-09-launchlab-anchor-1-and-excess-lamports)
+</Info>
+
+<Info>
+  Entri ini mencakup pembaruan program LaunchLab yang akan datang. Entri ini telah diverifikasi terhadap cabang rilis lokal sebelum deployment. Konfirmasi program yang di-deploy sebelum mengandalkan instruksi baru atau layout `MigrateToAmm` yang berubah.
+</Info>
+
+Ini adalah rilis di mana LaunchLab berhenti membawa scaffolding transisinya.
+
+Tiga mekanisme terpisah ada untuk membuat upgrade awal mendarat dengan lembut: `get_upgrade_timestamp`, tanggal cut-over yang dikodekan keras yang beberapa pemeriksaan bandingkan dengan clock; `Initialize` yang sudah usang yang terus bekerja selama tiga hari melewati tanggal tersebut; dan plumbing OpenBook milik `MigrateToAmm`, yang tidak ada yang diajak bicara setelah AMM v4 [menghapus dependensi OpenBook-nya sendiri](/id/reference/changelog/2026-07-22-amm-v4-openbook-removal) pada Juli. Ketiganya sudah hilang. Di mainnet cut-over sudah berbulan-bulan lalu, jadi efek perilaku adalah nol — tetapi *mode kegagalan* berubah, dan satu daftar akun berubah keras.
+
+Framework berpindah pada saat yang sama: Anchor `0.32.1` ke `=1.0.2`, Agave 2.3.0 ke 3.1.10. Dan, seperti pada AMM v4 dan CPMM, ada instruksi admin baru untuk mengklaim kembali rent.
+
+Trading, biaya, vesting, aturan kurva dan konfigurasi platform tidak berubah.
+
+## TL;DR untuk integrator
+
+- **Tidak ada instruksi trade yang mengubah akun, argumen atau matematikanya.** `BuyExactIn`, `BuyExactOut`, `SellExactIn`, `SellExactOut` identik byte-for-byte. Tidak ada layout akun yang berubah.
+- **`Initialize` (yang sudah usang) sekarang selalu gagal dengan `NotApproved` (`6000`),** sebelum membaca akun apa pun. Gunakan `InitializeV2`. Peluncuran yang sudah dibuat melaluinya berdagang dan lulus secara normal.
+- **`MigrateToAmm` hard-breaking untuk dompet migrasi.** Kehilangan ketiga argumen (`base_lot_size`, `quote_lot_size`, `market_vault_signer_nonce`) dan sembilan akun. Lihat di bawah.
+- **Tiga `remaining_accounts` trade sekarang diperlukan tanpa syarat,** dan slot `system_program` divalidasi. Builder yang menghilangkannya sekarang selalu gagal dengan `NotEnoughRemainingAccounts` (`6018`) alih-alih hanya setelah cut-over.
+- **Satu instruksi ditambahkan: `CollectExcessLamports`.** Admin-only. Lihat [`products/launchlab/instructions`](/id/products/launchlab/instructions#collectexcesslamports).
+- **Satu kode error ditambahkan: `6031` `LamportsCalculateError`.** Kode `6000`–`6030` tidak berubah.
+- **Tiga constraint alamat `MigrateToCpswap` dipindahkan ke dalam badan instruksi,** mengubah error mereka dari `ConstraintAddress` (`2012`) ke `RequireKeysEqViolated` (`2502`).
+- **Refresh IDL diperlukan.** Satu instruksi baru, satu set argumen dihapus, sembilan akun dihapus, satu varian error baru.
+
+## `MigrateToAmm` kehilangan bagian OpenBook-nya
+
+Ini adalah perubahan yang paling mungkin memecahkan sesuatu. Data instruksi lama membawa 17 byte argumen setelah discriminator; data baru adalah discriminator telanjang. Daftar akun lama membawa sembilan akun yang tidak lagi ada dalam struct, jadi semuanya setelah penghapusan pertama tidak selaras.
+
+**Argumen dihapus:** `base_lot_size: u64`, `quote_lot_size: u64`, `market_vault_signer_nonce: u8`. Ketiganya hanya ada untuk mengonfigurasi pasar OpenBook yang program gunakan untuk menginisialisasi melalui CPI. CPI itu — `initialize_openbook_market` — hilang, bersama dengan pemeriksaan `gen_vault_signer_key` yang memvalidasi nonce.
+
+**Akun dihapus:** `openbook_program`, `request_queue`, `event_queue`, `bids`, `asks`, `market_vault_signer`, `market_base_vault`, `market_quote_vault`, dan `amm_open_orders`. Yang terakhir hilang karena `Initialize2` milik AMM v4 tidak lagi mengambilnya.
+
+**Akun `market` tetap**, di posisi aslinya. AMM v4 masih mencatat pasar sebagai bidang referensi pada `AmmInfo`, jadi LaunchLab masih meneruskannya. Dua hal tentangnya berubah: program tidak lagi menginisialisasinya, dan sekarang **sepenuhnya tidak divalidasi** — deklarasinya adalah `#[account(mut)]` telanjang tanpa constraint owner, address atau seeds, karena `owner = openbook_program.key()` hilang bersama dengan akun `openbook_program` dan tidak ada yang menggantinya. Apa pun yang dompet migrasi lewatkan di sana diteruskan langsung ke CPI `Initialize2` AMM v4 dan dicatat di pool baru. Pemanggil yang menginginkan pasar yang benar-benar diinisialisasi di balik bidang itu harus membuatnya sebelumnya, dan program tidak akan memberitahunya sebaliknya.
+
+Daftar 23-akun yang dihasilkan didokumentasikan sepenuhnya di [`products/launchlab/instructions`](/id/products/launchlab/instructions#migratetoamm-/-migratetocpswap).
+
+`MigrateToCpswap` tidak terpengaruh — tidak pernah memiliki argumen, dan daftar akun-nya tidak berubah.
+
+## `Initialize` yang sudah usang selalu gagal
+
+`initialize` sebelumnya menjalankan deprecation lunak: ia bekerja sampai `get_upgrade_timestamp() + 3 days`, kemudian mengembalikan `NotApproved`. Dengan helper timestamp dihapus, kegagalan tidak bersyarat — handler sekarang adalah `msg!` dan `err!(NotApproved)` dan tidak ada lagi.
+
+Satu detail jika Anda membaca log: struct `Accounts` tidak berubah dan masih membawa empat constraint `init`, jadi prologue validasi akun yang dihasilkan Anchor berjalan — dan membuat akun-akun itu — sebelum handler kembali. Transaksi kembali baik cara, jadi tidak ada yang benar-benar dibuat, tetapi kegagalan muncul setelah validasi akun daripada sebelumnya.
+
+Instruksi dipertahankan daripada dihapus sehingga discriminator-nya tetap ditempati dan IDL mempertahankan bentuk yang stabil. Definisi argumen dan akun-nya masih layak didokumentasikan untuk mendekode transaksi historis, dan halaman menyimpannya di balik peringatan.
+
+## Gate `get_upgrade_timestamp` hilang
+
+Helper mengembalikan `0` di bawah fitur `local` dan `devnet` dan timestamp mainnet yang dikodekan keras `1755522000` (2025-08-18 13:00 UTC) sebaliknya. Empat instruksi membandingkan clock terhadapnya, di seluruh lima referensi dalam sumber. Masing-masing menjadi cabang post-cut-over tanpa syarat:
+
+| Situs Panggilan | Sebelum | Sesudah |
+|---|---|---|
+| `distribute_trade_fee` (semua empat jalur trade) | Baca `system_program`, `platform_fee_vault`, `creator_fee_vault` dari `remaining_accounts` hanya setelah cut-over; lewati pemisahan biaya platform/creator sebelumnya | Selalu baca ketiganya, **dan** memerlukan slot `system_program` sama dengan `System::id()` atau mengembalikan `InvalidInput` (`6002`) |
+| `migrate_to_cpswap` | Memilih `InitializeCpSwap` sebelumnya, `InitializeCpSwapWithPermission` sesudahnya | Selalu CPI yang diberi izin; helper `initialize_cpswap` legacy dihapus, dan minimum sepuluh-remaining-account tidak bersyarat |
+| `initialize_with_token_2022` | Diperlukan `amm_fee_on == BothToken` sebelum cut-over; menjalankan pemeriksaan aturan kurva platform hanya setelahnya | Tidak ada pembatasan `amm_fee_on`; pemeriksaan aturan kurva berjalan kapan pun `restrict_curve_param` diatur |
+| `initialize` (sudah usang) | Gagal hanya setelah cut-over plus tiga hari | Selalu gagal |
+
+Timestamp mainnet lebih dari setahun lalu, jadi builder yang benar dan terkini tidak melihat perubahan perilaku. Yang berubah adalah bahwa builder **usang** sekarang gagal secara deterministik alih-alih tampak bekerja terhadap build devnet. Validasi `system_program` baru benar-benar baru: slot itu sebelumnya menerima akun apa pun.
+
+## `CollectExcessLamports`
+
+Langkah 1 dari [SIMD-0437](/id/solana-fundamentals/rent-and-reclaimable-rent) mendarat di mainnet pada 3 September 2026, memotong minimum rent-exempt sebesar 9% dengan empat langkah lagi akan datang. Setiap vault pool LaunchLab, vault biaya dan PDA milik program yang dibuat sebelum langkah sekarang over-funded.
+
+Instruksi mengambil empat akun tetap — dompet signer/destination, **satu** vault authority PDA, dan kedua program token — kemudian sejumlah akun sumber di `remaining_accounts`.
+
+Slot `authority` adalah bagian yang layak dibaca dengan hati-hati. LaunchLab memiliki tiga vault authority PDA (`vault_auth_seed`, `platform_fee_vault_auth_seed`, `creator_fee_vault_auth_seed`), dan instruksi menyelesaikan mana pun yang Anda lewatkan dengan menurunkan ulang ketiganya dan mencocokkan; kunci yang tidak cocok dengan yang mana pun gagal dengan `InvalidOwner` (`6001`). Karena satu panggilan membawa satu authority dan program token memerlukan setiap pemilik akun yang sebenarnya untuk menandatangani, **akun sumber harus dikelompokkan berdasarkan authority** — vault pool, vault biaya platform dan vault biaya creator disapu dalam transaksi terpisah. PDA milik program didebit langsung dan dapat berjalan bersama authority apa pun.
+
+Wrapped SOL mengikuti urutan `SyncNative` → `UnwrapLamports` berukuran delta → assert-unchanged yang sama yang digunakan CPMM dan AMM v4, dengan `LamportsCalculateError` (`6031`) jika round-trip tidak netto ke nol. Peluncuran yang dikutip SOL menyimpan cadangan kutipan penuhnya.
+
+**Base mint tidak dapat disapu.** `InitializeV2` dan `InitializeWithToken2022` mencabut `MintTokens` dalam instruksi yang sama yang mencetak pasokan, jadi tidak ada kunci yang dapat menandatangani `WithdrawExcessLamports` untuk base mint. Rentnya terjebak dengan desain.
+
+Signer dapat berupa admin program bersama atau dompet collect-lamports khusus; alamat ada di [`reference/program-addresses`](/id/reference/program-addresses#excess-lamports-collection-wallets).
+
+## Relokasi constraint `MigrateToCpswap`
+
+Tiga constraint akun dipindahkan keluar dari struct `Accounts` dan ke dalam badan instruksi:
+
+```rust
+require_keys_eq!(ctx.accounts.platform_config.key(), ctx.accounts.pool_state.platform_config);
+require_keys_eq!(ctx.accounts.base_vault.key(),      ctx.accounts.pool_state.base_vault);
+require_keys_eq!(ctx.accounts.quote_vault.key(),     ctx.accounts.pool_state.quote_vault);
+```
+
+Persyaratan identik — ketiganya masih harus cocok dengan nilai yang disimpan di `PoolState`. Hanya permukaan error yang berbeda: `RequireKeysEqViolated` generik Anchor (`2502`), dilaporkan tanpa nama akun, daripada `ConstraintAddress` (`2012`) yang menamai akun yang bermasalah. Perbarui penanganan error apa pun yang cocok dengan `2012` untuk ketiga akun ini.
+
+## Perubahan toolchain dan dependensi
+
+| Item | Sebelum | Sesudah |
+|---|---|---|
+| `anchor-lang` / `anchor-spl` | `0.32.1` | `=1.0.2` |
+| `Anchor.toml` `solana_version` | `2.3.0` | `3.1.10` |
+| README: `rustup default` | `1.81.0` | `1.91.0` |
+| README: Solana installer | `release.anza.xyz/v2.1.0` | `release.anza.xyz/v3.1.10` |
+| README: `avm install` | `0.31.0` | `1.0.2` (plus `avm use 1.0.2`) |
+| README: Anchor repo | `coral-xyz/anchor` | `solana-foundation/anchor` |
+| `@coral-xyz/anchor` | `^0.32.1` | diganti oleh `@anchor-lang/core` `1.0.2` |
+| `@solana/spl-token` | `^0.4.0` | `^0.4.14` |
+| `typescript` | `^4.3.5` | `^5.6.3` |
+| `tsconfig` target / lib | `es6` / `es2015` | `ES2020` / `es2020`, `skipLibCheck` |
+
+Dua perubahan call-site Anchor 1.0 berlaku di sini juga: `Context` runtuh dari empat parameter lifetime menjadi satu, dan `CpiContext::new` mengambil `Pubkey` program daripada `AccountInfo`-nya. Lihat [`sdk-api/rust-cpi`](/id/sdk-api/rust-cpi#cargo-dependencies).
+
+Dua detail build-system tanpa efek on-chain: fitur `local` diganti dengan `localnet`, yang mengompilasi dompet lokal sebagai `admin` dari variabel lingkungan `LAUNCHPAD_LOCALNET_ADMIN` (`yarn test:local-admin` menghubungkannya), dan blok `[profile.release]` duplikat di `programs/launchpad/Cargo.toml` dihapus — Cargo mengabaikan `[profile]` di luar akar workspace, jadi blok akar sudah yang berlaku, termasuk fakta bahwa `panic = "abort"` blok level program tidak pernah diterapkan.
+
+## Apa yang tidak berubah
+
+- **Setiap layout akun.** `PoolState`, `GlobalConfig`, `PlatformConfig`, `PlatformCurveRule`, `PlatformAllowConfig`, catatan vesting — ukuran yang sama, offset yang sama.
+- **Kode error `6000`–`6030`,** termasuk `6020` yang sengaja dipertahankan.
+- **Matematika kurva, tingkat biaya, akrual biaya, jadwal vesting, dan pemisahan LP kelulusan.**
+- **Aturan kurva platform dan allowlist `GlobalConfig`.** Instruksi yang sama, akun yang sama, semantik yang sama; hanya gate clock di sekitar pemeriksaan aturan kurva yang hilang.
+- **Daftar akun `MigrateToCpswap` dan indeks `remaining_accounts`.**
+- **Penyerahan otoritas transfer-fee Token-2022 pada kelulusan.**
+- **Program ID.** Tidak berubah.
+
+## Halaman yang diperbarui
+
+- `products/launchlab/instructions` — `CollectExcessLamports` ditambahkan dengan daftar akun, tabel resolusi authority dan peringatan pengelompokan; penghapusan argumen dan akun `MigrateToAmm` didokumentasikan dengan daftar baru lengkap; `Initialize` dihadapkan dengan peringatan always-fails; bagian "Trade remaining accounts" baru mencakup tiga akun yang sekarang tidak bersyarat dan pemeriksaan `system_program`; `MigrateToCpswap` catatan pada jalur permission-only dan constraint yang dipindahkan; baris inventaris dan matriks perubahan state.
+- `products/launchlab/overview` — banner rilis; invariant "CPMM-only" dan base-mint dikoreksi.
+- `products/launchlab/accounts` — waktu pencabutan mint-authority dikoreksi ke pembuatan peluncuran (didokumentasikan pada kelulusan); baris `CollectExcessLamports` ditambahkan.
+- `reference/error-codes` — `6031` didokumentasikan.
+- `reference/program-addresses` — bagian "Excess-lamports collection wallets" baru.
+- `solana-fundamentals/rent-and-reclaimable-rent` — bagian "What the Raydium programs sweep on their own side" baru.
+- `sdk-api/rust-cpi`, `solana-fundamentals/toolchain` — pin Anchor 1.0 dan catatan migrasi CPI.
