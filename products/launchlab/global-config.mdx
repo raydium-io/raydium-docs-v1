@@ -18,7 +18,7 @@ A `GlobalConfig` is a singleton-per-`(curve_type, index)` PDA that fixes the pro
 - The quote mint (typically wrapped SOL or USDC) — the asset users buy with.
 - Four protocol-side wallets: the protocol-fee owner, the migrate-fee owner, and the two migration-control wallets retained for CPMM and legacy AMM v4 graduation.
 
-`GlobalConfig` accounts can be created by the LaunchLab program admin or the delegated create-config authority. Only the admin updates existing configs. See [`reference/program-addresses`](/reference/program-addresses) for the canonical authorities.
+`GlobalConfig` accounts can be created **and updated** by either the LaunchLab program admin or the delegated create-config authority; any other signer gets `InvalidOwner` (`6001`). See [`reference/program-addresses`](/reference/program-addresses) for the canonical authorities.
 
 ## Layout
 
@@ -81,7 +81,7 @@ Together these key a `GlobalConfig` uniquely. There is one `GlobalConfig` per `(
 
 - `trade_fee_rate` — denominated in `1/1_000_000` of trade volume. Applied to every buy and sell on the curve. The `protocol_fee_owner` claims its share via `CollectFee`.
 - `migrate_fee` — a flat fee in lamports (or quote units, depending on configuration) charged once at graduation. Claimed by `migrate_fee_owner` via `CollectMigrateFee`.
-- `max_share_fee_rate` — initialized to `10_000` (100 bps). Caps the `share_fee_rate` **argument** that `BuyExactIn`, `BuyExactOut`, `SellExactIn`, and `SellExactOut` accept — the referral fee paid straight to the share receiver during the trade. It does **not** bound `PlatformConfig.fee_rate`; that rate has its own caps, described in [`platform-config`](/products/launchlab/platform-config#rate-caps). Both `CreateConfig` and `UpdateConfig` enforce `trade_fee_rate + max_share_fee_rate < RATE_DENOMINATOR_VALUE`.
+- `max_share_fee_rate` — initialized to `10_000` (100 bps). Caps the `share_fee_rate` **argument** that `BuyExactIn`, `BuyExactOut`, `SellExactIn`, and `SellExactOut` accept — the referral fee paid straight to the share receiver during the trade. It does **not** bound `PlatformConfig.fee_rate`; that rate has its own caps, described in [`platform-config`](/products/launchlab/platform-config#rate-caps). `CreateConfig` enforces `trade_fee_rate + max_share_fee_rate < RATE_DENOMINATOR_VALUE` at init. On the update path only `param = 6` (`max_share_fee_rate`) re-checks the sum; `param = 0` (`trade_fee_rate`) asserts only `trade_fee_rate < RATE_DENOMINATOR_VALUE`, so raising the trade fee alone can push the pair over the combined bound. Set them in the order that keeps the invariant.
 
 ### Supply and rate floors
 
@@ -160,20 +160,29 @@ After `Initialize`, the launch's `PoolState` stores the `global_config` pubkey d
 
 ## Update path
 
-`UpdateConfig` is admin-only and takes a `(param: u8, value: u64)` pair. Each `param` value selects which field to mutate:
+`UpdateConfig` takes a `(param: u8, value: u64)` pair and accepts either the LaunchLab program admin **or** the delegated create-config authority as signer — any other signer gets `InvalidOwner` (`6001`). Each `param` value selects which field to mutate:
 
-| `param` | Field changed |
-|---------|---------------|
-| 0 | `migrate_fee` |
-| 1 | `trade_fee_rate` |
-| 2 | `max_share_fee_rate` |
-| 3 | `min_base_supply` |
-| 4 | `max_lock_rate` |
-| 5 | `min_base_sell_rate` |
-| 6 | `min_base_migrate_rate` |
-| 7 | `min_quote_fund_raising` |
+| `param` | Field changed | New value comes from | Validation |
+|---------|---------------|----------------------|------------|
+| 0 | `trade_fee_rate` | `value` | `< 1_000_000` (asserted — a violation panics rather than returning an error) |
+| 1 | `protocol_fee_owner` | `remaining_accounts[0].key` | must not be the default pubkey |
+| 2 | `migrate_fee_owner` | `remaining_accounts[0].key` | must not be the default pubkey |
+| 3 | `migrate_to_amm_wallet` | `remaining_accounts[0].key` | must not be the default pubkey |
+| 4 | `migrate_to_cpswap_wallet` | `remaining_accounts[0].key` | must not be the default pubkey |
+| 5 | `migrate_fee` | `value` | none |
+| 6 | `max_share_fee_rate` | `value` | `< 1_000_000 − trade_fee_rate` |
+| 7 | `min_base_supply` | `value` | `> 0` |
+| 8 | `max_lock_rate` | `value` | `< 1_000_000` |
+| 9 | `min_base_sell_rate` | `value` | `0 < v < 1_000_000` |
+| 10 | `min_base_migrate_rate` | `value` | `0 < v < 1_000_000` |
+| 11 | `min_quote_fund_raising` | `value` | `> 0` |
 
-Wallet rotations (`protocol_fee_owner`, `migrate_fee_owner`, `migrate_to_amm_wallet`, `migrate_to_cpswap_wallet`) take a separate `Pubkey` argument shape; check the `update_config` source for the exact dispatch table before composing an admin transaction.
+<Warning>
+  The four wallet rotations are ordinary `param` values in the same dispatch — they are **not** a
+  separate argument shape. They ignore `value` entirely and read the new key from the *first*
+  `remaining_account`; omitting that account panics on an `unwrap()`. Any `param` above `11` returns
+  `InvalidInput` (`6002`).
+</Warning>
 
 The former `UpdateConfig` selector `12` for platform authorization is removed. Platform admins now manage their own allowlists.
 
@@ -193,11 +202,16 @@ const [configPda] = PublicKey.findProgramAddressSync(
   LAUNCHLAB_PROGRAM_ID,
 );
 
-const config = await raydium.launchpad.getGlobalConfig(configPda);
-console.log(config.tradeFeeRate, config.minQuoteFundRaising);
+// The SDK exposes the layout, not a getter — decode the account yourself:
+import { LaunchpadConfig } from "@raydium-io/raydium-sdk-v2";
+const info = await connection.getAccountInfo(configPda);
+const config = LaunchpadConfig.decode(info!.data);
+console.log(config.tradeFeeRate.toString(), config.minFundRaisingB.toString());
 ```
 
-For a UI listing all available configs, walk the SDK's `getAllGlobalConfigs` helper or query the LaunchLab API endpoint that mirrors them; the on-chain account count is small (single digits in practice).
+Note the layout's field names differ from the on-chain Rust names: the fund-raising floor decodes as `minFundRaisingB`, the supply floor as `minSupplyA`, and the sell/migrate rate floors as `minSellRateA` / `minMigrateRateA`.
+
+For a UI listing all available configs, query the LaunchLab API endpoint that mirrors them (`raydium.api.fetchLaunchConfigs()`); the on-chain account count is small (single digits in practice).
 
 ## Pointers
 

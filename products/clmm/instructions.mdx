@@ -43,9 +43,17 @@ description: "Complete CLMM instruction reference: pool lifecycle, position mana
 | Rewards | `UpdateRewardInfos` | Settle reward growth to now (called by any swap / position change). |
 | Rewards | `TransferRewardOwner` | Transfer the authority that can set or top up a reward stream. |
 | Rewards | `CollectRemainingRewards` | After a reward stream's `end_time`, sweep any unallocated tokens back to the funder. |
-| Utility | `InitTickArray` | Initialize a tick-array account (often bundled with `OpenPosition`). |
+| Admin | `CloseSupportMintAssociated` | Remove a mint's `SupportMintAssociated` registration and refund its rent. |
 
-Most admin-only instructions (`CreateAmmConfig`, `UpdateAmmConfig`, `UpdatePoolStatus`, `CreateSupportMintAssociated`, `CreateOperationAccount`, `UpdateOperationAccount`, `CloseProtocolPosition`) are gated by the program's hardcoded `admin` pubkey. `CreatePermissionPda` / `ClosePermissionPda` accept either the `admin` pubkey **or** a dedicated `permission_pda_admin` key. Reward-stream admin instructions (`TransferRewardOwner`, `CollectRemainingRewards`) are gated by the reward funder, not the program admin.
+<Note>
+  **There is no init-tick-array instruction, and none is needed.** A tick array is created *inside*
+  `OpenPosition*` / `IncreaseLiquidity*` by `TickArrayState::get_or_create_tick_array`, paid for by
+  `payer`. Pass the (possibly still-uninitialized, system-owned) tick-array PDA as
+  `tick_array_lower` / `tick_array_upper` and the program allocates it if it is missing.
+  `OpenLimitOrder` does the same for its single `tick_array`.
+</Note>
+
+Most admin-only instructions (`CreateAmmConfig`, `UpdateAmmConfig`, `UpdatePoolStatus`, `CreateOperationAccount`, `UpdateOperationAccount`, `CloseProtocolPosition`) are gated by the program's hardcoded `admin` pubkey. `CreatePermissionPda` / `ClosePermissionPda` accept either the `admin` pubkey **or** a dedicated `permission_pda_admin` key; `CreateSupportMintAssociated` / `CloseSupportMintAssociated` accept either the `admin` pubkey **or** a dedicated support-mint owner key. Reward-stream admin instructions (`TransferRewardOwner`, `CollectRemainingRewards`) are gated by the reward funder, not the program admin.
 
 V2 suffix means "supports Token-2022 on vaults / NFT, requires bitmap-extension slot". The SDK picks V2 by default for new pools.
 
@@ -70,10 +78,18 @@ open_time:      u64            // swaps rejected before this time
 | 6 | `token_vault_0` | W |   | `init` here, owned by pool authority PDA. |
 | 7 | `token_vault_1` | W |   | |
 | 8 | `observation_state` | W |   | `init` here. |
-| 9 | `tick_array_bitmap_extension` | W |   | `init` here (V2). |
-| 10 | `token_program` |   |   | |
-| 11 | `token_program_2022` |   |   | |
-| 12 | `system_program`, `rent` |   |   | |
+| 9 | `tick_array_bitmap` | W |   | The `TickArrayBitmapExtension` PDA; `init` here. |
+| 10 | `token_program_0` |   |   | The program that owns `token_mint_0` — SPL Token **or** Token-2022. |
+| 11 | `token_program_1` |   |   | The program that owns `token_mint_1`. |
+| 12 | `system_program` |   |   | |
+| 13 | `rent` |   |   | |
+
+<Warning>
+  Slots 10 and 11 are **per-mint**, not "SPL Token then Token-2022". Each is constrained by
+  `mint::token_program` on the matching mint, so for a pool whose `token_mint_0` is Token-2022 and
+  `token_mint_1` is classic SPL you must pass Token-2022 in slot 10 and SPL Token in slot 11.
+  `CreateCustomizablePool` and `CreatePermissionedPool` use the same two slots.
+</Warning>
 
 **Preconditions**
 
@@ -102,13 +118,17 @@ pub struct CreateCustomizableParams {
 }
 ```
 
-**Accounts (abridged)** — same as `CreatePool` plus, when `enable_dynamic_fee = true`:
+**Accounts** — exactly the 13 declared accounts of `CreatePool`. `dynamic_fee_config` is **not** a declared account.
 
-| # | Name | W | S | Notes |
-|---|------|---|---|-------|
-| N | `dynamic_fee_config` |   |   | The shared config to snapshot from. Must already exist. |
+<Warning>
+  When `enable_dynamic_fee = true`, the `DynamicFeeConfig` to snapshot must be supplied as the
+  **last** `remaining_account` — the handler reads `ctx.remaining_accounts.last()`. Any
+  `SupportMintAssociated` bypass PDAs must therefore come *before* it, or the program snapshots the
+  wrong account and fails deserialization. Omitting it while the flag is set fails with
+  `AccountLack`.
+</Warning>
 
-**Preconditions** — same as `CreatePool`. If `enable_dynamic_fee = false`, `dynamic_fee_config` is ignored.
+**Preconditions** — same as `CreatePool`. If `enable_dynamic_fee = false`, no `remaining_account` is required and any that are passed are only scanned for support-mint records.
 
 **Postconditions**
 
@@ -175,35 +195,50 @@ with_metadata: bool           // write NFT metadata (Metaplex)
 base_flag: Option<bool>       // true = fit to amount0; false = fit to amount1
 ```
 
-**Accounts (abridged)**
+**Accounts** — the two variants have *different* account lists. `OpenPositionV2` declares 22; `OpenPositionWithToken22Nft` declares 20.
+
+`OpenPositionV2`, in order:
 
 | # | Name | W | S | Notes |
 |---|------|---|---|-------|
-| 1 | `payer` | W | S |
-| 2 | `position_nft_owner` |   |   |
-| 3 | `position_nft_mint` | W | S (keypair) |
+| 1 | `payer` | W | S | |
+| 2 | `position_nft_owner` |   |   | |
+| 3 | `position_nft_mint` | W | S | Fresh keypair. |
 | 4 | `position_nft_account` | W |   | Owner's ATA for the NFT. |
-| 5 | `metadata_account` | W |   | Metaplex (optional, if `with_metadata`). |
-| 6 | `pool_state` | W |   |
-| 7 | `protocol_position` |   |   |   |
-| 8 | `tick_array_lower` | W |   | Created if uninitialized. |
+| 5 | `metadata_account` | W |   | Metaplex metadata PDA. Declared **unconditionally**, even when `with_metadata = false`. |
+| 6 | `pool_state` | W |   | |
+| 7 | `protocol_position` |   |   | Vestigial; read-only `UncheckedAccount`. |
+| 8 | `tick_array_lower` | W |   | Created here if uninitialized. |
 | 9 | `tick_array_upper` | W |   | Same. |
 | 10 | `personal_position` | W |   | Created here. |
-| 11 | `token_account_0`, `token_account_1` | W |   | User source ATAs. |
-| 12 | `token_vault_0`, `token_vault_1` | W |   | |
-| 13 | `rent`, `system_program`, `token_program` |   |   | |
-| 14 | `associated_token_program` |   |   | |
-| 15 | `metadata_program` |   |   | Optional. |
-| 16 | `token_program_2022` |   |   | V2. |
-| 17 | `vault_0_mint`, `vault_1_mint` |   |   | V2. |
-| 18 | `tick_array_bitmap_extension` | W |   | V2 (if touched). |
+| 11 | `token_account_0` | W |   | User source ATA. |
+| 12 | `token_account_1` | W |   | |
+| 13 | `token_vault_0` | W |   | |
+| 14 | `token_vault_1` | W |   | |
+| 15 | `rent` |   |   | |
+| 16 | `system_program` |   |   | |
+| 17 | `token_program` |   |   | |
+| 18 | `associated_token_program` |   |   | |
+| 19 | `metadata_program` |   |   | Metaplex Token Metadata. |
+| 20 | `token_program_2022` |   |   | |
+| 21 | `vault_0_mint` |   |   | |
+| 22 | `vault_1_mint` |   |   | |
+
+`OpenPositionWithToken22Nft` is the same list with `metadata_account` (5) and `metadata_program` (19) **removed** — it writes the position's metadata through the Token-2022 metadata extension on the NFT mint instead — giving 20 accounts. Its `position_nft_mint` is a bare `Signer` and `position_nft_account` an `UncheckedAccount`.
+
+<Warning>
+  **`tick_array_bitmap_extension` is not a declared account on either variant.** When the position's
+  range falls outside the pool's inline `tick_array_bitmap` (±512 tick arrays), append the
+  `TickArrayBitmapExtension` PDA at seeds `["pool_tick_array_bitmap_extension", pool_state]` as
+  `remaining_accounts[0]`.
+</Warning>
 
 **Math** — see [`products/clmm/math`](/products/clmm/math). Given `base_flag`, the program resolves either `liquidity` or `(amount_0_max, amount_1_max)` into the actual `L` and the actual token amounts consumed.
 
 **Preconditions**
 
 - `tick_lower < tick_upper`, both multiples of `pool.tick_spacing`, within `[MIN_TICK, MAX_TICK]`.
-- Required tick arrays passed and initialized (or created here via `InitTickArray` CPI in the transaction).
+- The two tick-array PDAs are passed. They need **not** already exist — `get_or_create_tick_array` allocates a missing one at `payer`'s expense inside this instruction. There is no separate init-tick-array instruction.
 - User has at least `amount_0_max` and `amount_1_max` in the source ATAs.
 
 **Postconditions**
@@ -214,7 +249,7 @@ base_flag: Option<bool>       // true = fit to amount0; false = fit to amount1
 - The position NFT mint records `pool_state` as freeze authority. Mint authority is removed after the single NFT is minted. Recording the freeze authority does not change the NFT token account's state.
 - The NFT token account remains unfrozen unless the instruction is `OpenPositionV2` or `OpenPositionWithToken22Nft` **and** either vault mint's freeze authority matches CLMM's restricted-issuer list. Only that matching V2 path freezes the account. `OpenPosition` V1 does not freeze.
 
-**Common errors** — `InvalidTickIndex`, `NotApproved`, `ZeroAmountSpecified`, `TransactionTooLarge` (if too many tick arrays).
+**Common errors** — `TickInvalidOrder` (`tick_lower >= tick_upper`), `TickAndSpacingNotMatch` (an endpoint is not a multiple of `tick_spacing`), `InvalidTickIndex` (outside `[MIN_TICK, MAX_TICK]`), `MissingTickArrayBitmapExtensionAccount` (range outside the inline bitmap and the extension was not appended), `NotApproved` (`pool_state.status` blocks opening), `ZeroAmountSpecified`.
 
 <Note>
   Position freezing does not add declared instruction accounts or arguments. Clients can open these positions with the existing V2 layouts. The behavior is selected on-chain from `vault_0_mint` and `vault_1_mint`.
@@ -233,13 +268,33 @@ amount_1_max: u64
 base_flag: Option<bool>
 ```
 
-**Accounts** — like `OpenPosition` minus the NFT mint (position already exists; the NFT is passed as the owner's ATA holding 1 token).
+**Accounts** — 15, and *not* derivable from `OpenPosition`: there is no `rent`, no `system_program`, no `associated_token_program` and no metadata account.
+
+| # | Name | W | S |
+|---|------|---|---|
+| 1 | `nft_owner` |   | S |
+| 2 | `nft_account` |   |   |
+| 3 | `pool_state` | W |   |
+| 4 | `protocol_position` |   |   |
+| 5 | `personal_position` | W |   |
+| 6 | `tick_array_lower` | W |   |
+| 7 | `tick_array_upper` | W |   |
+| 8 | `token_account_0` | W |   |
+| 9 | `token_account_1` | W |   |
+| 10 | `token_vault_0` | W |   |
+| 11 | `token_vault_1` | W |   |
+| 12 | `token_program` |   |   |
+| 13 | `token_program_2022` |   |   |
+| 14 | `vault_0_mint` |   |   |
+| 15 | `vault_1_mint` |   |   |
+
+Prepend the `TickArrayBitmapExtension` PDA as `remaining_accounts[0]` when the position's range is outside the inline bitmap.
 
 **Effect**
 
 - Transfers `amount_0_actual` / `amount_1_actual` from user → vaults.
 - Increments `personal_position.liquidity` and `pool_state.liquidity` (if in range), and the endpoint-tick `liquidity_gross` / `liquidity_net` accordingly.
-- **Collects fees and rewards owed since last touch** and credits them to `tokens_fees_owed_{0,1}` / `reward_amount_owed`. Those are paid out only on `DecreaseLiquidity` or `CollectReward`, not on increase.
+- **Collects fees and rewards owed since last touch** and credits them to `token_fees_owed_{0,1}` / `reward_amount_owed`. Those are paid out only on `DecreaseLiquidity` / `DecreaseLiquidityV2`, not on increase — there is no standalone collect instruction.
 
 ## `DecreaseLiquidityV2`
 
@@ -253,7 +308,33 @@ amount_0_min: u64
 amount_1_min: u64
 ```
 
-**Accounts** — same shape as `IncreaseLiquidity`.
+**Accounts** — 16, and **not** the same shape or order as `IncreaseLiquidityV2`: `personal_position` and `pool_state` are swapped, the vaults come before the tick arrays, the user-side accounts are named `recipient_token_account_*`, and there is an extra `memo_program`.
+
+| # | Name | W | S |
+|---|------|---|---|
+| 1 | `nft_owner` |   | S |
+| 2 | `nft_account` |   |   |
+| 3 | `personal_position` | W |   |
+| 4 | `pool_state` | W |   |
+| 5 | `protocol_position` |   |   |
+| 6 | `token_vault_0` | W |   |
+| 7 | `token_vault_1` | W |   |
+| 8 | `tick_array_lower` | W |   |
+| 9 | `tick_array_upper` | W |   |
+| 10 | `recipient_token_account_0` | W |   |
+| 11 | `recipient_token_account_1` | W |   |
+| 12 | `token_program` |   |   |
+| 13 | `token_program_2022` |   |   |
+| 14 | `memo_program` |   |   |
+| 15 | `vault_0_mint` |   |   |
+| 16 | `vault_1_mint` |   |   |
+
+**Remaining accounts** — three per active reward being collected, in the order `reward_token_vault(W)`, `recipient_token_account(W)`, `reward_vault_mint`. Prepend the `TickArrayBitmapExtension` PDA when the position's range is outside the inline bitmap.
+
+<Note>
+  This is also the **only** way to collect fees and rewards. To collect without changing the
+  position, call it with `liquidity = 0`, `amount_0_min = 0`, `amount_1_min = 0`.
+</Note>
 
 **Effect**
 
@@ -342,7 +423,7 @@ Callers pass a ranked list of tick arrays covering the expected swap walk; the p
 - `now >= open_time`.
 - `sqrt_price_limit_x64` is on the correct side of `sqrt_price_x64` for the direction.
 
-**Common errors** — `ExceededSlippage`, `SqrtPriceLimitOverflow`, `TickArrayNotFound`, `LiquidityInsufficient`.
+**Common errors** — `TooLittleOutputReceived` (exact-in slippage), `TooMuchInputPaid` (exact-out slippage), `SqrtPriceLimitOverflow`, `NotEnoughTickArrayAccount`, `InvalidFirstTickArrayAccount`, `MissingTickArrayBitmapExtensionAccount`, `LiquidityInsufficient`, `NotApproved` (swap bit set on `pool_state.status`). CLMM has no `ExceededSlippage` variant — that name is CPMM's — and no `TickArrayNotFound`.
 
 **What `SwapV2` does internally that callers should know about** (post-2025 release):
 
@@ -381,7 +462,16 @@ amount:         u64      // input-token amount
 | 10 | `input_vault_mint` |   |   | Token-2022 fee handling. |
 | 11 | `output_vault_mint` |   |   | Mint of the output side (frozen-check pairing). |
 | 12 | `input_token_program` |   |   | SPL or Token-2022. |
-| 13 | `system_program`, `rent` |   |   | |
+| 13 | `system_program` |   |   | Funds the `limit_order`, `limit_order_nonce` and — if needed — the `tick_array` allocation. |
+
+**Remaining accounts** — `[0]` `tick_array_bitmap_extension`, required only when initializing a tick array whose start index falls outside the pool's inline bitmap. Pass nothing otherwise.
+
+<Warning>
+  There is **no `rent` account**: the struct ends at `system_program`, 13 declared accounts. A stray
+  `rent` in position 14 lands exactly where the optional bitmap extension is read, so the order
+  appears to work until the first time a tick array outside the inline bitmap has to be created —
+  and then fails.
+</Warning>
 
 <Note>
   **Account-list change (2026-07 release).** `OpenLimitOrder` now also takes the **output-side** accounts — `output_token_account`, `output_vault`, and `output_vault_mint` — in addition to the input side. They are used only for validation: the program rejects the order if the owner's input **or** output token account is frozen. This guarantees that a fill can actually be settled to the owner's output ATA, which matters for allow-list / default-frozen Token-2022 mints (e.g. permissioned tokens) where an account may not yet be thawed. Clients built against the older single-sided account list must add the three output accounts.
@@ -401,7 +491,7 @@ amount:         u64      // input-token amount
 - `limit_order_nonce.order_nonce += 1`.
 - `OpenLimitOrderEvent` emitted.
 
-**Common errors** — `NotApproved` (input or output token account frozen, or the pool has swap / limit-order disabled), `InvalidLimitOrderAmount` (zero or below the pool's minimum), `InvalidTickIndex` (out of `[MIN_TICK, MAX_TICK]`, or on the wrong side of `tick_current` for the chosen direction), `TickAndSpacingNotMatch` (`tick_index % pool.tick_spacing != 0`), `OrderPhaseSaturated`.
+**Common errors** — `NotApproved` (input or output token account frozen, or the pool has swap / limit-order disabled), `ZeroAmountSpecified` (`amount == 0` after the input-side transfer fee), `InvalidLimitOrderAmount` (the amount would produce an output below 1 base unit at that tick, or overflow `u64`), `InvalidTickIndex` (out of `[MIN_TICK, MAX_TICK]`, or on the wrong side of `tick_current` for the chosen direction), `TickAndSpacingNotMatch` (`tick_index % pool.tick_spacing != 0`), `OrderPhaseSaturated`.
 
 ## `IncreaseLimitOrder`
 
@@ -413,7 +503,18 @@ Add to an existing open order. Only callable by the order's `owner`.
 amount: u64    // additional input-token amount
 ```
 
-**Accounts** — like `OpenLimitOrder` minus the nonce account; the `limit_order` PDA is passed directly.
+**Accounts** — 8, input side only. It drops the nonce account, all three output-side accounts **and** `system_program`.
+
+| # | Name | W | S |
+|---|------|---|---|
+| 1 | `owner` |   | S |
+| 2 | `pool_state` | W |   |
+| 3 | `tick_array` | W |   |
+| 4 | `limit_order` | W |   |
+| 5 | `input_token_account` | W |   |
+| 6 | `input_vault` | W |   |
+| 7 | `input_vault_mint` |   |   |
+| 8 | `input_token_program` |   |   |
 
 **Preconditions**
 
@@ -531,19 +632,39 @@ Modify an existing `DynamicFeeConfig`. Pools that already snapshotted the config
 
 ## `CollectProtocolFee` / `CollectFundFee`
 
-Identical shape to CPMM's `CollectProtocolFee` / `CollectFundFee`. Signer must match `AmmConfig.owner` / `AmmConfig.fund_owner`. Sweep accrued protocol/fund fees from the pool's vaults to a recipient, zero the corresponding `PoolState.protocol_fees_*` / `fund_fees_*` fields.
+Sweep accrued protocol/fund fees from the pool's vaults to a recipient, zeroing the corresponding `PoolState.protocol_fees_*` / `fund_fees_*` fields. **This is not CPMM's layout** — CLMM has no `authority` account, and the recipient fields are named `recipient_token_account_{0,1}` rather than `recipient_token_{0,1}_account`.
+
+**Arguments** — `amount_0_requested: u64`, `amount_1_requested: u64`.
+
+| # | Name | W | S | Notes |
+|---|------|---|---|-------|
+| 1 | `owner` |   | S | `amm_config.owner` (or `amm_config.fund_owner` for the fund variant), or the program admin; else `NotApproved`. |
+| 2 | `pool_state` | W |   | |
+| 3 | `amm_config` |   |   | `address = pool_state.amm_config`. |
+| 4 | `token_vault_0` | W |   | |
+| 5 | `token_vault_1` | W |   | |
+| 6 | `vault_0_mint` |   |   | |
+| 7 | `vault_1_mint` |   |   | |
+| 8 | `recipient_token_account_0` | W |   | |
+| 9 | `recipient_token_account_1` | W |   | |
+| 10 | `token_program` |   |   | |
+| 11 | `token_program_2022` |   |   | |
 
 ## `InitializeReward`
 
 Add a new reward stream to a pool. Up to 3 streams may be active at once.
 
-**Arguments**
+**Arguments** — a single struct, `param: InitializeRewardParam`:
 
+```rust
+pub struct InitializeRewardParam {
+    pub open_time:                u64,
+    pub end_time:                 u64,
+    pub emissions_per_second_x64: u128,   // Q64.64
+}
 ```
-open_time:     u64
-end_time:      u64
-emissions_per_second_x64: u128   // Q64.64
-```
+
+The wire encoding is the three fields back to back, so a hand-built instruction is unaffected — but an IDL-driven client must pass one `param` object rather than three positional arguments.
 
 **Accounts**
 
@@ -573,28 +694,20 @@ Extend, top up, or change emission rate on an existing reward stream. Typically 
 
 Pure bookkeeping — settles `reward_growth_global_x64` to the current time by multiplying `emissions_per_second × Δt / liquidity`. Called internally by every liquidity-touching instruction. Exposed as a standalone instruction because external actors (UIs, cranks) sometimes want to trigger it.
 
-## `CollectReward`
+## Collecting rewards
 
-Position owner claims owed reward tokens.
+<Warning>
+  **There is no standalone collect-reward instruction.** The program exposes no `CollectReward`
+  entrypoint, and the published IDL has none either.
+</Warning>
 
-**Accounts**
+Rewards owed to a position are paid out by `DecreaseLiquidity` / `DecreaseLiquidityV2`. To collect
+without changing the position, call it with `liquidity = 0`, `amount_0_min = 0`, `amount_1_min = 0`.
+The reward vaults and recipient accounts go in `remaining_accounts` in groups of three per active
+reward, in the order `reward_token_vault(W)`, `recipient_token_account(W)`, `reward_vault_mint`.
 
-| # | Name | W | S | Notes |
-|---|------|---|---|-------|
-| 1 | `nft_owner` |   | S |
-| 2 | `nft_account` |   |   | Owner's ATA holding the position NFT. |
-| 3 | `personal_position` | W |   |
-| 4 | `pool_state` | W |   |
-| 5 | `protocol_position` |   |   |   |
-| 6 | `reward_token_vault` | W |   |
-| 7 | `recipient_token_account` | W |   |
-| 8 | `token_program` |   |   |
-| 9 | `token_program_2022` |   |   |
-
-**Effect**
-
-- Settles reward growth (same pattern as fees).
-- Transfers the owed amount to the recipient ATA, zeroes `reward_amount_owed[i]`.
+`CollectRemainingRewards` is a different thing: it lets the reward *funder*, after a stream's
+`end_time`, sweep tokens that were never allocated to any position.
 
 ## State-change matrix
 
@@ -613,7 +726,6 @@ Position owner claims owed reward tokens.
 | `CloseLimitOrder` | — | — | — | — | — |
 | `CreateCustomizablePool` | 0 | 0 | — | — | — |
 | `UpdateRewardInfos` | — | — | + | — | — |
-| `CollectReward` | — | — | settle owed | — | — |
 
 ## Where to go next
 

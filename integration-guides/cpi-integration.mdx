@@ -154,8 +154,14 @@ pub fn escrow_swap(
     let signer: &[&[&[u8]]] = &[seeds];
 
     let cpi_accounts = CpmmSwap {
-        payer:                ctx.accounts.user.to_account_info(),
-        authority:            ctx.accounts.escrow.to_account_info(),
+        // `payer` is the account whose signature must cover the input ATA. That ATA is
+        // owned by the escrow PDA, so the escrow — signing via new_with_signer below —
+        // goes here, NOT `user`.
+        payer:                ctx.accounts.escrow.to_account_info(),
+        // `authority` is CPMM's own vault PDA at [b"vault_and_lp_mint_auth_seed"];
+        // CPMM signs the vault leg with it itself. Passing your escrow here fails the
+        // seeds constraint before any transfer runs.
+        authority:            ctx.accounts.pool_authority.to_account_info(),
         amm_config:           ctx.accounts.amm_config.to_account_info(),
         pool_state:           ctx.accounts.pool_state.to_account_info(),
         input_token_account:  ctx.accounts.escrow_input_ata.to_account_info(),
@@ -189,9 +195,9 @@ The CPI succeeds only if the PDA passed as `authority` matches the derivation th
 2. The bump.
 3. The calling program ID (your program, not Raydium's).
 
-Raydium doesn't care who the authority is — it only cares that the `authority` signature covers the transaction and that the input ATA is owned by that authority. The validation happens in `anchor_spl::token::transfer`: the ATA's `authority` field must equal the signer.
+Note what the PDA has to match. CPMM's `authority` slot is **its own** vault PDA — a fixed, program-wide account it derives and signs with itself, and which your program neither controls nor substitutes. The account your PDA seeds have to line up with is **`payer`**: the check happens inside CPMM's own `transfer_from_user_to_pool_vault` helper, which requires the account passed as `payer` to be the owner of `input_token_account`.
 
-Common bug: passing `user` as the authority (and transferring from `escrow_input_ata` that is owned by the escrow PDA). The SPL Token program rejects with `owner mismatch`. Always make the `authority` field match the ATA owner.
+Common bug: passing `user` as `payer` while `escrow_input_ata` is owned by the escrow PDA. The SPL Token program rejects with `owner mismatch`. Always make `payer` the ATA's owner — and sign for it with `new_with_signer` when that owner is a PDA.
 
 ## Remaining accounts
 
@@ -232,18 +238,26 @@ Your calling program must pass the remaining accounts it receives from the clien
 
 ## Compute budget for composed calls
 
-A CPI costs ~1,500 CU for the call frame itself; the callee's own CU use stacks on top. Rough budget per Raydium CPI:
+A CPI costs ~1,500 CU for the call frame itself; the callee's own CU use stacks on top.
 
-| Call | CU (SPL Token) | CU (Token-2022) |
-|------|----------------|-----------------|
-| CPMM swap_base_input | ~150,000 | ~200,000 |
-| CLMM swap_v2 (single tick array) | ~180,000 | ~230,000 |
-| CLMM swap_v2 (crosses 2 ticks) | ~220,000 | ~270,000 |
-| Farm v6 deposit | ~120,000 | ~150,000 |
-| Farm v6 harvest (per reward slot) | +30,000 | +40,000 |
-| AMM v4 swap_base_in | ~140,000 | n/a |
+The callee figures below are measured from live mainnet transactions on high-volume pools on **2026-09-09**, read from the `Program <id> consumed N of M compute units` log line for the Raydium program's own invocation (so they include its inner token-program CPIs):
 
-Add ~1,500 for each CPI frame and ~20,000 for your own program's overhead. An auto-compounder doing `harvest → swap A → swap B → deposit LP → stake LP` easily hits 700k CU.
+| Callee instruction | Measured CU | Sample |
+|------|----|----|
+| CPMM `swap_base_input` | ~23,000 | 22,721–23,052 (n=8) |
+| AMM v4 swap | ~26,000 | 25,215–26,002 |
+| CLMM `swap` (V1) | ~41,000 | 37,148–44,721 |
+| CLMM `swap_v2` | ~48,000 | 43,838–52,887 (n=6) |
+| CLMM `increase_liquidity_v2` | ~36,000 | 36,058 |
+
+Add ~1,500 for each CPI frame and your own program's overhead on top. CLMM swap cost scales with tick crossings, so treat its figure as a floor. Token-2022 mints add the extension-handling cost of the transfer itself; measure it for your own mints rather than applying a flat multiplier.
+
+<Warning>
+  Earlier revisions of this page carried estimates 5–7× higher (a ~150,000 CU CPMM swap, ~180,000
+  for CLMM). Those were never measured. Budget from your own `computeUnitsConsumed` reading, not
+  from a documented number — and note that a full transaction costs more than the Raydium
+  instruction alone once ATA creation, wSOL wrapping and compute-budget instructions are counted.
+</Warning>
 
 Always set an explicit `ComputeBudgetProgram::set_compute_unit_limit`:
 
@@ -270,17 +284,23 @@ cpi::swap_base_input(cpi_ctx, amount_in, minimum_amount_out)?;
 Or intercept for specific codes:
 
 ```rust
+use anchor_lang::error::{Error, ERROR_CODE_OFFSET};
 use raydium_cp_swap::error::ErrorCode as CpmmErr;
 
 match cpi::swap_base_input(cpi_ctx, amount_in, minimum_amount_out) {
-    Ok(_) => {},
-    Err(err) if is_err(err, CpmmErr::ExceededSlippage) => {
+    Ok(_) => {}
+    Err(Error::ProgramError(pe))
+        if pe.program_error
+            == ProgramError::Custom(CpmmErr::ExceededSlippage as u32 + ERROR_CODE_OFFSET) =>
+    {
         // Your program might want to retry at a larger slippage, or unwind state.
         return err!(YourErr::PoolTooVolatile);
     }
     Err(err) => return Err(err),
 }
 ```
+
+Note the `ERROR_CODE_OFFSET` term: `#[error_code]` variants are emitted starting at 6000, so comparing against the bare enum discriminant never matches. (There is no `is_err` helper in `anchor-lang` or in `raydium_cp_swap` — earlier revisions of this page used one that does not exist.)
 
 The error code-to-meaning mapping is stable per the IDL policy ([`sdk-api/anchor-idl`](/sdk-api/anchor-idl)); new codes append at the end, existing codes never change meaning.
 
@@ -323,8 +343,12 @@ pub mod limit_orders {
         let pre_out_balance = ctx.accounts.escrow_output_ata.amount;
 
         let cpi_accounts = CpmmSwap {
-            payer:                ctx.accounts.keeper.to_account_info(),
-            authority:            ctx.accounts.order.to_account_info(),
+            // The escrow's input ATA is owned by the `order` PDA, so `order` must be
+            // `payer` — it signs via new_with_signer below. The keeper only pays the
+            // transaction fee; it is not the ATA owner.
+            payer:                ctx.accounts.order.to_account_info(),
+            // CPMM's own vault PDA at [b"vault_and_lp_mint_auth_seed"].
+            authority:            ctx.accounts.pool_authority.to_account_info(),
             amm_config:           ctx.accounts.amm_config.to_account_info(),
             pool_state:           ctx.accounts.pool_state.to_account_info(),
             input_token_account:  ctx.accounts.escrow_input_ata.to_account_info(),
@@ -361,7 +385,7 @@ pub mod limit_orders {
 }
 ```
 
-The keeper pays the transaction fee (they get a keeper fee elsewhere — not shown). The escrow PDA signs the CPI. Both the Raydium-side slippage check *and* the escrow's own delta check enforce the floor — belt and braces.
+The keeper pays the transaction fee (they get a keeper fee elsewhere — not shown). The `order` PDA signs the CPI as `payer`, because it owns the escrow's input ATA; `ExecuteOrder` therefore also needs a `pool_authority: UncheckedAccount<'info>` field for CPMM's own vault PDA. Both the Raydium-side slippage check *and* the escrow's own delta check enforce the floor — belt and braces.
 
 ## Testing
 
@@ -370,8 +394,8 @@ Pulling Raydium programs into a local validator for integration tests (from `Anc
 ```toml
 [test.validator]
 clone = [
-  { address = "CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK" }, # CPMM
-  { address = "CLMM...." },                                     # CLMM
+  { address = "CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C" }, # CPMM
+  { address = "CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK" }, # CLMM
   { address = "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8" }, # AMM v4
   { address = "FarmqiPv5eAj3j1GMdMCMUGXqPUvmquZtMy86QH6rzhG" }, # Farm v6
 ]
@@ -387,7 +411,7 @@ Solana has no true reentrancy — a CPI can't call back into the originating pro
 
 ### Account mutability drift
 
-If your program passes an account as `mut` but Raydium expects it read-only (or vice versa), the runtime rejects the invocation with `InvalidAccountData`. Always check Raydium's instruction's expected mutability in the IDL; `anchor_cp_swap::cpi::accounts::Swap` enforces it via its field types.
+If your program passes an account as `mut` but Raydium expects it read-only (or vice versa), the runtime rejects the invocation with `InvalidAccountData`. Always check Raydium's instruction's expected mutability in the IDL; `raydium_cp_swap::cpi::accounts::Swap` sets each account's mutability for you, from the `#[account(mut)]` markers on CPMM's own `Swap` struct — the generated fields are all plain `AccountInfo<'info>`, so it is the derived `ToAccountMetas` impl, not the field types, that carries the flags.
 
 ### Token-2022 program field
 
@@ -407,4 +431,4 @@ Sources:
 
 - [raydium-cp-swap CPI crate](https://github.com/raydium-io/raydium-cp-swap)
 - [raydium-clmm CPI crate](https://github.com/raydium-io/raydium-clmm)
-- [Anchor CPI docs](https://www.anchor-lang.com/docs/cross-program-invocations)
+- [Anchor CPI docs](https://www.anchor-lang.com/docs/basics/cpi)

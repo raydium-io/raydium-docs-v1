@@ -39,36 +39,42 @@ const raydium = await Raydium.load({
 });
 ```
 
-`Raydium.load` is async because it fetches a small `/config` payload from `api-v3.raydium.io` on startup (listing current `AmmConfig` accounts, fee tiers, etc.). Set `disableFeatureCheck: true` in offline environments; you will have to supply those values manually to some builders.
+`Raydium.load` is async because, by default, it loads the token list (`raydium.token.load()`) from `api-v3.raydium.io`. Pass `disableLoadToken: true` to skip that fetch. The availability feature-check is a separate call to `/v3/main/AvailabilityCheckAPI` and is **already skipped** unless you explicitly pass `disableFeatureCheck: false`. Fee configs are not fetched at load time at all — they come lazily from `raydium.api.getCpmmConfigs()` / `getClmmConfigs()` on first use.
 
-## The four module facades
+## The module facades
 
-Once loaded, the `raydium` object exposes four module facades, one per product surface:
+Once loaded, the `raydium` object exposes ten module facades plus an API client:
 
 ```ts
 raydium.cpmm       // CPMM pools: createPool, addLiquidity, withdrawLiquidity, swap, ...
 raydium.clmm       // CLMM pools: createPool, openPositionFromBase, increasePositionFromBase,
-                   //             decreaseLiquidity, harvestAllRewards, swap, ...
+                   //             decreaseLiquidity, harvestAllRewards, swap, limit orders, ...
 raydium.liquidity  // AMM v4 pools: computeAmountOut, swap, addLiquidity, removeLiquidity, ...
-raydium.farm       // Farm v3/v5/v6: deposit, withdraw, harvestAllRewards, create, setRewards
-raydium.launchpad  // LaunchLab: createLaunchpad, buyExactIn, sellExactIn, graduate, ...
-raydium.trade      // Multi-pool routing: quotes, route-execution (beta in 0.2.41)
-raydium.token      // Helpers: get token list, metadata, ATA creation
+raydium.farm       // Farm v3/v5/v6: deposit, withdraw, harvestAllRewards, create,
+                   //                restartReward(s), addNewRewardToken(s)
+raydium.launchpad  // LaunchLab: createLaunchpad, buyToken, buyTokenExactOut, sellToken,
+                   //            claimCreatorFee, curve-rule and platform-config builders, ...
+raydium.tradeV2    // Multi-pool routing: route discovery, compute, route-execution
+raydium.marketV2   // OpenBook market creation (legacy)
+raydium.utils1216  // One-off historical-claim helpers
+raydium.token      // Token list + metadata: load(), getTokenInfo()
+raydium.account    // Wallet token accounts, ATA lookup and creation
+raydium.api        // The REST client (fetchPoolById, getCpmmConfigs, fetchLaunchConfigs, ...)
 ```
-
-(Yes, five facades in total — "four" is the way Raydium groups them publicly, with `trade` and `token` as supporting utilities.)
 
 ## Transaction builders
 
 Every mutating function returns a builder rather than executing immediately:
 
 ```ts
-const { execute, builder, transaction, innerTransactions, extInfo } =
+import { Percent } from "@raydium-io/raydium-sdk-v2";
+
+const { execute, builder, transaction, instructionTypes, signers, extInfo } =
   await raydium.cpmm.addLiquidity({
     poolInfo,
-    amountInA,
-    amountInB,
-    slippage: 0.005,
+    inputAmount,              // BN — one side, not a pair
+    baseIn: true,
+    slippage: new Percent(1, 100),   // a Percent, not a number
     txVersion: TxVersion.V0,
   });
 ```
@@ -76,9 +82,18 @@ const { execute, builder, transaction, innerTransactions, extInfo } =
 Returned fields:
 
 - **`execute`** — a convenience function that signs + sends. Equivalent to `builder.execute`.
-- **`builder`** — the `TxBuilder` instance with all instructions and signers accumulated. Call `.build()` to get a `VersionedTransaction[]`; useful when you need to inject your own instructions or sign with external signers.
-- **`transaction` / `innerTransactions`** — the raw instruction arrays. Use when building composed multi-program transactions.
-- **`extInfo`** — product-specific extras. For example, `createPool` returns `extInfo.poolId`; `createLaunchpad` returns the new launch state PDA.
+- **`builder`** — the `TxBuilder` instance with all instructions and signers accumulated. `builder.build()` returns a `TxBuildData` whose `transaction` is a single legacy `Transaction`; `builder.buildV0()` returns a `TxV0BuildData` with a single `VersionedTransaction`. Only `buildMultiTx` / `buildMultiTxV0` produce an array.
+- **`transaction`** — the built `Transaction` / `VersionedTransaction`.
+- **`instructionTypes`** / **`signers`** — the accumulated instruction labels and signer set.
+- **`extInfo`** — product-specific extras. For example, `cpmm.createPool` returns `extInfo.address.{poolId, lpMint, vaultA, vaultB}`; `launchpad.createLaunchpad` returns `extInfo.address` (a `LaunchpadPoolInfo` plus `poolId`).
+
+<Note>
+  There is no `innerTransactions` field on the return type — destructuring it is a TypeScript
+  error. Builders whose return type is `MakeMultiTxData` (for example
+  `clmm.harvestAllRewards`, `farm.harvestAllRewards`, `tradeV2.swap`,
+  `launchpad.createLaunchpad`) expose `transactions` instead, and their `execute` **requires**
+  `{ sequentially: boolean }` and resolves to `{ txIds }` rather than `{ txId }`.
+</Note>
 
 `txVersion` controls legacy vs V0 transaction format. V0 (address lookup tables) is the default recommendation — it lets larger swaps fit in a single transaction.
 
@@ -90,14 +105,14 @@ Almost every builder internally fetches on-chain state: pool info (for quotes), 
 
 The CLMM facade gained surfaces for the new dynamic-fee, single-sided-fee, and limit-order features:
 
-- **`raydium.clmm.createCustomizablePool`** — superset of `createPool` that accepts `collectFeeOn`, `enableDynamicFee`, and `dynamicFeeConfigId`. Use this for any new pool that needs the new knobs; classic `createPool` continues to work for default-fee pools.
-- **`raydium.clmm.openLimitOrder`** — open a single-tick limit order on a pool that supports them. Takes `poolInfo`, `poolKeys`, `limitOrderConfig` (from `/main/clmm-limit-order-config`), `inputMint`, `inputAmount`, and the target `tick`.
-- **`raydium.clmm.increaseLimitOrder` / `decreaseLimitOrder`** — adjust the unfilled portion of an existing order. Decreasing reverts on a fully-filled order with `InvalidOrderPhase`.
-- **`raydium.clmm.settleLimitOrder` / `settleAllLimitOrder`** — sweep filled output to the owner's ATA. Either the order's owner or the pool's `limit_order_admin` keeper can call them.
+- **`raydium.clmm.createCustomizablePool`** — superset of `createPool` that accepts `collectFeeOn` and `dynamicFeeConfig` (the config account's `PublicKey`). Supplying `dynamicFeeConfig` is what enables dynamic fees; there is no separate `enableDynamicFee` flag and no `dynamicFeeConfigId`. Classic `createPool` continues to work for default-fee pools.
+- **`raydium.clmm.openLimitOrder`** — open a single-tick limit order. Takes `poolInfo`, `baseIn` (direction), `orderTick`, `amount`, and optionally `tickArrayBitmap`, `noneIndex`, `ownerInfo`. Use the exported `getOrderTick({ baseIn, mintADecimal, mintBDecimal, tickSpacing, price })` helper to quantize the tick.
+- **`raydium.clmm.increaseLimitOrder` / `decreaseLimitOrder`** — adjust the unfilled portion of an existing order. Both take `{ poolInfo, limitOrder, amount }`; `decreaseLimitOrder` adds an optional `slippage`. Decreasing reverts on a fully-filled order with `InvalidOrderPhase`.
+- **`raydium.clmm.settleLimitOrder` / `settleAllLimitOrder`** — sweep filled output to the owner's ATA. `settleLimitOrder` takes only `{ limitOrder }` — no `poolInfo`. Either the order's owner or the program's `limit_order_admin` keeper can call it.
 - **`raydium.clmm.closeLimitOrder` / `closeAllLimitOrder`** — close fully-settled orders to recover rent.
-- **`raydium.api.getClmmDynamicConfigs()` / `getClmmLimitOrderConfigs()`** — REST helpers that hit the new `/main/clmm-dynamic-config` and `/main/clmm-limit-order-config` endpoints.
+- **`raydium.api.getClmmDynamicConfigs()`** — REST helper that hits the new `/main/clmm-dynamic-config` endpoint. (There is no limit-order-config helper or endpoint: limit orders are keyed by tick, not by a per-pool config account.)
 
-A small reorg also moved `utils/` to `libraries/`. Code that imported from `@raydium-io/raydium-sdk-v2/utils/...` should switch to `@raydium-io/raydium-sdk-v2/libraries/...`. The top-level package barrel is unchanged, so most users never see the rename.
+The package declares no subpath exports, so `@raydium-io/raydium-sdk-v2/<anything>` does not resolve in any spelling — import everything from the top-level barrel. (Internally, `src/raydium/clmm/utils/` was renamed to `src/raydium/clmm/libraries/`, but that was never a public entry point.)
 
 End-to-end TypeScript walkthroughs live in [`products/clmm/code-demos`](/products/clmm/code-demos).
 
@@ -122,8 +137,9 @@ The SDK does not add compute-unit prices by default. In high-volume windows (new
 ```ts
 const { execute } = await raydium.cpmm.swap({
   poolInfo,
+  baseIn,                    // required: which side inputAmount is denominated in
   inputAmount: new BN(...),
-  swapResult: ...,
+  swapResult: ...,           // required: from CurveCalculator.swapBaseInput/Output
   slippage: 0.005,
   txVersion: TxVersion.V0,
   computeBudgetConfig: {
@@ -156,7 +172,7 @@ When upgrading between SDK minor versions:
 1. Re-check the return type of every mutating call — shape changes (e.g. `extInfo`) land frequently.
 2. Regenerate `poolInfo` fetch signatures — a field may have been renamed.
 3. Re-verify your slippage handling; the SDK has shifted between auto-bound and opt-in bound behaviors across releases.
-4. If you use `raydium.trade` (routing), re-verify the route shape — it is the most unstable part of the surface.
+4. If you use `raydium.tradeV2` (routing), re-verify the route shape — it is the most unstable part of the surface. Note the facade was renamed from `trade` to `tradeV2`; the old name no longer exists.
 
 ## Getting help
 

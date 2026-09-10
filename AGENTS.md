@@ -30,7 +30,9 @@
 
 ## Cross-reference conventions
 
-- **Program IDs and shared PDAs** live only in `reference/program-addresses.mdx`. Other pages link to it; don't hardcode addresses elsewhere. Source-code links there are limited to publicly-available repos (`raydium-amm`, `raydium-cp-swap`, `raydium-clmm`, `raydium-idl`); the rest of the program family is closed-source — write "source not publicly available" rather than inventing a URL.
+- **Program IDs and shared PDAs** live only in `reference/program-addresses.mdx`. Other pages link to it; don't restate addresses in prose or in prose tables elsewhere. Source-code links there are limited to publicly-available repos (`raydium-amm`, `raydium-cp-swap`, `raydium-clmm`, `raydium-idl`); the rest of the program family is closed-source — write "source not publicly available" rather than inventing a URL.
+  - **Exception — code samples.** A runnable snippet may contain a literal address, because a snippet the reader has to edit before it runs is worse than a duplicated constant. Every such literal must carry a trailing comment pointing at the canonical entry, e.g. `// see reference/program-addresses`, so a rotation can be found by grepping for that comment. Declare it as a named constant at the top of the snippet rather than inlining it at the call site.
+  - **Exception — the canonical page itself.** `reference/program-addresses.mdx` is where addresses are written out; new addresses go there first, and a page that needs one links to its section.
 - **Error codes** live only in `reference/error-codes.mdx`. Instruction pages link to its anchors.
 - **Math definitions** live in `algorithms/`. Per-product `math.mdx` pages give the product-specific instantiation and link back.
 - **API endpoints** live in `api-reference/openapi/*.yaml`. Don't restate request/response shapes in narrative pages; link to the endpoint.

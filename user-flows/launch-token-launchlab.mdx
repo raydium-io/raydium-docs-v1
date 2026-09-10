@@ -68,64 +68,103 @@ On [raydium.io/launchpad/create](https://raydium.io/launchpad/create):
 
 ## Programmatic walkthrough
 
+The curve shape, the quote mint, the raise target and the LP-disposal policy are **not** arguments — they come from the `GlobalConfig` you bind to and from the `PlatformConfig` your launch runs under. What you pass is the mint's identity, the config to bind, and optionally a first buy:
+
 ```ts
-import { Raydium, TxVersion } from "@raydium-io/raydium-sdk-v2";
-import { PublicKey } from "@solana/web3.js";
+import {
+  Raydium,
+  TxVersion,
+  LAUNCHPAD_PROGRAM,
+  LaunchpadConfig,
+  getPdaLaunchpadConfigId,
+} from "@raydium-io/raydium-sdk-v2";
+import { Keypair, PublicKey } from "@solana/web3.js";
+import { NATIVE_MINT } from "@solana/spl-token";
 import BN from "bn.js";
 
 const raydium = await Raydium.load({ connection, owner, cluster: "mainnet" });
+const programId = LAUNCHPAD_PROGRAM;
 
-const baseMint  = new PublicKey("MyNewToken...");
-const quoteMint = new PublicKey("So11111111111111111111111111111111111111112"); // SOL
+// You generate the base mint's keypair and sign with it.
+const pair  = Keypair.generate();
+const mintA = pair.publicKey;
+
+// Bind a config: (quote mint, curve_type, index). This is what fixes the curve
+// shape, the quote mint and the raise target.
+const configId   = getPdaLaunchpadConfigId(programId, NATIVE_MINT, 0, 0).publicKey;
+const configData = await raydium.connection.getAccountInfo(configId);
+const configInfo = LaunchpadConfig.decode(configData!.data);
+const mintBInfo  = await raydium.token.getTokenInfo(configInfo.mintB);
 
 const { execute, extInfo } = await raydium.launchpad.createLaunchpad({
-  programId:      LAUNCHPAD_PROGRAM_ID,
-  baseMint,
-  quoteMint,
-  curveType:      0,                           // quadratic
-  totalBaseSupply:    new BN("1000000000000000000"),   // 1B tokens with 9 decimals
-  graduationQuoteAmount: new BN("85000000000"),         // 85 SOL
-  lpDisposalPolicy:   "Burn",
-  priceCurveParams: {
-    a: new BN("1"),
-    b: new BN("0"),
-    c: new BN("0"),
-  },
-  startTime: new BN(Math.floor(Date.now() / 1000) + 300),  // start in 5 min
+  programId,
+  mintA,
+  decimals: 6,
+  name:   "My New Token",
+  symbol: "MYNEW",                    // 10 characters or fewer
+  uri:    "https://example.com/metadata.json",
+  migrateType: "amm",                 // "amm" | "cpmm"
+
+  configId,
+  configInfo,
+  mintBDecimals: mintBInfo.decimals,
+  mintBProgram:  new PublicKey(mintBInfo.programId),
+
+  createOnly: true,                   // true = create the mint without a first buy
+  buyAmount:  new BN(1000),
+  slippage:   new BN(100),            // 100 = 1%
+
+  extraSigners: [pair],               // the base-mint keypair must sign
   txVersion: TxVersion.V0,
   computeBudgetConfig: { units: 400_000, microLamports: 50_000 },
 });
 
-const { txId } = await execute({ sendAndConfirm: true });
-console.log("Launch ID:", extInfo.launchId.toBase58());
-console.log("Base vault:", extInfo.baseVault.toBase58());
-console.log("Quote vault:", extInfo.quoteVault.toBase58());
+// createLaunchpad returns several transactions - run them in order.
+const { txIds } = await execute({ sequentially: true });
+console.log("Pool ID:", extInfo.address.poolId.toBase58());
+console.log("Base mint:", mintA.toBase58());
 ```
+
+`raydium.api.fetchLaunchConfigs()` lists the available configs with their default supply, sell amount and raise target, so you can show the user what a given config implies before they sign. Full annotated version, including the Token-2022 variant: [`products/launchlab/code-demos`](/products/launchlab/code-demos#create-a-launch).
 
 ## Pre-graduation monitoring
 
 Track activity via the API:
 
-```ts
-const status = await fetch(
-  `https://api-v3.raydium.io/launchpad/status?launchId=${launchId}`
-).then(r => r.json());
+LaunchLab has its own API hosts, separate from `api-v3.raydium.io`:
 
-console.log("Sold so far:",       status.baseSold.toString());
-console.log("Quote raised:",      status.quoteRaised.toString());
-console.log("Current price:",     status.currentPriceUsd);
-console.log("Graduation progress:", status.graduationProgress, "%");
+```ts
+// Mint-level info, keyed by base mint (comma-separated for a batch).
+const r = await fetch(
+  `https://launch-mint-v1.raydium.io/get/by/mints?ids=${mintA.toBase58()}`,
+).then((r) => r.json());
+console.log(r.data.rows[0]);
+
+// Also available: /main/configs (config list) on the same host, and
+// https://launch-history-v1.raydium.io/kline and /trade for price and fills.
 ```
 
-Or decode the on-chain state directly:
+Or read the on-chain state directly. The pool id is a PDA of `(programId, mintA, mintB)`:
 
 ```ts
-const launchState = await raydium.launchpad.fetchLaunchState(launchId);
+import { getPdaLaunchpadPoolId, Curve } from "@raydium-io/raydium-sdk-v2";
+
+const poolId = getPdaLaunchpadPoolId(programId, mintA, NATIVE_MINT).publicKey;
+const poolInfo = await raydium.launchpad.getRpcPoolInfo({ poolId });
+
 console.log({
-  baseSold:   launchState.baseSold.toString(),
-  quoteHeld:  launchState.quoteHeld.toString(),
-  graduated:  launchState.graduated,
+  status:      poolInfo.status,
+  baseSold:    poolInfo.realA.toString(),
+  totalSellA:  poolInfo.totalSellA.toString(),
+  quoteRaised: poolInfo.realB.toString(),
+  raiseTarget: poolInfo.totalFundRaisingB.toString(),
 });
+```
+
+Progress is best expressed in **price** terms rather than as a fraction of the raise, because the curve is non-linear. The demo repo's [`getFinishRate.ts`](https://github.com/raydium-io/raydium-sdk-V2-demo/blob/master/src/launchpad/getFinishRate.ts) does it with `Curve.getPrice`, `Curve.getPoolEndPriceReal` and `Curve.getPoolInitPriceByPool`:
+
+```
+finishRate = (currentPrice − initPrice) / (endPrice − initPrice)   // clamped to 1
 ```
 
 ### Metrics to watch
@@ -139,7 +178,7 @@ If sell-through is `<10%` after 24 hours, consider whether marketing is adequate
 
 ## Graduation
 
-Graduation is a separate transaction, callable by anyone (usually the first person to notice the threshold is reached earns the small `graduation_bounty`). No action required from you as creator beyond the initial setup.
+Graduation is a separate transaction, and it is **not** callable by anyone: `MigrateToCpswap` and the legacy `MigrateToAmm` each require their signer to match a wallet recorded on the binding `GlobalConfig` (`migrate_to_cpswap_wallet` / `migrate_to_amm_wallet`), and any other signer gets `InvalidOwner`. There is no bounty. Those wallets are run by Raydium's graduation crank, which lands the migration within seconds of the threshold being crossed. No action required from you as creator beyond the initial setup.
 
 ### What graduation does
 
@@ -153,27 +192,20 @@ After graduation, the CPMM pool is live and trades through normal Raydium routin
 
 ### Monitoring for graduation
 
-```ts
-const launchState = await raydium.launchpad.fetchLaunchState(launchId);
-if (launchState.graduated) {
-  const cpmmPoolId = launchState.graduatedCpmmPool;
-  console.log("Graduated to CPMM pool:", cpmmPoolId.toBase58());
-}
-```
-
-### Manual graduation
-
-If nobody claims the bounty and you want to force graduation, you can call it yourself:
+Watch `status` on the pool state and switch your UI over when it changes:
 
 ```ts
-await raydium.launchpad.graduate({
-  launchId,
-  txVersion: TxVersion.V0,
-  computeBudgetConfig: { units: 600_000, microLamports: 100_000 },
-});
+const before = (await raydium.launchpad.getRpcPoolInfo({ poolId })).status;
+
+setInterval(async () => {
+  const p = await raydium.launchpad.getRpcPoolInfo({ poolId });
+  if (p.status !== before) console.log("migrated - switch to the CPMM pool page");
+}, 10_000);
 ```
 
-Graduation uses significant CU; budget 600k.
+The graduated pool's address is the CPMM PDA for `(cpswap config, token0, token1)`, so you can derive it rather than waiting for it to be reported. For an indexer, subscribe over gRPC instead of polling — see [`products/launchlab/code-demos`](/products/launchlab/code-demos#watch-configs-and-pools-over-grpc).
+
+There is no "manual graduation" path for a creator or a third party. If a launch has crossed its threshold and has not migrated, that is an operational matter for the migration wallet, not something you can force from a client.
 
 ## Post-graduation
 
@@ -201,14 +233,19 @@ The CPMM pool should have (approximately):
 
 If you configured a creator-fee share, call periodically:
 
+The builder is `claimCreatorFee`, and it is keyed by the **quote mint** rather than by a launch — one call sweeps your accrued creator fees in that mint:
+
 ```ts
-await raydium.launchpad.collectCreatorFees({
-  launchId,
+import { NATIVE_MINT } from "@solana/spl-token";
+
+await raydium.launchpad.claimCreatorFee({
+  programId,
+  mintB: NATIVE_MINT,      // the quote mint to claim in
   txVersion: TxVersion.V0,
 });
 ```
 
-Fees accrue from curve trades pre-graduation and from the graduated CPMM pool post-graduation (if `ToCreator` LP).
+Use `claimMultipleCreatorFee` to batch across mints. Fees accrue from curve trades pre-graduation, and post-graduation from the CPMM pool's creator-fee path when the platform's `platform_cp_creator` leaves you as the recorded pool creator — see [`products/launchlab/platform-config`](/products/launchlab/platform-config).
 
 ## Announcement checklist
 

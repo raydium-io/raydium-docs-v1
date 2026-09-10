@@ -4,7 +4,9 @@ description: "TypeScript examples for swapping against and providing liquidity t
 ---
 
 <Info>
-  **Version banner.** All demos target `@raydium-io/raydium-sdk-v2@0.2.64-alpha` against Solana mainnet-beta, verified 2026-04. Program ID: `675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8` (see [`reference/program-addresses`](/reference/program-addresses)).
+  **Version banner.** All demos target `@raydium-io/raydium-sdk-v2@0.2.64-alpha` against Solana mainnet-beta, **verified 2026-09-09** — every builder name, parameter name and parameter type below was checked against that release's source and against [`raydium-sdk-V2-demo/src/amm`](https://github.com/raydium-io/raydium-sdk-V2-demo/tree/master/src/amm). Program ID: `675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8` (see [`reference/program-addresses`](/reference/program-addresses)).
+
+  Two traps that bite most first integrations: `computeAmountOut`'s `slippage` is a plain **number** (`0.005` = 0.5%), not a `Percent`; and `liquidity.swap` **requires** `inputMint` as a base58 string.
 </Info>
 
 <Info>
@@ -30,19 +32,18 @@ const raydium = await Raydium.load({ owner, connection, cluster: "mainnet" });
 ```ts
 import { PublicKey } from "@solana/web3.js";
 
-const poolId = new PublicKey("<AMM_V4_POOL_ID>");
+// `liquidity.getPoolInfoFromRpc` takes the pool id as a base58 STRING, not a PublicKey.
+const poolId = "58oQChx4yWmvKdwLLZzBi4ChoCc2fqCUWBkwMihLYQo2"; // SOL-USDC, see reference/program-addresses
 
-// Pull the SDK-normalized pool object. For AMM v4 this includes the OpenBook
-// accounts the instruction builders will need.
 const data = await raydium.liquidity.getPoolInfoFromRpc({ poolId });
 const { poolInfo, poolKeys, poolRpcData } = data;
 
 console.log("Pair:", poolInfo.mintA.symbol, "/", poolInfo.mintB.symbol);
 console.log("Version:", poolInfo.version);       // 4 for AMM v4
-console.log("Market:", poolKeys.marketId.toBase58());
+console.log("Market:", poolKeys.marketId);       // already a base58 string
 ```
 
-`poolKeys` is the struct the instruction builders consume. It carries every AMM v4 and OpenBook account in the order the program expects.
+`poolKeys` is the struct the instruction builders consume. It carries every AMM v4 account in the order the program expects, plus the legacy market fields that the current program accepts positionally but no longer reads.
 
 ## Swap (base-in)
 
@@ -67,7 +68,7 @@ const { execute } = await raydium.liquidity.swap({
   amountIn,
   amountOut: computed.minAmountOut,
   fixedSide: "in",
-  inputMint,
+  inputMint: poolInfo.mintB.address,   // a base58 STRING, and it is required
   txVersion: TxVersion.V0,
 });
 
@@ -97,7 +98,7 @@ const { execute } = await raydium.liquidity.swap({
   amountIn: computed.maxAmountIn,
   amountOut,
   fixedSide: "out",
-  inputMint: new PublicKey(poolInfo.mintB.address),
+  inputMint: poolInfo.mintB.address,   // base58 string, not a PublicKey
   txVersion: TxVersion.V0,
 });
 
@@ -107,20 +108,27 @@ await execute({ sendAndConfirm: true });
 ## Add liquidity
 
 ```ts
-const amountA = new BN(100_000_000);           // 0.1 SOL
+import { Percent, TokenAmount, toToken } from "@raydium-io/raydium-sdk-v2";
 
-const { anotherAmount, maxAnotherAmount } = raydium.liquidity.computePairAmount({
-  poolInfo,
-  amount: amountA,
-  baseIn: true,
-  slippage: 0.01,
-});
+const amountARaw = new BN(100_000_000);        // 0.1 SOL, in base units
 
+// computePairAmount takes a UI-decimal string (or Decimal) and a Percent —
+// not a BN and not a number — and it is synchronous.
+const { anotherAmount, maxAnotherAmount, minAnotherAmount } =
+  raydium.liquidity.computePairAmount({
+    poolInfo,
+    amount: "0.1",
+    baseIn: true,
+    slippage: new Percent(1, 100),
+  });
+
+// addLiquidity takes THREE TokenAmounts; otherAmountMin is required.
 const { execute } = await raydium.liquidity.addLiquidity({
   poolInfo,
   poolKeys,
-  amountInA: amountA,
+  amountInA: new TokenAmount(toToken(poolInfo.mintA), amountARaw),
   amountInB: maxAnotherAmount,
+  otherAmountMin: minAnotherAmount,
   fixedSide: "a",
   txVersion: TxVersion.V0,
 });
@@ -128,7 +136,7 @@ const { execute } = await raydium.liquidity.addLiquidity({
 await execute({ sendAndConfirm: true });
 ```
 
-`fixedSide: "a"` tells the SDK you supplied the exact `amountInA` and that `amountInB` should be at-most `maxAnotherAmount`. The pool's on-book liquidity is settled before the pro-rata math so the deposit ratio matches the freshest reserves.
+`fixedSide: "a"` tells the SDK you supplied the exact `amountInA` and that `amountInB` should be at most `maxAnotherAmount`. The pro-rata math runs off the vault balances minus accrued PnL — there is no longer any on-book component to settle first.
 
 ## Remove liquidity
 
@@ -151,21 +159,19 @@ Slippage mins protect against the pool's state shifting between your pre-quote a
 
 ## Compute-unit / priority fee tuning
 
-AMM v4 swaps are heavy on compute because every instruction validates the full OpenBook state. A typical swap uses 180k–250k CU depending on how many open orders need settling on the way through. Always pass a compute-unit limit:
+Since the OpenBook removal an AMM v4 swap no longer validates any market state, so a V1 `SwapBaseIn` is markedly cheaper than it used to be — and `SwapBaseInV2` (8 accounts, no market placeholders) is cheaper still. Measure your own path rather than budgeting off historical figures, and always pass an explicit compute-unit limit:
 
 ```ts
-import { ComputeBudgetProgram } from "@solana/web3.js";
-
-const { execute, innerTransactions } = await raydium.liquidity.swap({
+const { execute, transaction } = await raydium.liquidity.swap({
   /* ...params... */
   computeBudgetConfig: {
     units: 400_000,
-    microLamports: 50_000,       // priority fee
+    microLamports: 50_000,       // priority fee per CU
   },
 });
 ```
 
-If you omit `computeBudgetConfig`, the SDK may still use its own default; inspect `innerTransactions` to confirm. See [`integration-guides/priority-fee-tuning`](/integration-guides/priority-fee-tuning).
+If you omit `computeBudgetConfig`, the SDK may still use its own default; inspect the returned `transaction` to confirm. See [`integration-guides/priority-fee-tuning`](/integration-guides/priority-fee-tuning).
 
 ## Direct Rust CPI
 

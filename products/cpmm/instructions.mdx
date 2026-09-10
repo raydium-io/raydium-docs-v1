@@ -61,7 +61,7 @@ open_time:     u64   // Unix timestamp; swaps rejected before this
 | 7 | `lp_mint` | W |   | `init`ed here. Authority set to `authority`. |
 | 8 | `creator_token_0` | W |   | Source ATA for `init_amount_0`. |
 | 9 | `creator_token_1` | W |   | Source ATA for `init_amount_1`. |
-| 10 | `creator_lp_token` | W |   | Destination for LP (created if missing). |
+| 10 | `creator_lp_token` | W |   | Creator's ATA on `lp_mint`. `init` (not `init_if_needed`) — it must not already exist, which it cannot, since `lp_mint` is created in this same instruction. |
 | 11 | `token_0_vault` | W |   | `init`ed here. Owned by `authority`. |
 | 12 | `token_1_vault` | W |   | |
 | 13 | `create_pool_fee` | W |   | Destination ATA for the `create_pool_fee` paid by the creator. |
@@ -78,14 +78,14 @@ open_time:     u64   // Unix timestamp; swaps rejected before this
 **Preconditions**
 
 - Mints are sorted (`token_0_mint < token_1_mint` by byte order).
-- Neither mint uses an extension outside the CPMM allow-list (`TransferFeeConfig`, `MetadataPointer`, `TokenMetadata`, `InterestBearingConfig`, `ScaledUiAmount`) — see [`products/cpmm/accounts`](/products/cpmm/accounts#vaults-and-token-2022). A mint with a `SupportMintAssociated` PDA (seed `[b"support_mint", mint]`) skips the check; that registry is the only bypass since the 2026-09 upgrade removed the hardcoded four-mint whitelist.
+- Neither mint uses an extension outside the CPMM allow-list (`TransferFeeConfig`, `MetadataPointer`, `TokenMetadata`, `InterestBearingConfig`, `ScaledUiAmount`) — see [`products/cpmm/accounts`](/products/cpmm/accounts#vaults-and-token-2022). A mint whose `SupportMintAssociated` PDA (seed `[b"support_mint", mint]`) exists skips the extension check — **but you must append that PDA to `remaining_accounts`**. The program only scans the accounts you pass and never loads the PDA itself, so relying on the registry without supplying the account still fails with `NotSupportMint` (`6007`). Order does not matter (matching is by key); pass one entry per mint that needs the bypass. That registry is the only bypass since the 2026-09 upgrade removed the hardcoded four-mint whitelist.
 - `creator` has at least `init_amount_0` and `init_amount_1` in the respective ATAs.
 - `amm_config.disable_create_pool == false`.
 
 **Postconditions**
 
-- `pool_state` exists with `lp_supply = sqrt(init_amount_0 * init_amount_1) − LOCKED_LP`.
-- The LP starter of `LOCKED_LP` (`100` lamports of LP token) is permanently locked in the pool — `pool_state.lp_supply` records `liquidity − 100` while `100` LP units remain outside circulation, preventing the pool from being fully drained and dividing by zero.
+- `pool_state.lp_supply = sqrt(init_amount_0 * init_amount_1)` — the **full** square root. The creator is minted `lp_supply − 100`; the 100 locked base units are counted in `lp_supply` but never minted.
+- So `lp_mint.supply == pool_state.lp_supply − 100` for the life of the pool. All LP-share math (deposit, withdraw) divides by `lp_supply`, so use that field and do not substitute the mint's on-chain supply. Reverts with `InitLpAmountTooLess` if `sqrt(...) < 100`.
 - `observation_state` is initialized; `observation_index = 0` and `pool_id = pool_state.key()`.
 - `create_pool_fee` lamports are transferred from the creator to the receiver and synced as native SOL (it is a wSOL ATA).
 - The pool's status bitmask is `0` (deposit / withdraw / swap all enabled).
@@ -131,13 +131,16 @@ maximum_token_1:   u64
 **Math**
 
 ```
-needed_token_0 = ceil(lp_token_amount * vault_0 / lp_supply)
-needed_token_1 = ceil(lp_token_amount * vault_1 / lp_supply)
-require(needed_token_0 <= maximum_token_0, "ExceededSlippage")
-require(needed_token_1 <= maximum_token_1, "ExceededSlippage")
+total_0 = vault_0 − protocol_fees_0 − fund_fees_0 − creator_fees_0    // same for side 1
+
+needed_token_0 = ceil(lp_token_amount * total_0 / lp_supply)
+transfer_0     = needed_token_0 + inverse_transfer_fee(needed_token_0) // Token-2022
+require(transfer_0 <= maximum_token_0, "ExceededSlippage")             // same for side 1
 ```
 
-No change to `k`'s proportionality — both vaults and `lp_supply` scale by the same factor.
+Two details worth pinning down: the pro-rata base is the **fee-excluded** vault total (`vault_amount_without_fee`, i.e. the raw balance minus the accrued protocol, fund and creator counters), not the raw vault balance; and the slippage cap is checked against what the payer actually transfers, *after* the Token-2022 transfer fee is added on, not against the gross vault movement.
+
+No change to `k`'s proportionality — both totals and `lp_supply` scale by the same factor.
 
 **Postconditions**
 
@@ -176,16 +179,21 @@ minimum_token_1:   u64
 | 11 | `vault_0_mint` |   |   |
 | 12 | `vault_1_mint` |   |   |
 | 13 | `lp_mint` | W |   |
+| 14 | `memo_program` |   |   |
 
-(Identical to `Deposit`; `lp_mint` is writable because the LP tokens are burned.)
+The first 13 accounts are identical to `Deposit`, and `lp_mint` is writable because the LP tokens are burned. `Withdraw` additionally takes a 14th account, `memo_program` (constrained `address = memo::ID`) — `Deposit` does not. A 13-account `Withdraw` fails Anchor deserialization, so the LP cannot exit.
 
 **Math**
 
 ```
-out_token_0 = floor(lp_token_amount * vault_0 / lp_supply)
-out_token_1 = floor(lp_token_amount * vault_1 / lp_supply)
-require(out_token_0 >= minimum_token_0, "ExceededSlippage")
-require(out_token_1 >= minimum_token_1, "ExceededSlippage")
+total_0 = vault_0 − protocol_fees_0 − fund_fees_0 − creator_fees_0    // same for side 1
+
+out_token_0     = min(total_0, floor(lp_token_amount * total_0 / lp_supply))
+receive_token_0 = out_token_0 − transfer_fee(out_token_0)             // Token-2022
+require(receive_token_0 >= minimum_token_0, "ExceededSlippage")       // same for side 1
+
+// As with Deposit: the base is the fee-excluded vault total, and the floor is
+// checked against what the LP actually receives, after the transfer fee.
 ```
 
 **Postconditions**
@@ -267,7 +275,7 @@ Sweep accrued protocol fees from the vaults to the protocol destination.
 
 | # | Name | W | S | Notes |
 |---|------|---|---|-------|
-| 1 | `owner` |   | S | Must match `amm_config.protocol_owner`. |
+| 1 | `owner` |   | S | Must equal `amm_config.protocol_owner` **or** the program's hardcoded admin key. |
 | 2 | `authority` |   |   |
 | 3 | `pool_state` | W |   |
 | 4 | `amm_config` |   |   |
@@ -291,11 +299,11 @@ pool_state.protocol_fees_token1 = 0
 
 No change to the curve's effective balances (accrued fees were already excluded).
 
-**Common error** — `NotApproved` if signer is not `protocol_owner`.
+**Common error** — `InvalidOwner` (`6001`) if the signer is neither `amm_config.protocol_owner` nor the program admin. (There is no `NotApproved` on this path.)
 
 ## `CollectFundFee`
 
-Same shape as `CollectProtocolFee` but signed by `fund_owner` and zeroing the `fund_fees_*` counters.
+Same shape as `CollectProtocolFee` but signed by `amm_config.fund_owner` — or, again, the program admin — and zeroing the `fund_fees_*` counters. Same `InvalidOwner` on a wrong signer.
 
 ## `CollectCreatorFee`
 
@@ -357,7 +365,7 @@ status: u8      // new bitmask
 | 1 | `authority` |   | S | Must match the admin key on the CPMM program. |
 | 2 | `pool_state` | W |   |
 
-The admin key is the upgrade authority on the CPMM program — in practice, the Raydium multisig. See [`security/admin-and-multisig`](/security/admin-and-multisig).
+The admin key is a pubkey **compiled into the program** (`crate::admin::ID`), not the BPF upgrade authority — changing it requires a program upgrade. See [`reference/program-addresses`](/reference/program-addresses) for the value and [`security/admin-and-multisig`](/security/admin-and-multisig) for who holds it.
 
 ## `CreateAmmConfig`
 
@@ -390,20 +398,23 @@ creator_fee_rate:  u64
 <Note>
   **Changed in 2026-09: the new config's fee owners no longer come from the signer.** `create_amm_config` now writes the program's hardcoded `protocol_fee_owner::ID` into `protocol_owner` and `fund_fee_owner::ID` into `fund_owner`, instead of copying the admin signer's key into both. Addresses are in [`reference/program-addresses`](/reference/program-addresses#cpmm-fee-owner-wallets).
 
-  Consequences: a newly created `AmmConfig` is immediately swept by the dedicated fee wallets rather than by the admin key, and the admin can no longer collect from a config it just created without first rotating the field. **Existing `AmmConfig` accounts are not rewritten** — whatever is stored on them still governs, so always read `protocol_owner` / `fund_owner` off the account instead of assuming either value. `UpdateAmmConfig` params `3` and `4` still rotate them.
+  Consequences: fees on a newly created `AmmConfig` land in the dedicated fee wallets rather than the admin's. The admin does remain an accepted *signer* for collection — `CollectProtocolFee` / `CollectFundFee` accept `amm_config.protocol_owner` / `fund_owner` **or** `crate::admin::ID` — so nothing has to be rotated to sweep; what changed is only where the proceeds go by default. **Existing `AmmConfig` accounts are not rewritten** — whatever is stored on them still governs, so always read `protocol_owner` / `fund_owner` off the account instead of assuming either value. `UpdateAmmConfig` params `3` and `4` still rotate them.
 </Note>
 
 ## `UpdateAmmConfig`
 
-Change fee rates or ownership on an existing `AmmConfig`. Takes a `param: u8` (discriminator for which field to update) and a `value: u64`. The value semantics per param are in the source; commonly:
+Change fee rates or ownership on an existing `AmmConfig`. Takes a `param: u8` (which field to update) and a `value: u64`. The full dispatch table:
 
-- `param = 0` → `trade_fee_rate`
-- `param = 1` → `protocol_fee_rate`
-- `param = 2` → `fund_fee_rate`
-- `param = 3` → `new_protocol_owner` (pass `Pubkey` bytes as a reinterpret)
-- `param = 4` → `new_fund_owner`
+- `param = 0` → `trade_fee_rate` (asserts `trade_fee_rate + creator_fee_rate < 1_000_000`)
+- `param = 1` → `protocol_fee_rate` (asserts `≤ 1_000_000` and `+ fund_fee_rate ≤ 1_000_000`)
+- `param = 2` → `fund_fee_rate` (asserts `≤ 1_000_000` and `+ protocol_fee_rate ≤ 1_000_000`)
+- `param = 3` → `protocol_owner`. The new key is **not** in `value`: append it as `remaining_accounts[0]` (read-only is fine). It must not be the default pubkey, and omitting the account panics on an `unwrap()`.
+- `param = 4` → `fund_owner`. Same mechanism as `3`.
 - `param = 5` → `create_pool_fee`
-- `param = 6` → `disable_create_pool`
+- `param = 6` → `disable_create_pool` (any non-zero `value` disables)
+- `param = 7` → `creator_fee_rate` (asserts `creator_fee_rate + trade_fee_rate < 1_000_000`)
+
+Any other `param` returns `InvalidInput`.
 
 Changes are signed by the admin and affect **every pool bound to this `AmmConfig`** on the next swap. No migration; pools simply read the new values.
 

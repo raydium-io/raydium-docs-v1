@@ -30,13 +30,27 @@ The exact files:
 
 The IDL files are versioned in the repo's git history; pin to a specific commit if you need byte-for-byte reproducibility.
 
-IDLs can also be pulled directly from the deployed programs via Anchor's **on-chain IDL** feature (if the program publisher opted in):
+Some IDLs can also be pulled directly from mainnet:
 
 ```bash
 anchor idl fetch <PROGRAM_ID> --provider.cluster mainnet
 ```
 
-CPMM, CLMM, and LaunchLab all have on-chain IDLs. AMM v4, Stable AMM, and Farm do not (pre-Anchor programs).
+There are now **two** on-chain IDL mechanisms, and Raydium's programs are split across them — which matters because a given Anchor CLI version may only know about one:
+
+| Program | Where its IDL lives | Account | Reports |
+|---------|--------------------|---------|---------|
+| CLMM | Legacy Anchor `anchor:idl` account | `FbDNAPsgm8Y5jWXQkXjpfN6Bp8xHeRkhMmsstAooPyY9` | `raydium_clmm` 0.1.0 — 38 instructions, 52 errors |
+| LaunchLab | Legacy Anchor `anchor:idl` account | `E6wT2uNeoWUvDrwdch1R8ETsyewR1ZM4WAwsa5hLJK5Z` | `raydium_launchpad` 0.2.0 — 27 instructions |
+| Lock (Burn \& Earn) | Legacy Anchor `anchor:idl` account | `HzLkUWn57cdtyQNQLJpyu2EPF8qQAiGt4iuiEo1XnEFK` | 4 instructions (pre-`metadata` IDL spec) |
+| **CPMM** | **Program Metadata program** `ProgM6JCCvbYkfKqJYHePx4xxSUSqJp7rh8Lyv7nk7S` | `FHuJXL7cEttfHk4sXdTAXVaRymBdKfVs7ZH6cMgA1ihk` (canonical, seed `idl`) | `raydium_cp_swap` 0.2.0 |
+| AMM v4, Stable AMM, AMM Routing, Farm v3 / v5 / v6 | Nowhere | — | Non-Anchor programs; no IDL is published |
+
+<Warning>
+  **CPMM has no legacy `anchor:idl` account.** Its IDL was migrated to the Program Metadata program, so `anchor idl fetch CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C` fails on any Anchor CLI that only checks the legacy PDA. Use the IDL shipped with the SDK, or read the metadata account above, until your CLI supports the metadata program.
+</Warning>
+
+All three legacy IDL accounts are writable by the IDL authority `2XVnob28A5Qnpcy95UVeHWNT6G8Poy3tpA3AFyAMoZDt`, which is separate from the programs' BPF upgrade authority — so an IDL can be refreshed without redeploying, and can also lag a redeploy. Treat the on-chain IDL as a convenience, not as proof of the deployed bytecode's shape.
 
 ## Regenerating a TypeScript client
 
@@ -58,7 +72,10 @@ import { Program, AnchorProvider } from "@anchor-lang/core";
 import cpmmIdl from "./idls/raydium_cp_swap.json";
 
 const provider = new AnchorProvider(connection, wallet, {});
-const program  = new Program(cpmmIdl as any, CPMM_PROGRAM_ID, provider);
+// Anchor >= 0.30 reads the program id from `idl.address` — these IDLs are spec 0.1.0
+// and carry it. The three-argument form `new Program(idl, programId, provider)` is
+// pre-0.30 and throws.
+const program  = new Program(cpmmIdl as any, provider);
 
 // Typed method builders auto-generated:
 await program.methods
@@ -74,11 +91,13 @@ Most integrators do **not** do this — they use the higher-level `raydium.cpmm.
 Raydium publishes Anchor crates for the programs that have IDLs:
 
 ```toml
-# Cargo.toml
+# Cargo.toml — the dependency key must be the crate's PACKAGE name.
 [dependencies]
-raydium_cp_swap = { git = "https://github.com/raydium-io/raydium-cp-swap", branch = "master", features = ["cpi"] }
-raydium_amm_v3 = { git = "https://github.com/raydium-io/raydium-clmm",    branch = "master", features = ["cpi"] }
+raydium-cp-swap = { git = "https://github.com/raydium-io/raydium-cp-swap", branch = "chore/upgrade-anchor", features = ["cpi"] }
+raydium-clmm    = { git = "https://github.com/raydium-io/raydium-clmm",    branch = "master",              features = ["cpi"] }
 ```
+
+In code, refer to them by their **lib** names, `raydium_cp_swap` and `raydium_clmm`. There is no crate called `raydium_amm_v3` under any spelling. Note the branches differ: `raydium-cp-swap`'s `master` still pins `anchor-lang 0.32.1`, so an Anchor-1.0 integration needs `chore/upgrade-anchor`; CLMM is on `0.32.1` either way, which is why the two cannot share a crate.
 
 The `cpi` feature exposes `cpi::accounts::<Ix>` account structs and `cpi::<ix>()` invokers — ready-to-use CPI wrappers. See [`sdk-api/rust-cpi`](/sdk-api/rust-cpi) for usage patterns.
 
@@ -122,11 +141,11 @@ See [`sdk-api/python-integration`](/sdk-api/python-integration) for a fuller wal
 Raydium follows these rules for IDL stability:
 
 1. **Instruction discriminators never change.** Adding new instructions extends the enum at the end; existing discriminators remain stable.
-2. **Account struct layouts evolve only additively.** New fields go at the end, preceded by a size bump in the on-chain schema. Existing fields keep their offsets.
+2. **Account sizes are stable; new fields come out of reserved padding.** Every Raydium state struct carries a trailing padding region sized at creation, and a new field is carved from that padding rather than appended — so the account's byte length and the offsets of all *pre-existing* fields stay fixed. The corollary is that bytes you previously read as padding can become meaningful, and a field can be retired back into padding (as `PlatformConfig.curve_params` was in the 2026-08-31 release). Re-read the struct definition after an upgrade; do not assume padding stays zero.
 3. **Error enum codes are append-only.** An existing error code always means the same thing.
 4. **Breaking changes ship in new programs.** When a redesign is needed, the team deploys a new program ID (e.g. CPMM as a fresh program rather than upgrading AMM v4). Old pools continue to run on the old program; new pools go to the new one.
 
-This policy makes regenerated clients backward-compatible: a client generated against a two-version-old IDL will still decode current state correctly (it sees extra trailing bytes as padding).
+This policy keeps regenerated clients mostly backward-compatible: a client generated against an older IDL keeps decoding the fields it knows, at the offsets it knows. What it will *not* see is a field carved out of what it still treats as padding — and, in the rare retirement case, a field it decodes may no longer be written. It does not see "extra trailing bytes": the account length does not change.
 
 ## What to do when the IDL changes
 
@@ -146,6 +165,8 @@ Usually means a client built against version N of the IDL is trying to invoke an
 anchor idl fetch <PROGRAM_ID>
 ```
 
+For CPMM this will not work — see the IDL-location table above; pull the SDK's bundled IDL instead.
+
 ### Account decode failures
 
 If `program.account.<Name>.fetch(pubkey)` throws with "Invalid account discriminator", the account was created by a previous program version and Anchor is rejecting its 8-byte discriminator. The fix is to use the raw layout parser from the SDK (`PoolInfoLayout.decode(accountData)`) which does not enforce Anchor discriminators.
@@ -163,4 +184,4 @@ Anchor's TS codegen only generates methods for instructions whose IDL entry has 
 Sources:
 
 - [Raydium IDL repository](https://github.com/raydium-io/raydium-idl)
-- [Anchor IDL spec](https://www.anchor-lang.com/docs/idl)
+- [Anchor IDL spec](https://www.anchor-lang.com/docs/basics/idl)
