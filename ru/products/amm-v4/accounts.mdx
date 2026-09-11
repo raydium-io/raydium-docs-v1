@@ -21,13 +21,11 @@ description: "Полный реестр аккаунтов пула AMM v4 — A
 |----------|---------|----------|------|
 | Пул | `AmmInfo` | Программа AMM v4 | Состояние пула: накопленные комиссии, статус, ссылки на хранилища (и, как устаревшие поля, маркет). |
 | Пул | `amm_authority` | Программа AMM v4 | Принадлежащий программе PDA, подписывающий перемещения хранилищ. Общий для всех пулов AMM v4. |
-| Пул | `amm_open_orders` | OpenBook | Устаревшая ссылка на `OpenOrders`. Больше не читается/записывается программой; по-прежнему передаётся позиционно в макетах v1. |
+| Пул | `amm_open_orders` | OpenBook | Устаревшая ссылка на `OpenOrders`. Никогда не создаётся и не читается текущей программой, которая записывает `AmmInfo.open_orders = Pubkey::default()` в каждом новом пуле; реальное значение есть только у пулов, созданных до удаления OpenBook. По-прежнему передаётся позиционно в макетах v1. |
 | Пул | `amm_target_orders` | Программа AMM v4 | Устаревший аккаунт целевых ордеров. По-прежнему используется `WithdrawPnl` (как аккаунт #10), но сетка не строится. |
 | Пул | `pool_coin_token_account` | SPL Token | Хранилище пула на стороне coin (ATA `amm_authority`). |
 | Пул | `pool_pc_token_account` | SPL Token | Хранилище пула на стороне pc. |
 | Пул | `lp_mint` | SPL Token | Fungible LP mint. |
-| Пул | `pool_withdraw_queue` | Программа AMM v4 | Устаревшая очередь для отложенных выводов; хранится нулевой длины. |
-| Пул | `pool_temp_lp` | Программа AMM v4 | Вспомогательный LP аккаунт. |
 | Устаревшие (OpenBook) | `serum_market` | OpenBook | Привязанный маркет. Передаётся в макетах v1, но больше не проверяется и не используется. |
 | Устаревшие | `serum_bids`, `serum_asks` | OpenBook | Очереди бидов/асков. Игнорируются. |
 | Устаревшие | `serum_event_queue` | OpenBook | Ожидающие события. Игнорируются. |
@@ -73,11 +71,12 @@ pub struct AmmInfo {
     pub market: Pubkey,        // маркет OpenBook
     pub market_program: Pubkey, // ID программы OpenBook
     pub target_orders: Pubkey,
-    pub withdraw_queue: Pubkey,
-    pub lp_vault:       Pubkey, // = pool_temp_lp
-    pub owner: Pubkey,          // администратор (multisig)
-    pub lp_reserve: u64,
-    pub padding: [u64; 3],
+    pub padding1: [u64; 8],     // резерв — НЕ withdraw_queue / lp_vault
+    pub amm_owner: Pubkey,      // администратор (multisig)
+    pub lp_amount: u64,         // внутренний итог LP пула; см. примечание ниже
+    pub client_order_id: u64,
+    pub recent_epoch: u64,
+    pub padding2: u64,
 }
 
 pub struct Fees {
@@ -118,7 +117,9 @@ pub struct StateData {
 - **`coin_decimals`**, **`pc_decimals`** — соответствующие минтам.
 - **`open_orders`**, **`target_orders`**, **`market`** — устаревшие справочные поля. По-прежнему присутствуют на `AmmInfo` и по-прежнему передаются позиционно в макетах инструкций v1, но программа больше их не читает и не проверяет. Точки входа V2 для свопов их опускают.
 - **`fees.swap_fee_numerator / swap_fee_denominator`** — объединённая комиссия торговли. По умолчанию `25 / 10_000 = 0.25%`.
-- **`status`** — битовая маска, ограничивающая операции. Устанавливается администратором через `AdminSetStatus`.
+- **`status`** — единственное перечислимое состояние типа `u64`, ограничивающее операции, а **не** битовая маска. Устанавливается администратором через `SetParams` с `param = 0` (`Status`). См. [Статус](#статус) ниже.
+- **`lp_amount`** — внутренний итог LP пула. Он **не** равен `lp_mint.supply`: он ровно на один целый LP-токен (`10^coin_decimals` базовых единиц) больше, потому что эта сумма учитывается при инициализации, но никогда не минтится. Вся пропорциональная математика в программе использует `lp_amount`, поэтому используйте его и вы.
+- **`amm_owner`** — записывается при создании из жёстко заданного в программе ключа администратора, а не из ключа создателя.
 - **`state_data.need_take_pnl_*`** — дельта между валовыми накопленными комиссиями и тем, что было снято. `TakePnl` обнуляет эти значения.
 
 ## Проводка OpenBook
@@ -166,48 +167,67 @@ const [ammAuthority] = PublicKey.findProgramAddressSync(
 );
 ```
 
-Существует отдельная authority, **ограниченная пулом**, полученная для каждого пула для подписания операций OpenBook (`amm_authority` выше фактически охватывает обе в дизайне этой программы; разные версии использовали разные получения, поэтому проверьте `AmmInfo.nonce` конкретного пула в коде).
+Второй, ограниченной пулом authority не существует: этот единственный PDA покрывает всё, что подписывает программа. Его bump равен `254` в mainnet и дублируется на каждом `AmmInfo` в поле `nonce`; `WithdrawExcessLamports` заново выводит его с жёстко заданным этим nonce.
 
 ## Хранилища
 
-Хранилища SPL Token пула — это стандартные аккаунты токенов, чей `owner` — это `amm_authority`. Не ATAs — их адреса — это специфичные PDAs, полученные при `Initialize` с seeds `["amm_associated_seed", coin_mint_or_pc_mint, market, amm_id]`. Адреса хранятся на `AmmInfo`; получение — это одноразовая любопытство.
+Хранилища SPL Token пула — это стандартные аккаунты токенов, чей `owner` — это `amm_authority`. Это не ATA — их адреса являются PDA, полученными при `Initialize2` из `[AMM_V4_PROGRAM_ID, market, "coin_vault_associated_seed"]` и `[AMM_V4_PROGRAM_ID, market, "pc_vault_associated_seed"]`. Минт в seeds не входит, как и `amm_id`. Адреса хранятся на `AmmInfo`; их вывод — одноразовое любопытство.
 
-Token-2022 **не поддерживается**. Программа жёстко кодирует ID программы SPL Token для всех перемещений хранилищ. Попытка привязать пул AMM v4 к минту Token-2022 не удаётся при `Initialize`.
+Token-2022 **не поддерживается**. Программа жёстко кодирует ID программы SPL Token для всех перемещений хранилищ. Попытка привязать пул AMM v4 к минту Token-2022 не удаётся при `Initialize2` с ошибкой `InvalidSplTokenProgram`.
 
 ## LP mint
 
-Классический SPL Token mint, чья authority — это `amm_authority`. Общее предложение отслеживает владение LP пулом; сжигание LP возвращает токены из обоих хранилищ пропорционально. Поскольку AMM v4 предшествует CPMM, в состоянии пула нет зеркала `lp_supply` — читайте предложение минта в цепи напрямую.
+Классический SPL Token mint, чья authority — это `amm_authority`. Общее предложение отслеживает владение LP пулом; сжигание LP возвращает токены из обоих хранилищ пропорционально.
 
-## Битовая маска статуса
+Зеркало в состоянии всё же **есть**: `AmmInfo.lp_amount`. Оно не равно предложению минта — оно ровно на один целый LP-токен (`10^coin_decimals` базовых единиц) больше, потому что эта сумма учитывается при инициализации, но никогда не минтится. Каждое пропорциональное вычисление в программе делит на `lp_amount`, поэтому используйте это поле, а не предложение минта в цепи.
 
-`AmmInfo.status` ограничивает операции. Биты (позиция может отличаться в разных версиях программы — подтвердите через исходный код):
+## Статус
 
-| Бит | Флаг | Эффект |
-|-----|------|--------|
-| 0 | `SWAP_DISABLED` | `Swap*` отклоняет. |
-| 1 | `DEPOSIT_DISABLED` | `Deposit` отклоняет. |
-| 2 | `WITHDRAW_DISABLED` | `Withdraw` отклоняет. |
-| 3 | `CLMM_LIKE_MIGRATE` | Флаг ограничения миграции, используемый операциями. |
+`AmmInfo.status` — это единственное перечислимое состояние типа `u64`, а **не** битовая маска. Проверяйте его на равенство: клиент, проверяющий `status & 1`, неверно классифицирует каждый живой пул, потому что обычное торговое состояние — это `6`, у которого бит 0 установлен.
 
-Multisig Raydium устанавливает эти значения через `SetParams` (с `param = Status`). (`AdminCancelOrders` был удалён.)
+| Значение | `AmmStatus` | Swap | Deposit | Withdraw |
+|-------|-------------|------|---------|----------|
+| 0 | `Uninitialized` | нет | нет | нет |
+| 1 | `Initialized` | да | да | да |
+| 2 | `Disabled` | нет | нет | нет |
+| 3 | `WithdrawOnly` | нет | нет | да |
+| 4 | `LiquidityOnly` | нет | да | да |
+| 5 | `OrderBookOnly` | нет | да | да |
+| 6 | `SwapOnly` | да | да | да |
+| 7 | `WaitingTrade` | да, после наступления `pool_open_time` | да | да |
+
+`Initialize2` записывает `7`, если `open_time` в будущем, и `6` в противном случае; пул со значением `7` сам переключается на `6` при первом свопе в момент `state_data.pool_open_time` или позже. Значение вне диапазона `0..=7` вызывает панику в `AmmStatus::from_u64`.
+
+Multisig Raydium устанавливает состояние через `SetParams` с `param = 0` (`Status`); принимаются только значения `1`–`7`. (`AdminCancelOrders` был удалён.)
 
 ## Наблюдение / оракул
 
-**AMM v4 не имеет выделенного аккаунта наблюдения.** Другие протоколы, которым нужен TWAP в цепи, обычно потребляют пересечения книги OpenBook косвенно или читают вне цепи. Если вам нужен TWAP Raydium с поддержкой программы, используйте CPMM или CLMM.
+**AMM v4 не имеет выделенного аккаунта наблюдения**, и после удаления OpenBook нет и состояния книги ордеров, из которого его можно было бы вывести. Если вам нужен TWAP Raydium с поддержкой программы, используйте CPMM или CLMM — оба поддерживают кольцевой буфер `ObservationState`. В противном случае индексируйте логи свопов вне цепи.
 
 ## Получение аккаунтов пула с нуля
 
-Поскольку AMM v4 не был разработан для детерминированных PDAs для каждой пары (это предшествует этому соглашению Solana), канонический `amm_id` — это **seeded keypair**, полученный с:
+Аккаунты пула AMM v4 — это обычные PDA, ключом для которых служит привязанный маркет: не seeded keypair и не PDA для каждой пары. Все они используют одну и ту же трёхсидовую форму `[AMM_V4_PROGRAM_ID, market, <label>]` под `AMM_V4_PROGRAM_ID`:
 
-```
-ammId = createWithSeed(
-  owner: ammAuthority,
-  seed:  marketPubkey.toBase58().slice(0, 32),
-  programId: AMM_V4_PROGRAM_ID,
-)
+| Аккаунт | `<label>` |
+|---------|-----------|
+| `amm_id` (`AmmInfo`) | `"amm_associated_seed"` |
+| `amm_target_orders` | `"target_associated_seed"` |
+| `lp_mint` | `"lp_mint_associated_seed"` |
+| `pool_coin_token_account` | `"coin_vault_associated_seed"` |
+| `pool_pc_token_account` | `"pc_vault_associated_seed"` |
+
+```ts
+const [ammId] = PublicKey.findProgramAddressSync(
+  [
+    AMM_V4_PROGRAM_ID.toBuffer(),
+    marketPubkey.toBuffer(),
+    Buffer.from("amm_associated_seed"),
+  ],
+  AMM_V4_PROGRAM_ID,
+);
 ```
 
-Тот же паттерн seeded-key применяется к `amm_open_orders`, `amm_target_orders`, `amm_withdraw_queue`, `pool_temp_lp`, `pool_coin_token_account`, `pool_pc_token_account` и `lp_mint`. SDK и API предварительно вычисляют эти значения для вас; см. `raydium-sdk-v2`'s `Liquidity.getAssociatedPoolKeys`.
+Привязанный маркет — единственный переменный seed, поэтому один маркет соответствует ровно одному пулу AMM v4. SDK и API предварительно вычисляют эти значения для вас; см. `Liquidity.getAssociatedPoolKeys` в `raydium-sdk-v2`.
 
 На практике интеграторы читают полный набор аккаунтов пула из `GET https://api-v3.raydium.io/pools/info/ids?ids=<POOL_ID>` или из SDK. Ручное получение редко требуется.
 
@@ -215,7 +235,7 @@ ammId = createWithSeed(
 
 | Событие | Созданные аккаунты | Удалённые аккаунты |
 |---------|-------------------|-------------------|
-| `Initialize2` | `amm_info`, `amm_open_orders`, `amm_target_orders`, хранилища, `lp_mint`, `pool_withdraw_queue`, `pool_temp_lp` | — |
+| `Initialize2` | `amm_info`, `amm_target_orders`, оба хранилища, `lp_mint` и LP ATA создателя | — |
 | `Deposit` | — (может создать пользовательский LP ATA) | — |
 | `Withdraw` | — | — |
 | `SwapBaseIn` / `SwapBaseOut` (v1 / V2) | — (может создать пользовательский ATA) | — |
@@ -228,7 +248,7 @@ ammId = createWithSeed(
 - **Математика и арифметика комиссий**: [`products/amm-v4/math`](/ru/products/amm-v4/math).
 - **Разделение комиссий и сравнение с CPMM/CLMM**: [`products/amm-v4/fees`](/ru/products/amm-v4/fees).
 - **Списки аккаунтов инструкций**: [`products/amm-v4/instructions`](/ru/products/amm-v4/instructions).
-- **Получение аккаунтов OpenBook**: Документация программы OpenBook ([`github.com/openbook-dex/program`](https://github.com/openbook-dex/program)).
+- **Получение аккаунтов OpenBook**: исходный код программы OpenBook ([`github.com/openbook-dex/program`](https://github.com/openbook-dex/program)) — Rust-монорепозиторий, а не текстовая документация.
 
 Источники:
 

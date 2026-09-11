@@ -9,6 +9,10 @@ description: "针对现有 AMM v4 池进行交换和提供流动性的 TypeScrip
   [查看英文版 →](/products/amm-v4/code-demos)
 </Info>
 
+**版本说明。** 所有示例针对 Solana mainnet-beta 上的 `@raydium-io/raydium-sdk-v2@0.2.64-alpha`，**已于 2026-09-09 验证** —— 下面每一个构建器名称、参数名称和参数类型都对照该版本的源码以及 [`raydium-sdk-V2-demo/src/amm`](https://github.com/raydium-io/raydium-sdk-V2-demo/tree/master/src/amm) 做过核对。程序 ID：`675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8`（见 [`reference/program-addresses`](/zh/reference/program-addresses)）。
+
+大多数首次集成都会踩的两个坑：`computeAmountOut` 的 `slippage` 是普通的**数字**（`0.005` = 0.5%），不是 `Percent`；并且 `liquidity.swap` **要求** `inputMint` 为 base58 字符串。
+
 <Info>
   **版本说明。** 所有示例针对 `@raydium-io/raydium-sdk-v2@0.2.64-alpha`，在 Solana mainnet-beta 上验证，时间为 2026-04。程序 ID：`675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8`（参见 [`reference/program-addresses`](/zh/reference/program-addresses)）。
 </Info>
@@ -36,18 +40,18 @@ const raydium = await Raydium.load({ owner, connection, cluster: "mainnet" });
 ```ts
 import { PublicKey } from "@solana/web3.js";
 
-const poolId = new PublicKey("<AMM_V4_POOL_ID>");
+// `liquidity.getPoolInfoFromRpc` takes the pool id as a base58 STRING, not a PublicKey.
+const poolId = "58oQChx4yWmvKdwLLZzBi4ChoCc2fqCUWBkwMihLYQo2"; // SOL-USDC, see reference/program-addresses
 
-// 拉取 SDK 规范化的池对象。对于 AMM v4，这包括指令构建器需要的 OpenBook 账户。
 const data = await raydium.liquidity.getPoolInfoFromRpc({ poolId });
 const { poolInfo, poolKeys, poolRpcData } = data;
 
 console.log("交易对：", poolInfo.mintA.symbol, "/", poolInfo.mintB.symbol);
 console.log("版本：", poolInfo.version);       // AMM v4 为 4
-console.log("市场：", poolKeys.marketId.toBase58());
+console.log("市场：", poolKeys.marketId);       // 已经是 base58 字符串
 ```
 
-`poolKeys` 是指令构建器使用的结构体。它按程序期望的顺序包含每个 AMM v4 和 OpenBook 账户。
+`poolKeys` 是指令构建器使用的结构体。它按程序期望的顺序包含每一个 AMM v4 账户，外加当前程序仍按位置接受但不再读取的旧版市场字段。
 
 ## 交换（基础输入）
 
@@ -72,7 +76,7 @@ const { execute } = await raydium.liquidity.swap({
   amountIn,
   amountOut: computed.minAmountOut,
   fixedSide: "in",
-  inputMint,
+  inputMint: poolInfo.mintB.address,   // a base58 STRING, and it is required
   txVersion: TxVersion.V0,
 });
 
@@ -102,7 +106,7 @@ const { execute } = await raydium.liquidity.swap({
   amountIn: computed.maxAmountIn,
   amountOut,
   fixedSide: "out",
-  inputMint: new PublicKey(poolInfo.mintB.address),
+  inputMint: poolInfo.mintB.address,   // base58 string, not a PublicKey
   txVersion: TxVersion.V0,
 });
 
@@ -112,20 +116,27 @@ await execute({ sendAndConfirm: true });
 ## 添加流动性
 
 ```ts
-const amountA = new BN(100_000_000);           // 0.1 SOL
+import { Percent, TokenAmount, toToken } from "@raydium-io/raydium-sdk-v2";
 
-const { anotherAmount, maxAnotherAmount } = raydium.liquidity.computePairAmount({
-  poolInfo,
-  amount: amountA,
-  baseIn: true,
-  slippage: 0.01,
-});
+const amountARaw = new BN(100_000_000);        // 0.1 SOL, in base units
 
+// computePairAmount takes a UI-decimal string (or Decimal) and a Percent —
+// not a BN and not a number — and it is synchronous.
+const { anotherAmount, maxAnotherAmount, minAnotherAmount } =
+  raydium.liquidity.computePairAmount({
+    poolInfo,
+    amount: "0.1",
+    baseIn: true,
+    slippage: new Percent(1, 100),
+  });
+
+// addLiquidity takes THREE TokenAmounts; otherAmountMin is required.
 const { execute } = await raydium.liquidity.addLiquidity({
   poolInfo,
   poolKeys,
-  amountInA: amountA,
+  amountInA: new TokenAmount(toToken(poolInfo.mintA), amountARaw),
   amountInB: maxAnotherAmount,
+  otherAmountMin: minAnotherAmount,
   fixedSide: "a",
   txVersion: TxVersion.V0,
 });
@@ -133,7 +144,7 @@ const { execute } = await raydium.liquidity.addLiquidity({
 await execute({ sendAndConfirm: true });
 ```
 
-`fixedSide: "a"` 告诉 SDK 你提供了精确的 `amountInA`，而 `amountInB` 应该最多为 `maxAnotherAmount`。池的链上流动性在按比例数学之前结算，因此存入比率与最新的储备相匹配。
+`fixedSide: "a"` 告诉 SDK 你提供了精确的 `amountInA`，而 `amountInB` 应该最多为 `maxAnotherAmount`。按比例的数学直接基于金库余额减去累积的 PnL 运行 —— 不再有需要先结算的挂单簿部分。
 
 ## 移除流动性
 
@@ -156,21 +167,19 @@ await execute({ sendAndConfirm: true });
 
 ## 计算单位 / 优先费用调整
 
-AMM v4 交换在计算上很重，因为每条指令都验证完整的 OpenBook 状态。典型的交换使用 180k–250k CU，具体取决于需要在过程中结算多少个开放订单。始终传递计算单位限制：
+自从移除 OpenBook 之后，AMM v4 交换不再验证任何市场状态，因此 V1 的 `SwapBaseIn` 明显比过去便宜 —— 而 `SwapBaseInV2`（8 个账户，没有市场占位符）还要更便宜。请测量你自己的路径，而不要按历史数字做预算，并且始终传递明确的计算单位限制：
 
 ```ts
-import { ComputeBudgetProgram } from "@solana/web3.js";
-
-const { execute, innerTransactions } = await raydium.liquidity.swap({
+const { execute, transaction } = await raydium.liquidity.swap({
   /* ...params... */
   computeBudgetConfig: {
     units: 400_000,
-    microLamports: 50_000,       // 优先费用
+    microLamports: 50_000,       // 每 CU 的优先费用
   },
 });
 ```
 
-如果你省略 `computeBudgetConfig`，SDK 可能仍会使用自己的默认值；检查 `innerTransactions` 以确认。参见 [`integration-guides/priority-fee-tuning`](/zh/integration-guides/priority-fee-tuning)。
+如果你省略 `computeBudgetConfig`，SDK 可能仍会使用自己的默认值；检查返回的 `transaction` 以确认。参见 [`integration-guides/priority-fee-tuning`](/zh/integration-guides/priority-fee-tuning)。
 
 ## 直接 Rust CPI
 

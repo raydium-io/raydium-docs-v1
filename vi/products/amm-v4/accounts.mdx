@@ -21,13 +21,11 @@ Một pool AMM v4 ghi lại một thị trường được liên kết trên `Am
 |----------|-----------|-----------|--------|
 | Pool | `AmmInfo` | Chương trình AMM v4 | Trạng thái pool: phí tích lũy, trạng thái, tham chiếu đến vaults (và, như các trường cũ, thị trường). |
 | Pool | `amm_authority` | Chương trình AMM v4 | PDA do chương trình sở hữu ký các lần di chuyển vault. Được chia sẻ trên tất cả các pool AMM v4. |
-| Pool | `amm_open_orders` | OpenBook | Tham chiếu `OpenOrders` cũ. Không còn được đọc/ghi bởi chương trình; vẫn được truyền theo vị trí trên bố cục v1. |
+| Pool | `amm_open_orders` | OpenBook | Tham chiếu `OpenOrders` cũ. Không bao giờ được chương trình hiện tại tạo hoặc đọc; chương trình ghi `AmmInfo.open_orders = Pubkey::default()` trên mọi pool mới, nên chỉ các pool được tạo trước khi OpenBook bị loại bỏ mới mang một giá trị thực. Vẫn được truyền theo vị trí trên bố cục v1. |
 | Pool | `amm_target_orders` | Chương trình AMM v4 | Tài khoản target-orders cũ. Vẫn được tham chiếu bởi `WithdrawPnl` (như tài khoản #10) nhưng không có lưới nào được xây dựng. |
 | Pool | `pool_coin_token_account` | SPL Token | Vault phía coin của pool (ATA của `amm_authority`). |
 | Pool | `pool_pc_token_account` | SPL Token | Vault phía pc của pool. |
 | Pool | `lp_mint` | SPL Token | Mint LP có thể trao đổi. |
-| Pool | `pool_withdraw_queue` | Chương trình AMM v4 | Hàng đợi cũ cho rút tiền bị trì hoãn; giữ độ dài bằng không. |
-| Pool | `pool_temp_lp` | Chương trình AMM v4 | Tài khoản LP phụ trợ. |
 | Legacy (OpenBook) | `serum_market` | OpenBook | Thị trường được liên kết. Được truyền trên bố cục v1 nhưng không còn được xác thực hoặc sử dụng. |
 | Legacy | `serum_bids`, `serum_asks` | OpenBook | Hàng đợi bid/ask. Bỏ qua. |
 | Legacy | `serum_event_queue` | OpenBook | Các sự kiện đang chờ xử lý. Bỏ qua. |
@@ -73,11 +71,12 @@ pub struct AmmInfo {
     pub market: Pubkey,        // OpenBook market
     pub market_program: Pubkey, // OpenBook program ID
     pub target_orders: Pubkey,
-    pub withdraw_queue: Pubkey,
-    pub lp_vault:       Pubkey, // = pool_temp_lp
-    pub owner: Pubkey,          // admin (multisig)
-    pub lp_reserve: u64,
-    pub padding: [u64; 3],
+    pub padding1: [u64; 8],     // reserved — NOT withdraw_queue / lp_vault
+    pub amm_owner: Pubkey,      // admin (multisig)
+    pub lp_amount: u64,         // the pool's internal LP total; see the note below
+    pub client_order_id: u64,
+    pub recent_epoch: u64,
+    pub padding2: u64,
 }
 
 pub struct Fees {
@@ -116,9 +115,11 @@ Các trường hướng đến người tích hợp:
 
 - **`coin_vault`**, **`pc_vault`** — các vault SPL Token của pool. `coin` là `token_0` theo quy ước Serum/OpenBook (base), `pc` là `token_1` (quote).
 - **`coin_decimals`**, **`pc_decimals`** — khớp với các mint.
-- **`open_orders`**, **`target_orders`**, **`market`** — các trường tham chiếu cũ. Vẫn có trên `AmmInfo` và vẫn được truyền theo vị trí trên bố cục lệnh v1 cũ, nhưng chương trình không còn đọc hoặc xác thực chúng. Các điểm vào swap V2 bỏ qua chúng.
+- **`open_orders`**, **`target_orders`**, **`market`** — các trường tham chiếu cũ. Vẫn có trên `AmmInfo` và vẫn được truyền theo vị trí trên bố cục lệnh v1, nhưng chương trình không còn đọc hoặc xác thực chúng. Các điểm vào swap V2 bỏ qua chúng.
 - **`fees.swap_fee_numerator / swap_fee_denominator`** — phí giao dịch kết hợp. Mặc định `25 / 10_000 = 0.25%`.
-- **`status`** — bitmask gating các hoạt động. Có thể đặt bởi admin thông qua `AdminSetStatus`.
+- **`status`** — một trạng thái `u64` dạng liệt kê duy nhất gating các hoạt động, **không phải** bitmask. Có thể đặt bởi admin thông qua `SetParams` với `param = 0` (`Status`). Xem [Trạng thái](#status) bên dưới.
+- **`lp_amount`** — tổng LP nội bộ của pool. Nó **không** bằng `lp_mint.supply`: nó cao hơn đúng một token LP trọn vẹn (`10^coin_decimals` đơn vị cơ sở), vì lượng đó được tính tại thời điểm khởi tạo nhưng chưa bao giờ được mint. Mọi phép tính theo tỷ lệ trong chương trình đều dùng `lp_amount`, vậy bạn cũng nên dùng nó.
+- **`amm_owner`** — được ghi tại thời điểm tạo từ khóa admin hardcode của chương trình, không phải từ người tạo pool.
 - **`state_data.need_take_pnl_*`** — delta giữa phí tích lũy brutto và những gì đã được quét. `TakePnl` đặt lại những cái này thành không.
 
 ## Dây dẫn OpenBook
@@ -166,48 +167,67 @@ const [ammAuthority] = PublicKey.findProgramAddressSync(
 );
 ```
 
-Có một authority **scoped pool** riêng biệt được lấy cho mỗi pool để ký các hoạt động OpenBook (`amm_authority` ở trên thực tế bao gồm cả hai trong thiết kế chương trình này; các phiên bản khác nhau sử dụng các lệnh lấy khác nhau, vì vậy hãy kiểm tra `AmmInfo.nonce` của pool cụ thể trong mã).
+Không có authority thứ hai nào theo phạm vi pool: chỉ một PDA này bao trùm mọi thứ mà chương trình ký. Bump của nó là `254` trên mainnet và được phản chiếu trên mọi `AmmInfo` dưới dạng `nonce`; `WithdrawExcessLamports` dẫn xuất lại nó với nonce đó được hardcode.
 
 ## Vaults
 
-Các vault SPL Token của pool là các tài khoản token tiêu chuẩn có `owner` là `amm_authority`. Không phải ATA — địa chỉ của chúng là các PDA cụ thể được lấy tại `Initialize` với các seed `["amm_associated_seed", coin_mint_or_pc_mint, market, amm_id]`. Địa chỉ được lưu trữ trên `AmmInfo`; lệnh lấy là một điều tò mò một lần.
+Các vault SPL Token của pool là các tài khoản token tiêu chuẩn có `owner` là `amm_authority`. Không phải ATA — địa chỉ của chúng là các PDA được lấy tại `Initialize2` từ `[AMM_V4_PROGRAM_ID, market, "coin_vault_associated_seed"]` và `[AMM_V4_PROGRAM_ID, market, "pc_vault_associated_seed"]`. Mint không phải là seed, và `amm_id` cũng không. Địa chỉ được lưu trữ trên `AmmInfo`; việc lấy địa chỉ chỉ là một điều tò mò một lần.
 
-Token-2022 **không** được hỗ trợ. Chương trình hardcode ID chương trình SPL Token cho tất cả các lần di chuyển vault. Cố gắng liên kết một pool AMM v4 với một mint Token-2022 sẽ thất bại tại `Initialize`.
+Token-2022 **không** được hỗ trợ. Chương trình hardcode ID chương trình SPL Token cho tất cả các lần di chuyển vault. Cố gắng liên kết một pool AMM v4 với một mint Token-2022 sẽ thất bại tại `Initialize2` với `InvalidSplTokenProgram`.
 
 ## LP mint
 
-Một mint SPL Token cổ điển có authority là `amm_authority`. Tổng cung theo dõi quyền sở hữu LP của pool; đốt LP trả lại token từ cả hai vault theo tỷ lệ. Vì AMM v4 trước CPMM, không có `lp_supply` mirror trong trạng thái pool — đọc cung cấp trên chuỗi của mint trực tiếp.
+Một mint SPL Token cổ điển có authority là `amm_authority`. Tổng cung theo dõi quyền sở hữu LP của pool; đốt LP trả lại token từ cả hai vault theo tỷ lệ.
 
-## Bitmask trạng thái
+**Có** một bản phản chiếu trong trạng thái: `AmmInfo.lp_amount`. Nó không bằng tổng cung của mint — nó cao hơn đúng một token LP trọn vẹn (`10^coin_decimals` đơn vị cơ sở), vì lượng đó được tính tại thời điểm khởi tạo nhưng chưa bao giờ được mint. Mọi phép tính theo tỷ lệ trong chương trình đều chia cho `lp_amount`, vì vậy hãy dùng trường đó thay vì tổng cung on-chain của mint.
 
-`AmmInfo.status` gating các hoạt động. Các bit (vị trí có thể khác nhau giữa các phiên bản chương trình — xác nhận thông qua nguồn):
+## Trạng thái
 
-| Bit | Cờ | Hiệu ứng |
-|-----|-----|---------|
-| 0 | `SWAP_DISABLED` | `Swap*` từ chối. |
-| 1 | `DEPOSIT_DISABLED` | `Deposit` từ chối. |
-| 2 | `WITHDRAW_DISABLED` | `Withdraw` từ chối. |
-| 3 | `CLMM_LIKE_MIGRATE` | Cờ migration-gate được sử dụng bởi ops. |
+`AmmInfo.status` là một trạng thái `u64` dạng liệt kê duy nhất, **không phải** bitmask. Hãy kiểm tra nó bằng phép so sánh bằng — một client kiểm tra `status & 1` sẽ phân loại sai mọi pool đang hoạt động, vì trạng thái giao dịch bình thường là `6`, mà bit 0 của nó lại được đặt.
 
-Multisig Raydium đặt những cái này thông qua `SetParams` (với `param = Status`). (`AdminCancelOrders` đã bị xóa.)
+| Giá trị | `AmmStatus` | Swap | Deposit | Withdraw |
+|-------|-------------|------|---------|----------|
+| 0 | `Uninitialized` | không | không | không |
+| 1 | `Initialized` | có | có | có |
+| 2 | `Disabled` | không | không | không |
+| 3 | `WithdrawOnly` | không | không | có |
+| 4 | `LiquidityOnly` | không | có | có |
+| 5 | `OrderBookOnly` | không | có | có |
+| 6 | `SwapOnly` | có | có | có |
+| 7 | `WaitingTrade` | có, khi `pool_open_time` đã qua | có | có |
+
+`Initialize2` ghi `7` khi `open_time` ở tương lai và `6` trong các trường hợp còn lại; một pool ở `7` tự chuyển sang `6` ở lần swap đầu tiên tại hoặc sau `state_data.pool_open_time`. Một giá trị nằm ngoài `0..=7` làm `AmmStatus::from_u64` panic.
+
+Multisig Raydium đặt trạng thái thông qua `SetParams` với `param = 0` (`Status`); chỉ các giá trị `1`–`7` được chấp nhận. (`AdminCancelOrders` đã bị xóa.)
 
 ## Quan sát / oracle
 
-**AMM v4 không có tài khoản quan sát chuyên dụng.** Các giao thức khác cần TWAP trên chuỗi thường tiêu thụ các lần giao nhau sách OpenBook gián tiếp hoặc đọc ngoài chuỗi. Nếu bạn cần TWAP Raydium với hỗ trợ chương trình, hãy sử dụng CPMM hoặc CLMM.
+**AMM v4 không có tài khoản quan sát chuyên dụng**, và kể từ khi OpenBook bị loại bỏ thì cũng không còn trạng thái order-book nào để lấy ra một cái. Nếu bạn cần TWAP Raydium với hỗ trợ chương trình, hãy sử dụng CPMM hoặc CLMM — cả hai đều duy trì một vòng đệm `ObservationState`. Nếu không, hãy index các log swap ngoài chuỗi.
 
 ## Lấy các tài khoản của pool từ đầu
 
-Vì AMM v4 không được thiết kế cho các PDA xác định theo cặp (nó trước quy ước Solana đó), `amm_id` chính tắc là một **seeded keypair** được lấy với:
+Các tài khoản pool của AMM v4 là các PDA thuần được khóa theo thị trường được liên kết — không phải seeded keypair, và cũng không phải PDA theo từng cặp. Mỗi tài khoản trong số đó đều dùng cùng một dạng ba seed `[AMM_V4_PROGRAM_ID, market, <label>]` dưới `AMM_V4_PROGRAM_ID`:
 
-```
-ammId = createWithSeed(
-  owner: ammAuthority,
-  seed:  marketPubkey.toBase58().slice(0, 32),
-  programId: AMM_V4_PROGRAM_ID,
-)
+| Account | `<label>` |
+|---------|-----------|
+| `amm_id` (`AmmInfo`) | `"amm_associated_seed"` |
+| `amm_target_orders` | `"target_associated_seed"` |
+| `lp_mint` | `"lp_mint_associated_seed"` |
+| `pool_coin_token_account` | `"coin_vault_associated_seed"` |
+| `pool_pc_token_account` | `"pc_vault_associated_seed"` |
+
+```ts
+const [ammId] = PublicKey.findProgramAddressSync(
+  [
+    AMM_V4_PROGRAM_ID.toBuffer(),
+    marketPubkey.toBuffer(),
+    Buffer.from("amm_associated_seed"),
+  ],
+  AMM_V4_PROGRAM_ID,
+);
 ```
 
-Mô hình seeded-key tương tự áp dụng cho `amm_open_orders`, `amm_target_orders`, `amm_withdraw_queue`, `pool_temp_lp`, `pool_coin_token_account`, `pool_pc_token_account`, và `lp_mint`. SDK và API tính toán trước những cái này cho bạn; xem `raydium-sdk-v2`'s `Liquidity.getAssociatedPoolKeys`.
+Thị trường được liên kết là seed biến thiên duy nhất, đó là lý do một thị trường tương ứng chính xác với một pool AMM v4. SDK và API tính toán trước những cái này cho bạn; xem `Liquidity.getAssociatedPoolKeys` của `raydium-sdk-v2`.
 
 Trong thực tế, các người tích hợp đọc bộ tài khoản đầy đủ của pool từ `GET https://api-v3.raydium.io/pools/info/ids?ids=<POOL_ID>` hoặc từ SDK. Lệnh lấy bằng tay hiếm khi cần thiết.
 
@@ -215,7 +235,7 @@ Trong thực tế, các người tích hợp đọc bộ tài khoản đầy đ�
 
 | Sự kiện | Tài khoản được tạo | Tài khoản bị xóa |
 |--------|-------------------|-----------------|
-| `Initialize2` | `amm_info`, `amm_open_orders`, `amm_target_orders`, vaults, `lp_mint`, `pool_withdraw_queue`, `pool_temp_lp` | — |
+| `Initialize2` | `amm_info`, `amm_target_orders`, cả hai vault, `lp_mint`, và ATA LP của người tạo | — |
 | `Deposit` | — (có thể tạo ATA LP của người dùng) | — |
 | `Withdraw` | — | — |
 | `SwapBaseIn` / `SwapBaseOut` (v1 / V2) | — (có thể tạo ATA của người dùng) | — |
@@ -228,7 +248,7 @@ Các pool và tài khoản của chúng tồn tại vô thời hạn. Ngay cả 
 - **Toán học và số học phí**: [`products/amm-v4/math`](/vi/products/amm-v4/math).
 - **Chia tách phí và cách nó so sánh với CPMM/CLMM**: [`products/amm-v4/fees`](/vi/products/amm-v4/fees).
 - **Danh sách tài khoản lệnh**: [`products/amm-v4/instructions`](/vi/products/amm-v4/instructions).
-- **Lệnh lấy tài khoản OpenBook**: Tài liệu chương trình OpenBook ([`github.com/openbook-dex/program`](https://github.com/openbook-dex/program)).
+- **Lệnh lấy tài khoản OpenBook**: nguồn chương trình OpenBook ([`github.com/openbook-dex/program`](https://github.com/openbook-dex/program)) — một monorepo Rust, không phải tài liệu văn xuôi.
 
 Nguồn:
 

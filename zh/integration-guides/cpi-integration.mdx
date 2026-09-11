@@ -160,8 +160,14 @@ pub fn escrow_swap(
     let signer: &[&[&[u8]]] = &[seeds];
 
     let cpi_accounts = CpmmSwap {
-        payer:                ctx.accounts.user.to_account_info(),
-        authority:            ctx.accounts.escrow.to_account_info(),
+        // `payer` is the account whose signature must cover the input ATA. That ATA is
+        // owned by the escrow PDA, so the escrow — signing via new_with_signer below —
+        // goes here, NOT `user`.
+        payer:                ctx.accounts.escrow.to_account_info(),
+        // `authority` is CPMM's own vault PDA at [b"vault_and_lp_mint_auth_seed"];
+        // CPMM signs the vault leg with it itself. Passing your escrow here fails the
+        // seeds constraint before any transfer runs.
+        authority:            ctx.accounts.pool_authority.to_account_info(),
         amm_config:           ctx.accounts.amm_config.to_account_info(),
         pool_state:           ctx.accounts.pool_state.to_account_info(),
         input_token_account:  ctx.accounts.escrow_input_ata.to_account_info(),
@@ -195,9 +201,9 @@ CPI 仅在作为 `authority` 传递的 PDA 与调用方声称的派生相匹配�
 2. bump。
 3. 调用程序 ID（你的程序，不是 Raydium 的）。
 
-Raydium 不关心 authority 是谁——它只关心 `authority` 签名覆盖交易，以及输入 ATA 由该 authority 拥有。验证发生在 `anchor_spl::token::transfer` 中：ATA 的 `authority` 字段必须等于签名者。
+注意 PDA 必须与什么匹配。CPMM 的 `authority` 槽位是**它自己的**金库 PDA —— 一个固定的、程序范围内的账户，由 CPMM 自己派生并签名，你的程序既不控制它也不能替换它。你的 PDA 种子必须对得上的账户是 **`payer`**：检查发生在 CPMM 自己的 `transfer_from_user_to_pool_vault` 辅助函数内部，它要求作为 `payer` 传入的账户必须是 `input_token_account` 的所有者。
 
-常见错误：将 `user` 作为 authority 传递（并从由托管 PDA 拥有的 `escrow_input_ata` 转账）。SPL Token 程序以 `owner mismatch` 拒绝。始终使 `authority` 字段与 ATA 所有者匹配。
+常见错误：在 `escrow_input_ata` 由托管 PDA 拥有时，却把 `user` 作为 `payer` 传递。SPL Token 程序会以 `owner mismatch` 拒绝。始终让 `payer` 是该 ATA 的所有者 —— 当该所有者是 PDA 时，用 `new_with_signer` 为它签名。
 
 ## 剩余账户
 
@@ -238,18 +244,25 @@ remaining = [
 
 ## 组合调用的计算预算
 
-CPI 本身的调用框架成本约 1,500 CU；被调用方自己的 CU 使用堆叠在顶部。每个 Raydium CPI 的粗略预算：
+CPI 本身的调用框架成本约 1,500 CU；被调用方自己的 CU 使用堆叠在其上。
 
-| 调用 | CU (SPL Token) | CU (Token-2022) |
-|------|----------------|-----------------|
-| CPMM swap_base_input | ~150,000 | ~200,000 |
-| CLMM swap_v2 (single tick array) | ~180,000 | ~230,000 |
-| CLMM swap_v2 (crosses 2 ticks) | ~220,000 | ~270,000 |
-| Farm v6 deposit | ~120,000 | ~150,000 |
-| Farm v6 harvest (per reward slot) | +30,000 | +40,000 |
-| AMM v4 swap_base_in | ~140,000 | n/a |
+下面的被调用方数据是 **2026-09-09** 在高交易量池上从主网实际交易中测得的，读取的是 Raydium 程序自身调用的 `Program <id> consumed N of M compute units` 日志行（因此已包含其内部的 token 程序 CPI）：
 
-为每个 CPI 框架添加约 1,500，为你自己程序的开销添加约 20,000。执行 `harvest → swap A → swap B → deposit LP → stake LP` 的自动复利器轻松达到 700k CU。
+| 被调用指令 | 实测 CU | 样本 |
+|------|----|----|
+| CPMM `swap_base_input` | ~23,000 | 22,721–23,052 (n=8) |
+| AMM v4 swap | ~26,000 | 25,215–26,002 |
+| CLMM `swap`（V1） | ~41,000 | 37,148–44,721 |
+| CLMM `swap_v2` | ~48,000 | 43,838–52,887 (n=6) |
+| CLMM `increase_liquidity_v2` | ~36,000 | 36,058 |
+
+在此之上，每个 CPI 框架再加约 1,500，以及你自己程序的开销。CLMM 交换的成本随穿越的 tick 数增长，因此把它的数值当作下限。Token-2022 mint 会增加转账本身处理扩展的成本；请针对你自己的 mint 实测，而不要套用一个固定倍数。
+
+<Warning>
+  本页较早的修订版给出的估计高出 5–7 倍（CPMM 交换约 150,000 CU，CLMM 约 180,000）。那些数字从未
+  被实测过。请以你自己读到的 `computeUnitsConsumed` 为预算依据，而不是文档里的数字 —— 并注意一旦把
+  ATA 创建、wSOL 包装和 compute-budget 指令都算进去，整笔交易的成本会高于单条 Raydium 指令。
+</Warning>
 
 始终设置显式的 `ComputeBudgetProgram::set_compute_unit_limit`：
 
@@ -276,17 +289,23 @@ cpi::swap_base_input(cpi_ctx, amount_in, minimum_amount_out)?;
 或拦截特定代码：
 
 ```rust
+use anchor_lang::error::{Error, ERROR_CODE_OFFSET};
 use raydium_cp_swap::error::ErrorCode as CpmmErr;
 
 match cpi::swap_base_input(cpi_ctx, amount_in, minimum_amount_out) {
-    Ok(_) => {},
-    Err(err) if is_err(err, CpmmErr::ExceededSlippage) => {
+    Ok(_) => {}
+    Err(Error::ProgramError(pe))
+        if pe.program_error
+            == ProgramError::Custom(CpmmErr::ExceededSlippage as u32 + ERROR_CODE_OFFSET) =>
+    {
         // 你的程序可能想以更大的滑点重试，或展开状态。
         return err!(YourErr::PoolTooVolatile);
     }
     Err(err) => return Err(err),
 }
 ```
+
+注意 `ERROR_CODE_OFFSET` 这一项：`#[error_code]` 变体从 6000 开始生成，因此与裸枚举判别值比较永远不会匹配。（`anchor-lang` 和 `raydium_cp_swap` 中都没有 `is_err` 辅助函数——本页的早期版本用过一个并不存在的函数。）
 
 错误代码到含义的映射根据 IDL 策略是稳定的（[`sdk-api/anchor-idl`](/zh/sdk-api/anchor-idl)）；新代码在末尾追加，现有代码的含义永不改变。
 
@@ -329,8 +348,12 @@ pub mod limit_orders {
         let pre_out_balance = ctx.accounts.escrow_output_ata.amount;
 
         let cpi_accounts = CpmmSwap {
-            payer:                ctx.accounts.keeper.to_account_info(),
-            authority:            ctx.accounts.order.to_account_info(),
+            // The escrow's input ATA is owned by the `order` PDA, so `order` must be
+            // `payer` — it signs via new_with_signer below. The keeper only pays the
+            // transaction fee; it is not the ATA owner.
+            payer:                ctx.accounts.order.to_account_info(),
+            // CPMM's own vault PDA at [b"vault_and_lp_mint_auth_seed"].
+            authority:            ctx.accounts.pool_authority.to_account_info(),
             amm_config:           ctx.accounts.amm_config.to_account_info(),
             pool_state:           ctx.accounts.pool_state.to_account_info(),
             input_token_account:  ctx.accounts.escrow_input_ata.to_account_info(),
@@ -367,7 +390,7 @@ pub mod limit_orders {
 }
 ```
 
-保管人支付交易费（他们在其他地方获得保管人费——未显示）。托管 PDA 签署 CPI。Raydium 端滑点检查*和*托管自己的增量检查都强制执行下限——双重保险。
+保管人支付交易费（他们在其他地方获得保管人费——未显示）。`order` PDA 作为 `payer` 为 CPI 签名，因为它拥有托管的输入 ATA；因此 `ExecuteOrder` 还需要一个 `pool_authority: UncheckedAccount<'info>` 字段来传入 CPMM 自己的金库 PDA。Raydium 端滑点检查*和*托管自己的增量检查都强制执行下限——双重保险。
 
 ## 测试
 
@@ -376,8 +399,8 @@ pub mod limit_orders {
 ```toml
 [test.validator]
 clone = [
-  { address = "CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK" }, # CPMM
-  { address = "CLMM...." },                                     # CLMM
+  { address = "CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C" }, # CPMM
+  { address = "CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK" }, # CLMM
   { address = "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8" }, # AMM v4
   { address = "FarmqiPv5eAj3j1GMdMCMUGXqPUvmquZtMy86QH6rzhG" }, # Farm v6
 ]
@@ -393,7 +416,7 @@ Solana 没有真正的可重入性——CPI 不能在同一调用中回调到原
 
 ### 账户可变性漂移
 
-如果你的程序将账户作为 `mut` 传递，但 Raydium 期望它为只读（或反之），运行时以 `InvalidAccountData` 拒绝调用。始终在 IDL 中检查 Raydium 指令的预期可变性；`anchor_cp_swap::cpi::accounts::Swap` 通过其字段类型强制执行。
+如果你的程序将账户作为 `mut` 传递，但 Raydium 期望它为只读（或反之），运行时以 `InvalidAccountData` 拒绝调用。始终在 IDL 中检查 Raydium 指令的预期可变性；`raydium_cp_swap::cpi::accounts::Swap` 会根据 CPMM 自己的 `Swap` 结构体上的 `#[account(mut)]` 标记为你设置每个账户的可变性 —— 生成的字段全都是普通的 `AccountInfo<'info>`，因此携带这些标志的是派生出的 `ToAccountMetas` 实现，而不是字段类型。
 
 ### Token-2022 程序字段
 
@@ -413,4 +436,4 @@ Solana 没有真正的可重入性——CPI 不能在同一调用中回调到原
 
 - [raydium-cp-swap CPI crate](https://github.com/raydium-io/raydium-cp-swap)
 - [raydium-clmm CPI crate](https://github.com/raydium-io/raydium-clmm)
-- [Anchor CPI docs](https://www.anchor-lang.com/docs/cross-program-invocations)
+- [Anchor CPI docs](https://www.anchor-lang.com/docs/basics/cpi)

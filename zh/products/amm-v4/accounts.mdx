@@ -21,13 +21,11 @@ AMM v4 池在创建时在 `AmmInfo` 上记录一个绑定的市场。完整情�
 |----------|---------|-------|------|
 | 池 | `AmmInfo` | AMM v4 程序 | 池状态：累积费用、状态、对金库的引用（以及作为旧版字段，市场）。 |
 | 池 | `amm_authority` | AMM v4 程序 | 程序所有的 PDA，签署金库操作。在所有 AMM v4 池中共享。 |
-| 池 | `amm_open_orders` | OpenBook | 旧版 `OpenOrders` 引用。程序不再读写；仍在 v1 布局上按位置传递。 |
+| 池 | `amm_open_orders` | OpenBook | 旧版 `OpenOrders` 引用。当前程序从不创建或读取它——它在每个新池上都写入 `AmmInfo.open_orders = Pubkey::default()`；只有在移除 OpenBook 之前创建的池才带有真实值。仍在 v1 布局上按位置传递。 |
 | 池 | `amm_target_orders` | AMM v4 程序 | 旧版目标订单账户。仍由 `WithdrawPnl`（作为账户 #10）引用，但不再构建网格。 |
 | 池 | `pool_coin_token_account` | SPL Token | 池的币侧金库（`amm_authority` 的 ATA）。 |
 | 池 | `pool_pc_token_account` | SPL Token | 池的 pc 侧金库。 |
 | 池 | `lp_mint` | SPL Token | 可互换的 LP 铸币。 |
-| 池 | `pool_withdraw_queue` | AMM v4 程序 | 旧版延迟提取队列；保持零长度。 |
-| 池 | `pool_temp_lp` | AMM v4 程序 | 辅助 LP 账户。 |
 | 旧版（OpenBook） | `serum_market` | OpenBook | 绑定的市场。在 v1 布局上传递，但不再验证或使用。 |
 | 旧版 | `serum_bids`、`serum_asks` | OpenBook | 买价/卖价队列。被忽略。 |
 | 旧版 | `serum_event_queue` | OpenBook | 待处理事件。被忽略。 |
@@ -73,11 +71,12 @@ pub struct AmmInfo {
     pub market: Pubkey,        // OpenBook 市场
     pub market_program: Pubkey, // OpenBook 程序 ID
     pub target_orders: Pubkey,
-    pub withdraw_queue: Pubkey,
-    pub lp_vault:       Pubkey, // = pool_temp_lp
-    pub owner: Pubkey,          // 管理员（多签）
-    pub lp_reserve: u64,
-    pub padding: [u64; 3],
+    pub padding1: [u64; 8],     // 保留 —— 不是 withdraw_queue / lp_vault
+    pub amm_owner: Pubkey,      // 管理员（多签）
+    pub lp_amount: u64,         // 池内部的 LP 总量；见下面的说明
+    pub client_order_id: u64,
+    pub recent_epoch: u64,
+    pub padding2: u64,
 }
 
 pub struct Fees {
@@ -118,7 +117,9 @@ pub struct StateData {
 - **`coin_decimals`**、**`pc_decimals`** — 与铸币相匹配。
 - **`open_orders`**、**`target_orders`**、**`market`** — 旧版参考字段。仍在 `AmmInfo` 上，仍在 v1 指令布局上按位置传递，但程序不再读取或验证它们。V2 交换入口点省略了它们。
 - **`fees.swap_fee_numerator / swap_fee_denominator`** — 合并的交易费。默认 `25 / 10_000 = 0.25%`。
-- **`status`** — 位掩码，控制操作。通过 `AdminSetStatus` 由管理员设置。
+- **`status`** — 单一的枚举 `u64` 状态，用于控制操作，**不是**位掩码。可由管理员通过 `SetParams` 以 `param = 0`（`Status`）设置。见下面的 [状态](#status)。
+- **`lp_amount`** — 池内部的 LP 总量。它**不**等于 `lp_mint.supply`：它恰好高出整整一个 LP 代币（`10^coin_decimals` 个基础单位），因为该数量在初始化时被计入但从未铸造。程序中所有按比例的计算都除以 `lp_amount`，所以你也应该用它。
+- **`amm_owner`** — 在创建时从程序硬编码的管理员密钥写入，而不是来自创建者。
 - **`state_data.need_take_pnl_*`** — 累积总费用与已清扫费用之间的差值。`TakePnl` 将其清零。
 
 ## OpenBook 接线
@@ -166,48 +167,67 @@ const [ammAuthority] = PublicKey.findProgramAddressSync(
 );
 ```
 
-有一个单独的**池范围**权限，每个池派生一个以签署 OpenBook 操作（`amm_authority` 在此程序的设计中实际上涵盖两者；不同版本使用不同的派生，因此在代码中检查特定池的 `AmmInfo.nonce`）。
+不存在第二个池范围的权限：这一个 PDA 涵盖程序签署的所有内容。它在主网上的 bump 是 `254`，并镜像在每个 `AmmInfo` 的 `nonce` 上；`WithdrawExcessLamports` 用硬编码的该 nonce 重新派生它。
 
 ## 金库
 
-池的 SPL Token 金库是标准代币账户，其`所有者`是 `amm_authority`。不是 ATA — 它们的地址是在 `Initialize` 时使用 `["amm_associated_seed", coin_mint_or_pc_mint, market, amm_id]` 种子派生的特定 PDA。地址存储在 `AmmInfo` 上；派生是一次性的好奇心。
+池的 SPL Token 金库是标准代币账户，其 `owner` 是 `amm_authority`。不是 ATA —— 它们的地址是在 `Initialize2` 时由 `[AMM_V4_PROGRAM_ID, market, "coin_vault_associated_seed"]` 和 `[AMM_V4_PROGRAM_ID, market, "pc_vault_associated_seed"]` 派生的 PDA。铸币不是种子，`amm_id` 也不是。地址存储在 `AmmInfo` 上；派生只是一次性的好奇心。
 
-**不支持** Token-2022。程序为所有金库操作硬编码 SPL Token 的程序 ID。尝试将 AMM v4 池绑定到 Token-2022 铸币在 `Initialize` 时失败。
+**不支持** Token-2022。程序为所有金库操作硬编码 SPL Token 的程序 ID。尝试将 AMM v4 池绑定到 Token-2022 铸币会在 `Initialize2` 时以 `InvalidSplTokenProgram` 失败。
 
 ## LP 铸币
 
-一个经典的 SPL Token 铸币，其权限是 `amm_authority`。总供应量跟踪 LP 对池的所有权；燃烧 LP 按比例从两个金库返回代币。因为 AMM v4 早于 CPMM，池状态中没有 `lp_supply` 镜像 — 直接读取铸币的链上供应量。
+一个经典的 SPL Token 铸币，其权限是 `amm_authority`。总供应量跟踪 LP 对池的所有权；燃烧 LP 按比例从两个金库返回代币。
 
-## 状态位掩码
+状态中**确实**有一个镜像：`AmmInfo.lp_amount`。它不等于铸币的供应量 —— 它恰好高出整整一个 LP 代币（`10^coin_decimals` 个基础单位），因为该数量在初始化时被计入但从未铸造。程序中每一处按比例的计算都除以 `lp_amount`，所以请使用该字段，而不是铸币的链上供应量。
 
-`AmmInfo.status` 控制操作。位（位置可能因程序版本而异 — 通过源代码确认）：
+## 状态
 
-| 位 | 标志 | 效果 |
-|-----|------|--------|
-| 0 | `SWAP_DISABLED` | `Swap*` 拒绝。 |
-| 1 | `DEPOSIT_DISABLED` | `Deposit` 拒绝。 |
-| 2 | `WITHDRAW_DISABLED` | `Withdraw` 拒绝。 |
-| 3 | `CLMM_LIKE_MIGRATE` | 由操作使用的迁移门标志。 |
+`AmmInfo.status` 是单一的枚举 `u64` 状态，**不是**位掩码。请按相等来判断 —— 用 `status & 1` 判断的客户端会把每一个活跃池都归错类，因为正常交易状态是 `6`，而它的第 0 位是置位的。
 
-Raydium 多签通过 `SetParams`（使用 `param = Status`）设置这些。（`AdminCancelOrders` 已被移除。）
+| 值 | `AmmStatus` | 交换 | 存入 | 提取 |
+|-------|-------------|------|---------|----------|
+| 0 | `Uninitialized` | 否 | 否 | 否 |
+| 1 | `Initialized` | 是 | 是 | 是 |
+| 2 | `Disabled` | 否 | 否 | 否 |
+| 3 | `WithdrawOnly` | 否 | 否 | 是 |
+| 4 | `LiquidityOnly` | 否 | 是 | 是 |
+| 5 | `OrderBookOnly` | 否 | 是 | 是 |
+| 6 | `SwapOnly` | 是 | 是 | 是 |
+| 7 | `WaitingTrade` | 是，一旦 `pool_open_time` 已过 | 是 | 是 |
+
+当 `open_time` 在未来时，`Initialize2` 写入 `7`，否则写入 `6`；处于 `7` 的池会在 `state_data.pool_open_time` 当时或之后的第一次交换时把自己翻转为 `6`。超出 `0..=7` 的值会让 `AmmStatus::from_u64` panic。
+
+Raydium 多签通过 `SetParams`（使用 `param = 0`，即 `Status`）设置该状态；只接受 `1`–`7` 的值。（`AdminCancelOrders` 已被移除。）
 
 ## 观察 / 预言机
 
-**AMM v4 没有专用的观察账户。** 需要链上 TWAP 的其他协议通常间接消费 OpenBook 的账本交叉或读取链下数据。如果你需要具有程序支持的 Raydium TWAP，请使用 CPMM 或 CLMM。
+**AMM v4 没有专用的观察账户**，并且自从移除 OpenBook 之后，也不再有可以从中派生观察数据的订单簿状态。如果你需要具有程序支持的 Raydium TWAP，请使用 CPMM 或 CLMM —— 两者都维护 `ObservationState` 环形缓冲。否则，请在链下索引交换日志。
 
 ## 从头开始派生池的账户
 
-因为 AMM v4 不是为确定性的每对 PDA 设计的（它早于该 Solana 约定），规范的 `amm_id` 是一个**有种子的密钥对**，派生方式如下：
+AMM v4 的池账户是以绑定市场为键的普通 PDA —— 不是有种子的密钥对，也不是每个交易对一个的 PDA。它们每一个都在 `AMM_V4_PROGRAM_ID` 下使用同样的三种子形式 `[AMM_V4_PROGRAM_ID, market, <label>]`：
 
-```
-ammId = createWithSeed(
-  owner: ammAuthority,
-  seed:  marketPubkey.toBase58().slice(0, 32),
-  programId: AMM_V4_PROGRAM_ID,
-)
+| Account | `<label>` |
+|---------|-----------|
+| `amm_id` (`AmmInfo`) | `"amm_associated_seed"` |
+| `amm_target_orders` | `"target_associated_seed"` |
+| `lp_mint` | `"lp_mint_associated_seed"` |
+| `pool_coin_token_account` | `"coin_vault_associated_seed"` |
+| `pool_pc_token_account` | `"pc_vault_associated_seed"` |
+
+```ts
+const [ammId] = PublicKey.findProgramAddressSync(
+  [
+    AMM_V4_PROGRAM_ID.toBuffer(),
+    marketPubkey.toBuffer(),
+    Buffer.from("amm_associated_seed"),
+  ],
+  AMM_V4_PROGRAM_ID,
+);
 ```
 
-相同的有种子密钥对模式适用于 `amm_open_orders`、`amm_target_orders`、`amm_withdraw_queue`、`pool_temp_lp`、`pool_coin_token_account`、`pool_pc_token_account` 和 `lp_mint`。SDK 和 API 为你预计算这些；参见 `raydium-sdk-v2` 的 `Liquidity.getAssociatedPoolKeys`。
+绑定的市场是唯一可变的种子，这就是为什么一个市场恰好映射到一个 AMM v4 池。SDK 和 API 为你预计算这些；参见 `raydium-sdk-v2` 的 `Liquidity.getAssociatedPoolKeys`。
 
 实际上，集成商从 `GET https://api-v3.raydium.io/pools/info/ids?ids=<POOL_ID>` 或 SDK 读取池的完整账户集。手动派生很少需要。
 
@@ -215,7 +235,7 @@ ammId = createWithSeed(
 
 | 事件 | 创建的账户 | 销毁的账户 |
 |-------|------------------|---------------------|
-| `Initialize2` | `amm_info`、`amm_open_orders`、`amm_target_orders`、金库、`lp_mint`、`pool_withdraw_queue`、`pool_temp_lp` | — |
+| `Initialize2` | `amm_info`、`amm_target_orders`、两个金库、`lp_mint`，以及创建者的 LP ATA | — |
 | `Deposit` | —（可能创建用户 LP ATA） | — |
 | `Withdraw` | — | — |
 | `SwapBaseIn` / `SwapBaseOut`（v1 / V2） | —（可能创建用户 ATA） | — |
@@ -228,7 +248,7 @@ ammId = createWithSeed(
 - **数学和费用算术**：[`products/amm-v4/math`](/zh/products/amm-v4/math)。
 - **费用分割以及它与 CPMM/CLMM 的比较**：[`products/amm-v4/fees`](/zh/products/amm-v4/fees)。
 - **指令账户列表**：[`products/amm-v4/instructions`](/zh/products/amm-v4/instructions)。
-- **OpenBook 账户派生**：OpenBook 程序文档（[`github.com/openbook-dex/program`](https://github.com/openbook-dex/program)）。
+- **OpenBook 账户派生**：OpenBook 程序源码（[`github.com/openbook-dex/program`](https://github.com/openbook-dex/program)）—— 一个 Rust 单体仓库，而不是文字文档。
 
 来源：
 

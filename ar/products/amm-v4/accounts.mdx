@@ -21,13 +21,11 @@ description: "الجرد الكامل لحسابات مجمع AMM v4 — AmmInfo
 |----------|---------|-------|------|
 | المجمع | `AmmInfo` | برنامج AMM v4 | حالة المجمع: الرسوم المتراكمة والحالة والمراجع إلى الخزائن (وكحقول قديمة، السوق). |
 | المجمع | `amm_authority` | برنامج AMM v4 | PDA مملوك للبرنامج يوقّع حركات الخزائن. مشترك بين جميع مجمعات AMM v4. |
-| المجمع | `amm_open_orders` | OpenBook | مرجع `OpenOrders` قديم. لم يعد يُقرأ أو يُكتب من قبل البرنامج؛ لا يزال يُمرر موضعيًا على تخطيطات v1. |
+| المجمع | `amm_open_orders` | OpenBook | مرجع `OpenOrders` قديم. لا يُنشئه ولا يقرأه البرنامج الحالي، الذي يكتب `AmmInfo.open_orders = Pubkey::default()` في كل مجمع جديد؛ المجمعات المنشأة قبل إزالة OpenBook هي وحدها التي تحمل قيمة حقيقية. لا يزال يُمرر موضعيًا على تخطيطات v1. |
 | المجمع | `amm_target_orders` | برنامج AMM v4 | حساب الطلبات المستهدفة القديم. لا يزال مرجعيًا بواسطة `WithdrawPnl` (كحساب #10) لكن لا يتم بناء شبكة. |
 | المجمع | `pool_coin_token_account` | SPL Token | خزينة جانب العملة للمجمع (ATA من `amm_authority`). |
 | المجمع | `pool_pc_token_account` | SPL Token | خزينة جانب pc للمجمع. |
 | المجمع | `lp_mint` | SPL Token | عملة LP قابلة للاستبدال. |
-| المجمع | `pool_withdraw_queue` | برنامج AMM v4 | قائمة انتظار قديمة للسحب المؤجل؛ تُبقى بطول صفر. |
-| المجمع | `pool_temp_lp` | برنامج AMM v4 | حساب LP مساعد. |
 | قديم (OpenBook) | `serum_market` | OpenBook | السوق المرتبط. يُمرر على تخطيطات v1 لكن لم يعد يُتحقق منه أو يُستخدم. |
 | قديم | `serum_bids`, `serum_asks` | OpenBook | قوائم الطلب والعرض. مُتجاهلة. |
 | قديم | `serum_event_queue` | OpenBook | الأحداث المعلقة. مُتجاهلة. |
@@ -73,11 +71,12 @@ pub struct AmmInfo {
     pub market: Pubkey,        // OpenBook market
     pub market_program: Pubkey, // OpenBook program ID
     pub target_orders: Pubkey,
-    pub withdraw_queue: Pubkey,
-    pub lp_vault:       Pubkey, // = pool_temp_lp
-    pub owner: Pubkey,          // admin (multisig)
-    pub lp_reserve: u64,
-    pub padding: [u64; 3],
+    pub padding1: [u64; 8],     // reserved — NOT withdraw_queue / lp_vault
+    pub amm_owner: Pubkey,      // admin (multisig)
+    pub lp_amount: u64,         // the pool's internal LP total; see the note below
+    pub client_order_id: u64,
+    pub recent_epoch: u64,
+    pub padding2: u64,
 }
 
 pub struct Fees {
@@ -118,7 +117,9 @@ pub struct StateData {
 - **`coin_decimals`**, **`pc_decimals`** — مطابقة للعملات.
 - **`open_orders`**, **`target_orders`**, **`market`** — حقول مرجعية قديمة. لا تزال موجودة على `AmmInfo` وتُمرر موضعيًا على تخطيطات التعليمات v1، لكن البرنامج لم يعد يقرأها أو يتحقق منها. نقاط نهاية المبادلة V2 تحذفها.
 - **`fees.swap_fee_numerator / swap_fee_denominator`** — رسم التداول المدمج. الافتراضي `25 / 10_000 = 0.25%`.
-- **`status`** — bitmask يحد العمليات. قابل للتعيين من قبل المسؤول عبر `AdminSetStatus`.
+- **`status`** — حالة `u64` مُعدَّدة واحدة تحدّ العمليات، وهي **ليست** bitmask. قابلة للتعيين من قبل المسؤول عبر `SetParams` مع `param = 0` (`Status`). انظر [الحالة](#status) أدناه.
+- **`lp_amount`** — إجمالي LP الداخلي للمجمع. وهو **لا** يساوي `lp_mint.supply`: إنه أعلى بمقدار رمز LP كامل واحد بالضبط (`10^coin_decimals` وحدة أساسية)، لأن ذلك المقدار يُحسب عند التهيئة لكنه لا يُصدر أبدًا. كل الحسابات التناسبية تستخدم `lp_amount`، فاستخدمه أنت أيضًا.
+- **`amm_owner`** — يُكتب عند الإنشاء من مفتاح المسؤول المضمّن في البرنامج، وليس من المنشئ.
 - **`state_data.need_take_pnl_*`** — الفرق بين الرسوم المتراكمة الإجمالية وما تم مسحه. `TakePnl` يصفر هذه.
 
 ## توصيل OpenBook
@@ -166,48 +167,67 @@ const [ammAuthority] = PublicKey.findProgramAddressSync(
 );
 ```
 
-يوجد سلطة **محدودة النطاق بالمجمع** منفصلة مشتقة لكل مجمع لتوقيع عمليات OpenBook (`amm_authority` أعلاه يغطي كليهما في الواقع في تصميم هذا البرنامج؛ استخدمت الإصدارات المختلفة اشتقاقات مختلفة، لذا تحقق من `AmmInfo.nonce` للمجمع المحدد في الكود).
+لا توجد سلطة ثانية محدودة النطاق بالمجمع: هذا الـ PDA الواحد يغطي كل ما يوقّعه البرنامج. قيمة bump الخاصة به هي `254` على الشبكة الرئيسية وهي مُنسَخة على كل `AmmInfo` كـ `nonce`؛ وتعيد `WithdrawExcessLamports` اشتقاقها مع تضمين ذلك الـ nonce بشكل ثابت.
 
 ## الخزائن
 
-خزائن SPL Token للمجمع هي حسابات رموز قياسية يكون `owner` لها `amm_authority`. ليست ATAs — عناوينها PDAs محددة مشتقة عند `Initialize` ببذور `["amm_associated_seed", coin_mint_or_pc_mint, market, amm_id]`. يتم تخزين العناوين على `AmmInfo`؛ الاشتقاق فضول لمرة واحدة.
+خزائن SPL Token للمجمع هي حسابات رموز قياسية يكون `owner` لها `amm_authority`. ليست ATAs — عناوينها PDAs مشتقة عند `Initialize2` من `[AMM_V4_PROGRAM_ID, market, "coin_vault_associated_seed"]` و `[AMM_V4_PROGRAM_ID, market, "pc_vault_associated_seed"]`. العملة ليست بذرة، ولا `amm_id` كذلك. يتم تخزين العناوين على `AmmInfo`؛ الاشتقاق فضول لمرة واحدة.
 
-Token-2022 **غير مدعوم**. يحمّل البرنامج معرّف برنامج SPL Token لجميع حركات الخزائن. محاولة ربط مجمع AMM v4 بعملة Token-2022 تفشل عند `Initialize`.
+Token-2022 **غير مدعوم**. يحمّل البرنامج معرّف برنامج SPL Token لجميع حركات الخزائن. محاولة ربط مجمع AMM v4 بعملة Token-2022 تفشل عند `Initialize2` بـ `InvalidSplTokenProgram`.
 
 ## عملة LP
 
-عملة SPL Token كلاسيكية سلطتها `amm_authority`. إجمالي العرض يتتبع ملكية LP للمجمع؛ حرق LP يعيد الرموز من كلا الخزائن بنسبة. لأن AMM v4 سابق لـ CPMM، لا توجد مرآة `lp_supply` في حالة المجمع — اقرأ عرض العملة على السلسلة مباشرة.
+عملة SPL Token كلاسيكية سلطتها `amm_authority`. إجمالي العرض يتتبع ملكية LP للمجمع؛ حرق LP يعيد الرموز من كلا الخزائن بنسبة.
 
-## bitmask الحالة
+**توجد** مرآة داخل الحالة: `AmmInfo.lp_amount`. وهي لا تساوي عرض العملة — إنها أعلى بمقدار رمز LP كامل واحد بالضبط (`10^coin_decimals` وحدة أساسية)، لأن ذلك المقدار يُحسب عند التهيئة لكنه لا يُصدر أبدًا. كل حساب تناسبي في البرنامج يقسم على `lp_amount`، فاستخدم ذلك الحقل بدلاً من عرض العملة على السلسلة.
 
-`AmmInfo.status` يحد العمليات. البتات (قد يختلف الموضع عبر إصدارات البرنامج — تأكد عبر المصدر):
+## الحالة
 
-| البت | العلم | التأثير |
-|-----|------|--------|
-| 0 | `SWAP_DISABLED` | `Swap*` يرفض. |
-| 1 | `DEPOSIT_DISABLED` | `Deposit` يرفض. |
-| 2 | `WITHDRAW_DISABLED` | `Withdraw` يرفض. |
-| 3 | `CLMM_LIKE_MIGRATE` | علم بوابة الهجرة المستخدم من قبل العمليات. |
+`AmmInfo.status` هي حالة `u64` مُعدَّدة واحدة، وهي **ليست** bitmask. اختبرها بالتساوي — العميل الذي يختبر `status & 1` يصنّف كل مجمع نشط تصنيفًا خاطئًا، لأن حالة التداول العادية هي `6`، والتي بها البت 0 مضبوط.
 
-تعيّن مجموعة Raydium متعددة التوقيع هذه عبر `SetParams` (مع `param = Status`). (تم إزالة `AdminCancelOrders`.)
+| القيمة | `AmmStatus` | المبادلة | الإيداع | السحب |
+|-------|-------------|------|---------|----------|
+| 0 | `Uninitialized` | لا | لا | لا |
+| 1 | `Initialized` | نعم | نعم | نعم |
+| 2 | `Disabled` | لا | لا | لا |
+| 3 | `WithdrawOnly` | لا | لا | نعم |
+| 4 | `LiquidityOnly` | لا | نعم | نعم |
+| 5 | `OrderBookOnly` | لا | نعم | نعم |
+| 6 | `SwapOnly` | نعم | نعم | نعم |
+| 7 | `WaitingTrade` | نعم، بعد أن يمضي `pool_open_time` | نعم | نعم |
+
+تكتب `Initialize2` القيمة `7` عندما يكون `open_time` في المستقبل و `6` غير ذلك؛ والمجمع الموجود عند `7` يقلب نفسه إلى `6` عند أول مبادلة عند أو بعد `state_data.pool_open_time`. أي قيمة خارج `0..=7` تجعل `AmmStatus::from_u64` يتعطل.
+
+تعيّن مجموعة Raydium متعددة التوقيع الحالة عبر `SetParams` مع `param = 0` (`Status`)؛ ولا تُقبل إلا القيم `1`–`7`. (تم إزالة `AdminCancelOrders`.)
 
 ## الملاحظة / الأوراكل
 
-**AMM v4 ليس لديه حساب ملاحظة مخصص.** البروتوكولات الأخرى التي تحتاج إلى TWAP على السلسلة عادة ما تستهلك عبور كتاب OpenBook بشكل غير مباشر أو تقرأ خارج السلسلة. إذا كنت بحاجة إلى Raydium TWAP مع دعم البرنامج، استخدم CPMM أو CLMM.
+**لا يمتلك AMM v4 حساب مراقبة مخصصًا**، ومنذ إزالة OpenBook لم تبقَ حالة دفتر أوامر يمكن اشتقاق واحد منها أيضًا. إذا احتجت إلى TWAP من Raydium بدعم من البرنامج، فاستخدم CPMM أو CLMM — كلاهما يحتفظ بحاوية حلقية `ObservationState`. غير ذلك، فهرِس سجلات المبادلة خارج السلسلة.
 
 ## اشتقاق حسابات المجمع من الصفر
 
-لأن AMM v4 لم يتم تصميمه لـ PDAs حتمية لكل زوج (سابق لهذه الاتفاقية Solana)، `amm_id` الكنسي هو **مفتاح مزروع** مشتق مع:
+حسابات مجمع AMM v4 هي PDAs عادية مفتاحها السوق المرتبط — ليست مفاتيح مزروعة، وليست PDAs لكل زوج. كل واحد منها يستخدم نفس شكل البذور الثلاثية `[AMM_V4_PROGRAM_ID, market, <label>]` تحت `AMM_V4_PROGRAM_ID`:
 
-```
-ammId = createWithSeed(
-  owner: ammAuthority,
-  seed:  marketPubkey.toBase58().slice(0, 32),
-  programId: AMM_V4_PROGRAM_ID,
-)
+| Account | `<label>` |
+|---------|-----------|
+| `amm_id` (`AmmInfo`) | `"amm_associated_seed"` |
+| `amm_target_orders` | `"target_associated_seed"` |
+| `lp_mint` | `"lp_mint_associated_seed"` |
+| `pool_coin_token_account` | `"coin_vault_associated_seed"` |
+| `pool_pc_token_account` | `"pc_vault_associated_seed"` |
+
+```ts
+const [ammId] = PublicKey.findProgramAddressSync(
+  [
+    AMM_V4_PROGRAM_ID.toBuffer(),
+    marketPubkey.toBuffer(),
+    Buffer.from("amm_associated_seed"),
+  ],
+  AMM_V4_PROGRAM_ID,
+);
 ```
 
-ينطبق نفس نمط المفتاح المزروع على `amm_open_orders` و `amm_target_orders` و `amm_withdraw_queue` و `pool_temp_lp` و `pool_coin_token_account` و `pool_pc_token_account` و `lp_mint`. SDK والـ API يحسبان هذه مسبقًا لك؛ انظر `raydium-sdk-v2` الخاص بـ `Liquidity.getAssociatedPoolKeys`.
+السوق المرتبط هو البذرة المتغيرة الوحيدة، ولهذا يقابل كل سوق مجمع AMM v4 واحدًا بالضبط. SDK والـ API يحسبان هذه مسبقًا لك؛ انظر `raydium-sdk-v2` الخاص بـ `Liquidity.getAssociatedPoolKeys`.
 
 في الممارسة العملية، يقرأ المدمجون مجموعة الحسابات الكاملة للمجمع من `GET https://api-v3.raydium.io/pools/info/ids?ids=<POOL_ID>` أو من SDK. الاشتقاق اليدوي نادرًا ما يكون مطلوبًا.
 
@@ -215,7 +235,7 @@ ammId = createWithSeed(
 
 | الحدث | الحسابات المُنشأة | الحسابات المحذوفة |
 |-------|------------------|---------------------|
-| `Initialize2` | `amm_info`, `amm_open_orders`, `amm_target_orders`, الخزائن, `lp_mint`, `pool_withdraw_queue`, `pool_temp_lp` | — |
+| `Initialize2` | `amm_info`, `amm_target_orders`, كلا الخزينتين, `lp_mint`, و ATA LP للمنشئ | — |
 | `Deposit` | — (قد ينشئ ATA LP للمستخدم) | — |
 | `Withdraw` | — | — |
 | `SwapBaseIn` / `SwapBaseOut` (v1 / V2) | — (قد ينشئ ATA للمستخدم) | — |
@@ -228,7 +248,7 @@ ammId = createWithSeed(
 - **الرياضيات وحسابات الرسوم**: [`products/amm-v4/math`](/ar/products/amm-v4/math).
 - **تقسيم الرسوم وكيفية مقارنتها بـ CPMM/CLMM**: [`products/amm-v4/fees`](/ar/products/amm-v4/fees).
 - **قوائم حسابات التعليمات**: [`products/amm-v4/instructions`](/ar/products/amm-v4/instructions).
-- **اشتقاق حساب OpenBook**: وثائق برنامج OpenBook ([`github.com/openbook-dex/program`](https://github.com/openbook-dex/program)).
+- **اشتقاق حساب OpenBook**: مصدر برنامج OpenBook ([`github.com/openbook-dex/program`](https://github.com/openbook-dex/program)) — مستودع Rust أحادي، وليس وثائق نصية.
 
 المصادر:
 

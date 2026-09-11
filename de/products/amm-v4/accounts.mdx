@@ -21,13 +21,11 @@ Ein AMM v4 Pool registriert einen gebundenen Markt auf `AmmInfo` bei der Erstell
 |----------|---------|-------|------|
 | Pool | `AmmInfo` | AMM v4 Programm | Pool State: aufgelaufene Gebühren, Status, Referenzen zu Vaults (und als Legacy Felder der Markt). |
 | Pool | `amm_authority` | AMM v4 Programm | Programm-eigene PDA, die Vault Bewegungen signiert. Gemeinsam für alle AMM v4 Pools. |
-| Pool | `amm_open_orders` | OpenBook | Legacy `OpenOrders` Referenz. Wird nicht mehr vom Programm gelesen/geschrieben; wird noch positionell auf v1 Layouts übergeben. |
+| Pool | `amm_open_orders` | OpenBook | Legacy `OpenOrders` Referenz. Wird vom aktuellen Programm nie erstellt oder gelesen; es schreibt bei jedem neuen Pool `AmmInfo.open_orders = Pubkey::default()`. Nur Pools, die vor der OpenBook Entfernung erstellt wurden, tragen einen echten Wert. Wird noch positionell auf v1 Layouts übergeben. |
 | Pool | `amm_target_orders` | AMM v4 Programm | Legacy Target Orders Konto. Wird noch von `WithdrawPnl` (als Konto #10) referenziert, aber kein Grid wird gebaut. |
 | Pool | `pool_coin_token_account` | SPL Token | Pool's Coin-seitiger Vault (ATA von `amm_authority`). |
 | Pool | `pool_pc_token_account` | SPL Token | Pool's PC-seitiger Vault. |
 | Pool | `lp_mint` | SPL Token | Fungible LP Mint. |
-| Pool | `pool_withdraw_queue` | AMM v4 Programm | Legacy Queue für verzögerte Abhebungen; wird auf Nulllänge gehalten. |
-| Pool | `pool_temp_lp` | AMM v4 Programm | Hilfs LP Konto. |
 | Legacy (OpenBook) | `serum_market` | OpenBook | Der gebundene Markt. Wird auf v1 Layouts übergeben, wird aber nicht mehr validiert oder verwendet. |
 | Legacy | `serum_bids`, `serum_asks` | OpenBook | Geld-/Briefschlangen. Ignoriert. |
 | Legacy | `serum_event_queue` | OpenBook | Ausstehende Events. Ignoriert. |
@@ -73,11 +71,12 @@ pub struct AmmInfo {
     pub market: Pubkey,        // OpenBook Markt
     pub market_program: Pubkey, // OpenBook Programm ID
     pub target_orders: Pubkey,
-    pub withdraw_queue: Pubkey,
-    pub lp_vault:       Pubkey, // = pool_temp_lp
-    pub owner: Pubkey,          // Admin (Multisig)
-    pub lp_reserve: u64,
-    pub padding: [u64; 3],
+    pub padding1: [u64; 8],     // reserviert — NICHT withdraw_queue / lp_vault
+    pub amm_owner: Pubkey,      // Admin (Multisig)
+    pub lp_amount: u64,         // interner LP Gesamtbestand des Pools; siehe Hinweis unten
+    pub client_order_id: u64,
+    pub recent_epoch: u64,
+    pub padding2: u64,
 }
 
 pub struct Fees {
@@ -117,8 +116,10 @@ Integrator-relevante Felder:
 - **`coin_vault`**, **`pc_vault`** — die SPL Token Vaults des Pools. `coin` ist `token_0` nach Serum/OpenBook Konvention (Basis), `pc` ist `token_1` (Quote).
 - **`coin_decimals`**, **`pc_decimals`** — entsprechend den Mints.
 - **`open_orders`**, **`target_orders`**, **`market`** — Legacy Referenzfelder. Sind noch auf `AmmInfo` vorhanden und werden noch positionell auf v1 Instruktionslayouts übergeben, aber das Programm liest oder validiert sie nicht mehr. Die V2 Swap Entrypoints lassen sie weg.
-- **`fees.swap_fee_numerator / swap_fee_denominator`** — die kombinierte Trade Gebühr. Standard `25 / 10_000 = 0,25%`.
-- **`status`** — Bitmaske, die Operationen kontrolliert. Admin-setzbar via `AdminSetStatus`.
+- **`fees.swap_fee_numerator / swap_fee_denominator`** — die kombinierte Trade Gebühr. Standard `25 / 10_000 = 0.25%`.
+- **`status`** — ein einzelner aufgezählter `u64` Zustand, der Operationen kontrolliert, **keine** Bitmaske. Admin-setzbar via `SetParams` mit `param = 0` (`Status`). Siehe [Status](#status) unten.
+- **`lp_amount`** — der interne LP Gesamtbestand des Pools. Er ist **nicht** gleich `lp_mint.supply`: er liegt genau ein ganzes LP Token (`10^coin_decimals` Base Units) höher, weil dieser Betrag bei der Initialisierung gezählt, aber nie gemintet wird. Die gesamte Pro-rata Mathematik verwendet `lp_amount`, verwenden Sie ihn also ebenfalls.
+- **`amm_owner`** — wird bei der Erstellung aus dem hartcodierten Admin Key des Programms geschrieben, nicht vom Ersteller.
 - **`state_data.need_take_pnl_*`** — Delta zwischen Brutto aufgelaufenen Gebühren und dem, was eingezogen wurde. `TakePnl` setzt diese auf Null.
 
 ## Die OpenBook Verdrahtung
@@ -166,48 +167,67 @@ const [ammAuthority] = PublicKey.findProgramAddressSync(
 );
 ```
 
-Es gibt eine separate **Pool-scoped** Authority, die pro Pool abgeleitet wird, um OpenBook Operationen zu signieren (`amm_authority` oben deckt tatsächlich beide in diesem Programm Design ab; verschiedene Versionen verwendeten unterschiedliche Ableitungen, daher überprüfen Sie den spezifischen `AmmInfo.nonce` des Pools im Code).
+Es gibt keine zweite, Pool-scoped Authority: diese eine PDA deckt alles ab, was das Programm signiert. Ihr Bump ist `254` auf Mainnet und wird auf jedem `AmmInfo` als `nonce` gespiegelt; `WithdrawExcessLamports` leitet sie mit diesem hartcodierten Nonce erneut ab.
 
 ## Vaults
 
-Die SPL Token Vaults des Pools sind Standard Token Konten, deren `owner` `amm_authority` ist. Keine ATAs — ihre Adressen sind spezifische PDAs, die bei `Initialize` mit `["amm_associated_seed", coin_mint_or_pc_mint, market, amm_id]` Seeds abgeleitet werden. Adressen werden auf `AmmInfo` gespeichert; Ableitung ist eine einmalige Kuriosität.
+Die SPL Token Vaults des Pools sind Standard Token Konten, deren `owner` `amm_authority` ist. Keine ATAs — ihre Adressen sind PDAs, die bei `Initialize2` aus `[AMM_V4_PROGRAM_ID, market, "coin_vault_associated_seed"]` und `[AMM_V4_PROGRAM_ID, market, "pc_vault_associated_seed"]` abgeleitet werden. Der Mint ist kein Seed, und `amm_id` ist es auch nicht. Adressen werden auf `AmmInfo` gespeichert; die Ableitung ist eine einmalige Kuriosität.
 
-Token-2022 wird **nicht** unterstützt. Das Programm hardcoded die SPL Token Programm ID für alle Vault Bewegungen. Der Versuch, einen AMM v4 Pool an einen Token-2022 Mint zu binden, schlägt bei `Initialize` fehl.
+Token-2022 wird **nicht** unterstützt. Das Programm hardcoded die SPL Token Programm ID für alle Vault Bewegungen. Der Versuch, einen AMM v4 Pool an einen Token-2022 Mint zu binden, schlägt bei `Initialize2` mit `InvalidSplTokenProgram` fehl.
 
 ## LP Mint
 
-Ein klassischer SPL Token Mint, dessen Authority `amm_authority` ist. Die Gesamtversorgung verfolgt LP Eigentum des Pools; das Verbrennen von LP gibt Token aus beiden Vaults proportional zurück. Da AMM v4 CPMM vorausgeht, gibt es keinen `lp_supply` Mirror im Pool State — lesen Sie die Mint's On-Chain Versorgung direkt.
+Ein klassischer SPL Token Mint, dessen Authority `amm_authority` ist. Die Gesamtversorgung verfolgt LP Eigentum des Pools; das Verbrennen von LP gibt Token aus beiden Vaults proportional zurück.
 
-## Status Bitmaske
+Es **gibt** einen Mirror im Pool State: `AmmInfo.lp_amount`. Er ist nicht gleich der Versorgung des Mints — er liegt genau ein ganzes LP Token (`10^coin_decimals` Base Units) höher, weil dieser Betrag bei der Initialisierung gezählt, aber nie gemintet wird. Jede Pro-rata Berechnung im Programm dividiert durch `lp_amount`, verwenden Sie also dieses Feld statt der On-Chain Versorgung des Mints.
 
-`AmmInfo.status` kontrolliert Operationen. Bits (Position kann zwischen Programmversionen unterschiedlich sein — bestätigen Sie über die Quelle):
+## Status
 
-| Bit | Flag | Effekt |
-|-----|------|--------|
-| 0 | `SWAP_DISABLED` | `Swap*` lehnt ab. |
-| 1 | `DEPOSIT_DISABLED` | `Deposit` lehnt ab. |
-| 2 | `WITHDRAW_DISABLED` | `Withdraw` lehnt ab. |
-| 3 | `CLMM_LIKE_MIGRATE` | Migrations-Gate Flag verwendet von Ops. |
+`AmmInfo.status` ist ein einzelner aufgezählter `u64` Zustand, **keine** Bitmaske. Testen Sie ihn auf Gleichheit — ein Client, der `status & 1` testet, klassifiziert jeden aktiven Pool falsch, denn der normale Handelszustand ist `6`, bei dem Bit 0 gesetzt ist.
 
-Das Raydium Multisig setzt diese via `SetParams` (mit `param = Status`). (`AdminCancelOrders` wurde entfernt.)
+| Wert | `AmmStatus` | Swap | Deposit | Withdraw |
+|-------|-------------|------|---------|----------|
+| 0 | `Uninitialized` | nein | nein | nein |
+| 1 | `Initialized` | ja | ja | ja |
+| 2 | `Disabled` | nein | nein | nein |
+| 3 | `WithdrawOnly` | nein | nein | ja |
+| 4 | `LiquidityOnly` | nein | ja | ja |
+| 5 | `OrderBookOnly` | nein | ja | ja |
+| 6 | `SwapOnly` | ja | ja | ja |
+| 7 | `WaitingTrade` | ja, sobald `pool_open_time` vergangen ist | ja | ja |
+
+`Initialize2` schreibt `7`, wenn `open_time` in der Zukunft liegt, andernfalls `6`; ein Pool bei `7` wechselt beim ersten Swap ab `state_data.pool_open_time` selbst auf `6`. Ein Wert außerhalb von `0..=7` lässt `AmmStatus::from_u64` panicken.
+
+Das Raydium Multisig setzt den Zustand via `SetParams` mit `param = 0` (`Status`); nur die Werte `1`–`7` werden akzeptiert. (`AdminCancelOrders` wurde entfernt.)
 
 ## Beobachtung / Oracle
 
-**AMM v4 hat kein dediziertes Observation Konto.** Andere Protokolle, die einen On-Chain TWAP benötigen, konsumieren typischerweise OpenBook's Buch Crossings indirekt oder lesen Off-Chain. Wenn Sie einen Raydium TWAP mit Programm Support benötigen, verwenden Sie CPMM oder CLMM.
+**AMM v4 hat kein dediziertes Observation Konto**, und seit der OpenBook Entfernung gibt es auch keinen Orderbuch State, aus dem sich eines ableiten ließe. Wenn Sie einen Raydium TWAP mit Programm Support benötigen, verwenden Sie CPMM oder CLMM — beide unterhalten einen `ObservationState` Ringpuffer. Andernfalls indexieren Sie die Swap Logs off-chain.
 
 ## Ableitung der Pool Konten von Grund auf
 
-Da AMM v4 nicht für deterministische Pro-Pair PDAs entworfen wurde (es geht diesem Solana Convention voraus), ist die kanonische `amm_id` ein **Seeded Keypair**, abgeleitet mit:
+Die Pool Konten von AMM v4 sind einfache PDAs, die auf den gebundenen Markt geschlüsselt sind — keine Seeded Keypairs und keine Pro-Pair PDAs. Jedes von ihnen verwendet dieselbe Drei-Seed Form `[AMM_V4_PROGRAM_ID, market, <label>]` unter `AMM_V4_PROGRAM_ID`:
 
-```
-ammId = createWithSeed(
-  owner: ammAuthority,
-  seed:  marketPubkey.toBase58().slice(0, 32),
-  programId: AMM_V4_PROGRAM_ID,
-)
+| Account | `<label>` |
+|---------|-----------|
+| `amm_id` (`AmmInfo`) | `"amm_associated_seed"` |
+| `amm_target_orders` | `"target_associated_seed"` |
+| `lp_mint` | `"lp_mint_associated_seed"` |
+| `pool_coin_token_account` | `"coin_vault_associated_seed"` |
+| `pool_pc_token_account` | `"pc_vault_associated_seed"` |
+
+```ts
+const [ammId] = PublicKey.findProgramAddressSync(
+  [
+    AMM_V4_PROGRAM_ID.toBuffer(),
+    marketPubkey.toBuffer(),
+    Buffer.from("amm_associated_seed"),
+  ],
+  AMM_V4_PROGRAM_ID,
+);
 ```
 
-Das gleiche Seeded-Key Muster gilt für `amm_open_orders`, `amm_target_orders`, `amm_withdraw_queue`, `pool_temp_lp`, `pool_coin_token_account`, `pool_pc_token_account` und `lp_mint`. Das SDK und die API berechnen diese für Sie vor; siehe `raydium-sdk-v2`'s `Liquidity.getAssociatedPoolKeys`.
+Der gebundene Markt ist der einzige variable Seed, weshalb ein Markt genau einem AMM v4 Pool entspricht. Das SDK und die API berechnen diese für Sie vor; siehe `raydium-sdk-v2`'s `Liquidity.getAssociatedPoolKeys`.
 
 In der Praxis lesen Integratoren den vollständigen Kontosatz des Pools von `GET https://api-v3.raydium.io/pools/info/ids?ids=<POOL_ID>` oder vom SDK. Manuelle Ableitung ist selten erforderlich.
 
@@ -215,7 +235,7 @@ In der Praxis lesen Integratoren den vollständigen Kontosatz des Pools von `GET
 
 | Event | Konten erstellt | Konten gelöscht |
 |-------|------------------|---------------------|
-| `Initialize2` | `amm_info`, `amm_open_orders`, `amm_target_orders`, Vaults, `lp_mint`, `pool_withdraw_queue`, `pool_temp_lp` | — |
+| `Initialize2` | `amm_info`, `amm_target_orders`, beide Vaults, `lp_mint` und die LP-ATA des Erstellers | — |
 | `Deposit` | — (kann Benutzer LP ATA erstellen) | — |
 | `Withdraw` | — | — |
 | `SwapBaseIn` / `SwapBaseOut` (v1 / V2) | — (kann Benutzer ATA erstellen) | — |
@@ -228,7 +248,7 @@ Pools und ihre Konten bleiben unbegrenzt bestehen. Selbst wenn Liquidität volls
 - **Mathematik und Gebühren Arithmetik**: [`products/amm-v4/math`](/de/products/amm-v4/math).
 - **Gebühren Split und wie es sich mit CPMM/CLMM vergleicht**: [`products/amm-v4/fees`](/de/products/amm-v4/fees).
 - **Instruktions Kontolisten**: [`products/amm-v4/instructions`](/de/products/amm-v4/instructions).
-- **OpenBook Konto Ableitung**: OpenBook Programm Docs ([`github.com/openbook-dex/program`](https://github.com/openbook-dex/program)).
+- **OpenBook Konto Ableitung**: OpenBook Programm Quellcode ([`github.com/openbook-dex/program`](https://github.com/openbook-dex/program)) — ein Rust Monorepo, keine Prosa Dokumentation.
 
 Quellen:
 

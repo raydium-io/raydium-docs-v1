@@ -1,6 +1,6 @@
 ---
-title: "Demonstrações de código para farm/staking"
-description: "Exemplos em TypeScript para criar um farm, fazer stake de LP, coletar recompensas e adicionar orçamento de recompensas no programa farm v6 da Raydium."
+title: "Demonstrações de código para Farm / Staking"
+description: "Exemplos em TypeScript para criar um farm, fazer stake de LP, coletar recompensas e recarregar orçamentos de recompensas contra o programa farm v6 do Raydium."
 ---
 
 <Info>
@@ -10,10 +10,12 @@ description: "Exemplos em TypeScript para criar um farm, fazer stake de LP, cole
 </Info>
 
 <Info>
-  **Informações de versão.** Todos os exemplos visam `@raydium-io/raydium-sdk-v2@0.2.64-alpha` contra Solana mainnet-beta, verificado em 2026-04. O SDK despacha v3 / v5 / v6 internamente com base no proprietário do programa do farm; os exemplos abaixo assumem um farm v6. Consulte [`reference/program-addresses`](/pt/reference/program-addresses) para os três IDs de programa.
+  **Banner de versão.** Todos os exemplos visam `@raydium-io/raydium-sdk-v2@0.2.64-alpha` contra Solana mainnet-beta, **verificado em 2026-09-09** — cada nome de builder, nome de parâmetro e tipo de parâmetro abaixo foi verificado contra o `src/raydium/farm/` dessa versão e contra [`raydium-sdk-V2-demo/src/farm`](https://github.com/raydium-io/raydium-sdk-V2-demo/tree/master/src/farm). O SDK despacha v3 / v5 / v6 internamente com base no proprietário do programa do farm; os exemplos abaixo assumem um farm v6. Veja [`reference/program-addresses`](/pt/reference/program-addresses) para os três IDs de programa.
+
+  Os nomes dos métodos do módulo farm não são o que você esperaria: não há `getFarmById` e não há `setRewards`. A busca passa por `raydium.api.fetchFarmInfoById`, e os builders de edição de recompensas são `addNewRewardToken` / `addNewRewardsToken` e `restartReward` / `restartRewards`.
 </Info>
 
-## Setup
+## Configuração
 
 Os exemplos aqui espelham arquivos em [`raydium-sdk-V2-demo/src/farm`](https://github.com/raydium-io/raydium-sdk-V2-demo/tree/master/src/farm). O bootstrap segue o [`config.ts.template`](https://github.com/raydium-io/raydium-sdk-V2-demo/blob/master/src/config.ts.template) do repositório de demonstração:
 
@@ -37,36 +39,39 @@ const raydium = await Raydium.load({
 export const txVersion = TxVersion.V0;
 ```
 
-## Buscar um farm por ID
+## Buscar um farm por id
+
+Não há `raydium.farm.getFarmById`. Todo exemplo de farm começa a partir do módulo API, que retorna a forma normalizada `FormatFarmInfoOut` que `deposit` / `withdraw` / `harvestAllRewards` usam:
 
 ```ts
-const farmId = new PublicKey("<FARM_ID>");
+const farmId = "CHYrUBX2RKX8iBg7gYTkccoGNBzP44LdaazMHCLcdEgS"; // RAY-USDC farm
 
-const farm = await raydium.farm.getFarmById({ farmId });
-console.log("Staking mint:", farm.symbolMint.toBase58());
-console.log("Total staked:", farm.totalStaked.toString());
-console.log("Rewards:");
-for (const r of farm.rewardInfos) {
-  console.log(
-    "  -", r.mint.toBase58(),
-    "rate(1e-" + r.decimals + "/s):", r.perSecond.toString(),
-    "open:", new Date(r.openTime * 1000).toISOString(),
-    "end: ", new Date(r.endTime * 1000).toISOString(),
-  );
+const farmInfo = (await raydium.api.fetchFarmInfoById({ ids: farmId }))[0];
+if (!farmInfo) throw new Error("farm not found");
+
+console.log("LP mint:", farmInfo.lpMint.address);
+console.log("TVL:", farmInfo.tvl);
+for (const r of farmInfo.rewardInfos) {
+  console.log("  -", r.mint.address, r.mint.symbol);
 }
 ```
 
-`getFarmById` obtém `FarmState` fora da cadeia, decodifica por versão de programa e normaliza a taxa de emissão de ponto fixo para um simples `Decimal` por segundo.
+`fetchFarmInfoById` recebe uma **string separada por vírgulas** de ids e retorna um array, então uma chamada pode hidratar um portfólio inteiro. Se você precisar das chaves de conta bruta em vez das informações de exibição, `raydium.api.fetchFarmKeysById({ ids })` retorna os vaults e PDAs de autoridade; o SDK a chama internamente para você dentro de cada builder abaixo.
 
 ## Fazer stake de tokens LP
 
 Fonte: [`src/farm/stake.ts`](https://github.com/raydium-io/raydium-sdk-V2-demo/blob/master/src/farm/stake.ts)
 
 ```ts
-const amount = new BN(1_000_000_000);   // 1 LP (assumindo 9 decimais)
+// O exemplo faz stake do saldo LP inteiro da carteira; qualquer BN em unidades brutas funciona.
+const amount = raydium.account.tokenAccountRawInfos.find(
+  (a) => a.accountInfo.mint.toBase58() === farmInfo.lpMint.address,
+)?.accountInfo.amount;
+
+if (!amount || amount.isZero()) throw new Error("user does not have an LP balance");
 
 const { execute } = await raydium.farm.deposit({
-  farmInfo: farm,
+  farmInfo,
   amount,
   txVersion: TxVersion.V0,
 });
@@ -75,45 +80,49 @@ const { txId } = await execute({ sendAndConfirm: true });
 console.log("Deposit tx:", txId);
 ```
 
-O SDK lida com a pré-liquidação de qualquer recompensa pendente, então se esta carteira já tiver stake neste farm, a instrução pagará recompensas acumuladas aos ATAs do usuário na mesma transação.
+O SDK lida com o pré-liquidação de qualquer recompensa pendente, então se essa carteira já tem stake neste farm, a instrução pagará as recompensas acumuladas para os ATAs do usuário na mesma transação.
 
 ## Apenas coleta (harvest)
 
 Fonte: [`src/farm/harvest.ts`](https://github.com/raydium-io/raydium-sdk-V2-demo/blob/master/src/farm/harvest.ts)
 
+`farmInfoList` é um **`Record` indexado por id do farm**, não um array, e o builder retorna **múltiplas** transações — então `execute` deve receber `sequentially: true`:
+
 ```ts
+const farmIds = [farmId, "<ANOTHER_FARM_ID>"];
+const farmInfos = await raydium.api.fetchFarmInfoById({ ids: farmIds.join(",") });
+
 const { execute } = await raydium.farm.harvestAllRewards({
-  farmInfoList: [farm],
+  farmInfoList: Object.fromEntries(farmInfos.map((f) => [f.id, f])),
   txVersion: TxVersion.V0,
 });
 
-await execute({ sendAndConfirm: true });
+const { txIds } = await execute({ sequentially: true });
+console.log("harvest txs:", txIds);
 ```
 
-`harvestAllRewards` aceita uma lista — para UIs mostrando uma visão de portfólio, agrupe a chamada. Cada farm é coletado em uma instrução separada em uma transação (sujeito ao limite de tamanho de 1232 bytes; para >~6 farms, divida em múltiplas transações).
+O builder empacota o máximo de farms por transação que o limite de 1232 bytes permite e divide o resto em transações subsequentes, é por isso que retorna `txIds` em vez de um único `txId`.
 
-Para um único farm em v6, você também pode usar o caminho `Harvest` explícito:
+Para um único farm, faça harvest com o idioma `amount: 0` — isso é o que [`src/farm/harvest.ts`](https://github.com/raydium-io/raydium-sdk-V2-demo/blob/master/src/farm/harvest.ts) faz, em todas as versões incluindo v6:
 
 ```ts
 const { execute } = await raydium.farm.withdraw({
-  farmInfo: farm,
-  amount: new BN(0),        // 0 = caminho harvest-only, mesmo em v6
+  farmInfo,
+  amount: new BN(0),        // 0 = harvest-only path
   txVersion: TxVersion.V0,
 });
 await execute({ sendAndConfirm: true });
 ```
 
-Em v3 e v5 o idioma `amount: 0` é necessário; o SDK o despacha corretamente.
-
-## Unstake
+## Remover stake
 
 Fonte: [`src/farm/unstake.ts`](https://github.com/raydium-io/raydium-sdk-V2-demo/blob/master/src/farm/unstake.ts)
 
 ```ts
-const amount = new BN(500_000_000);   // 0.5 LP
+const amount = new BN(500_000_000);   // 0.5 LP, raw units
 
 const { execute } = await raydium.farm.withdraw({
-  farmInfo: farm,
+  farmInfo,
   amount,
   txVersion: TxVersion.V0,
 });
@@ -125,33 +134,37 @@ await execute({ sendAndConfirm: true });
 
 Fonte: [`src/farm/createAmmFarm.ts`](https://github.com/raydium-io/raydium-sdk-V2-demo/blob/master/src/farm/createAmmFarm.ts) e [`editAmmFarm.ts`](https://github.com/raydium-io/raydium-sdk-V2-demo/blob/master/src/farm/editAmmFarm.ts)
 
+`create` recebe o **objeto de informações do pool** para o pool cujo mint LP está sendo feito stake (não um mint simples), e cada entrada de `rewardInfos` é um `FarmRewardInfo`: `{ mint: PublicKey, perSecond: string, openTime: number, endTime: number, rewardType: "Standard SPL" | "Option tokens" }`. Os tempos são **segundos simples**, e `perSecond` é uma **string**, não um `BN`. `programId` padrão é o programa v6, então você raramente o passa.
+
 ```ts
-import { CurveCalculator } from "@raydium-io/raydium-sdk-v2"; // opcional, para planejamento de APR
+import type { ApiV3PoolInfoStandardItem, FarmRewardInfo } from "@raydium-io/raydium-sdk-v2";
+import { RAYMint } from "@raydium-io/raydium-sdk-v2";
 
-const stakingMint = new PublicKey("<LP_MINT>");       // ex: um mint LP CPMM
-const rewardMint  = new PublicKey("<REWARD_MINT>");   // ex: token do seu projeto
+// O pool que você possui cujo mint LP será o mint de staking.
+const poolInfo = (
+  await raydium.api.fetchPoolById({ ids: "<POOL_ID>" })
+)[0] as ApiV3PoolInfoStandardItem;
+if (!poolInfo) throw new Error("pool not found");
 
-const now      = Math.floor(Date.now() / 1000);
-const openTime = now + 60 * 60;                       // começar em 1h
-const duration = 60 * 60 * 24 * 30;                   // 30 dias
-const endTime  = openTime + duration;
+const rewardMint = await raydium.token.getTokenInfo(RAYMint);
 
-const totalBudget = new BN(1_000_000).mul(new BN(10).pow(new BN(9))); // 1M tokens de recompensa (9 dec)
-const perSecond   = totalBudget.div(new BN(duration));                // inteiro, SDK levanta para Q64.64
+// Use o tempo da chain, não o tempo de parede — o programa valida contra o primeiro.
+const openTime = Math.floor((await raydium.currentBlockChainTime()) / 1000);
+const endTime  = openTime + 60 * 60 * 24 * 7; // 7 days
+
+const rewardInfos: FarmRewardInfo[] = [
+  {
+    mint:       new PublicKey(rewardMint.address),
+    perSecond:  "1",              // string, in raw units per second
+    openTime,                      // seconds, not BN
+    endTime,
+    rewardType: "Standard SPL",   // "Option tokens" is the only other value
+  },
+];
 
 const { execute, extInfo } = await raydium.farm.create({
-  programId: /* ID do programa v6, de reference/program-addresses */,
-  poolInfo: { lpMint: { address: stakingMint, decimals: 9, programId: /* SPL Token */ } as any },
-  rewardInfos: [
-    {
-      mint:           rewardMint,
-      openTime:       new BN(openTime),
-      endTime:        new BN(endTime),
-      perSecond,
-      rewardSender:   owner.publicKey,    // quem paga o orçamento inicial
-      mintProgramId:  /* SPL Token ou Token-2022 */,
-    },
-  ],
+  poolInfo,
+  rewardInfos,
   txVersion: TxVersion.V0,
 });
 
@@ -161,25 +174,30 @@ console.log("Farm:", extInfo.farmId.toBase58(), "createTx:", txId);
 
 Pontos-chave:
 
-- `perSecond` é a taxa de emissão inteira por segundo. O SDK a empacota em Q64.64 antes de enviar. Para uma taxa fracionária, escale e ajuste a duração.
-- O orçamento completo (`perSecond × duration`) deve estar presente em seu ATA de recompensa — `create` o move para o vault de recompensa atomicamente.
-- Você pode semear até 5 recompensas em uma chamada `create`. A lista de contas cresce por `(reward_mint, reward_vault, sender_ata, token_program)` por fluxo extra; esteja atento ao limite de tamanho de transação de 1232 bytes. Para 4+ recompensas, crie com 1–2 e use `AddReward` em transações subsequentes.
+- `perSecond` é a taxa de emissão por segundo nas unidades **brutas** do mint de recompensa, passada como uma string decimal. O SDK a empacota na representação de ponto fixo on-chain antes de enviar.
+- O orçamento completo (`perSecond × (endTime − openTime)`) deve estar presente no seu ATA de recompensa — `create` o move para o vault de recompensa atomicamente.
+- **Mints de recompensa Token-2022 não são suportados pelos builders de farm do SDK** nesta versão do SDK; use um mint SPL simples para recompensas.
+- Você pode semear até 5 recompensas em uma chamada `create`. A lista de contas cresce por `(reward_mint, reward_vault, sender_ata, token_program)` por stream extra; fique atento ao limite de tamanho de transação de 1232 bytes. Para 4+ recompensas, crie com 1–2 e use `addNewRewardsToken` em transações subsequentes.
 
-## Adicionar orçamento a um fluxo de recompensa existente
+## Adicionar um novo stream de recompensa
+
+Não há `raydium.farm.setRewards`. Os dois builders que alteram as recompensas de um farm são `addNewRewardToken` / `addNewRewardsToken` (ocupam um slot livre com um mint **novo**) e `restartReward` / `restartRewards` (re-armam um slot cujo stream terminou). Ambos recebem objetos `FarmRewardInfo` exatamente na forma que `create` usa.
 
 ```ts
-const additionalDays = 30;
-const extraSeconds   = 60 * 60 * 24 * additionalDays;
-const extraBudget    = perSecond.mul(new BN(extraSeconds));
+import { USDCMint } from "@raydium-io/raydium-sdk-v2";
 
-const { execute } = await raydium.farm.setRewards({
-  farmInfo: farm,
-  rewardInfos: [
+const added = await raydium.token.getTokenInfo(USDCMint);
+const openTime = Math.floor((await raydium.currentBlockChainTime()) / 1000);
+
+const { execute } = await raydium.farm.addNewRewardsToken({
+  farmInfo,
+  newRewardInfos: [
     {
-      rewardMint:  rewardMint,
-      newEndTime:  new BN(farm.rewardInfos[0].endTime + extraSeconds),
-      newPerSecond: perSecond,                   // manter mesma taxa
-      payer:        owner.publicKey,
+      mint:       new PublicKey(added.address),
+      perSecond:  "1",
+      openTime,
+      endTime:    openTime + 60 * 60 * 24 * 7,
+      rewardType: "Standard SPL",
     },
   ],
   txVersion: TxVersion.V0,
@@ -188,95 +206,70 @@ const { execute } = await raydium.farm.setRewards({
 await execute({ sendAndConfirm: true });
 ```
 
-`setRewards` estende `end_time` e transfere o orçamento delta. A instrução não pode encurtar um fluxo, não pode baixar `per_second` em um fluxo ativo e não pode alterar o mint de recompensa. Para trocar mints, aguarde `end_time` e use `AddReward` em um slot liberado (se houver), ou crie um novo farm.
+O orçamento delta (`perSecond × duration`) é puxado do ATA do pagador como parte da transação. A instrução subjacente não pode encurtar um stream, não pode reduzir `per_second` em um stream ativo e não pode alterar o mint de recompensa de um slot — para trocar mints, aguarde `end_time` e use `addNewRewardsToken` em um slot liberado, ou crie um novo farm.
 
-## Reiniciar um fluxo terminado
+<Tip>
+  `restartRewards` e `addNewRewardsToken` cada um retornam um builder, então uma única transação pode fazer ambos. [`src/farm/editAmmFarm.ts`](https://github.com/raydium-io/raydium-sdk-V2-demo/blob/master/src/farm/editAmmFarm.ts) mostra o padrão: `editFarmBuilder.builder.addInstruction(addNewRewardBuildData.builder.AllTxData)`, depois um `versionBuild({ txVersion })`.
+</Tip>
+
+## Reiniciar um stream finalizado
+
+Fonte: [`src/farm/editAmmFarm.ts`](https://github.com/raydium-io/raydium-sdk-V2-demo/blob/master/src/farm/editAmmFarm.ts)
+
+`restartRewards` recebe **`newRewardInfos`** (plural, um array); `restartReward` é a forma de item único e recebe `newRewardInfo`. O campo mint é `mint`, não `rewardMint`, e deve corresponder a um slot que já existe no farm — o builder procura o slot por mint e gera erro se estiver ausente.
 
 ```ts
-const { execute } = await raydium.farm.restartRewards({
-  farmInfo: farm,
-  newRewardInfo: {
-    rewardMint:   rewardMint,
-    openTime:     new BN(Math.floor(Date.now() / 1000) + 60 * 60),
-    endTime:      new BN(Math.floor(Date.now() / 1000) + 60 * 60 + 60 * 60 * 24 * 14),
-    perSecond:    new BN("1000000000"),
-    payer:        owner.publicKey,
+import type { FarmRewardInfo } from "@raydium-io/raydium-sdk-v2";
+
+// Re-arme o slot de recompensa existente primeiro do farm.
+const existing = await raydium.token.getTokenInfo(farmInfo.rewardInfos[0].mint.address);
+const openTime = Math.floor((await raydium.currentBlockChainTime()) / 1000);
+
+const newRewardInfos: FarmRewardInfo[] = [
+  {
+    mint:       new PublicKey(existing.address),
+    perSecond:  "1",
+    openTime,
+    endTime:    openTime + 60 * 60 * 24 * 14,
+    rewardType: "Standard SPL",
   },
+];
+
+const { execute } = await raydium.farm.restartRewards({
+  farmInfo,
+  newRewardInfos,
   txVersion: TxVersion.V0,
 });
 
 await execute({ sendAndConfirm: true });
 ```
 
-Válido apenas quando o `reward_state == 2` (terminado) do slot alvo. O chamador deve ser o `reward_sender` do slot (v6) ou o proprietário do farm (v5).
+`restartRewards` é **apenas v6** — o builder lê o id do programa do farm e gera erro para farms v3 / v5. Válido apenas quando o `reward_state == 2` do slot alvo (finalizado); o chamador deve ser o `reward_sender` do slot. Note que `openTime >= endTime` é rejeitado no lado do cliente antes de qualquer RPC ser feito.
 
 ## Rust CPI
 
-Diferentemente do AMM v4, o programa farm v6 vem com um crate Anchor (`raydium_farm_v6`) publicado junto com as fontes do frontend e SDK. Um esboço `Deposit` mínimo:
+<Warning>
+  **Não há crate Anchor `raydium_farm_v6`.** Nenhum crate com esse nome existe em crates.io, o programa Farm v6 não publica nenhum IDL on-chain (nem uma conta `anchor:idl` legada nem uma entrada no programa Program Metadata), e nenhum repositório de fonte pública para ele existe. Uma revisão anterior desta página mostrou um exemplo `raydium_farm_v6::cpi::deposit`; ele não compilava contra nada e foi removido.
+</Warning>
 
-```rust
-use anchor_lang::prelude::*;
-use raydium_farm_v6::{self, cpi::accounts::Deposit as RaydiumDeposit};
+Farm v6 foi implantado pela última vez em 2024-05-13 e não é um programa Anchor do ponto de vista de um integrador. Se você precisar compor com ele a partir do seu próprio programa on-chain, construa a `Instruction` manualmente — derive a lista de contas e discriminadores de instrução independentemente (dos layouts TypeScript do SDK em `raydium-sdk-V2/src/raydium/farm/`, ou decodificando transações reais), e `invoke_signed` isso. Veja [`sdk-api/rust-cpi`](/pt/sdk-api/rust-cpi#farm-v6) para esse procedimento.
 
-#[derive(Accounts)]
-pub struct ProxyFarmDeposit<'info> {
-    /// CHECK:
-    pub farm_program: UncheckedAccount<'info>,
-    #[account(mut)] pub user: Signer<'info>,
-    #[account(mut)] /// CHECK:
-    pub user_ledger: UncheckedAccount<'info>,
-    #[account(mut)] /// CHECK:
-    pub farm_state: UncheckedAccount<'info>,
-    /// CHECK:
-    pub farm_authority: UncheckedAccount<'info>,
-    #[account(mut)] /// CHECK:
-    pub staking_vault: UncheckedAccount<'info>,
-    #[account(mut)] /// CHECK:
-    pub user_staking_ata: UncheckedAccount<'info>,
-    // Seguido em remaining_accounts por pares (reward_vault_i, user_reward_ata_i)
-    // para cada fluxo de recompensa ativo no farm.
-    pub token_program: UncheckedAccount<'info>,
-    pub system_program: Program<'info, System>,
-}
+Qualquer que seja a rota que você tome, a cauda `remaining_accounts` deve corresponder aos slots de recompensa ativos do farm 1-para-1 (pares de `reward_vault_i`, `user_reward_ata_i` em ordem de índice). Omitir ou desordenar esses produz uma contabilidade silenciosa incorreta — o programa transferirá o valor errado.
 
-pub fn proxy_deposit<'info>(
-    ctx: Context<'_, '_, '_, 'info, ProxyFarmDeposit<'info>>,
-    amount: u64,
-) -> Result<()> {
-    let cpi_ctx = CpiContext::new(
-        ctx.accounts.farm_program.to_account_info(),
-        RaydiumDeposit {
-            user:             ctx.accounts.user.to_account_info(),
-            user_ledger:      ctx.accounts.user_ledger.to_account_info(),
-            farm_state:       ctx.accounts.farm_state.to_account_info(),
-            farm_authority:   ctx.accounts.farm_authority.to_account_info(),
-            staking_vault:    ctx.accounts.staking_vault.to_account_info(),
-            user_staking_ata: ctx.accounts.user_staking_ata.to_account_info(),
-            token_program:    ctx.accounts.token_program.to_account_info(),
-            system_program:   ctx.accounts.system_program.to_account_info(),
-        },
-    ).with_remaining_accounts(ctx.remaining_accounts.to_vec());
+## Armadilhas
 
-    raydium_farm_v6::cpi::deposit(cpi_ctx, amount)
-}
-```
-
-A fatia `remaining_accounts` deve corresponder 1 para 1 aos slots de recompensa ativos do farm (pares de `reward_vault_i`, `user_reward_ata_i` em ordem de índice). Omitir ou desordenar esses produz uma contabilização silenciosamente incorreta — o programa transferirá o valor incorreto.
-
-## Armadilhas comuns
-
-- **Esquecer de coletar antes de sacar.** Inofensivo — `Withdraw` liquida recompensas pendentes primeiro. Mas se sua UI mostrar "coletar" separadamente de "sacar", o usuário pode pensar que ainda há algo a coletar após um `Withdraw`. Não há; tudo acumulado até aquele ponto foi pago.
-- **`total_staked = 0` durante emissões.** Emissões acumuladas enquanto nada estava em stake são perdidas (a fórmula de atualização `reward_per_share` divide por 0 e o programa pula a atualização). Para programas com `open_time` agendado, execute um "seed stake" no open_time para evitar isso.
-- **Taxas de transferência Token-2022.** Em farms v6 com mints de recompensa Token-2022, a taxa de transferência se aplica na emissão (vault → usuário). Fatore isso em citações de APR.
-- **Pequeno `per_second` em v5.** A taxa `u64` do v5 significa que qualquer `per_second < 1` unidade de token por segundo (em mints com ≥9 decimais esta é frequentemente a taxa desejada) não pode ser expressa — a taxa do fluxo arredonda para 0 e o farm não emite nada. Use v6.
+- **Esquecer de coletar antes de remover stake.** Inofensivo — `Withdraw` liquida recompensas pendentes primeiro. Mas se sua UI mostrar "coletar" separadamente de "remover stake", o usuário pode pensar que ainda há algo para coletar após um `Withdraw`. Não há; tudo acumulado até esse ponto foi pago.
+- **`total_staked = 0` durante emissões.** Emissões acumuladas enquanto nada estava em stake são perdidas (a fórmula de atualização `reward_per_share` divide por 0 e o programa pula a atualização). Para programas com `open_time` agendado, execute um "seed stake" em open_time para evitar isso.
+- **Taxas de transferência Token-2022.** Em farms v6 com mints de recompensa Token-2022, a taxa de transferência se aplica na emissão (vault → usuário). Fatore isso em cotações de APR.
+- **Pequeno `per_second` em v5.** A taxa `u64` do v5 significa que qualquer `per_second < 1` unidade de token por segundo (em mints com ≥9 decimais isso é frequentemente a taxa desejada) não pode ser expressa — a taxa do stream arredonda para 0 e o farm não emite nada. Use v6.
 
 ## Próximos passos
 
 - [`products/farm-staking/instructions`](/pt/products/farm-staking/instructions) — referência de instrução subjacente.
-- [`products/clmm/fees`](/pt/products/clmm/fees) — comparar com fluxos de recompensa nativos do CLMM.
-- [`user-flows/migrate-amm-v4-to-cpmm`](/pt/user-flows/migrate-amm-v4-to-cpmm) — frequentemente associado a iniciar um novo farm CPMM.
+- [`products/clmm/fees`](/pt/products/clmm/fees) — compare com os streams de recompensa nativos do CLMM.
+- [`user-flows/migrate-amm-v4-to-cpmm`](/pt/user-flows/migrate-amm-v4-to-cpmm) — frequentemente emparelhado com a criação de um novo farm CPMM.
 
 Fontes:
 
 - [Raydium SDK v2](https://github.com/raydium-io/raydium-sdk-V2)
-- Farm v6 IDL agrupado em [`raydium-io/raydium-sdk-V2`](https://github.com/raydium-io/raydium-sdk-V2) sob `src/raydium/farm/`.
+- Farm v6 IDL agrupado em [`raydium-io/raydium-sdk-V2`](https://github.com/raydium-io/raydium-sdk-V2) em `src/raydium/farm/`.

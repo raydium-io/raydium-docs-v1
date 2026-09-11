@@ -32,7 +32,7 @@ Un tick corresponde a un movimiento de precio del 0.01%, o aproximadamente 1 pun
 
 ## Espaciado de ticks
 
-El `AmmConfig` de un pool fija un **espaciado de ticks** — los únicos ticks que una posición puede usar como puntos finales. Si `tick_spacing = 60`, solo los ticks `…, −120, −60, 0, 60, 120, …` son válidos. Un intento de abrir una posición con punto final `31` revierte con `InvalidTickIndex`.
+El `AmmConfig` de un pool fija un **espaciado de ticks** — los únicos ticks que una posición puede usar como puntos finales. Si `tick_spacing = 60`, solo los ticks `…, −120, −60, 0, 60, 120, …` son válidos. Un intento de abrir una posición con punto final `31` revierte con `TickAndSpacingNotMatch`.
 
 Espaciados publicados comunes:
 
@@ -58,7 +58,7 @@ Un punto final de posición `t = 2040` con `tick_spacing = 60` vive en el tick a
 
 ### Cuándo se crea un array
 
-Un tick array es perezoso: la **primera** posición que referencia cualquier tick dentro de él inicializa el array, pagando la renta. Los swaps no inicializan tick arrays — los saltan usando el bitmap. El flujo de apertura de posición del SDK inspecciona el rango elegido, calcula la lista de tick arrays que toca, y añade instrucciones `init_tick_array` en la misma transacción que `OpenPosition` si falta alguno.
+Un tick array es perezoso: la **primera** posición que referencia cualquier tick dentro de él inicializa el array, pagando la renta. Los swaps no inicializan tick arrays — los saltan usando el bitmap. No existe una instrucción separada de inicialización de tick array: `OpenPosition*` e `IncreaseLiquidity*` llaman internamente a `TickArrayState::get_or_create_tick_array` y asignan un array que falte a expensas de `payer`. Simplemente pasas el PDA del tick array — incluso cuando aún está sin inicializar y es propiedad del sistema.
 
 ### Los tick arrays no se cierran
 
@@ -66,7 +66,7 @@ Una vez que un tick array ha sido inicializado, persiste durante la vida del poo
 
 ### El bitmap
 
-Encontrar "el siguiente tick inicializado a la izquierda/derecha del tick actual" tiene que ser rápido — un swap puede cruzar muchos ticks. El pool almacena un bitmap de 1 bit por tick array en línea en `PoolState` para el rango ±1,024 arrays alrededor del tick 0. Fuera de ese rango (posiciones de rango completo, configuraciones exóticas), `TickArrayBitmapExtension` proporciona el desbordamiento.
+Encontrar "el siguiente tick inicializado a la izquierda/derecha del tick actual" tiene que ser rápido — un swap puede cruzar muchos ticks. El pool almacena un bitmap de 1 bit por tick array en línea en `PoolState` para el rango **±512** arrays alrededor del tick 0 (`TICK_ARRAY_BITMAP_SIZE = 512`; el campo es `[u64; 16]` = 1,024 bits, divididos 512 negativos / 512 positivos, es decir, índices de array −512 … +511). Fuera de ese rango (posiciones de rango completo, configuraciones exóticas), `TickArrayBitmapExtension` proporciona el desbordamiento.
 
 Un swap camina el bitmap: `lowest_set_bit_above(tick_current_array_index)` da el siguiente array con un tick inicializado en el lado hacia el que el swap está cruzando. Dentro de ese array, un escaneo de bits similar localiza el siguiente tick inicializado.
 
@@ -146,10 +146,10 @@ En el momento de `OpenPosition`, el programa garantiza:
 1. `tick_lower < tick_upper`.
 2. `tick_lower % tick_spacing == 0` y `tick_upper % tick_spacing == 0`.
 3. `MIN_TICK <= tick_lower` y `tick_upper <= MAX_TICK`.
-4. El llamador ha suministrado los tick arrays que contienen `tick_lower` y `tick_upper` — ya inicializados o a través de un `init_tick_array` en la misma transacción.
+4. El llamador ha suministrado los PDAs de tick array que contienen `tick_lower` y `tick_upper`. No necesitan estar inicializados — el programa crea por sí mismo el que falte.
 5. La cuenta de extensión de bitmap, si esta posición se extiende al rango de extensión.
 
-Si alguna verificación falla, la instrucción revierte con `InvalidTickIndex`, `NotApproved`, o `InsufficientLiquidity` dependiendo de qué restricción. Consulta [`reference/error-codes`](/es/reference/error-codes).
+Si alguna verificación falla, la instrucción revierte con `TickInvalidOrder` (regla 1), `TickAndSpacingNotMatch` (regla 2), `InvalidTickIndex` (regla 3), o `MissingTickArrayBitmapExtensionAccount` (regla 5); `NotApproved` cubre el caso aparte en el que `pool_state.status` tiene activado el bit de apertura de posición. Consulta [`reference/error-codes`](/es/reference/error-codes).
 
 ## "En rango" vs "fuera de rango"
 
@@ -157,7 +157,7 @@ Una posición está **en rango** cuando `tick_lower <= tick_current < tick_upper
 
 Una posición fuera de rango:
 
-- Sostiene el 100% de *un* token (el que su rango ha pasado). Específicamente, si `tick_current < tick_lower`, la posición sostiene solo token1 (ya ha sido "vendida" por el precio moviéndose); si `tick_current >= tick_upper`, sostiene solo token0.
+- Sostiene el 100% de *un* token. Si `tick_current < tick_lower` — precio **por debajo** del rango — la posición es enteramente **token0**; si `tick_current >= tick_upper` — precio **por encima** del rango — es enteramente **token1**. El precio se cotiza `token1/token0`, así que una posición atravesada por un precio en alza acaba sosteniendo el activo de cotización.
 - **No** gana comisiones de swap.
 - **Sí** continúa acumulando recompensas si los flujos de recompensa del pool emiten a liquidez fuera de rango — pero el comportamiento predeterminado de Raydium es "emitir solo a en rango", coincidiendo con la convención de Uniswap v3. Consulta [`products/clmm/fees`](/es/products/clmm/fees).
 
@@ -165,10 +165,10 @@ Los LPs que gestionan posiciones CLMM gastan la mayoría de su atención manteni
 
 ## Trampas comunes de integración
 
-- **Puntos finales fuera de espaciado.** El código que calcula un tick a partir de un precio objetivo debe ajustarse a un múltiplo de `tick_spacing` antes de pasarlo a `OpenPosition`. Los ayudantes del SDK (`TickUtils.getTickWithPriceAndTickspacing`) hacen esto; las matemáticas caseras a menudo no.
-- **Tick arrays faltantes.** Abrir una posición amplia puede requerir inicializar varios tick arrays; olvidar pasarlos como cuentas escribibles revierte. El `openPositionFromBase` del SDK te devuelve la lista.
+- **Puntos finales fuera de espaciado.** El código que calcula un tick a partir de un precio objetivo debe ajustarse a un múltiplo de `tick_spacing` antes de pasarlo a `OpenPosition`, o revierte con `TickAndSpacingNotMatch`. El ayudante del SDK es `TickUtil.getPriceAndTick({ price, mintADecimals, mintBDecimals, zeroForOne, tickSpacing })` (nota: `TickUtil`, en singular); las matemáticas caseras a menudo se saltan el ajuste.
+- **Tick arrays faltantes.** Abrir una posición amplia toca dos tick arrays; olvidar pasarlos como cuentas escribibles revierte. No necesitan existir de antemano — el programa crea el que falte — pero la *cuenta* debe estar en la lista.
 - **Tick obsoleto después de un swap.** `tick_current` puede cruzar muchos ticks en un swap. Si tu UX muestra un "tick actual" de una llamada RPC y luego abre una posición en una posterior, la posición relativa vs el precio en vivo puede estar desviada por docenas de ticks. Vuelve a obtener justo antes de firmar.
-- **NFTs de posición con metadatos adicionales.** Si construyes una billetera que reconoce posiciones de Raydium, usa el PDA de posición / datos del programa y no un campo de metadatos codificado. Los nuevos mints de posición usan el PDA del pool como autoridad de mint y congelación en la creación; la autoridad de mint se elimina después de que se acuña el único NFT.
+- **NFTs de posición con metadatos adicionales.** Si construyes una billetera que reconoce posiciones de Raydium, usa el PDA de posición / datos del programa y no un campo de metadatos codificado. Los nuevos mints de posición usan el PDA del pool como mint y autoridad de congelación en la creación; la autoridad de mint se elimina después de que se acuña el único NFT.
 - **Asumir que cada posición es transferible.** Lee el estado `isFrozen` de la cuenta de token NFT antes de mostrar acciones de transferencia, mercado, depósito en garantía, o Burn & Earn.
 
 ## Dónde ir a continuación

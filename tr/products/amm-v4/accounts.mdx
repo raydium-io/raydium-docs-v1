@@ -21,13 +21,11 @@ Bir AMM v4 havuzu, oluşturulduğunda `AmmInfo` üzerinde bir bağlı market kay
 |----------|-------|--------|-----|
 | Havuz | `AmmInfo` | AMM v4 programı | Havuz durumu: tahakkuk eden ücretler, durum, vault'lara referanslar (ve eski alanlar olarak market). |
 | Havuz | `amm_authority` | AMM v4 programı | Program tarafından sahip olunan PDA, vault hareketlerini imzalar. Tüm AMM v4 havuzları arasında paylaşılır. |
-| Havuz | `amm_open_orders` | OpenBook | Eski `OpenOrders` referansı. Program tarafından artık okunmaz/yazılmaz; v1 düzenlerinde konumsal olarak geçirilir. |
+| Havuz | `amm_open_orders` | OpenBook | Eski `OpenOrders` referansı. Mevcut program bunu hiçbir zaman oluşturmaz veya okumaz; her yeni havuzda `AmmInfo.open_orders = Pubkey::default()` yazar. Yalnızca OpenBook kaldırılmasından önce oluşturulan havuzlar gerçek bir değer taşır. v1 düzenlerinde hâlâ konumsal olarak geçirilir. |
 | Havuz | `amm_target_orders` | AMM v4 programı | Eski target-orders hesabı. `WithdrawPnl` tarafından hala referans alınır (hesap #10 olarak) ancak grid oluşturulmaz. |
 | Havuz | `pool_coin_token_account` | SPL Token | Havuzun coin tarafı vault'u (`amm_authority`'nin ATA'sı). |
 | Havuz | `pool_pc_token_account` | SPL Token | Havuzun pc tarafı vault'u. |
 | Havuz | `lp_mint` | SPL Token | Fungible LP mint'i. |
-| Havuz | `pool_withdraw_queue` | AMM v4 programı | Gecikmeli çekilişler için eski kuyruk; sıfır uzunlukta tutulur. |
-| Havuz | `pool_temp_lp` | AMM v4 programı | Yardımcı LP hesabı. |
 | Eski (OpenBook) | `serum_market` | OpenBook | Bağlı market. v1 düzenlerinde geçirilir ancak artık doğrulanmaz veya kullanılmaz. |
 | Eski | `serum_bids`, `serum_asks` | OpenBook | Alış/satış kuyrukları. Yoksayılır. |
 | Eski | `serum_event_queue` | OpenBook | Bekleyen olaylar. Yoksayılır. |
@@ -73,11 +71,12 @@ pub struct AmmInfo {
     pub market: Pubkey,        // OpenBook market'i
     pub market_program: Pubkey, // OpenBook program ID'si
     pub target_orders: Pubkey,
-    pub withdraw_queue: Pubkey,
-    pub lp_vault:       Pubkey, // = pool_temp_lp
-    pub owner: Pubkey,          // admin (multisig)
-    pub lp_reserve: u64,
-    pub padding: [u64; 3],
+    pub padding1: [u64; 8],     // reserved — NOT withdraw_queue / lp_vault
+    pub amm_owner: Pubkey,      // admin (multisig)
+    pub lp_amount: u64,         // the pool's internal LP total; see the note below
+    pub client_order_id: u64,
+    pub recent_epoch: u64,
+    pub padding2: u64,
 }
 
 pub struct Fees {
@@ -117,8 +116,10 @@ Entegratör tarafından görülen alanlar:
 - **`coin_vault`**, **`pc_vault`** — havuzun SPL Token vault'ları. `coin`, Serum/OpenBook kuralına göre `token_0`'dır (taban), `pc` ise `token_1`'dir (alıntı).
 - **`coin_decimals`**, **`pc_decimals`** — mint'lerle eşleşir.
 - **`open_orders`**, **`target_orders`**, **`market`** — eski referans alanları. `AmmInfo` üzerinde hala mevcuttur ve v1 instruction düzenlerinde konumsal olarak hala geçirilir, ancak program artık bunları okumaz veya doğrulamaz. V2 swap giriş noktaları bunları atlar.
-- **`fees.swap_fee_numerator / swap_fee_denominator`** — birleştirilmiş işlem ücreti. Varsayılan `25 / 10_000 = %0.25`.
-- **`status`** — işlemleri kapı açan bitmask. `AdminSetStatus` aracılığıyla admin tarafından ayarlanabilir.
+- **`fees.swap_fee_numerator / swap_fee_denominator`** — birleştirilmiş işlem ücreti. Varsayılan `25 / 10_000 = 0.25%`.
+- **`status`** — işlemleri kapı açan tek bir numaralandırılmış `u64` durumudur, bitmask **değildir**. `param = 0` (`Status`) ile `SetParams` aracılığıyla admin tarafından ayarlanabilir. Aşağıdaki [Durum](#status) bölümüne bakın.
+- **`lp_amount`** — havuzun dahili LP toplamı. `lp_mint.supply` ile **eşit değildir**: tam olarak bir bütün LP token'ı (`10^coin_decimals` taban birimi) kadar daha yüksektir, çünkü bu miktar init sırasında sayılır ama hiçbir zaman mint'lenmez. Programdaki tüm orantısal matematik `lp_amount` kullanır; siz de onu kullanın.
+- **`amm_owner`** — oluşturma sırasında yaratıcıdan değil, programın hardcode edilmiş admin anahtarından yazılır.
 - **`state_data.need_take_pnl_*`** — brüt tahakkuk eden ücretler ile taranmış olanlar arasındaki delta. `TakePnl` bunları sıfırlar.
 
 ## OpenBook bağlantısı
@@ -166,56 +167,75 @@ const [ammAuthority] = PublicKey.findProgramAddressSync(
 );
 ```
 
-OpenBook işlemlerini imzalamak için havuz başına türetilen ayrı bir **havuz kapsamlı** authority vardır (`amm_authority` yukarıda aslında bu programın tasarımında her ikisini de kapsar; farklı sürümler farklı türetme kullandı, bu nedenle kodda belirli havuzun `AmmInfo.nonce`'ını kontrol edin).
+İkinci, havuz kapsamlı bir authority yoktur: bu tek PDA, programın imzaladığı her şeyi kapsar. Bump değeri mainnet'te `254`'tür ve her `AmmInfo` üzerinde `nonce` olarak yansıtılır; `WithdrawExcessLamports` bunu, söz konusu nonce hardcode edilmiş hâlde yeniden türetir.
 
 ## Vault'lar
 
-Havuzun SPL Token vault'ları, `owner`'ı `amm_authority` olan standart token hesaplarıdır. ATA değil — adresleri `Initialize` sırasında `["amm_associated_seed", coin_mint_or_pc_mint, market, amm_id]` tohumlarıyla türetilen belirli PDA'lardır. Adresler `AmmInfo` üzerinde depolanır; türetme tek seferlik bir merak konusudur.
+Havuzun SPL Token vault'ları, `owner`'ı `amm_authority` olan standart token hesaplarıdır. ATA değil — adresleri, `Initialize2` sırasında `[AMM_V4_PROGRAM_ID, market, "coin_vault_associated_seed"]` ve `[AMM_V4_PROGRAM_ID, market, "pc_vault_associated_seed"]` tohumlarından türetilen PDA'lardır. Mint bir tohum değildir, `amm_id` de değildir. Adresler `AmmInfo` üzerinde depolanır; türetme tek seferlik bir merak konusudur.
 
-Token-2022 **desteklenmez**. Program, tüm vault hareketleri için SPL Token'ın program ID'sini hardcode eder. Bir AMM v4 havuzunu Token-2022 mint'ine bağlamaya çalışmak `Initialize` sırasında başarısız olur.
+Token-2022 **desteklenmez**. Program, tüm vault hareketleri için SPL Token'ın program ID'sini hardcode eder. Bir AMM v4 havuzunu Token-2022 mint'ine bağlamaya çalışmak `Initialize2` sırasında `InvalidSplTokenProgram` ile başarısız olur.
 
 ## LP mint
 
-`amm_authority`'nin authority'si olan klasik bir SPL Token mint'i. Toplam arz, havuzun LP sahipliğini izler; LP'yi yakma, her iki vault'tan orantılı olarak token'ları döndürür. AMM v4 CPMM'den önce geldiğinden, havuz durumunda `lp_supply` aynası yoktur — mint'in zincir üzerindeki arzını doğrudan okuyun.
+`amm_authority`'nin authority'si olan klasik bir SPL Token mint'i. Toplam arz, havuzun LP sahipliğini izler; LP'yi yakma, her iki vault'tan orantılı olarak token'ları döndürür.
 
-## Durum bitmask'ı
+Durum içinde bir ayna **vardır**: `AmmInfo.lp_amount`. Bu, mint'in arzına eşit değildir — tam olarak bir bütün LP token'ı (`10^coin_decimals` taban birimi) kadar daha yüksektir, çünkü bu miktar init sırasında sayılır ama hiçbir zaman mint'lenmez. Programdaki her orantısal hesaplama `lp_amount`'a böler; bu nedenle mint'in zincir üzerindeki arzı yerine bu alanı kullanın.
 
-`AmmInfo.status` işlemleri kapı açar. Bitler (konum program sürümleri arasında farklılık gösterebilir — kaynaktan onaylayın):
+## Durum
 
-| Bit | Bayrak | Etki |
-|-----|--------|------|
-| 0 | `SWAP_DISABLED` | `Swap*` reddeder. |
-| 1 | `DEPOSIT_DISABLED` | `Deposit` reddeder. |
-| 2 | `WITHDRAW_DISABLED` | `Withdraw` reddeder. |
-| 3 | `CLMM_LIKE_MIGRATE` | Ops tarafından kullanılan geçiş kapısı bayrak'ı. |
+`AmmInfo.status`, tek bir numaralandırılmış `u64` durumudur, bitmask **değildir**. Eşitlik için test edin — `status & 1` testi yapan bir istemci her canlı havuzu yanlış sınıflandırır, çünkü normal işlem durumu `6`'dır ve bu değerin 0. biti set edilmiştir.
 
-Raydium multisig'i bunları `SetParams` aracılığıyla ayarlar (`param = Status` ile). (`AdminCancelOrders` kaldırılmıştır.)
+| Değer | `AmmStatus` | Swap | Yatırma | Çekme |
+|-------|-------------|------|---------|----------|
+| 0 | `Uninitialized` | hayır | hayır | hayır |
+| 1 | `Initialized` | evet | evet | evet |
+| 2 | `Disabled` | hayır | hayır | hayır |
+| 3 | `WithdrawOnly` | hayır | hayır | evet |
+| 4 | `LiquidityOnly` | hayır | evet | evet |
+| 5 | `OrderBookOnly` | hayır | evet | evet |
+| 6 | `SwapOnly` | evet | evet | evet |
+| 7 | `WaitingTrade` | evet, `pool_open_time` geçtikten sonra | evet | evet |
+
+`Initialize2`, `open_time` gelecekteyse `7`, aksi hâlde `6` yazar; `7` durumundaki bir havuz, `state_data.pool_open_time` anında veya sonrasındaki ilk swap'ta kendisini `6`'ya çevirir. `0..=7` aralığı dışındaki bir değer `AmmStatus::from_u64`'ün panik yapmasına neden olur.
+
+Raydium multisig'i durumu `param = 0` (`Status`) ile `SetParams` aracılığıyla ayarlar; yalnızca `1`–`7` değerleri kabul edilir. (`AdminCancelOrders` kaldırılmıştır.)
 
 ## Gözlem / oracle
 
-**AMM v4'ün adanmış gözlem hesabı yoktur.** Zincir üzerinde TWAP'a ihtiyaç duyan diğer protokoller, OpenBook'un kitap geçişlerini dolaylı olarak tüketir veya zincir dışından okur. Raydium TWAP'ına program desteği ile ihtiyacınız varsa, CPMM veya CLMM kullanın.
+**AMM v4'ün adanmış gözlem hesabı yoktur** ve OpenBook kaldırıldığından bu yana bundan türetilebilecek bir emir defteri durumu da yoktur. Program desteğiyle bir Raydium TWAP'ına ihtiyacınız varsa CPMM veya CLMM kullanın — her ikisi de bir `ObservationState` halka tamponu tutar. Aksi hâlde swap loglarını zincir dışında indeksleyin.
 
 ## Bir havuzun hesaplarını sıfırdan türetme
 
-AMM v4, belirleyici per-pair PDA'lar için tasarlanmadığından (bu Solana kuralından önce gelir), kanonik `amm_id` bir **tohumlanmış keypair**'dir:
+AMM v4'ün havuz hesapları, bağlı market üzerine anahtarlanmış düz PDA'lardır — tohumlanmış keypair'ler değil, çift başına PDA'lar da değil. Hepsi `AMM_V4_PROGRAM_ID` altında aynı üç tohumlu `[AMM_V4_PROGRAM_ID, market, <label>]` şeklini kullanır:
 
-```
-ammId = createWithSeed(
-  owner: ammAuthority,
-  seed:  marketPubkey.toBase58().slice(0, 32),
-  programId: AMM_V4_PROGRAM_ID,
-)
+| Hesap | `<label>` |
+|---------|-----------|
+| `amm_id` (`AmmInfo`) | `"amm_associated_seed"` |
+| `amm_target_orders` | `"target_associated_seed"` |
+| `lp_mint` | `"lp_mint_associated_seed"` |
+| `pool_coin_token_account` | `"coin_vault_associated_seed"` |
+| `pool_pc_token_account` | `"pc_vault_associated_seed"` |
+
+```ts
+const [ammId] = PublicKey.findProgramAddressSync(
+  [
+    AMM_V4_PROGRAM_ID.toBuffer(),
+    marketPubkey.toBuffer(),
+    Buffer.from("amm_associated_seed"),
+  ],
+  AMM_V4_PROGRAM_ID,
+);
 ```
 
-Aynı tohumlanmış anahtar deseni `amm_open_orders`, `amm_target_orders`, `amm_withdraw_queue`, `pool_temp_lp`, `pool_coin_token_account`, `pool_pc_token_account` ve `lp_mint` için geçerlidir. SDK ve API bunları önceden hesaplar; `raydium-sdk-v2`'nin `Liquidity.getAssociatedPoolKeys` bölümüne bakın.
+Bağlı market tek değişken tohumdur; bu nedenle bir market tam olarak bir AMM v4 havuzuna karşılık gelir. SDK ve API bunları önceden hesaplar; `raydium-sdk-v2`'nin `Liquidity.getAssociatedPoolKeys` bölümüne bakın.
 
 Uygulamada, entegratörler havuzun tam hesap setini `GET https://api-v3.raydium.io/pools/info/ids?ids=<POOL_ID>` veya SDK'dan okurlar. El ile türetme nadiren gereklidir.
 
 ## Yaşam döngüsü hızlı referansı
 
 | Olay | Oluşturulan Hesaplar | Yok Edilen Hesaplar |
-|------|---------------------|---------------------|
-| `Initialize2` | `amm_info`, `amm_open_orders`, `amm_target_orders`, vault'lar, `lp_mint`, `pool_withdraw_queue`, `pool_temp_lp` | — |
+|-------|------------------|---------------------|
+| `Initialize2` | `amm_info`, `amm_target_orders`, her iki vault, `lp_mint` ve yaratıcının LP ATA'sı | — |
 | `Deposit` | — (kullanıcı LP ATA'sı oluşturabilir) | — |
 | `Withdraw` | — | — |
 | `SwapBaseIn` / `SwapBaseOut` (v1 / V2) | — (kullanıcı ATA'sı oluşturabilir) | — |
@@ -228,7 +248,7 @@ Havuzlar ve hesapları süresiz olarak kalır. Likidite tamamen çekilse bile, `
 - **Matematik ve ücret aritmetiği**: [`products/amm-v4/math`](/tr/products/amm-v4/math).
 - **Ücret bölünmesi ve CPMM/CLMM ile nasıl karşılaştırıldığı**: [`products/amm-v4/fees`](/tr/products/amm-v4/fees).
 - **Instruction hesap listeleri**: [`products/amm-v4/instructions`](/tr/products/amm-v4/instructions).
-- **OpenBook hesap türetmesi**: OpenBook program dokümanları ([`github.com/openbook-dex/program`](https://github.com/openbook-dex/program)).
+- **OpenBook hesap türetmesi**: OpenBook program kaynağı ([`github.com/openbook-dex/program`](https://github.com/openbook-dex/program)) — düzyazı dokümantasyon değil, bir Rust monorepo'su.
 
 Kaynaklar:
 

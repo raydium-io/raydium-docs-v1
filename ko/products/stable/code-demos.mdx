@@ -15,7 +15,7 @@ description: "API에서 Stable AMM 풀을 식별하고, Liquidity 모듈을 통�
   - SDK: `@raydium-io/raydium-sdk-v2@0.2.64-alpha`
   - 클러스터: Solana `mainnet-beta`
   - Stable AMM 프로그램 ID: `5quBtoiQqxF9Jv6KYKctB59NT3gtJD2Y65kdnB1Uev3h` ([`reference/program-addresses`](/ko/reference/program-addresses) 참조)
-  - 마지막 검증: 2026-04
+  - 마지막 검증: **2026-09-09** (SDK `0.2.64-alpha` 소스 및 `raydium-sdk-V2-demo` amm/trade 데모 기준)
 
   SDK의 `liquidity` 모듈은 Stable AMM 풀을 기본적으로 지원합니다. Stable 풀은 `ApiV3PoolInfoStandardItem`에서 **`version: 5`** (또는 `pooltype: "StablePool"`)로 표시되며, AMM v4 (`version: 4`) 상수곱 풀과 동일한 `addLiquidity` / `removeLiquidity` / 스왑 헬퍼를 사용합니다. SDK가 변형을 감지하고 올바른 명령어를 자동으로 생성합니다. 오프체인 stable-curve 수학은 `src/raydium/liquidity/stable.ts`에 있습니다.
 </Info>
@@ -35,22 +35,24 @@ import bs58 from "bs58";
 const connection = new Connection(clusterApiUrl("mainnet-beta"));
 const owner = Keypair.fromSecretKey(bs58.decode(process.env.PRIVATE_KEY!));
 
-const raydium = await Raydium.load({
-  connection,
-  owner,
-  cluster: "mainnet",
-  // 선택사항: `liquidity/stable.ts`의 견적 헬퍼를 직접 호출하려면
-  // stable curve 모델 레이아웃을 로드합니다. 풀 수준의 스왑 / 추가 / 제거는
-  // 이를 지연 로드하므로 대부분의 호출자는 이 단계를 건너뛸 수 있습니다.
-});
+const raydium = await Raydium.load({ connection, owner, cluster: "mainnet" });
 
-// 일회성: 오프체인 stable-curve 헬퍼에서 사용하는 온체인 모델 데이터 레이아웃을 미리 가져옵니다.
-// getStablePrice / getDxByDyBaseIn / getDyByDxBaseIn을 직접 호출할 때만 필요합니다.
-// addLiquidity / removeLiquidity / swap은 이를 필요로 하지 않습니다.
+// Stable 풀 견적을 위해 필수입니다. initLayout()은 온체인
+// ModelDataInfo 조회 테이블을 raydium.liquidity.stableLayout으로 가져옵니다.
 await raydium.liquidity.initLayout();
 ```
 
-## Stable 풀 식별하기
+<Warning>
+  **`initLayout()`은 Stable 풀에서 선택사항이 아닙니다.** `liquidity.computeAmountOut`은 `poolInfo.version`에 따라 분기됩니다. version 4의 경우 상수곱 공식을 사용하고, 다른 경우 `this.stableLayout.stableModelData`를 읽고 조회 테이블을 보간합니다. `initLayout()`이 실행될 때까지 이 캐시는 비어 있으므로, 이 없이 v5 풀을 견적하면 오류 대신 잘못된 결과가 나옵니다. 멱등성이 있고 비용이 저렴하므로 시작 시 한 번 호출하세요.
+
+  트랜잭션 빌더(`swap`, `addLiquidity`, `removeLiquidity`)는 이를 필요로 하지 않습니다. `pooltype.includes("StablePool")`에 따라 분기하고 `AmmV5*` 명령어를 생성하며, 전달하는 금액 범위는 이미 계산되어 있습니다.
+</Warning>
+
+<Warning>
+  **`liquidity.computeAmountIn`은 Stable 풀을 지원하지 않습니다.** `computeAmountOut`과 달리 버전 분기가 없으므로 항상 상수곱 역함수를 적용하여 v5 풀에서 잘못된 `maxAmountIn`을 반환합니다. Stable 풀에 대한 정확한 출력 스왑의 경우, 아래 [오프체인 견적 헬퍼](#오프체인-견적-헬퍼-stablets)에서 `getDxByDyBaseIn`으로 직접 역함수를 계산하고 결과를 `fixedSide: "out"`과 함께 `swap`에 전달하세요.
+</Warning>
+
+## Stable 풀 식별
 
 `ApiV3PoolInfoStandardItem`의 두 가지 동등한 신호:
 
@@ -64,7 +66,7 @@ const STABLE_AMM_PROGRAM_ID = "5quBtoiQqxF9Jv6KYKctB59NT3gtJD2Y65kdnB1Uev3h";
 const isStableByProgram = pool.programId === STABLE_AMM_PROGRAM_ID;
 ```
 
-AMM v4 (`version: 4`, 상수곱)와 Stable AMM (`version: 5`) 모두 SDK의 동일한 `LiquidityModule` API를 통해 흐릅니다. 내부적으로 모듈은 다음으로 디스패치합니다:
+AMM v4 (`version: 4`, 상수곱)와 Stable AMM (`version: 5`) 모두 SDK의 동일한 `LiquidityModule` API를 통해 흐릅니다. 내부적으로 모듈은 다음으로 분기합니다:
 
 - v4 풀의 경우 `InstructionType.AmmV4AddLiquidity` / `AmmV4RemoveLiquidity`
 - v5 (Stable) 풀의 경우 `InstructionType.AmmV5AddLiquidity` / `AmmV5RemoveLiquidity`
@@ -75,19 +77,21 @@ AMM v4 (`version: 4`, 상수곱)와 Stable AMM (`version: 5`) 모두 SDK의 동�
 
 ```ts
 import { PublicKey } from "@solana/web3.js";
+import type { ApiV3PoolInfoStandardItem } from "@raydium-io/raydium-sdk-v2";
 
 // 예제로 사용할 두 가지 일반적인 민트
-const mintA = new PublicKey("Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB"); // USDT
+const mintA = new PublicKey("Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB"); // USDT — reference/program-addresses 참조
 const mintB = new PublicKey("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"); // USDC
 
-const pools = await raydium.api.fetchPoolByMintPair({
+// fetchPoolByMints는 페이지 처리된 봉투를 반환합니다: { count, data, hasNextPage }
+const res = await raydium.api.fetchPoolByMints({
   mint1: mintA.toBase58(),
   mint2: mintB.toBase58(),
 });
 
-const stablePool = pools.find(
+const stablePool = res.data.find(
   (p) => p.version === 5 || p.pooltype.includes("StablePool"),
-);
+) as ApiV3PoolInfoStandardItem | undefined;
 
 if (!stablePool) {
   throw new Error("이 민트 쌍에 대한 Stable 풀이 없습니다");
@@ -98,44 +102,57 @@ console.log("Stable 풀 programId:", stablePool.programId);
 console.log("TVL:", stablePool.tvl);
 ```
 
-민트 쌍에 v4 (상수곱) 풀과 v5 (stable) 풀이 모두 있으면 응답에 둘 다 포함됩니다. 흐름에 필요한 것을 선택하거나 [AMM Routing](/ko/products/routing) 프로그램에 전달하고 최적의 경로를 선택하도록 합니다.
+민트 쌍에 v4 (상수곱) 풀과 v5 (stable) 풀이 모두 있으면 응답에 둘 다 포함됩니다. 흐름에 필요한 것을 선택하거나 [AMM 라우팅](/ko/products/routing) 프로그램에 전달하고 최적의 경로를 선택하도록 하세요.
 
 ## Stable 풀을 통한 스왑
 
-`LiquidityModule.swap` 흐름은 v4 풀과 동일한 형태입니다. v5 풀 객체를 전달하기만 하면 됩니다:
+`LiquidityModule.swap` 흐름은 v4 풀과 동일한 형태입니다. v5 풀 객체를 전달하기만 하면 됩니다. 실수하기 쉬운 두 가지 세부 사항이 있습니다: `computeAmountOut`은 풀의 **라이브 리저브**가 풀 정보에 접합되어야 하고 (API 항목만으로는 충분하지 않음), `slippage`는 `Percent`가 아닌 일반 **숫자**입니다:
 
 ```ts
-import { Percent, TokenAmount, toToken } from "@raydium-io/raydium-sdk-v2";
+import BN from "bn.js";
 
-const inputAmount = new TokenAmount(toToken(stablePool.mintA), 1_000_000); // 1 USDT
-const slippage = new Percent(50, 10_000); // 0.5%
+const amountIn = new BN(1_000_000); // 1 USDT (6 decimals), 원시 단위
 
-// SDK의 stable-curve 헬퍼를 내부적으로 사용하여 예상 출력을 계산합니다.
-const { amountOut, minAmountOut } = raydium.liquidity.computeAmountOut({
-  poolInfo: stablePool,
-  amountIn: inputAmount,
+// 라이브 리저브 + 상태. 메인넷에서는 getAmmPoolKeys(poolId)에서 poolKeys를
+// getRpcPoolInfo(poolId)에서 리저브를 가져올 수도 있습니다.
+const rpcData  = await raydium.liquidity.getRpcPoolInfo(stablePool.id);
+const poolKeys = await raydium.liquidity.getAmmPoolKeys(stablePool.id);
+
+const out = raydium.liquidity.computeAmountOut({
+  poolInfo: {
+    ...stablePool,
+    baseReserve:  rpcData.baseReserve,
+    quoteReserve: rpcData.quoteReserve,
+    status:       rpcData.status.toNumber(),
+    version:      5, // 5 = Stable; 곡선 분기가 이것으로 선택됩니다
+  },
+  amountIn,
   mintIn:  stablePool.mintA.address,
   mintOut: stablePool.mintB.address,
-  slippage,
+  slippage: 0.005, // 일반 숫자: 0.005 = 0.5% (범위 1 ~ 0.0001)
 });
 
-console.log("예상 출력:", amountOut.toSignificant());
-console.log("최소 출력:", minAmountOut.toSignificant());
+// amountOut / minAmountOut은 TokenAmount가 아닌 원시 단위의 BN입니다.
+console.log("예상 출력:", out.amountOut.toString());
+console.log("최소 출력:", out.minAmountOut.toString());
 
-// 스왑 트랜잭션을 구성하고 서명합니다.
+// 스왑 트랜잭션을 빌드하고 서명합니다. `inputMint`는 필수입니다. 없으면
+// SDK가 풀의 어느 쪽을 판매하는지 알 수 없습니다.
 const { transaction, execute } = await raydium.liquidity.swap({
-  poolInfo: stablePool,
-  amountIn:    inputAmount.raw,
-  amountOut:   minAmountOut.raw,
-  fixedSide:   "in",
-  txVersion:   TxVersion.V0,
+  poolInfo:  stablePool,
+  poolKeys,
+  amountIn,
+  amountOut: out.minAmountOut, // out.amountOut는 슬리피지 전 수치입니다
+  inputMint: stablePool.mintA.address,
+  fixedSide: "in",
+  txVersion: TxVersion.V0,
 });
 
 const { txId } = await execute({ sendAndConfirm: true });
 console.log("Stable 스왑 tx:", txId);
 ```
 
-SDK는 풀 키에서 풀의 `programId`를 읽고 Stable AMM 프로그램으로 디스패치합니다. 특별한 `programId` 인수가 필요하지 않습니다.
+SDK는 풀 키에서 풀의 `programId`를 읽고 Stable AMM 프로그램으로 분기합니다. 특별한 `programId` 인수가 필요하지 않습니다.
 
 ## 유동성 추가 및 제거
 
@@ -143,23 +160,31 @@ SDK는 풀 키에서 풀의 `programId`를 읽고 Stable AMM 프로그램으로 
 
 ```ts
 import { Percent, TokenAmount, toToken } from "@raydium-io/raydium-sdk-v2";
+import Decimal from "decimal.js";
 
-const amountInA = new TokenAmount(toToken(stablePool.mintA), 100_000_000); // 100 USDT
-const slippage  = new Percent(50, 10_000); // 0.5%
+const inputAmount = "100"; // 100 USDT, 인간 단위 — computePairAmount는 십진수 문자열을 사용합니다
 
 // 곡선이 이 크기의 A에 필요한 일치하는 B 금액을 계산합니다.
-const { anotherAmount, minAnotherAmount } = raydium.liquidity.computePairAmount({
+// 참고: computePairAmount의 slippage는 Percent입니다 (computeAmountOut의 것과 달리).
+const r = raydium.liquidity.computePairAmount({
   poolInfo: stablePool,
-  amount:   amountInA.toSignificant(),
+  amount:   inputAmount,
   baseIn:   true,
-  slippage,
+  slippage: new Percent(50, 10_000), // 0.5%
 });
 
 const { execute } = await raydium.liquidity.addLiquidity({
   poolInfo: stablePool,
-  amountInA,
-  amountInB:      anotherAmount,
-  otherAmountMin: minAnotherAmount,
+  poolKeys,
+  amountInA: new TokenAmount(
+    toToken(stablePool.mintA),
+    new Decimal(inputAmount).mul(10 ** stablePool.mintA.decimals).toFixed(0),
+  ),
+  amountInB: new TokenAmount(
+    toToken(stablePool.mintB),
+    new Decimal(r.maxAnotherAmount.toExact()).mul(10 ** stablePool.mintB.decimals).toFixed(0),
+  ),
+  otherAmountMin: r.minAnotherAmount,
   fixedSide:      "a",
   txVersion:      TxVersion.V0,
 });
@@ -168,7 +193,7 @@ const { txId } = await execute({ sendAndConfirm: true });
 console.log("유동성 추가 tx:", txId);
 ```
 
-내부적으로 SDK는 `pooltype.includes("StablePool")`이 참이므로 `InstructionType.AmmV5AddLiquidity`를 생성합니다. 해당하는 `removeLiquidity` 흐름은 대칭입니다. `lpAmount`와 각 측면에서 수락할 최소 금액을 입력합니다.
+내부적으로 SDK는 `pooltype.includes("StablePool")`이 참이므로 `InstructionType.AmmV5AddLiquidity`를 생성합니다. 해당하는 `removeLiquidity` 흐름은 대칭입니다. `lpAmount`와 각 쪽에서 수락할 최소 금액을 입력하세요.
 
 ## 오프체인 견적 헬퍼 (stable.ts)
 
@@ -185,65 +210,86 @@ import {
 // `ModelDataInfo` PDA를 SDK의 StableLayout 캐시로 로드합니다).
 await raydium.liquidity.initLayout();
 
-const modelData = raydium.liquidity.stableLayout;
+// initLayout()은 StableLayout 인스턴스를 채웁니다. 아래 세 헬퍼가
+// 기대하는 일반 데이터 객체는 인스턴스가 아닌 `stableModelData` 게터입니다.
+const modelData = raydium.liquidity.stableLayout.stableModelData;
 
-// 풀의 현재 준비금에서의 현물 가격입니다.
-const price = getStablePrice(modelData, /* x */, /* y */, /* withFee */);
+// 리저브는 일반 숫자로 인간 단위로 전달됩니다 (BN이 아님, 원시 단위 아님).
+const coinReserve = 1_200_000; // 풀의 코인 쪽 리저브
+const pcReserve   = 1_150_000; // 풀의 pc 쪽 리저브
+
+// 풀의 현재 리저브에서의 현물 가격. 네 번째 인수는 `baseCoin`입니다:
+// true는 coin-per-pc를 반환하고, false는 역수를 반환합니다.
+const price = getStablePrice(modelData, coinReserve, pcReserve, true);
 console.log("현물 가격:", price);
 
-// 견적: dx 입력이 주어졌을 때 얼마나 많은 dy 출력인가요 (수수료 미적용)?
-const dyOut = getDyByDxBaseIn(modelData, /* x */, /* y */, /* dx */);
+// 견적: dx 입력이 주어졌을 때 얼마나 많은 dy 출력인가 (수수료 미적용)?
+const dyOut = getDyByDxBaseIn(modelData, coinReserve, pcReserve, 1_000);
 
-// 견적: dy 출력 목표가 주어졌을 때 필요한 dx 입력은 얼마인가요?
-const dxIn  = getDxByDyBaseIn(modelData, /* x */, /* y */, /* dy */);
+// 견적: dy 출력 목표가 주어졌을 때 필요한 dx 입력은 얼마인가?
+const dxIn  = getDxByDyBaseIn(modelData, coinReserve, pcReserve, 1_000);
 ```
 
-이들은 순수 함수입니다. RPC 없음, 서명 없음. 온체인 `ModelDataInfo`는 `initLayout()`에 의해 한 번 가져와지고 `raydium.liquidity.stableLayout`에 캐시됩니다. 현재 준비금 (`x`, `y`)을 전달하면 헬퍼는 조회 테이블을 이진 검색하고 두 개의 인접한 `DataElement` 행 사이를 선형 보간하여 계산합니다. 기본 알고리즘은 [`products/stable/math`](/ko/products/stable/math)를 참조하세요.
+이들은 순수 함수입니다. RPC 없음, 서명 없음. 온체인 `ModelDataInfo`는 `initLayout()`에 의해 한 번 가져와지고 `raydium.liquidity.stableLayout` 내에 캐시되며, `.stableModelData`로 읽을 수 있습니다. `initStableModelLayout()`은 멱등성이 있습니다. `validDataCount === 0`인 동안만 다시 가져오므로 `initLayout()`을 다시 호출하는 것은 무료입니다. 현재 리저브(`x`, `y`)를 전달하면 헬퍼는 조회 테이블을 이진 검색하고 두 개의 인접한 `DataElement` 행 사이를 선형 보간하여 계산합니다. 기본 알고리즘은 [`products/stable/math`](/ko/products/stable/math)를 참조하세요.
 
-## AMM Routing을 통한 라우팅 (멀티홉 / 최적 가격)
+## AMM 라우팅을 통한 라우팅 (멀티홉 / 최적 가격)
 
-직접 거래소를 선택하지 않으려면 [AMM Routing](/ko/products/routing) 프로그램이 모든 Raydium AMM (v4 / CPMM / CLMM / Stable)을 고려하고 최적의 조합을 통해 라우팅합니다:
+직접 장소를 선택하지 않으려면 [AMM 라우팅](/ko/products/routing) 프로그램이 모든 Raydium AMM (v4 / CPMM / CLMM / Stable)을 고려하고 최적의 조합을 통해 라우팅합니다:
+
+라우터는 단일 `swap()`이 아닌 5개 호출 파이프라인이며, 프로덕션에서 사용 가능하게 하는 캐싱 조언과 함께 [`products/routing/code-demos`](/ko/products/routing/code-demos)에 완전히 작성되어 있습니다. 형태는:
 
 ```ts
-const route = await raydium.tradeV2.fetchRoutes({
-  inputMint:  mintA,
-  outputMint: mintB,
-  amount:     new BN(1_000_000),
-  slippage,
+import { Router } from "@raydium-io/raydium-sdk-v2";
+
+const poolData = await raydium.tradeV2.fetchRoutePoolBasicInfo(); // 이를 캐시하세요
+const routes   = raydium.tradeV2.getAllRoute({ inputMint: mintA, outputMint: mintB, ...poolData });
+const ctx      = await raydium.tradeV2.fetchSwapRoutesData({ routes, inputMint: mintA, outputMint: mintB });
+const quotes   = raydium.tradeV2.getAllRouteComputeAmountOut({ /* ...ctx, amount, slippage, ... */ });
+
+const best = quotes[0]; // 최적 우선 정렬
+if (!best) throw new Error("스왑 경로를 찾을 수 없습니다");
+
+// best.poolInfoList 항목은 `version`을 포함합니다. 5는 경로의 Stable 풀을 표시합니다.
+console.log(best.routeType, best.poolInfoList.map((p) => p.version));
+
+const poolKeys = await raydium.tradeV2.computePoolToPoolKeys({
+  pools: best.poolInfoList,
+  ammRpcData:  ctx.ammPoolsRpcInfo,
+  clmmRpcData: ctx.clmmPoolsRpcInfo,
 });
 
-// route.routes[0].poolType는 최적 경로가 사용하는 프로그램을 알려줍니다.
-// Stable 풀이 최적 경로의 일부일 때마다 "Stable"이 여기에 나타납니다.
-console.log(route.routes[0]);
-
 const { execute } = await raydium.tradeV2.swap({
-  inputMint:    mintA,
-  outputMint:   mintB,
-  inputAmount:  new BN(1_000_000),
-  swapResult:   route.routes[0],
-  slippage,
+  routeProgram: Router,
+  swapInfo:     best,
+  swapPoolKeys: poolKeys,
+  ownerInfo:    { associatedOnly: true, checkCreateATAOwner: true },
   txVersion:    TxVersion.V0,
 });
 
-const { txId } = await execute({ sendAndConfirm: true });
+// tradeV2.swap은 여러 트랜잭션을 반환할 수 있습니다. 첫 번째는 중간 ATA를 생성합니다.
+const { txIds } = await execute({ sequentially: true });
 ```
 
-이것은 프로덕션 스왑 및 애그리게이터를 위한 권장 경로입니다. Stable 풀이 존재하는지 또는 오늘 더 나은 거래소인지 수동으로 결정할 필요가 없습니다.
+<Warning>
+  `raydium.tradeV2.fetchRoutes`는 없으며, `tradeV2.swap`은 `inputMint` / `outputMint` / `slippage`를 수락하지 **않습니다**. `getAllRouteComputeAmountOut`에서 이미 계산된 `swapInfo`를 사용합니다. **단일** 알려진 풀의 경우 해당 풀 유형의 자체 빌더 (`raydium.liquidity.swap` for AMM v4 and Stable, `raydium.cpmm.swap`, `raydium.clmm.swap`)를 이 페이지의 앞부분에 표시된 대로 사용하세요.
+</Warning>
 
-## 권장사항
+이것은 프로덕션 스왑퍼 및 애그리게이터를 위한 권장 경로입니다. Stable 풀이 존재하는지 또는 오늘 더 나은 장소인지 수동으로 결정할 필요가 없습니다.
 
-1. **최종 사용자 스왑의 경우** [`tradeV2`](/ko/products/routing) 라우팅 흐름을 선호합니다. Stable을 포함한 모든 Raydium 풀 유형을 처리합니다.
-2. **풀별 작업의 경우** (알려진 Stable 풀에서 LP 추가 / 제거), `LiquidityModule`을 직접 사용합니다. v5 풀을 자동으로 감지합니다.
-3. **오프체인 견적 / 분석의 경우** `initLayout()` 후 `getStablePrice` / `getDyByDxBaseIn` / `getDxByDyBaseIn`을 호출합니다. 모델 데이터가 캐시된 후 견적당 RPC 트래픽이 없습니다.
-4. **원시 `SwapBaseIn` 명령어를 직접 인코딩하지 마세요.** [2026-06-22 업그레이드](/ko/reference/changelog)는 죽은 OpenBook 계정을 제거했으므로 새로운 스왑 레이아웃은 **9개 계정**을 사용합니다 (이전 18개 계정 레이아웃은 하위 호환성을 위해 여전히 파싱됨). `Deposit`은 이제 12개 계정입니다 (이전 14개 호환), `Withdraw` 12개 (이전 21/22개 호환), `WithdrawPnl` 10개이며 **호환성 경로가 없습니다**. SDK의 사전 구성된 헬퍼는 올바른 레이아웃과 순서를 선택합니다. 직접 구현하는 것은 오류가 발생하기 쉽습니다. 전체 계정 테이블은 [`products/stable/instructions`](/ko/products/stable/instructions)를 참조하세요.
+## 권장 사항
+
+1. **최종 사용자 스왑의 경우** [`tradeV2`](/ko/products/routing) 라우팅 흐름을 선호하세요. Stable을 포함한 모든 Raydium 풀 유형을 처리합니다.
+2. **풀 특정 작업** (알려진 Stable 풀에서 LP 추가/제거)의 경우 `LiquidityModule`을 직접 사용하세요. v5 풀을 자동으로 감지합니다.
+3. **오프체인 견적 / 분석의 경우** `initLayout()` 후 `getStablePrice` / `getDyByDxBaseIn` / `getDxByDyBaseIn`을 호출하세요. 모델 데이터가 캐시된 후 견적당 RPC 트래픽이 없습니다.
+4. **원시 `SwapBaseIn` 명령어를 직접 인코딩하지 마세요.** [2026-06-22 업그레이드](/ko/reference/changelog)는 죽은 OpenBook 계정을 제거했으므로 새로운 스왑 레이아웃은 **9개 계정**을 사용합니다 (이전 18개 계정 레이아웃은 하위 호환성을 위해 여전히 파싱됨). `Deposit`은 이제 12개 계정 (이전 14개 호환), `Withdraw` 12개 (이전 21/22개 호환), `WithdrawPnl` 10개 **호환성 경로 없음**입니다. SDK의 사전 빌드된 헬퍼는 올바른 레이아웃과 순서를 선택합니다. 직접 작성하는 것은 오류가 발생하기 쉽습니다. 전체 계정 테이블은 [`products/stable/instructions`](/ko/products/stable/instructions)를 참조하세요.
 
 ## 다음 단계
 
-- [Math](/ko/products/stable/math) — 조회 테이블 보간이 어떻게 작동하는지.
-- [Instructions](/ko/products/stable/instructions) — 전체 명령어 참조.
-- [AMM Routing](/ko/products/routing) — AMM v4, CPMM, CLMM, Stable 전체의 멀티풀 라우팅.
+- [수학](/ko/products/stable/math) — 조회 테이블 보간이 작동하는 방식.
+- [명령어](/ko/products/stable/instructions) — 전체 명령어 참조.
+- [AMM 라우팅](/ko/products/routing) — AMM v4, CPMM, CLMM, Stable 전체의 멀티풀 라우팅.
 
 소스:
 
-- [`raydium-sdk-V2/src/raydium/liquidity/liquidity.ts`](https://github.com/raydium-io/raydium-sdk-V2/blob/master/src/raydium/liquidity/liquidity.ts) — 모듈 진입점; v4 / v5 디스패치.
+- [`raydium-sdk-V2/src/raydium/liquidity/liquidity.ts`](https://github.com/raydium-io/raydium-sdk-V2/blob/master/src/raydium/liquidity/liquidity.ts) — 모듈 진입점; v4 / v5 분기.
 - [`raydium-sdk-V2/src/raydium/liquidity/stable.ts`](https://github.com/raydium-io/raydium-sdk-V2/blob/master/src/raydium/liquidity/stable.ts) — `StableLayout`, `getStablePrice`, `getDxByDyBaseIn`, `getDyByDxBaseIn`.

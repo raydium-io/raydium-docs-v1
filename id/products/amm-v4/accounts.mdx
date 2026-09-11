@@ -21,13 +21,11 @@ Pool AMM v4 mencatat satu pasar terikat pada `AmmInfo` saat pembuatan. Gambaran 
 |----------|------|---------|-------|
 | Pool | `AmmInfo` | Program AMM v4 | Status pool: biaya yang terkumpul, status, referensi ke vault (dan, sebagai bidang warisan, pasar). |
 | Pool | `amm_authority` | Program AMM v4 | PDA milik program yang menandatangani pergerakan vault. Dibagikan di semua pool AMM v4. |
-| Pool | `amm_open_orders` | OpenBook | Referensi `OpenOrders` warisan. Tidak lagi dibaca/ditulis oleh program; masih dilewatkan secara posisional pada tata letak v1. |
+| Pool | `amm_open_orders` | OpenBook | Referensi `OpenOrders` warisan. Tidak pernah dibuat atau dibaca oleh program saat ini, yang menulis `AmmInfo.open_orders = Pubkey::default()` pada setiap pool baru; hanya pool yang dibuat sebelum penghapusan OpenBook yang membawa nilai sungguhan. Masih dilewatkan secara posisional pada tata letak v1. |
 | Pool | `amm_target_orders` | Program AMM v4 | Akun target-orders warisan. Masih direferensikan oleh `WithdrawPnl` (sebagai akun #10) tetapi tidak ada grid yang dibangun. |
 | Pool | `pool_coin_token_account` | SPL Token | Vault sisi coin pool (ATA dari `amm_authority`). |
 | Pool | `pool_pc_token_account` | SPL Token | Vault sisi pc pool. |
 | Pool | `lp_mint` | SPL Token | Mint LP yang dapat ditukar. |
-| Pool | `pool_withdraw_queue` | Program AMM v4 | Antrian warisan untuk penarikan tertunda; disimpan dengan panjang nol. |
-| Pool | `pool_temp_lp` | Program AMM v4 | Akun LP tambahan. |
 | Legacy (OpenBook) | `serum_market` | OpenBook | Pasar yang terikat. Dilewatkan pada tata letak v1 tetapi tidak lagi divalidasi atau digunakan. |
 | Legacy | `serum_bids`, `serum_asks` | OpenBook | Antrian bid/ask. Diabaikan. |
 | Legacy | `serum_event_queue` | OpenBook | Peristiwa yang tertunda. Diabaikan. |
@@ -73,11 +71,12 @@ pub struct AmmInfo {
     pub market: Pubkey,        // OpenBook market
     pub market_program: Pubkey, // OpenBook program ID
     pub target_orders: Pubkey,
-    pub withdraw_queue: Pubkey,
-    pub lp_vault:       Pubkey, // = pool_temp_lp
-    pub owner: Pubkey,          // admin (multisig)
-    pub lp_reserve: u64,
-    pub padding: [u64; 3],
+    pub padding1: [u64; 8],     // reserved — NOT withdraw_queue / lp_vault
+    pub amm_owner: Pubkey,      // admin (multisig)
+    pub lp_amount: u64,         // the pool's internal LP total; see the note below
+    pub client_order_id: u64,
+    pub recent_epoch: u64,
+    pub padding2: u64,
 }
 
 pub struct Fees {
@@ -118,7 +117,9 @@ Bidang yang menghadap integrator:
 - **`coin_decimals`**, **`pc_decimals`** — sesuai dengan mint.
 - **`open_orders`**, **`target_orders`**, **`market`** — bidang referensi warisan. Masih ada di `AmmInfo` dan masih dilewatkan secara posisional pada tata letak instruksi v1, tetapi program tidak lagi membaca atau memvalidasinya. Titik masuk swap V2 menghilangkannya.
 - **`fees.swap_fee_numerator / swap_fee_denominator`** — biaya perdagangan gabungan. Default `25 / 10_000 = 0.25%`.
-- **`status`** — bitmask yang membatasi operasi. Dapat diatur admin melalui `AdminSetStatus`.
+- **`status`** — satu status `u64` terenumerasi yang membatasi operasi, **bukan** bitmask. Dapat diatur admin melalui `SetParams` dengan `param = 0` (`Status`). Lihat [Status](#status) di bawah.
+- **`lp_amount`** — total LP internal pool. Nilainya **tidak** sama dengan `lp_mint.supply`: nilainya lebih tinggi tepat satu token LP utuh (`10^coin_decimals` unit dasar), karena jumlah itu dihitung saat init tetapi tidak pernah di-mint. Semua matematika pro-rata memakai `lp_amount`, jadi gunakan itu juga.
+- **`amm_owner`** — ditulis saat pembuatan dari kunci admin yang di-hardcode pada program, bukan dari kreator.
 - **`state_data.need_take_pnl_*`** — delta antara biaya yang terkumpul kotor dan apa yang telah disapu. `TakePnl` mengosongkan ini.
 
 ## Pengkabelan OpenBook
@@ -166,48 +167,67 @@ const [ammAuthority] = PublicKey.findProgramAddressSync(
 );
 ```
 
-Ada authority **scoped-pool** terpisah yang diturunkan per pool untuk menandatangani operasi OpenBook (`amm_authority` di atas sebenarnya mencakup keduanya dalam desain program ini; versi berbeda menggunakan derivasi berbeda, jadi periksa `AmmInfo.nonce` pool spesifik dalam kode).
+Tidak ada authority kedua yang berskala pool: satu PDA ini mencakup semua yang ditandatangani program. Bump-nya adalah `254` di mainnet dan dicerminkan pada setiap `AmmInfo` sebagai `nonce`; `WithdrawExcessLamports` menurunkannya kembali dengan nonce itu di-hardcode.
 
 ## Vault
 
-Vault SPL Token pool adalah akun token standar yang `owner`-nya adalah `amm_authority`. Bukan ATA — alamatnya adalah PDA spesifik yang diturunkan pada `Initialize` dengan seed `["amm_associated_seed", coin_mint_or_pc_mint, market, amm_id]`. Alamat disimpan di `AmmInfo`; derivasi adalah keingintahuan satu kali.
+Vault SPL Token pool adalah akun token standar yang `owner`-nya adalah `amm_authority`. Bukan ATA — alamatnya adalah PDA yang diturunkan pada `Initialize2` dari `[AMM_V4_PROGRAM_ID, market, "coin_vault_associated_seed"]` dan `[AMM_V4_PROGRAM_ID, market, "pc_vault_associated_seed"]`. Mint bukan seed, dan `amm_id` juga bukan. Alamat disimpan di `AmmInfo`; derivasi adalah keingintahuan satu kali.
 
-Token-2022 **tidak** didukung. Program hardcode ID program SPL Token untuk semua pergerakan vault. Mencoba mengikat pool AMM v4 ke mint Token-2022 gagal pada `Initialize`.
+Token-2022 **tidak** didukung. Program hardcode ID program SPL Token untuk semua pergerakan vault. Mencoba mengikat pool AMM v4 ke mint Token-2022 gagal pada `Initialize2` dengan `InvalidSplTokenProgram`.
 
 ## LP mint
 
-Mint SPL Token klasik yang authority-nya adalah `amm_authority`. Total supply melacak kepemilikan LP dari pool; membakar LP mengembalikan token dari kedua vault secara pro-rata. Karena AMM v4 mendahului CPMM, tidak ada mirror `lp_supply` dalam status pool — baca supply mint on-chain secara langsung.
+Mint SPL Token klasik yang authority-nya adalah `amm_authority`. Total supply melacak kepemilikan LP dari pool; membakar LP mengembalikan token dari kedua vault secara pro-rata.
 
-## Bitmask status
+Mirror dalam status **memang ada**: `AmmInfo.lp_amount`. Nilainya tidak sama dengan supply mint — nilainya lebih tinggi tepat satu token LP utuh (`10^coin_decimals` unit dasar), karena jumlah itu dihitung saat init tetapi tidak pernah di-mint. Setiap perhitungan pro-rata dalam program membagi dengan `lp_amount`, jadi gunakan bidang itu daripada supply on-chain mint.
 
-`AmmInfo.status` membatasi operasi. Bit (posisi mungkin berbeda di seluruh versi program — konfirmasi melalui sumber):
+## Status
 
-| Bit | Flag | Efek |
-|-----|------|------|
-| 0 | `SWAP_DISABLED` | `Swap*` ditolak. |
-| 1 | `DEPOSIT_DISABLED` | `Deposit` ditolak. |
-| 2 | `WITHDRAW_DISABLED` | `Withdraw` ditolak. |
-| 3 | `CLMM_LIKE_MIGRATE` | Flag gerbang migrasi yang digunakan oleh ops. |
+`AmmInfo.status` adalah satu status `u64` terenumerasi, **bukan** bitmask. Uji dengan kesetaraan — klien yang menguji `status & 1` salah mengklasifikasikan setiap pool aktif, karena status perdagangan normal adalah `6`, yang bit 0-nya disetel.
 
-Multisig Raydium menetapkan ini melalui `SetParams` (dengan `param = Status`). (`AdminCancelOrders` telah dihapus.)
+| Nilai | `AmmStatus` | Swap | Deposit | Withdraw |
+|-------|-------------|------|---------|----------|
+| 0 | `Uninitialized` | tidak | tidak | tidak |
+| 1 | `Initialized` | ya | ya | ya |
+| 2 | `Disabled` | tidak | tidak | tidak |
+| 3 | `WithdrawOnly` | tidak | tidak | ya |
+| 4 | `LiquidityOnly` | tidak | ya | ya |
+| 5 | `OrderBookOnly` | tidak | ya | ya |
+| 6 | `SwapOnly` | ya | ya | ya |
+| 7 | `WaitingTrade` | ya, setelah `pool_open_time` terlewati | ya | ya |
+
+`Initialize2` menulis `7` ketika `open_time` berada di masa depan dan `6` jika tidak; pool pada `7` beralih sendiri ke `6` pada swap pertama pada atau setelah `state_data.pool_open_time`. Nilai di luar `0..=7` membuat `AmmStatus::from_u64` panic.
+
+Multisig Raydium menetapkan status melalui `SetParams` dengan `param = 0` (`Status`); hanya nilai `1`–`7` yang diterima. (`AdminCancelOrders` telah dihapus.)
 
 ## Observasi / oracle
 
-**AMM v4 tidak memiliki akun observasi khusus.** Protokol lain yang membutuhkan TWAP on-chain biasanya mengonsumsi penyeberangan buku OpenBook secara tidak langsung atau membaca off-chain. Jika Anda membutuhkan TWAP Raydium dengan dukungan program, gunakan CPMM atau CLMM.
+**AMM v4 tidak memiliki akun observasi khusus**, dan sejak penghapusan OpenBook juga tidak ada status order-book untuk menurunkannya. Jika Anda membutuhkan TWAP Raydium dengan dukungan program, gunakan CPMM atau CLMM — keduanya memelihara ring buffer `ObservationState`. Jika tidak, indeks log swap secara off-chain.
 
 ## Menurunkan akun pool dari awal
 
-Karena AMM v4 tidak dirancang untuk PDA per-pasangan deterministik (mendahului konvensi Solana itu), `amm_id` kanonik adalah **keypair berseeded** yang diturunkan dengan:
+Akun pool AMM v4 adalah PDA biasa yang dikunci pada pasar terikat — bukan keypair berseeded, dan bukan PDA per-pasangan. Daftar berikut lengkap: tidak ada akun `ObservationState` di antaranya. Setiap akun memakai bentuk tiga-seed yang sama `[AMM_V4_PROGRAM_ID, market, <label>]` di bawah `AMM_V4_PROGRAM_ID`:
 
-```
-ammId = createWithSeed(
-  owner: ammAuthority,
-  seed:  marketPubkey.toBase58().slice(0, 32),
-  programId: AMM_V4_PROGRAM_ID,
-)
+| Account | `<label>` |
+|---------|-----------|
+| `amm_id` (`AmmInfo`) | `"amm_associated_seed"` |
+| `amm_target_orders` | `"target_associated_seed"` |
+| `lp_mint` | `"lp_mint_associated_seed"` |
+| `pool_coin_token_account` | `"coin_vault_associated_seed"` |
+| `pool_pc_token_account` | `"pc_vault_associated_seed"` |
+
+```ts
+const [ammId] = PublicKey.findProgramAddressSync(
+  [
+    AMM_V4_PROGRAM_ID.toBuffer(),
+    marketPubkey.toBuffer(),
+    Buffer.from("amm_associated_seed"),
+  ],
+  AMM_V4_PROGRAM_ID,
+);
 ```
 
-Pola kunci berseeded yang sama berlaku untuk `amm_open_orders`, `amm_target_orders`, `amm_withdraw_queue`, `pool_temp_lp`, `pool_coin_token_account`, `pool_pc_token_account`, dan `lp_mint`. SDK dan API pra-menghitung ini untuk Anda; lihat `raydium-sdk-v2`'s `Liquidity.getAssociatedPoolKeys`.
+Pasar terikat adalah satu-satunya seed variabel, itulah sebabnya satu pasar dipetakan ke tepat satu pool AMM v4. SDK dan API pra-menghitung ini untuk Anda; lihat `Liquidity.getAssociatedPoolKeys` dari `raydium-sdk-v2`.
 
 Dalam praktiknya, integrator membaca set akun lengkap pool dari `GET https://api-v3.raydium.io/pools/info/ids?ids=<POOL_ID>` atau dari SDK. Derivasi manual jarang diperlukan.
 
@@ -215,7 +235,7 @@ Dalam praktiknya, integrator membaca set akun lengkap pool dari `GET https://api
 
 | Peristiwa | Akun dibuat | Akun dihapus |
 |-----------|-------------|-------------|
-| `Initialize2` | `amm_info`, `amm_open_orders`, `amm_target_orders`, vault, `lp_mint`, `pool_withdraw_queue`, `pool_temp_lp` | — |
+| `Initialize2` | `amm_info`, `amm_target_orders`, kedua vault, `lp_mint`, dan ATA LP kreator | — |
 | `Deposit` | — (mungkin membuat ATA LP pengguna) | — |
 | `Withdraw` | — | — |
 | `SwapBaseIn` / `SwapBaseOut` (v1 / V2) | — (mungkin membuat ATA pengguna) | — |
@@ -228,7 +248,7 @@ Pool dan akun mereka bertahan selamanya. Bahkan jika likuiditas sepenuhnya ditar
 - **Matematika dan aritmetika biaya**: [`products/amm-v4/math`](/id/products/amm-v4/math).
 - **Pembagian biaya dan bagaimana perbandingannya dengan CPMM/CLMM**: [`products/amm-v4/fees`](/id/products/amm-v4/fees).
 - **Daftar akun instruksi**: [`products/amm-v4/instructions`](/id/products/amm-v4/instructions).
-- **Derivasi akun OpenBook**: Dokumen program OpenBook ([`github.com/openbook-dex/program`](https://github.com/openbook-dex/program)).
+- **Derivasi akun OpenBook**: sumber program OpenBook ([`github.com/openbook-dex/program`](https://github.com/openbook-dex/program)) — sebuah monorepo Rust, bukan dokumentasi prosa.
 
 Sumber:
 

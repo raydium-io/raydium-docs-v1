@@ -32,7 +32,7 @@ Um tick corresponde a um movimento de preço de 0,01%, ou ~1 basis point. O mape
 
 ## Espaçamento de ticks
 
-O `AmmConfig` de um pool define um **espaçamento de ticks** — os únicos ticks que uma posição pode usar como endpoints. Se `tick_spacing = 60`, apenas ticks `…, −120, −60, 0, 60, 120, …` são válidos. Uma tentativa de abrir uma posição com endpoint `31` reverte com `InvalidTickIndex`.
+O `AmmConfig` de um pool define um **espaçamento de ticks** — os únicos ticks que uma posição pode usar como endpoints. Se `tick_spacing = 60`, apenas ticks `…, −120, −60, 0, 60, 120, …` são válidos. Uma tentativa de abrir uma posição com endpoint `31` reverte com `TickAndSpacingNotMatch`.
 
 Espaçamentos publicados comuns:
 
@@ -58,7 +58,7 @@ Um endpoint de posição `t = 2040` em `tick_spacing = 60` vive no tick array co
 
 ### Quando um array é criado
 
-Um tick array é lazy: a **primeira** posição que referencia qualquer tick dentro dele inicializa o array, pagando o aluguel. Swaps não inicializam tick arrays — eles pulam sobre arrays não inicializados usando o bitmap. O fluxo de abertura de posição do SDK inspeciona o intervalo escolhido, calcula a lista de tick arrays que ele toca, e adiciona instruções `init_tick_array` na mesma transação que `OpenPosition` se algum estiver faltando.
+Um tick array é lazy: a **primeira** posição que referencia qualquer tick dentro dele inicializa o array, pagando o aluguel. Swaps não inicializam tick arrays — eles pulam sobre arrays não inicializados usando o bitmap. Não existe uma instrução separada de init-tick-array: `OpenPosition*` e `IncreaseLiquidity*` chamam `TickArrayState::get_or_create_tick_array` internamente e alocam um array faltante às custas do `payer`. Você simplesmente passa o PDA do tick-array — mesmo quando ele ainda não está inicializado e é de propriedade do sistema.
 
 ### Tick arrays não são fechados
 
@@ -66,7 +66,7 @@ Uma vez que um tick array foi inicializado, ele persiste pela vida do pool. O pr
 
 ### O bitmap
 
-Encontrar "o próximo tick inicializado à esquerda/direita do tick atual" tem que ser rápido — um swap pode cruzar muitos ticks. O pool armazena um bitmap de 1-bit-por-tick-array inline em `PoolState` para o intervalo ±1.024 arrays ao redor do tick 0. Fora desse intervalo (posições de intervalo completo, configurações exóticas), `TickArrayBitmapExtension` fornece o overflow.
+Encontrar "o próximo tick inicializado à esquerda/direita do tick atual" tem que ser rápido — um swap pode cruzar muitos ticks. O pool armazena um bitmap de 1-bit-por-tick-array inline em `PoolState` para o intervalo de **±512** arrays ao redor do tick 0 (`TICK_ARRAY_BITMAP_SIZE = 512`; o campo é `[u64; 16]` = 1.024 bits, dividido em 512 negativos / 512 positivos, isto é, índices de array −512 … +511). Fora desse intervalo (posições de intervalo completo, configurações exóticas), `TickArrayBitmapExtension` fornece o overflow.
 
 Um swap caminha pelo bitmap: `lowest_set_bit_above(tick_current_array_index)` fornece o próximo array com um tick inicializado no lado para o qual o swap está se movendo. Dentro desse array, um bit-scan similar localiza o próximo tick inicializado.
 
@@ -146,10 +146,10 @@ No momento de `OpenPosition` o programa garante:
 1. `tick_lower < tick_upper`.
 2. `tick_lower % tick_spacing == 0` e `tick_upper % tick_spacing == 0`.
 3. `MIN_TICK <= tick_lower` e `tick_upper <= MAX_TICK`.
-4. O chamador forneceu os tick arrays contendo `tick_lower` e `tick_upper` — já inicializados ou via um `init_tick_array` na mesma transação.
+4. O chamador forneceu os PDAs de tick-array contendo `tick_lower` e `tick_upper`. Eles não precisam estar inicializados — o programa cria por conta própria um que esteja faltando.
 5. A conta de extensão de bitmap, se esta posição se estende para o intervalo de extensão.
 
-Se qualquer verificação falhar a instrução reverte com `InvalidTickIndex`, `NotApproved`, ou `InsufficientLiquidity` dependendo de qual restrição. Veja [`reference/error-codes`](/pt/reference/error-codes).
+Se qualquer verificação falhar, a instrução reverte com `TickInvalidOrder` (regra 1), `TickAndSpacingNotMatch` (regra 2), `InvalidTickIndex` (regra 3), ou `MissingTickArrayBitmapExtensionAccount` (regra 5); `NotApproved` cobre o caso separado em que `pool_state.status` tem o bit de abrir-posição definido. Veja [`reference/error-codes`](/pt/reference/error-codes).
 
 ## "In-range" vs "out-of-range"
 
@@ -157,7 +157,7 @@ Uma posição está **in-range** quando `tick_lower <= tick_current < tick_upper
 
 Uma posição out-of-range:
 
-- Detém 100% de *um* token (aquele para o qual seu intervalo caminhou). Especificamente, se `tick_current < tick_lower`, a posição detém apenas token1 (já foi "vendida" pelo preço se movendo para longe); se `tick_current >= tick_upper`, detém apenas token0.
+- Detém 100% de *um* token. Se `tick_current < tick_lower` — preço **abaixo** do intervalo — a posição é inteiramente **token0**; se `tick_current >= tick_upper` — preço **acima** do intervalo — ela é inteiramente **token1**. O preço é cotado como `token1/token0`, portanto uma posição atravessada por um preço em alta acaba detendo o ativo de cotação.
 - **Não** ganha taxas de swap.
 - **Continua** a acumular recompensas se os fluxos de recompensa do pool emitem para liquidez out-of-range — mas o comportamento padrão do Raydium é "emitir apenas para in-range", correspondendo à convenção do Uniswap v3. Veja [`products/clmm/fees`](/pt/products/clmm/fees).
 
@@ -165,9 +165,9 @@ LPs gerenciando posições CLMM gastam a maior parte de sua atenção mantendo p
 
 ## Armadilhas comuns de integração
 
-- **Endpoints fora do espaçamento.** Código que calcula um tick a partir de um preço alvo deve se ajustar a um múltiplo de `tick_spacing` antes de passá-lo para `OpenPosition`. Os auxiliares do SDK (`TickUtils.getTickWithPriceAndTickspacing`) fazem isso; matemática caseira frequentemente não.
-- **Tick arrays faltando.** Abrir uma posição ampla pode exigir inicializar vários tick arrays; esquecer de passá-los como contas graváveis reverte. O `openPositionFromBase` do SDK retorna a lista para você.
-- **Tick obsoleto após um swap.** `tick_current` pode cruzar muitos ticks em um swap. Se sua UX mostra um "tick atual" de uma chamada RPC e depois abre uma posição em uma posterior, a posição relativa vs o preço ao vivo pode estar desligada por dezenas de ticks. Re-busque logo antes de assinar.
+- **Endpoints fora do espaçamento.** Código que calcula um tick a partir de um preço alvo deve se ajustar a um múltiplo de `tick_spacing` antes de passá-lo para `OpenPosition`, ou a instrução reverte com `TickAndSpacingNotMatch`. O auxiliar do SDK é `TickUtil.getPriceAndTick({ price, mintADecimals, mintBDecimals, zeroForOne, tickSpacing })` (note: `TickUtil`, no singular); matemática caseira frequentemente pula o ajuste.
+- **Tick arrays faltando.** Abrir uma posição ampla toca dois tick arrays; esquecer de passá-los como contas graváveis reverte. Eles não precisam existir previamente — o programa cria um que esteja faltando — mas a *conta* deve estar na lista.
+- **Tick obsoleto após um swap.** `tick_current` pode cruzar muitos ticks em um swap. Se sua UX mostra um "tick atual" de uma chamada RPC e depois abre uma posição em uma posterior, a posição relativa vs o preço ao vivo pode estar desviada por dezenas de ticks. Re-busque logo antes de assinar.
 - **NFTs de posição com metadados extras.** Se você construir uma carteira que reconheça posições do Raydium, use o PDA de posição / dados do programa e não um campo de metadados codificado. Novos mints de posição usam o PDA do pool como autoridade de mint e congelamento na criação; a autoridade de mint é removida após o único NFT ser cunhado.
 - **Assumindo que toda posição é transferível.** Leia o estado `isFrozen` da conta de token do NFT antes de mostrar transferência, marketplace, escrow, ou ações de Burn & Earn.
 

@@ -156,8 +156,14 @@ pub fn escrow_swap(
     let signer: &[&[&[u8]]] = &[seeds];
 
     let cpi_accounts = CpmmSwap {
-        payer:                ctx.accounts.user.to_account_info(),
-        authority:            ctx.accounts.escrow.to_account_info(),
+        // `payer` is the account whose signature must cover the input ATA. That ATA is
+        // owned by the escrow PDA, so the escrow — signing via new_with_signer below —
+        // goes here, NOT `user`.
+        payer:                ctx.accounts.escrow.to_account_info(),
+        // `authority` is CPMM's own vault PDA at [b"vault_and_lp_mint_auth_seed"];
+        // CPMM signs the vault leg with it itself. Passing your escrow here fails the
+        // seeds constraint before any transfer runs.
+        authority:            ctx.accounts.pool_authority.to_account_info(),
         amm_config:           ctx.accounts.amm_config.to_account_info(),
         pool_state:           ctx.accounts.pool_state.to_account_info(),
         input_token_account:  ctx.accounts.escrow_input_ata.to_account_info(),
@@ -191,9 +197,9 @@ CPI успешен только если PDA, переданный как `autho
 2. Bump.
 3. ID вызывающей программы (ваша программа, не Raydium).
 
-Raydium не волнует, кто является authority — ему важно только, что подпись `authority` покрывает транзакцию и что входной ATA принадлежит этому authority. Проверка происходит в `anchor_spl::token::transfer`: поле `authority` ATA должно равняться подписанту.
+Обратите внимание, чему именно должен соответствовать PDA. Слот `authority` в CPMM — это **его собственный** vault PDA: фиксированный аккаунт уровня программы, который CPMM выводит и подписывает сам и который ваша программа не контролирует и не подменяет. Аккаунт, с которым должны совпадать сиды вашего PDA, — это **`payer`**: проверка происходит внутри собственного хелпера CPMM `transfer_from_user_to_pool_vault`, который требует, чтобы аккаунт, переданный как `payer`, был владельцем `input_token_account`.
 
-Частая ошибка: передача `user` как authority (и передача из `escrow_input_ata`, которым владеет PDA эскроу). Программа SPL Token отклоняет с `owner mismatch`. Всегда делайте поле `authority` совпадающим с владельцем ATA.
+Частая ошибка: передача `user` как `payer`, когда `escrow_input_ata` принадлежит PDA эскроу. Программа SPL Token отклоняет с `owner mismatch`. Всегда делайте `payer` владельцем ATA — и подписывайте за него через `new_with_signer`, когда этот владелец является PDA.
 
 ## Оставшиеся аккаунты
 
@@ -234,18 +240,27 @@ remaining = [
 
 ## Бюджет вычислений для составных вызовов
 
-CPI стоит ~1,500 CU для самого фрейма вызова; собственное использование CU вызываемой стороны складывается сверху. Примерный бюджет на CPI Raydium:
+CPI стоит ~1,500 CU для самого фрейма вызова; собственное использование CU вызываемой стороны складывается сверху.
 
-| Вызов | CU (SPL Token) | CU (Token-2022) |
-|------|----------------|-----------------|
-| CPMM swap_base_input | ~150,000 | ~200,000 |
-| CLMM swap_v2 (один массив тиков) | ~180,000 | ~230,000 |
-| CLMM swap_v2 (пересекает 2 тика) | ~220,000 | ~270,000 |
-| Farm v6 deposit | ~120,000 | ~150,000 |
-| Farm v6 harvest (на слот награды) | +30,000 | +40,000 |
-| AMM v4 swap_base_in | ~140,000 | n/a |
+Приведённые ниже цифры для вызываемой стороны измерены на реальных транзакциях mainnet в высокообъёмных пулах **2026-09-09** и считаны из строки лога `Program <id> consumed N of M compute units` для собственного вызова программы Raydium (то есть они включают её внутренние CPI к token-программе):
 
-Добавьте ~1,500 на каждый фрейм CPI и ~20,000 на накладные расходы вашей собственной программы. Автокомпаундер, выполняющий `harvest → swap A → swap B → deposit LP → stake LP`, легко достигает 700k CU.
+| Инструкция вызываемой стороны | Измеренные CU | Выборка |
+|------|----|----|
+| CPMM `swap_base_input` | ~23,000 | 22,721–23,052 (n=8) |
+| AMM v4 swap | ~26,000 | 25,215–26,002 |
+| CLMM `swap` (V1) | ~41,000 | 37,148–44,721 |
+| CLMM `swap_v2` | ~48,000 | 43,838–52,887 (n=6) |
+| CLMM `increase_liquidity_v2` | ~36,000 | 36,058 |
+
+Добавьте сверху ~1,500 на каждый фрейм CPI и накладные расходы вашей собственной программы. Стоимость свопа в CLMM растёт с числом пересечённых тиков, поэтому считайте её цифру нижней границей. Минты Token-2022 добавляют стоимость обработки расширения при самой передаче; измеряйте её для своих минтов, а не применяйте единый множитель.
+
+<Warning>
+  В более ранних редакциях этой страницы приводились оценки в 5–7 раз выше (~150,000 CU на своп
+  CPMM, ~180,000 для CLMM). Они никогда не измерялись. Планируйте бюджет по собственному
+  показанию `computeUnitsConsumed`, а не по числу из документации — и учитывайте, что полная
+  транзакция стоит больше, чем одна инструкция Raydium, как только учтены создание ATA,
+  обёртывание wSOL и инструкции compute-budget.
+</Warning>
 
 Всегда устанавливайте явный `ComputeBudgetProgram::set_compute_unit_limit`:
 
@@ -272,17 +287,23 @@ cpi::swap_base_input(cpi_ctx, amount_in, minimum_amount_out)?;
 Или перехватите для конкретных кодов:
 
 ```rust
+use anchor_lang::error::{Error, ERROR_CODE_OFFSET};
 use raydium_cp_swap::error::ErrorCode as CpmmErr;
 
 match cpi::swap_base_input(cpi_ctx, amount_in, minimum_amount_out) {
-    Ok(_) => {},
-    Err(err) if is_err(err, CpmmErr::ExceededSlippage) => {
+    Ok(_) => {}
+    Err(Error::ProgramError(pe))
+        if pe.program_error
+            == ProgramError::Custom(CpmmErr::ExceededSlippage as u32 + ERROR_CODE_OFFSET) =>
+    {
         // Ваша программа может захотеть повторить попытку с большим проскальзыванием или отменить состояние.
         return err!(YourErr::PoolTooVolatile);
     }
     Err(err) => return Err(err),
 }
 ```
+
+Обратите внимание на слагаемое `ERROR_CODE_OFFSET`: варианты `#[error_code]` нумеруются начиная с 6000, поэтому сравнение с «сырым» дискриминантом перечисления никогда не совпадёт. (Ни в `anchor-lang`, ни в `raydium_cp_swap` нет вспомогательной функции `is_err` — в более ранних редакциях этой страницы использовалась функция, которой не существует.)
 
 Сопоставление кода ошибки со значением стабильно согласно политике IDL ([`sdk-api/anchor-idl`](/ru/sdk-api/anchor-idl)); новые коды добавляются в конец, существующие коды никогда не меняют значение.
 
@@ -325,8 +346,12 @@ pub mod limit_orders {
         let pre_out_balance = ctx.accounts.escrow_output_ata.amount;
 
         let cpi_accounts = CpmmSwap {
-            payer:                ctx.accounts.keeper.to_account_info(),
-            authority:            ctx.accounts.order.to_account_info(),
+            // The escrow's input ATA is owned by the `order` PDA, so `order` must be
+            // `payer` — it signs via new_with_signer below. The keeper only pays the
+            // transaction fee; it is not the ATA owner.
+            payer:                ctx.accounts.order.to_account_info(),
+            // CPMM's own vault PDA at [b"vault_and_lp_mint_auth_seed"].
+            authority:            ctx.accounts.pool_authority.to_account_info(),
             amm_config:           ctx.accounts.amm_config.to_account_info(),
             pool_state:           ctx.accounts.pool_state.to_account_info(),
             input_token_account:  ctx.accounts.escrow_input_ata.to_account_info(),
@@ -363,7 +388,7 @@ pub mod limit_orders {
 }
 ```
 
-Хранитель платит комиссию за транзакцию (они получают комиссию хранителя где-то ещё — не показано). PDA эскроу подписывает CPI. Как проверка проскальзывания на стороне Raydium, *так и* собственная проверка дельты эскроу обеспечивают минимум — подстраховка.
+Хранитель платит комиссию за транзакцию (они получают комиссию хранителя где-то ещё — не показано). PDA `order` подписывает CPI как `payer`, поскольку ему принадлежит входной ATA эскроу; поэтому `ExecuteOrder` также нужно поле `pool_authority: UncheckedAccount<'info>` для собственного vault PDA программы CPMM. Как проверка проскальзывания на стороне Raydium, *так и* собственная проверка дельты эскроу обеспечивают минимум — подстраховка.
 
 ## Тестирование
 
@@ -372,8 +397,8 @@ pub mod limit_orders {
 ```toml
 [test.validator]
 clone = [
-  { address = "CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK" }, # CPMM
-  { address = "CLMM...." },                                     # CLMM
+  { address = "CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C" }, # CPMM
+  { address = "CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK" }, # CLMM
   { address = "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8" }, # AMM v4
   { address = "FarmqiPv5eAj3j1GMdMCMUGXqPUvmquZtMy86QH6rzhG" }, # Farm v6
 ]
@@ -389,7 +414,7 @@ Solana не имеет истинной реентерабельности — C
 
 ### Дрейф изменяемости аккаунта
 
-Если ваша программа передаёт аккаунт как `mut`, но Raydium ожидает его только для чтения (или наоборот), runtime отклоняет вызов с `InvalidAccountData`. Всегда проверяйте ожидаемую изменяемость инструкции Raydium в IDL; `anchor_cp_swap::cpi::accounts::Swap` обеспечивает это через типы полей.
+Если ваша программа передаёт аккаунт как `mut`, но Raydium ожидает его только для чтения (или наоборот), runtime отклоняет вызов с `InvalidAccountData`. Всегда проверяйте ожидаемую изменяемость инструкции Raydium в IDL; `raydium_cp_swap::cpi::accounts::Swap` выставляет изменяемость каждого аккаунта за вас, исходя из маркеров `#[account(mut)]` на собственной структуре `Swap` в CPMM — сгенерированные поля все имеют простой тип `AccountInfo<'info>`, так что флаги несёт производная реализация `ToAccountMetas`, а не типы полей.
 
 ### Поле программы Token-2022
 
@@ -409,4 +434,4 @@ Solana не имеет истинной реентерабельности — C
 
 - [raydium-cp-swap CPI crate](https://github.com/raydium-io/raydium-cp-swap)
 - [raydium-clmm CPI crate](https://github.com/raydium-io/raydium-clmm)
-- [Anchor CPI docs](https://www.anchor-lang.com/docs/cross-program-invocations)
+- [Anchor CPI docs](https://www.anchor-lang.com/docs/basics/cpi)

@@ -67,7 +67,7 @@ open_time:     u64   // Unix 時間戳；此前拒絕交換
 | 7 | `lp_mint` | W |   | 在此 `init`。授權設定為 `authority`。 |
 | 8 | `creator_token_0` | W |   | `init_amount_0` 的來源 ATA。 |
 | 9 | `creator_token_1` | W |   | `init_amount_1` 的來源 ATA。 |
-| 10 | `creator_lp_token` | W |   | LP 的目的地（如果遺漏則建立）。 |
+| 10 | `creator_lp_token` | W |   | 建立者在 `lp_mint` 上的 ATA。`init`（不是 `init_if_needed`） — 它必須尚不存在，而且它也不可能存在，因為 `lp_mint` 是在同一條指令中建立的。 |
 | 11 | `token_0_vault` | W |   | 在此 `init`。由 `authority` 擁有。 |
 | 12 | `token_1_vault` | W |   | |
 | 13 | `create_pool_fee` | W |   | 創建者支付的 `create_pool_fee` 的目的地 ATA。 |
@@ -84,14 +84,14 @@ open_time:     u64   // Unix 時間戳；此前拒絕交換
 **前置條件**
 
 - 鑄幣廠已排序（按位元組順序 `token_0_mint < token_1_mint`）。
-- 兩個鑄幣廠都不使用 CPMM 允許清單外的擴充功能（`TransferFeeConfig`、`MetadataPointer`、`TokenMetadata`、`InterestBearingConfig`、`ScaledUiAmount`） — 見 [`products/cpmm/accounts`](/zh-Hant/products/cpmm/accounts#vaults-and-token-2022)。具有 `SupportMintAssociated` PDA（種子 `[b"support_mint", mint]`）的鑄幣廠會跳過檢查；該登記是自 2026-09 升級移除硬編碼四鑄幣廠白名單以來唯一的繞過方式。
+- 兩個鑄幣廠都不使用 CPMM 允許清單外的擴充功能（`TransferFeeConfig`、`MetadataPointer`、`TokenMetadata`、`InterestBearingConfig`、`ScaledUiAmount`） — 見 [`products/cpmm/accounts`](/zh-Hant/products/cpmm/accounts#vaults-and-token-2022)。具有 `SupportMintAssociated` PDA（種子 `[b"support_mint", mint]`）的鑄幣廠會跳過擴充功能檢查 — **但你必須把該 PDA 附加到 `remaining_accounts`**。程式只掃描你傳入的帳戶，永遠不會自行載入該 PDA，因此只依賴該登記而不提供帳戶仍會以 `NotSupportMint`（`6007`）失敗。順序無關（比對是依金鑰進行）；為每個需要繞過的鑄幣廠傳入一筆。該登記是自 2026-09 升級移除硬編碼四鑄幣廠白名單以來唯一的繞過方式。
 - `creator` 在各自的 ATA 中至少有 `init_amount_0` 和 `init_amount_1`。
 - `amm_config.disable_create_pool == false`。
 
 **後置條件**
 
-- `pool_state` 存在，`lp_supply = sqrt(init_amount_0 * init_amount_1) − LOCKED_LP`。
-- LP 啟動者的 `LOCKED_LP`（100 個 LP 代幣的 lamports）永久鎖定在池中 — `pool_state.lp_supply` 記錄 `liquidity − 100`，而 100 個 LP 單位保持在流通外，防止池被完全排空並除以零。
+- `pool_state.lp_supply = sqrt(init_amount_0 * init_amount_1)` — **完整**的平方根。建立者被鑄造 `lp_supply − 100`；那 100 個被鎖定的基礎單位計入 `lp_supply` 但從未鑄造。
+- 因此在池的整個生命週期內 `lp_mint.supply == pool_state.lp_supply − 100`。所有 LP 份額計算（存入、提取）都除以 `lp_supply`，所以請使用該欄位，不要以鑄幣廠的鏈上供應量替代。若 `sqrt(...) < 100`，則以 `InitLpAmountTooLess` 還原。
 - `observation_state` 已初始化；`observation_index = 0` 且 `pool_id = pool_state.key()`。
 - `create_pool_fee` lamports 從創建者轉移到接收者並同步為原生 SOL（它是 wSOL ATA）。
 - 池的狀態位元遮罩為 `0`（存款/提取/交換全部啟用）。
@@ -137,13 +137,16 @@ maximum_token_1:   u64
 **數學**
 
 ```
-needed_token_0 = ceil(lp_token_amount * vault_0 / lp_supply)
-needed_token_1 = ceil(lp_token_amount * vault_1 / lp_supply)
-require(needed_token_0 <= maximum_token_0, "ExceededSlippage")
-require(needed_token_1 <= maximum_token_1, "ExceededSlippage")
+total_0 = vault_0 − protocol_fees_0 − fund_fees_0 − creator_fees_0    // same for side 1
+
+needed_token_0 = ceil(lp_token_amount * total_0 / lp_supply)
+transfer_0     = needed_token_0 + inverse_transfer_fee(needed_token_0) // Token-2022
+require(transfer_0 <= maximum_token_0, "ExceededSlippage")             // same for side 1
 ```
 
-`k` 的比例性沒有變化 — 保管庫和 `lp_supply` 按相同因子縮放。
+有兩個細節值得釘死：按比例的基準是**排除費用後**的金庫總額（`vault_amount_without_fee`，即原始餘額減去累積的協議、基金和建立者計數器），而不是原始金庫餘額；而滑點上限檢查的是付款人實際轉出的金額，也就是*加上* Token-2022 轉帳費用之後的金額，而不是金庫的毛額變動。
+
+`k` 的比例性沒有變化 — 兩側的總額和 `lp_supply` 按相同因子縮放。
 
 **後置條件**
 
@@ -182,16 +185,21 @@ minimum_token_1:   u64
 | 11 | `vault_0_mint` |   |   |
 | 12 | `vault_1_mint` |   |   |
 | 13 | `lp_mint` | W |   |
+| 14 | `memo_program` |   |   |
 
-（與 `Deposit` 相同；`lp_mint` 可寫是因為 LP 代幣被燒毀。）
+前 13 個帳戶與 `Deposit` 完全相同，而 `lp_mint` 可寫是因為 LP 代幣被燒毀。`Withdraw` 另外還取用第 14 個帳戶 `memo_program`（約束為 `address = memo::ID`） — `Deposit` 沒有。只有 13 個帳戶的 `Withdraw` 會在 Anchor 反序列化時失敗，因此 LP 無法退出。
 
 **數學**
 
 ```
-out_token_0 = floor(lp_token_amount * vault_0 / lp_supply)
-out_token_1 = floor(lp_token_amount * vault_1 / lp_supply)
-require(out_token_0 >= minimum_token_0, "ExceededSlippage")
-require(out_token_1 >= minimum_token_1, "ExceededSlippage")
+total_0 = vault_0 − protocol_fees_0 − fund_fees_0 − creator_fees_0    // same for side 1
+
+out_token_0     = min(total_0, floor(lp_token_amount * total_0 / lp_supply))
+receive_token_0 = out_token_0 − transfer_fee(out_token_0)             // Token-2022
+require(receive_token_0 >= minimum_token_0, "ExceededSlippage")       // same for side 1
+
+// As with Deposit: the base is the fee-excluded vault total, and the floor is
+// checked against what the LP actually receives, after the transfer fee.
 ```
 
 **後置條件**
@@ -273,7 +281,7 @@ amount_out:     u64
 
 | # | 名稱 | W | S | 備註 |
 |---|------|---|---|-------|
-| 1 | `owner` |   | S | 必須符合 `amm_config.protocol_owner`。 |
+| 1 | `owner` |   | S | 必須等於 `amm_config.protocol_owner` **或**程式硬編碼的管理員密鑰。 |
 | 2 | `authority` |   |   |
 | 3 | `pool_state` | W |   |
 | 4 | `amm_config` |   |   |
@@ -297,11 +305,11 @@ pool_state.protocol_fees_token1 = 0
 
 曲線有效餘額沒有變化（累積費用已被排除）。
 
-**常見錯誤** — 如果簽署者不是 `protocol_owner`，則 `NotApproved`。
+**常見錯誤** — 如果簽署者既不是 `amm_config.protocol_owner` 也不是程式管理員，則為 `InvalidOwner`（`6001`）。（此路徑上沒有 `NotApproved`。）
 
 ## `CollectFundFee`
 
-與 `CollectProtocolFee` 相同的形狀，但由 `fund_owner` 簽署並將 `fund_fees_*` 計數器歸零。
+與 `CollectProtocolFee` 相同的形狀，但由 `amm_config.fund_owner` 簽署 — 或者同樣地，由程式管理員簽署 — 並將 `fund_fees_*` 計數器歸零。錯誤的簽署者同樣會得到 `InvalidOwner`。
 
 ## `CollectCreatorFee`
 
@@ -363,7 +371,7 @@ status: u8      // 新位元遮罩
 | 1 | `authority` |   | S | 必須符合 CPMM 程式上的管理員金鑰。 |
 | 2 | `pool_state` | W |   |
 
-管理員金鑰是 CPMM 程式上的升級授權 — 實際上是 Raydium 多簽。見 [`security/admin-and-multisig`](/zh-Hant/security/admin-and-multisig)。
+管理員金鑰是**編譯進程式**的公鑰（`crate::admin::ID`），不是 BPF 升級授權 — 要更改它需要進行程式升級。其值見 [`reference/program-addresses`](/zh-Hant/reference/program-addresses)，持有者見 [`security/admin-and-multisig`](/zh-Hant/security/admin-and-multisig)。
 
 ## `CreateAmmConfig`
 
@@ -396,20 +404,23 @@ creator_fee_rate:  u64
 <Note>
   **2026-09 中變更：新配置的費用所有者不再來自簽署者。** `create_amm_config` 現在將程式的硬編碼 `protocol_fee_owner::ID` 寫入 `protocol_owner` 並將 `fund_fee_owner::ID` 寫入 `fund_owner`，而不是將管理員簽署者的金鑰複製到兩者。地址在 [`reference/program-addresses`](/zh-Hant/reference/program-addresses#cpmm-fee-owner-wallets)。
 
-  後果：新建立的 `AmmConfig` 立即由專用費用錢包掃除，而不是由管理員金鑰掃除，管理員無法在首次旋轉欄位之前從其剛建立的配置中收集。**現有 `AmmConfig` 帳戶不會被重寫** — 儲存在其上的任何內容仍然管理，因此始終從帳戶讀取 `protocol_owner` / `fund_owner` 而不是假設任一值。`UpdateAmmConfig` 參數 `3` 和 `4` 仍然旋轉它們。
+  後果：新建立的 `AmmConfig` 上的費用會進入專用的費用錢包，而不是管理員的錢包。管理員仍然是收取時可接受的*簽署者* — `CollectProtocolFee` / `CollectFundFee` 接受 `amm_config.protocol_owner` / `fund_owner` **或** `crate::admin::ID` — 因此不需要輪換任何東西就能清掃；改變的只是收益預設的去向。**現有 `AmmConfig` 帳戶不會被重寫** — 儲存在其上的任何內容仍然管理，因此始終從帳戶讀取 `protocol_owner` / `fund_owner` 而不是假設任一值。`UpdateAmmConfig` 參數 `3` 和 `4` 仍然可以輪換它們。
 </Note>
 
 ## `UpdateAmmConfig`
 
-變更現有 `AmmConfig` 上的費率或所有權。取得 `param: u8`（用於更新哪個欄位的判別器）和 `value: u64`。每個參數的值語義在來源中；常見的：
+變更現有 `AmmConfig` 上的費率或所有權。取得 `param: u8`（要更新哪個欄位）和 `value: u64`。完整的分派表：
 
-- `param = 0` → `trade_fee_rate`
-- `param = 1` → `protocol_fee_rate`
-- `param = 2` → `fund_fee_rate`
-- `param = 3` → `new_protocol_owner`（將 `Pubkey` 位元組作為重新解釋傳遞）
-- `param = 4` → `new_fund_owner`
+- `param = 0` → `trade_fee_rate`（斷言 `trade_fee_rate + creator_fee_rate < 1_000_000`）
+- `param = 1` → `protocol_fee_rate`（斷言 `≤ 1_000_000` 且 `+ fund_fee_rate ≤ 1_000_000`）
+- `param = 2` → `fund_fee_rate`（斷言 `≤ 1_000_000` 且 `+ protocol_fee_rate ≤ 1_000_000`）
+- `param = 3` → `protocol_owner`。新金鑰**不**在 `value` 中：請把它附加為 `remaining_accounts[0]`（唯讀即可）。它不得為預設公鑰，而省略該帳戶會在 `unwrap()` 上 panic。
+- `param = 4` → `fund_owner`。與 `3` 相同的機制。
 - `param = 5` → `create_pool_fee`
-- `param = 6` → `disable_create_pool`
+- `param = 6` → `disable_create_pool`（任何非零 `value` 都會停用）
+- `param = 7` → `creator_fee_rate`（斷言 `creator_fee_rate + trade_fee_rate < 1_000_000`）
+
+任何其他 `param` 都會返回 `InvalidInput`。
 
 變更由管理員簽署，影響**綁定到此 `AmmConfig` 的每個池**在下一次交換時。無遷移；池只是讀取新值。
 

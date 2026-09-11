@@ -32,7 +32,7 @@ Satu tick sesuai dengan pergerakan harga 0,01%, atau ~1 basis poin. Pemetaannya 
 
 ## Tick spacing
 
-`AmmConfig` pool menetapkan **tick spacing** — satu-satunya ticks yang diizinkan posisi gunakan sebagai endpoint. Jika `tick_spacing = 60`, hanya ticks `…, −120, −60, 0, 60, 120, …` yang valid. Upaya membuka posisi dengan endpoint `31` akan kembali dengan `InvalidTickIndex`.
+`AmmConfig` pool menetapkan **tick spacing** — satu-satunya ticks yang diizinkan posisi gunakan sebagai endpoint. Jika `tick_spacing = 60`, hanya ticks `…, −120, −60, 0, 60, 120, …` yang valid. Upaya membuka posisi dengan endpoint `31` akan kembali dengan `TickAndSpacingNotMatch`.
 
 Spacing yang dipublikasikan secara umum:
 
@@ -58,7 +58,7 @@ Endpoint posisi `t = 2040` pada `tick_spacing = 60` berada di tick array dengan 
 
 ### Ketika array diinisialisasi
 
-Tick array adalah lazy: posisi **pertama** yang mereferensikan tick apa pun di dalamnya menginisialisasi array, membayar sewa. Swap tidak menginisialisasi tick arrays — mereka melewati array yang tidak diinisialisasi menggunakan bitmap. Alur open-position SDK memeriksa rentang yang dipilih, menghitung daftar tick arrays yang disentuhnya, dan menambahkan instruksi `init_tick_array` dalam transaksi yang sama dengan `OpenPosition` jika ada yang hilang.
+Tick array bersifat lazy: posisi **pertama** yang mereferensikan tick apa pun di dalamnya menginisialisasi array itu dan membayar sewanya. Swap tidak menginisialisasi tick array — swap melewati array yang belum diinisialisasi menggunakan bitmap. Tidak ada instruksi init-tick-array terpisah: `OpenPosition*` dan `IncreaseLiquidity*` memanggil `TickArrayState::get_or_create_tick_array` secara internal dan mengalokasikan array yang belum ada atas biaya `payer`. Anda cukup melewatkan PDA tick-array — bahkan ketika PDA itu masih belum diinisialisasi dan dimiliki system.
 
 ### Tick arrays tidak ditutup
 
@@ -66,7 +66,7 @@ Setelah tick array diinisialisasi, array tersebut bertahan selama masa hidup poo
 
 ### Bitmap
 
-Menemukan "tick yang diinisialisasi berikutnya ke kiri/kanan dari tick saat ini" harus cepat — swap dapat melintasi banyak ticks. Pool menyimpan bitmap 1-bit-per-tick-array inline di `PoolState` untuk rentang ±1.024 arrays di sekitar tick 0. Di luar rentang itu (posisi full-range, setup eksotis), `TickArrayBitmapExtension` menyediakan overflow.
+Menemukan "tick yang diinisialisasi berikutnya ke kiri/kanan dari tick saat ini" harus cepat — swap dapat melintasi banyak tick. Pool menyimpan bitmap 1-bit-per-tick-array inline di `PoolState` untuk rentang **±512** array di sekitar tick 0 (`TICK_ARRAY_BITMAP_SIZE = 512`; field-nya adalah `[u64; 16]` = 1.024 bit, dibagi 512 negatif / 512 positif, yaitu indeks array −512 … +511). Di luar rentang itu (posisi full-range, setup eksotis), `TickArrayBitmapExtension` menyediakan overflow.
 
 Swap berjalan melalui bitmap: `lowest_set_bit_above(tick_current_array_index)` memberikan array berikutnya dengan tick yang diinisialisasi di sisi yang dilintasi swap. Dalam array itu, bit-scan serupa menemukan tick yang diinisialisasi berikutnya.
 
@@ -146,10 +146,10 @@ Pada waktu `OpenPosition` program memberlakukan:
 1. `tick_lower < tick_upper`.
 2. `tick_lower % tick_spacing == 0` dan `tick_upper % tick_spacing == 0`.
 3. `MIN_TICK <= tick_lower` dan `tick_upper <= MAX_TICK`.
-4. Pemanggil telah menyediakan tick arrays yang berisi `tick_lower` dan `tick_upper` — baik sudah diinisialisasi atau melalui `init_tick_array` dalam transaksi yang sama.
+4. Pemanggil telah menyediakan PDA tick-array yang berisi `tick_lower` dan `tick_upper`. PDA itu tidak harus sudah diinisialisasi — program membuat sendiri yang belum ada.
 5. Akun bitmap extension, jika posisi ini meluas ke dalam rentang extension.
 
-Jika pemeriksaan apa pun gagal, instruksi akan kembali dengan `InvalidTickIndex`, `NotApproved`, atau `InsufficientLiquidity` tergantung pada batasan mana. Lihat [`reference/error-codes`](/id/reference/error-codes).
+Jika salah satu pemeriksaan gagal, instruksi dibatalkan dengan `TickInvalidOrder` (aturan 1), `TickAndSpacingNotMatch` (aturan 2), `InvalidTickIndex` (aturan 3), atau `MissingTickArrayBitmapExtensionAccount` (aturan 5); `NotApproved` mencakup kasus terpisah di mana `pool_state.status` menyetel bit open-position. Lihat [`reference/error-codes`](/id/reference/error-codes).
 
 ## "In-range" vs "out-of-range"
 
@@ -157,7 +157,7 @@ Posisi adalah **in range** ketika `tick_lower <= tick_current < tick_upper`. Han
 
 Posisi out-of-range:
 
-- Memegang 100% dari *satu* token (yang rentangnya telah melewati). Secara spesifik, jika `tick_current < tick_lower`, posisi hanya memegang token1 (sudah "dijual" oleh harga yang bergerak menjauh); jika `tick_current >= tick_upper`, hanya memegang token0.
+- Memegang 100% dari *satu* token. Jika `tick_current < tick_lower` — harga **di bawah** rentang — posisi seluruhnya berupa **token0**; jika `tick_current >= tick_upper` — harga **di atas** rentang — posisi seluruhnya berupa **token1**. Harga dikutip sebagai `token1/token0`, sehingga posisi yang dilewati oleh harga yang naik berakhir memegang aset quote.
 - **Tidak** mendapatkan biaya swap.
 - **Terus** mengumpulkan reward jika aliran reward pool memancarkan ke likuiditas out-of-range — tetapi perilaku default Raydium adalah "emit hanya ke in-range", sesuai dengan konvensi Uniswap v3. Lihat [`products/clmm/fees`](/id/products/clmm/fees).
 
@@ -165,9 +165,9 @@ LP yang mengelola posisi CLMM menghabiskan sebagian besar perhatian mereka untuk
 
 ## Jebakan integrasi umum
 
-- **Endpoint off-spacing.** Kode yang menghitung tick dari harga target harus snap ke kelipatan `tick_spacing` sebelum meneruskannya ke `OpenPosition`. Helper SDK (`TickUtils.getTickWithPriceAndTickspacing`) melakukan ini; math buatan sendiri sering tidak.
-- **Tick arrays yang hilang.** Membuka posisi yang lebar mungkin memerlukan inisialisasi beberapa tick arrays; lupa meneruskannya sebagai akun writable akan kembali. SDK `openPositionFromBase` mengembalikan daftar untuk Anda.
-- **Tick stale setelah swap.** `tick_current` dapat melintasi banyak ticks dalam satu swap. Jika UX Anda menampilkan "current tick" dari satu panggilan RPC dan kemudian membuka posisi di panggilan yang lebih baru, posisi relatif vs harga live dapat mati puluhan ticks. Ambil ulang tepat sebelum menandatangani.
+- **Endpoint off-spacing.** Kode yang menghitung tick dari harga target harus snap ke kelipatan `tick_spacing` sebelum meneruskannya ke `OpenPosition`, atau instruksi dibatalkan dengan `TickAndSpacingNotMatch`. Helper SDK-nya adalah `TickUtil.getPriceAndTick({ price, mintADecimals, mintBDecimals, zeroForOne, tickSpacing })` (perhatikan: `TickUtil`, bentuk tunggal); math buatan sendiri sering melewatkan snap itu.
+- **Tick array yang hilang.** Membuka posisi yang lebar menyentuh dua tick array; lupa meneruskannya sebagai akun writable akan membatalkan instruksi. Tick array itu tidak perlu ada sebelumnya — program membuat yang belum ada — tetapi *akun*-nya harus ada dalam daftar.
+- **Tick stale setelah swap.** `tick_current` dapat melintasi banyak tick dalam satu swap. Jika UX Anda menampilkan "current tick" dari satu panggilan RPC dan kemudian membuka posisi di panggilan yang lebih baru, posisi relatif vs harga live dapat menyimpang puluhan tick. Ambil ulang tepat sebelum menandatangani.
 - **NFT posisi dengan metadata tambahan.** Jika Anda membangun dompet yang mengenali posisi Raydium, gunakan posisi PDA / data program dan bukan field metadata yang dikodekan keras. Mint posisi baru menggunakan pool PDA sebagai mint dan freeze authority saat pembuatan; mint authority dihapus setelah NFT tunggal dicetak.
 - **Mengasumsikan setiap posisi dapat ditransfer.** Baca status `isFrozen` akun token NFT sebelum menampilkan transfer, marketplace, escrow, atau Burn & Earn actions.
 

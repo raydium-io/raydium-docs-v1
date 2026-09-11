@@ -49,9 +49,18 @@ description: "Référence complète des instructions CLMM : cycle de vie du pool
 | Récompenses | `UpdateRewardInfos` | Régler la croissance des récompenses à maintenant (appelé par tout swap / changement de position). |
 | Récompenses | `TransferRewardOwner` | Transférer l'autorité qui peut définir ou alimenter un flux de récompenses. |
 | Récompenses | `CollectRemainingRewards` | Après le `end_time` d'un flux de récompenses, balayer tous les jetons non alloués vers le financeur. |
-| Utilitaire | `InitTickArray` | Initialiser un compte tick-array (souvent regroupé avec `OpenPosition`). |
+| Admin | `CloseSupportMintAssociated` | Supprimer l'enregistrement `SupportMintAssociated` d'un mint et rembourser son loyer. |
 
-La plupart des instructions réservées à l'admin (`CreateAmmConfig`, `UpdateAmmConfig`, `UpdatePoolStatus`, `CreateSupportMintAssociated`, `CreateOperationAccount`, `UpdateOperationAccount`, `CloseProtocolPosition`) sont contrôlées par la clé `admin` codée en dur du programme. `CreatePermissionPda` / `ClosePermissionPda` acceptent soit la clé `admin` **soit** une clé `permission_pda_admin` dédiée. Les instructions d'admin de flux de récompenses (`TransferRewardOwner`, `CollectRemainingRewards`) sont contrôlées par le financeur de récompenses, pas par l'admin du programme.
+<Note>
+  **Il n'existe pas d'instruction d'initialisation de tick array, et aucune n'est nécessaire.** Un tick
+  array est créé *à l'intérieur* de `OpenPosition*` / `IncreaseLiquidity*` par
+  `TickArrayState::get_or_create_tick_array`, aux frais de `payer`. Passez la PDA de tick array
+  (éventuellement encore non initialisée et détenue par le système) comme `tick_array_lower` /
+  `tick_array_upper` et le programme l'alloue si elle est absente. `OpenLimitOrder` fait de même pour
+  son unique `tick_array`.
+</Note>
+
+La plupart des instructions réservées à l'admin (`CreateAmmConfig`, `UpdateAmmConfig`, `UpdatePoolStatus`, `CreateOperationAccount`, `UpdateOperationAccount`, `CloseProtocolPosition`) sont contrôlées par la clé `admin` codée en dur du programme. `CreatePermissionPda` / `ClosePermissionPda` acceptent soit la clé `admin` **soit** une clé `permission_pda_admin` dédiée ; `CreateSupportMintAssociated` / `CloseSupportMintAssociated` acceptent soit la clé `admin` **soit** une clé dédiée de propriétaire des mints supportés. Les instructions d'admin de flux de récompenses (`TransferRewardOwner`, `CollectRemainingRewards`) sont contrôlées par le financeur de récompenses, pas par l'admin du programme.
 
 Le suffixe V2 signifie « supporte Token-2022 sur les coffres / NFT, nécessite l'emplacement d'extension bitmap ». Le SDK choisit V2 par défaut pour les nouveaux pools.
 
@@ -76,10 +85,19 @@ open_time:      u64            // les swaps sont rejetés avant cette heure
 | 6 | `token_vault_0` | W |   | `init` ici, détenu par le PDA d'autorité du pool. |
 | 7 | `token_vault_1` | W |   | |
 | 8 | `observation_state` | W |   | `init` ici. |
-| 9 | `tick_array_bitmap_extension` | W |   | `init` ici (V2). |
-| 10 | `token_program` |   |   | |
-| 11 | `token_program_2022` |   |   | |
-| 12 | `system_program`, `rent` |   |   | |
+| 9 | `tick_array_bitmap` | W |   | La PDA `TickArrayBitmapExtension` ; `init` ici. |
+| 10 | `token_program_0` |   |   | Le programme qui possède `token_mint_0` — SPL Token **ou** Token-2022. |
+| 11 | `token_program_1` |   |   | Le programme qui possède `token_mint_1`. |
+| 12 | `system_program` |   |   | |
+| 13 | `rent` |   |   | |
+
+<Warning>
+  Les slots 10 et 11 sont **par mint**, et non « SPL Token puis Token-2022 ». Chacun est contraint
+  par `mint::token_program` sur le mint correspondant : pour un pool dont le `token_mint_0` est
+  Token-2022 et le `token_mint_1` du SPL classique, vous devez donc passer Token-2022 dans le slot 10
+  et SPL Token dans le slot 11. `CreateCustomizablePool` et `CreatePermissionedPool` utilisent les
+  deux mêmes slots.
+</Warning>
 
 **Préconditions**
 
@@ -108,13 +126,17 @@ pub struct CreateCustomizableParams {
 }
 ```
 
-**Comptes (abrégés)** — identiques à `CreatePool` plus, lorsque `enable_dynamic_fee = true` :
+**Comptes** — exactement les 13 comptes déclarés de `CreatePool`. `dynamic_fee_config` n'est **pas** un compte déclaré.
 
-| # | Nom | W | S | Notes |
-|---|------|---|---|-------|
-| N | `dynamic_fee_config` |   |   | La configuration partagée à capturer. Doit déjà exister. |
+<Warning>
+  Lorsque `enable_dynamic_fee = true`, le `DynamicFeeConfig` à capturer doit être fourni comme
+  **dernier** `remaining_account` — le gestionnaire lit `ctx.remaining_accounts.last()`. Toute PDA de
+  contournement `SupportMintAssociated` doit donc venir *avant* lui, sinon le programme capture le
+  mauvais compte et échoue à la désérialisation. L'omettre alors que le drapeau est positionné échoue
+  avec `AccountLack`.
+</Warning>
 
-**Préconditions** — identiques à `CreatePool`. Si `enable_dynamic_fee = false`, `dynamic_fee_config` est ignoré.
+**Préconditions** — identiques à `CreatePool`. Si `enable_dynamic_fee = false`, aucun `remaining_account` n'est requis et ceux qui sont passés ne sont analysés qu'à la recherche d'enregistrements de mints supportés.
 
 **Postconditions**
 
@@ -185,31 +207,44 @@ base_flag: Option<bool>       // true = adapter à amount0 ; false = adapter à 
 
 | # | Nom | W | S | Notes |
 |---|------|---|---|-------|
-| 1 | `payer` | W | S |
-| 2 | `position_nft_owner` |   |   |
-| 3 | `position_nft_mint` | W | S (keypair) |
+| 1 | `payer` | W | S | |
+| 2 | `position_nft_owner` |   |   | |
+| 3 | `position_nft_mint` | W | S | Nouvelle keypair. |
 | 4 | `position_nft_account` | W |   | ATA du propriétaire pour le NFT. |
-| 5 | `metadata_account` | W |   | Metaplex (optionnel, si `with_metadata`). |
-| 6 | `pool_state` | W |   |
-| 7 | `protocol_position` |   |   |   |
-| 8 | `tick_array_lower` | W |   | Créé s'il n'est pas initialisé. |
+| 5 | `metadata_account` | W |   | PDA de métadonnées Metaplex. Déclaré **inconditionnellement**, même lorsque `with_metadata = false`. |
+| 6 | `pool_state` | W |   | |
+| 7 | `protocol_position` |   |   | Résiduel ; `UncheckedAccount` en lecture seule. |
+| 8 | `tick_array_lower` | W |   | Créé ici s'il n'est pas initialisé. |
 | 9 | `tick_array_upper` | W |   | Idem. |
 | 10 | `personal_position` | W |   | Créé ici. |
-| 11 | `token_account_0`, `token_account_1` | W |   | ATAs source de l'utilisateur. |
-| 12 | `token_vault_0`, `token_vault_1` | W |   | |
-| 13 | `rent`, `system_program`, `token_program` |   |   | |
-| 14 | `associated_token_program` |   |   | |
-| 15 | `metadata_program` |   |   | Optionnel. |
-| 16 | `token_program_2022` |   |   | V2. |
-| 17 | `vault_0_mint`, `vault_1_mint` |   |   | V2. |
-| 18 | `tick_array_bitmap_extension` | W |   | V2 (si touché). |
+| 11 | `token_account_0` | W |   | ATA source de l'utilisateur. |
+| 12 | `token_account_1` | W |   | |
+| 13 | `token_vault_0` | W |   | |
+| 14 | `token_vault_1` | W |   | |
+| 15 | `rent` |   |   | |
+| 16 | `system_program` |   |   | |
+| 17 | `token_program` |   |   | |
+| 18 | `associated_token_program` |   |   | |
+| 19 | `metadata_program` |   |   | Metaplex Token Metadata. |
+| 20 | `token_program_2022` |   |   | |
+| 21 | `vault_0_mint` |   |   | |
+| 22 | `vault_1_mint` |   |   | |
+
+`OpenPositionWithToken22Nft` est la même liste avec `metadata_account` (5) et `metadata_program` (19) **retirés** — il écrit les métadonnées de la position via l'extension de métadonnées Token-2022 sur le mint du NFT — soit 20 comptes. Son `position_nft_mint` est un simple `Signer` et son `position_nft_account` un `UncheckedAccount`.
+
+<Warning>
+  **`tick_array_bitmap_extension` n'est un compte déclaré sur aucune des deux variantes.** Lorsque la
+  plage de la position sort du `tick_array_bitmap` inline du pool (±512 tick arrays), ajoutez la PDA
+  `TickArrayBitmapExtension` aux seeds `["pool_tick_array_bitmap_extension", pool_state]` comme
+  `remaining_accounts[0]`.
+</Warning>
 
 **Mathématiques** — voir [`products/clmm/math`](/fr/products/clmm/math). Donné `base_flag`, le programme résout soit `liquidity` soit `(amount_0_max, amount_1_max)` en `L` réel et les montants de jetons réels consommés.
 
 **Préconditions**
 
 - `tick_lower < tick_upper`, tous deux multiples de `pool.tick_spacing`, dans `[MIN_TICK, MAX_TICK]`.
-- Les tick arrays requis passés et initialisés (ou créés ici via CPI `InitTickArray` dans la transaction).
+- Les deux PDAs de tick array sont passées. Elles n'ont **pas** besoin d'exister déjà — `get_or_create_tick_array` alloue celle qui manque aux frais du `payer`, à l'intérieur de cette instruction. Il n'existe pas d'instruction distincte d'initialisation de tick array.
 - L'utilisateur a au moins `amount_0_max` et `amount_1_max` dans les ATAs source.
 
 **Postconditions**
@@ -220,7 +255,7 @@ base_flag: Option<bool>       // true = adapter à amount0 ; false = adapter à 
 - Le mint NFT de la position enregistre `pool_state` comme autorité de gel. L'autorité de mint est supprimée après que le seul NFT soit frappé. L'enregistrement de l'autorité de gel ne change pas l'état du compte de jeton NFT.
 - Le compte de jeton NFT reste dégelé sauf si l'instruction est `OpenPositionV2` ou `OpenPositionWithToken22Nft` **et** que l'autorité de gel de l'un des mints de coffre correspond à la liste des émetteurs restreints de CLMM. Seul ce chemin V2 correspondant gèle le compte. `OpenPosition` V1 ne gèle pas.
 
-**Erreurs courantes** — `InvalidTickIndex`, `NotApproved`, `ZeroAmountSpecified`, `TransactionTooLarge` (si trop de tick arrays).
+**Erreurs courantes** — `TickInvalidOrder` (`tick_lower >= tick_upper`), `TickAndSpacingNotMatch` (une extrémité n'est pas un multiple de `tick_spacing`), `InvalidTickIndex` (en dehors de `[MIN_TICK, MAX_TICK]`), `MissingTickArrayBitmapExtensionAccount` (plage en dehors du bitmap inline et extension non ajoutée), `NotApproved` (`pool_state.status` bloque l'ouverture), `ZeroAmountSpecified`.
 
 <Note>
   Le gel de position n'ajoute pas de comptes d'instruction déclarés ou d'arguments. Les clients peuvent ouvrir ces positions avec les dispositions V2 existantes. Le comportement est sélectionné on-chain à partir de `vault_0_mint` et `vault_1_mint`.
@@ -239,13 +274,33 @@ amount_1_max: u64
 base_flag: Option<bool>
 ```
 
-**Comptes** — comme `OpenPosition` moins le mint NFT (la position existe déjà ; le NFT est passé comme l'ATA du propriétaire détenant 1 jeton).
+**Comptes** — 15, et *non* dérivables de `OpenPosition` : il n'y a ni `rent`, ni `system_program`, ni `associated_token_program`, ni compte de métadonnées.
+
+| # | Nom | W | S |
+|---|------|---|---|
+| 1 | `nft_owner` |   | S |
+| 2 | `nft_account` |   |   |
+| 3 | `pool_state` | W |   |
+| 4 | `protocol_position` |   |   |
+| 5 | `personal_position` | W |   |
+| 6 | `tick_array_lower` | W |   |
+| 7 | `tick_array_upper` | W |   |
+| 8 | `token_account_0` | W |   |
+| 9 | `token_account_1` | W |   |
+| 10 | `token_vault_0` | W |   |
+| 11 | `token_vault_1` | W |   |
+| 12 | `token_program` |   |   |
+| 13 | `token_program_2022` |   |   |
+| 14 | `vault_0_mint` |   |   |
+| 15 | `vault_1_mint` |   |   |
+
+Ajoutez la PDA `TickArrayBitmapExtension` en tête, comme `remaining_accounts[0]`, lorsque la plage de la position sort du bitmap inline.
 
 **Effet**
 
 - Transfère `amount_0_actual` / `amount_1_actual` de l'utilisateur → coffres.
 - Incrémente `personal_position.liquidity` et `pool_state.liquidity` (si en plage), et le `liquidity_gross` / `liquidity_net` du tick d'extrémité en conséquence.
-- **Collecte les frais et récompenses dus depuis le dernier toucher** et les crédite à `tokens_fees_owed_{0,1}` / `reward_amount_owed`. Ceux-ci ne sont payés que sur `DecreaseLiquidity` ou `CollectReward`, pas sur l'augmentation.
+- **Collecte les frais et récompenses dus depuis le dernier toucher** et les crédite à `token_fees_owed_{0,1}` / `reward_amount_owed`. Ceux-ci ne sont payés que sur `DecreaseLiquidity` / `DecreaseLiquidityV2`, pas sur l'augmentation — il n'existe pas d'instruction de collecte autonome.
 
 ## `DecreaseLiquidityV2`
 
@@ -259,7 +314,33 @@ amount_0_min: u64
 amount_1_min: u64
 ```
 
-**Comptes** — même forme que `IncreaseLiquidity`.
+**Comptes** — 16, et **pas** la même forme ni le même ordre que `IncreaseLiquidityV2` : `personal_position` et `pool_state` sont inversés, les coffres viennent avant les tick arrays, les comptes côté utilisateur sont nommés `recipient_token_account_*`, et il y a un `memo_program` supplémentaire.
+
+| # | Nom | W | S |
+|---|------|---|---|
+| 1 | `nft_owner` |   | S |
+| 2 | `nft_account` |   |   |
+| 3 | `personal_position` | W |   |
+| 4 | `pool_state` | W |   |
+| 5 | `protocol_position` |   |   |
+| 6 | `token_vault_0` | W |   |
+| 7 | `token_vault_1` | W |   |
+| 8 | `tick_array_lower` | W |   |
+| 9 | `tick_array_upper` | W |   |
+| 10 | `recipient_token_account_0` | W |   |
+| 11 | `recipient_token_account_1` | W |   |
+| 12 | `token_program` |   |   |
+| 13 | `token_program_2022` |   |   |
+| 14 | `memo_program` |   |   |
+| 15 | `vault_0_mint` |   |   |
+| 16 | `vault_1_mint` |   |   |
+
+**Comptes restants** — trois par récompense active collectée, dans l'ordre `reward_token_vault(W)`, `recipient_token_account(W)`, `reward_vault_mint`. Ajoutez en tête la PDA `TickArrayBitmapExtension` lorsque la plage de la position sort du bitmap inline.
+
+<Note>
+  C'est aussi le **seul** moyen de collecter les frais et les récompenses. Pour collecter sans
+  modifier la position, appelez-la avec `liquidity = 0`, `amount_0_min = 0`, `amount_1_min = 0`.
+</Note>
 
 **Effet**
 
@@ -348,7 +429,7 @@ Les appelants passent une liste classée de tick arrays couvrant la marche de sw
 - `now >= open_time`.
 - `sqrt_price_limit_x64` est du bon côté de `sqrt_price_x64` pour la direction.
 
-**Erreurs courantes** — `ExceededSlippage`, `SqrtPriceLimitOverflow`, `TickArrayNotFound`, `LiquidityInsufficient`.
+**Erreurs courantes** — `TooLittleOutputReceived` (slippage en entrée exacte), `TooMuchInputPaid` (slippage en sortie exacte), `SqrtPriceLimitOverflow`, `NotEnoughTickArrayAccount`, `InvalidFirstTickArrayAccount`, `MissingTickArrayBitmapExtensionAccount`, `LiquidityInsufficient`, `NotApproved` (bit de swap positionné sur `pool_state.status`). Le CLMM n'a pas de variante `ExceededSlippage` — ce nom est celui du CPMM — ni de `TickArrayNotFound`.
 
 **Ce que `SwapV2` fait en interne que les appelants doivent savoir** (version post-2025) :
 
@@ -387,7 +468,16 @@ amount:         u64      // montant du jeton d'entrée
 | 10 | `input_vault_mint` |   |   | Gestion des frais Token-2022. |
 | 11 | `output_vault_mint` |   |   | Mint du côté de sortie (appariement de vérification gelée). |
 | 12 | `input_token_program` |   |   | SPL ou Token-2022. |
-| 13 | `system_program`, `rent` |   |   | |
+| 13 | `system_program` |   |   | Finance l'allocation de `limit_order`, de `limit_order_nonce` et — si nécessaire — du `tick_array`. |
+
+**Comptes restants** — `[0]` `tick_array_bitmap_extension`, requis uniquement lors de l'initialisation d'un tick array dont l'index de début sort du bitmap inline du pool. Ne passez rien sinon.
+
+<Warning>
+  Il n'y a **aucun compte `rent`** : la struct se termine à `system_program`, soit 13 comptes déclarés.
+  Un `rent` égaré en position 14 atterrit exactement là où l'extension bitmap optionnelle est lue, de
+  sorte que l'ordre semble fonctionner jusqu'à la première fois où un tick array situé en dehors du
+  bitmap inline doit être créé — et échoue alors.
+</Warning>
 
 <Note>
   **Changement de liste de comptes (version 2026-07).** `OpenLimitOrder` prend maintenant aussi les comptes du **côté de la sortie** — `output_token_account`, `output_vault` et `output_vault_mint` — en plus du côté d'entrée. Ils sont utilisés uniquement pour la validation : le programme rejette l'ordre si le compte de jeton d'entrée **ou** de sortie du propriétaire est gelé. Cela garantit qu'un remplissage peut réellement être réglé à l'ATA de sortie du propriétaire, ce qui importe pour les mints Token-2022 avec liste blanche / gelés par défaut (par exemple, jetons autorisés) où un compte peut ne pas encore être dégelé. Les clients construits contre la liste de comptes unilatérale plus ancienne doivent ajouter les trois comptes de sortie.
@@ -407,7 +497,7 @@ amount:         u64      // montant du jeton d'entrée
 - `limit_order_nonce.order_nonce += 1`.
 - `OpenLimitOrderEvent` émis.
 
-**Erreurs courantes** — `NotApproved` (compte de jeton d'entrée ou de sortie gelé, ou le pool a le swap / ordre limite désactivé), `InvalidLimitOrderAmount` (zéro ou en dessous du minimum du pool), `InvalidTickIndex` (hors de `[MIN_TICK, MAX_TICK]`, ou du mauvais côté de `tick_current` pour la direction choisie), `TickAndSpacingNotMatch` (`tick_index % pool.tick_spacing != 0`), `OrderPhaseSaturated`.
+**Erreurs courantes** — `NotApproved` (compte de jeton d'entrée ou de sortie gelé, ou le pool a le swap / ordre limite désactivé), `ZeroAmountSpecified` (`amount == 0` après les frais de transfert côté entrée), `InvalidLimitOrderAmount` (le montant produirait une sortie inférieure à 1 unité de base à ce tick, ou déborderait `u64`), `InvalidTickIndex` (hors de `[MIN_TICK, MAX_TICK]`, ou du mauvais côté de `tick_current` pour la direction choisie), `TickAndSpacingNotMatch` (`tick_index % pool.tick_spacing != 0`), `OrderPhaseSaturated`.
 
 ## `IncreaseLimitOrder`
 
@@ -419,7 +509,18 @@ Ajouter à un ordre ouvert existant. Uniquement appelable par le `owner` de l'or
 amount: u64    // montant supplémentaire du jeton d'entrée
 ```
 
-**Comptes** — comme `OpenLimitOrder` moins le compte nonce ; le PDA `limit_order` est passé directement.
+**Comptes** — 8, côté entrée uniquement. Il supprime le compte de nonce, les trois comptes côté sortie **et** `system_program`.
+
+| # | Nom | W | S |
+|---|------|---|---|
+| 1 | `owner` |   | S |
+| 2 | `pool_state` | W |   |
+| 3 | `tick_array` | W |   |
+| 4 | `limit_order` | W |   |
+| 5 | `input_token_account` | W |   |
+| 6 | `input_vault` | W |   |
+| 7 | `input_vault_mint` |   |   |
+| 8 | `input_token_program` |   |   |
 
 **Préconditions**
 
@@ -537,19 +638,39 @@ Modifier un `DynamicFeeConfig` existant. Les pools qui ont déjà capturé la co
 
 ## `CollectProtocolFee` / `CollectFundFee`
 
-Forme identique à `CollectProtocolFee` / `CollectFundFee` du CPMM. Le signataire doit correspondre à `AmmConfig.owner` / `AmmConfig.fund_owner`. Balayer les frais de protocole/fonds accumulés des coffres du pool vers un destinataire, mettre à zéro les champs correspondants `PoolState.protocol_fees_*` / `fund_fees_*`.
+Balayer les frais de protocole/fonds accumulés des coffres du pool vers un destinataire, en mettant à zéro les champs correspondants `PoolState.protocol_fees_*` / `fund_fees_*`. **Ce n'est pas le layout du CPMM** — le CLMM n'a pas de compte `authority`, et les champs de destinataire sont nommés `recipient_token_account_{0,1}` plutôt que `recipient_token_{0,1}_account`.
+
+**Arguments** — `amount_0_requested: u64`, `amount_1_requested: u64`.
+
+| # | Nom | W | S | Notes |
+|---|------|---|---|-------|
+| 1 | `owner` |   | S | `amm_config.owner` (ou `amm_config.fund_owner` pour la variante fonds), ou l'admin du programme ; sinon `NotApproved`. |
+| 2 | `pool_state` | W |   | |
+| 3 | `amm_config` |   |   | `address = pool_state.amm_config`. |
+| 4 | `token_vault_0` | W |   | |
+| 5 | `token_vault_1` | W |   | |
+| 6 | `vault_0_mint` |   |   | |
+| 7 | `vault_1_mint` |   |   | |
+| 8 | `recipient_token_account_0` | W |   | |
+| 9 | `recipient_token_account_1` | W |   | |
+| 10 | `token_program` |   |   | |
+| 11 | `token_program_2022` |   |   | |
 
 ## `InitializeReward`
 
 Ajouter un nouveau flux de récompenses à un pool. Jusqu'à 3 flux peuvent être actifs à la fois.
 
-**Arguments**
+**Arguments** — une struct unique, `param: InitializeRewardParam`, soit un seul argument `param` :
 
+```rust
+pub struct InitializeRewardParam {
+    pub open_time:                u64,
+    pub end_time:                 u64,
+    pub emissions_per_second_x64: u128,   // Q64.64
+}
 ```
-open_time:     u64
-end_time:      u64
-emissions_per_second_x64: u128   // Q64.64
-```
+
+L'encodage de transmission place les trois champs bout à bout, de sorte qu'une instruction construite à la main n'est pas affectée — mais un client piloté par l'IDL doit passer un unique objet `param` plutôt que trois arguments positionnels.
 
 **Comptes**
 
@@ -579,28 +700,21 @@ emissions_per_second_x64: u128   // Q64.64
 
 Pur comptage — règle `reward_growth_global_x64` à l'heure actuelle en multipliant `emissions_per_second × Δt / liquidity`. Appelé en interne par chaque instruction touchant la liquidité. Exposé en tant qu'instruction autonome car les acteurs externes (UIs, cranks) veulent parfois le déclencher.
 
-## `CollectReward`
+## Collecting rewards
 
-Le propriétaire de la position réclame les jetons de récompense dus.
+<Warning>
+  **Il n'existe pas d'instruction autonome de collecte de récompense.** Le programme n'expose aucun
+  point d'entrée `CollectReward`, et l'IDL publié n'en contient pas non plus.
+</Warning>
 
-**Comptes**
+Les récompenses dues à une position sont payées par `DecreaseLiquidity` / `DecreaseLiquidityV2`. Pour
+collecter sans modifier la position, appelez-la avec `liquidity = 0`, `amount_0_min = 0`,
+`amount_1_min = 0`. Les coffres de récompense et les comptes destinataires vont dans
+`remaining_accounts` par groupes de trois par récompense active, dans l'ordre
+`reward_token_vault(W)`, `recipient_token_account(W)`, `reward_vault_mint`.
 
-| # | Nom | W | S | Notes |
-|---|------|---|---|-------|
-| 1 | `nft_owner` |   | S |
-| 2 | `nft_account` |   |   | ATA du propriétaire détenant le NFT de position. |
-| 3 | `personal_position` | W |   |
-| 4 | `pool_state` | W |   |
-| 5 | `protocol_position` |   |   |   |
-| 6 | `reward_token_vault` | W |   |
-| 7 | `recipient_token_account` | W |   |
-| 8 | `token_program` |   |   |
-| 9 | `token_program_2022` |   |   |
-
-**Effet**
-
-- Règle la croissance des récompenses (même motif que les frais).
-- Transfère le montant dû à l'ATA du destinataire, met à zéro `reward_amount_owed[i]`.
+`CollectRemainingRewards` est autre chose : il permet au *financeur* des récompenses, après le
+`end_time` d'un flux, de balayer les jetons qui n'ont jamais été alloués à une position.
 
 ## Matrice de changement d'état
 
@@ -619,7 +733,6 @@ Le propriétaire de la position réclame les jetons de récompense dus.
 | `CloseLimitOrder` | — | — | — | — | — |
 | `CreateCustomizablePool` | 0 | 0 | — | — | — |
 | `UpdateRewardInfos` | — | — | + | — | — |
-| `CollectReward` | — | — | régler dû | — | — |
 
 ## Où aller ensuite
 

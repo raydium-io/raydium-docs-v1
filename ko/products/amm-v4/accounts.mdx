@@ -73,11 +73,12 @@ pub struct AmmInfo {
     pub market: Pubkey,        // OpenBook 마켓
     pub market_program: Pubkey, // OpenBook 프로그램 ID
     pub target_orders: Pubkey,
-    pub withdraw_queue: Pubkey,
-    pub lp_vault:       Pubkey, // = pool_temp_lp
-    pub owner: Pubkey,          // 관리자 (멀티시그)
-    pub lp_reserve: u64,
-    pub padding: [u64; 3],
+    pub padding1: [u64; 8],     // 예약됨 — withdraw_queue / lp_vault 아님
+    pub amm_owner: Pubkey,      // 관리자 (멀티시그)
+    pub lp_amount: u64,         // 풀의 내부 LP 총액; 아래 참고 사항 참조
+    pub client_order_id: u64,
+    pub recent_epoch: u64,
+    pub padding2: u64,
 }
 
 pub struct Fees {
@@ -118,7 +119,9 @@ pub struct StateData {
 - **`coin_decimals`**, **`pc_decimals`** — 민트와 일치합니다.
 - **`open_orders`**, **`target_orders`**, **`market`** — 레거시 참조 필드. 여전히 `AmmInfo`에 있고 v1 명령어 레이아웃에서 위치상으로 전달되지만, 프로그램은 더 이상 읽거나 검증하지 않습니다. V2 스왑 진입점은 이들을 생략합니다.
 - **`fees.swap_fee_numerator / swap_fee_denominator`** — 결합된 거래 수수료. 기본값 `25 / 10_000 = 0.25%`.
-- **`status`** — 작업을 제어하는 비트마스크. `AdminSetStatus`를 통해 관리자가 설정 가능합니다.
+- **`status`** — 작업을 제어하는 단일 열거형 `u64` 상태이며 비트마스크가 **아닙니다**. `param = 0`(`Status`)과 함께 `SetParams`를 통해 관리자가 설정 가능합니다. 아래 [Status](#status)를 참조하세요.
+- **`lp_amount`** — 풀의 내부 LP 총액. `lp_mint.supply`와 **같지 않습니다**: 정확히 온전한 LP 토큰 한 개(`10^coin_decimals` 기본 단위)만큼 더 큽니다. 그 양은 초기화 시 계산되지만 실제로 발행되지는 않기 때문입니다. 모든 비례 계산은 `lp_amount`를 사용하므로 당신도 이를 사용하세요.
+- **`amm_owner`** — 생성 시 크리에이터가 아니라 프로그램에 하드코딩된 관리자 키에서 기록됩니다.
 - **`state_data.need_take_pnl_*`** — 총 누적 수수료와 스윕된 금액 간의 차이. `TakePnl`이 이를 0으로 설정합니다.
 
 ## OpenBook 연결
@@ -166,48 +169,67 @@ const [ammAuthority] = PublicKey.findProgramAddressSync(
 );
 ```
 
-OpenBook 작업에 서명하기 위해 풀당 별도의 **풀 범위** 권한이 파생됩니다(이 프로그램의 설계에서 `amm_authority`는 실제로 둘 다 포함합니다; 다른 버전은 다른 파생을 사용했으므로 코드에서 특정 풀의 `AmmInfo.nonce`를 확인하세요).
+두 번째의 풀 범위 권한은 없습니다: 이 하나의 PDA가 프로그램이 서명하는 모든 것을 담당합니다. 메인넷에서 그 범프는 `254`이며 모든 `AmmInfo`에 `nonce`로 미러링됩니다. `WithdrawExcessLamports`는 그 nonce를 하드코딩하여 이를 다시 파생합니다.
 
 ## 볼트
 
-풀의 SPL Token 볼트는 `owner`가 `amm_authority`인 표준 토큰 계정입니다. ATA가 아닙니다 — 그들의 주소는 `["amm_associated_seed", coin_mint_or_pc_mint, market, amm_id]` 시드로 `Initialize`에서 파생된 특정 PDA입니다. 주소는 `AmmInfo`에 저장됩니다; 파생은 일회성 호기심입니다.
+풀의 SPL Token 볼트는 `owner`가 `amm_authority`인 표준 토큰 계정입니다. ATA가 아닙니다 — 그들의 주소는 `Initialize2`에서 `[AMM_V4_PROGRAM_ID, market, "coin_vault_associated_seed"]` 및 `[AMM_V4_PROGRAM_ID, market, "pc_vault_associated_seed"]`로부터 파생된 PDA입니다. 민트는 시드가 아니며 `amm_id`도 시드가 아닙니다. 주소는 `AmmInfo`에 저장됩니다; 파생은 일회성 호기심입니다.
 
-Token-2022는 **지원되지 않습니다**. 프로그램은 모든 볼트 이동에 대해 SPL Token의 프로그램 ID를 하드코딩합니다. AMM v4 풀을 Token-2022 민트에 바인딩하려고 시도하면 `Initialize`에서 실패합니다.
+Token-2022는 **지원되지 않습니다**. 프로그램은 모든 볼트 이동에 대해 SPL Token의 프로그램 ID를 하드코딩합니다. AMM v4 풀을 Token-2022 민트에 바인딩하려고 시도하면 `Initialize2`에서 `InvalidSplTokenProgram`으로 실패합니다.
 
 ## LP 민트
 
-권한이 `amm_authority`인 클래식 SPL Token 민트입니다. 총 공급량은 풀의 LP 소유권을 추적합니다; LP를 소각하면 두 볼트에서 비례적으로 토큰을 반환합니다. AMM v4가 CPMM보다 먼저 나왔기 때문에, 풀 상태에 `lp_supply` 미러가 없습니다 — 민트의 온체인 공급량을 직접 읽으세요.
+권한이 `amm_authority`인 클래식 SPL Token 민트입니다. 총 공급량은 풀의 LP 소유권을 추적합니다; LP를 소각하면 두 볼트에서 비례적으로 토큰을 반환합니다.
 
-## 상태 비트마스크
+상태 내 미러는 **존재합니다**: `AmmInfo.lp_amount`. 이는 민트의 공급량과 같지 않습니다 — 정확히 온전한 LP 토큰 한 개(`10^coin_decimals` 기본 단위)만큼 더 큽니다. 그 양은 초기화 시 계산되지만 실제로 발행되지는 않기 때문입니다. 프로그램의 모든 비례 계산은 `lp_amount`로 나누므로, 민트의 온체인 공급량 대신 이 필드를 사용하세요.
 
-`AmmInfo.status`는 작업을 제어합니다. 비트(위치는 프로그램 버전에 따라 다를 수 있습니다 — 소스를 통해 확인하세요):
+## 상태
 
-| 비트 | 플래그 | 효과 |
-|-----|--------|------|
-| 0 | `SWAP_DISABLED` | `Swap*`이 거부됩니다. |
-| 1 | `DEPOSIT_DISABLED` | `Deposit`이 거부됩니다. |
-| 2 | `WITHDRAW_DISABLED` | `Withdraw`가 거부됩니다. |
-| 3 | `CLMM_LIKE_MIGRATE` | 작업에서 사용하는 마이그레이션 게이트 플래그. |
+`AmmInfo.status`는 단일 열거형 `u64` 상태이며 비트마스크가 **아닙니다**. 동등성으로 검사하세요 — `status & 1`을 검사하는 클라이언트는 모든 라이브 풀을 잘못 분류합니다. 정상 거래 상태가 비트 0이 설정된 `6`이기 때문입니다.
 
-Raydium 멀티시그는 `SetParams`를 통해 이를 설정합니다(`param = Status`). (`AdminCancelOrders`는 제거되었습니다.)
+| 값 | `AmmStatus` | 스왑 | 예치 | 출금 |
+|-------|-------------|------|---------|----------|
+| 0 | `Uninitialized` | 불가 | 불가 | 불가 |
+| 1 | `Initialized` | 가능 | 가능 | 가능 |
+| 2 | `Disabled` | 불가 | 불가 | 불가 |
+| 3 | `WithdrawOnly` | 불가 | 불가 | 가능 |
+| 4 | `LiquidityOnly` | 불가 | 가능 | 가능 |
+| 5 | `OrderBookOnly` | 불가 | 가능 | 가능 |
+| 6 | `SwapOnly` | 가능 | 가능 | 가능 |
+| 7 | `WaitingTrade` | `pool_open_time`이 지나면 가능 | 가능 | 가능 |
+
+`Initialize2`는 `open_time`이 미래이면 `7`을, 그렇지 않으면 `6`을 기록합니다. `7` 상태의 풀은 `state_data.pool_open_time` 시점 이후의 첫 스왑에서 스스로 `6`으로 전환됩니다. `0..=7` 범위를 벗어난 값은 `AmmStatus::from_u64`를 패닉시킵니다.
+
+Raydium 멀티시그는 `param = 0`(`Status`)과 함께 `SetParams`를 통해 상태를 설정하며 `1`–`7` 값만 허용됩니다. (`AdminCancelOrders`는 제거되었습니다.)
 
 ## 관찰 / 오라클
 
-**AMM v4는 전용 관찰 계정이 없습니다.** 온체인 TWAP가 필요한 다른 프로토콜은 일반적으로 OpenBook의 북 교차를 간접적으로 소비하거나 오프체인을 읽습니다. 프로그램 지원이 있는 Raydium TWAP가 필요하면 CPMM 또는 CLMM을 사용하세요.
+**AMM v4는 전용 관찰 계정이 없으며**, OpenBook 제거 이후로는 그것을 파생할 오더북 상태도 없습니다. 프로그램 지원이 있는 Raydium TWAP가 필요하면 CPMM 또는 CLMM을 사용하세요 — 둘 다 `ObservationState` 링 버퍼를 유지합니다. 그렇지 않으면 스왑 로그를 오프체인에서 인덱싱하세요.
 
 ## 처음부터 풀의 계정 파생
 
-AMM v4는 결정론적 쌍별 PDA를 위해 설계되지 않았기 때문에(Solana 규칙보다 먼저 나왔음), 정규 `amm_id`는 다음으로 파생된 **시드 키쌍**입니다:
+AMM v4의 풀 계정은 바인딩된 마켓을 키로 하는 일반 PDA입니다 — 시드 키쌍도 아니고 쌍별 PDA도 아닙니다. 그 모두가 `AMM_V4_PROGRAM_ID` 아래에서 동일한 3개 시드 형태 `[AMM_V4_PROGRAM_ID, market, <label>]`를 사용합니다:
 
-```
-ammId = createWithSeed(
-  owner: ammAuthority,
-  seed:  marketPubkey.toBase58().slice(0, 32),
-  programId: AMM_V4_PROGRAM_ID,
-)
+| Account | `<label>` |
+|---------|-----------|
+| `amm_id` (`AmmInfo`) | `"amm_associated_seed"` |
+| `amm_target_orders` | `"target_associated_seed"` |
+| `lp_mint` | `"lp_mint_associated_seed"` |
+| `pool_coin_token_account` | `"coin_vault_associated_seed"` |
+| `pool_pc_token_account` | `"pc_vault_associated_seed"` |
+
+```ts
+const [ammId] = PublicKey.findProgramAddressSync(
+  [
+    AMM_V4_PROGRAM_ID.toBuffer(),
+    marketPubkey.toBuffer(),
+    Buffer.from("amm_associated_seed"),
+  ],
+  AMM_V4_PROGRAM_ID,
+);
 ```
 
-동일한 시드 키 패턴이 `amm_open_orders`, `amm_target_orders`, `amm_withdraw_queue`, `pool_temp_lp`, `pool_coin_token_account`, `pool_pc_token_account`, 및 `lp_mint`에 적용됩니다. SDK와 API는 이를 미리 계산합니다; `raydium-sdk-v2`의 `Liquidity.getAssociatedPoolKeys`를 참조하세요.
+바인딩된 마켓이 유일한 가변 시드이며, 그래서 하나의 마켓이 정확히 하나의 AMM v4 풀에 매핑됩니다. SDK와 API는 이를 미리 계산합니다; `raydium-sdk-v2`의 `Liquidity.getAssociatedPoolKeys`를 참조하세요.
 
 실제로, 통합자는 `GET https://api-v3.raydium.io/pools/info/ids?ids=<POOL_ID>`에서 또는 SDK에서 풀의 전체 계정 세트를 읽습니다. 손으로 파생하는 것은 거의 필요하지 않습니다.
 
@@ -215,7 +237,7 @@ ammId = createWithSeed(
 
 | 이벤트 | 생성된 계정 | 삭제된 계정 |
 |--------|-----------|-----------|
-| `Initialize2` | `amm_info`, `amm_open_orders`, `amm_target_orders`, 볼트, `lp_mint`, `pool_withdraw_queue`, `pool_temp_lp` | — |
+| `Initialize2` | `amm_info`, `amm_target_orders`, 두 볼트, `lp_mint`, 그리고 크리에이터의 LP ATA | — |
 | `Deposit` | — (사용자 LP ATA를 생성할 수 있음) | — |
 | `Withdraw` | — | — |
 | `SwapBaseIn` / `SwapBaseOut` (v1 / V2) | — (사용자 ATA를 생성할 수 있음) | — |
@@ -228,7 +250,7 @@ ammId = createWithSeed(
 - **수학 및 수수료 산술**: [`products/amm-v4/math`](/ko/products/amm-v4/math).
 - **수수료 분할 및 CPMM/CLMM과의 비교**: [`products/amm-v4/fees`](/ko/products/amm-v4/fees).
 - **명령어 계정 목록**: [`products/amm-v4/instructions`](/ko/products/amm-v4/instructions).
-- **OpenBook 계정 파생**: OpenBook 프로그램 문서([`github.com/openbook-dex/program`](https://github.com/openbook-dex/program)).
+- **OpenBook 계정 파생**: OpenBook 프로그램 소스([`github.com/openbook-dex/program`](https://github.com/openbook-dex/program)) — 산문 형태의 문서가 아니라 Rust 모노레포입니다.
 
 출처:
 

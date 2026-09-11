@@ -45,36 +45,42 @@ const raydium = await Raydium.load({
 });
 ```
 
-`Raydium.load` est asynchrone car elle récupère une petite charge utile `/config` depuis `api-v3.raydium.io` au démarrage (listant les comptes `AmmConfig` actuels, les niveaux de frais, etc.). Définissez `disableFeatureCheck: true` dans les environnements hors ligne ; vous devrez fournir ces valeurs manuellement à certains constructeurs.
+`Raydium.load` est asynchrone car, par défaut, elle charge la liste des jetons (`raydium.token.load()`) depuis `api-v3.raydium.io`. Passez `disableLoadToken: true` pour éviter cette requête. La vérification de disponibilité des fonctionnalités est un appel distinct à `/v3/main/AvailabilityCheckAPI` et est **déjà ignorée** sauf si vous passez explicitement `disableFeatureCheck: false`. Les configurations de frais ne sont pas du tout récupérées au chargement — elles proviennent paresseusement de `raydium.api.getCpmmConfigs()` / `getClmmConfigs()` à la première utilisation.
 
-## Les quatre façades de modules
+## Les façades de modules
 
-Une fois chargé, l'objet `raydium` expose quatre façades de modules, une par surface de produit :
+Une fois chargé, l'objet `raydium` expose dix façades de modules plus un client d'API :
 
 ```ts
 raydium.cpmm       // Pools CPMM : createPool, addLiquidity, withdrawLiquidity, swap, ...
 raydium.clmm       // Pools CLMM : createPool, openPositionFromBase, increasePositionFromBase,
-                   //             decreaseLiquidity, harvestAllRewards, swap, ...
+                   //             decreaseLiquidity, harvestAllRewards, swap, limit orders, ...
 raydium.liquidity  // Pools AMM v4 : computeAmountOut, swap, addLiquidity, removeLiquidity, ...
-raydium.farm       // Farm v3/v5/v6 : deposit, withdraw, harvestAllRewards, create, setRewards
-raydium.launchpad  // LaunchLab : createLaunchpad, buyExactIn, sellExactIn, graduate, ...
-raydium.trade      // Routage multi-pool : quotes, route-execution (bêta en 0.2.41)
-raydium.token      // Assistants : obtenir la liste des jetons, métadonnées, création d'ATA
+raydium.farm       // Farm v3/v5/v6 : deposit, withdraw, harvestAllRewards, create,
+                   //                restartReward(s), addNewRewardToken(s)
+raydium.launchpad  // LaunchLab : createLaunchpad, buyToken, buyTokenExactOut, sellToken,
+                   //            claimCreatorFee, constructeurs de curve-rule et de platform-config, ...
+raydium.tradeV2    // Routage multi-pool : découverte de route, compute, route-execution
+raydium.marketV2   // Création de marché OpenBook (héritée)
+raydium.utils1216  // Assistants ponctuels de réclamation historique
+raydium.token      // Liste de jetons + métadonnées : load(), getTokenInfo()
+raydium.account    // Comptes de jetons du portefeuille, recherche et création d'ATA
+raydium.api        // Le client REST (fetchPoolById, getCpmmConfigs, fetchLaunchConfigs, ...)
 ```
-
-(Oui, cinq façades au total — « quatre » est la façon dont Raydium les groupe publiquement, avec `trade` et `token` comme utilitaires de support.)
 
 ## Constructeurs de transactions
 
 Chaque fonction mutante retourne un constructeur plutôt que d'exécuter immédiatement :
 
 ```ts
-const { execute, builder, transaction, innerTransactions, extInfo } =
+import { Percent } from "@raydium-io/raydium-sdk-v2";
+
+const { execute, builder, transaction, instructionTypes, signers, extInfo } =
   await raydium.cpmm.addLiquidity({
     poolInfo,
-    amountInA,
-    amountInB,
-    slippage: 0.005,
+    inputAmount,              // BN — one side, not a pair
+    baseIn: true,
+    slippage: new Percent(1, 100),   // a Percent, not a number
     txVersion: TxVersion.V0,
   });
 ```
@@ -82,9 +88,18 @@ const { execute, builder, transaction, innerTransactions, extInfo } =
 Champs retournés :
 
 - **`execute`** — une fonction de commodité qui signe + envoie. Équivalent à `builder.execute`.
-- **`builder`** — l'instance `TxBuilder` avec toutes les instructions et les signataires accumulés. Appelez `.build()` pour obtenir un `VersionedTransaction[]` ; utile quand vous devez injecter vos propres instructions ou signer avec des signataires externes.
-- **`transaction` / `innerTransactions`** — les tableaux d'instructions brutes. À utiliser lors de la construction de transactions multi-programmes composées.
-- **`extInfo`** — extras spécifiques au produit. Par exemple, `createPool` retourne `extInfo.poolId` ; `createLaunchpad` retourne le PDA du nouvel état de lancement.
+- **`builder`** — l'instance `TxBuilder` avec toutes les instructions et tous les signataires accumulés. `builder.build()` retourne un `TxBuildData` dont la `transaction` est une unique `Transaction` héritée ; `builder.buildV0()` retourne un `TxV0BuildData` avec une unique `VersionedTransaction`. Seuls `buildMultiTx` / `buildMultiTxV0` produisent un tableau.
+- **`transaction`** — la `Transaction` / `VersionedTransaction` construite.
+- **`instructionTypes`** / **`signers`** — les étiquettes d'instructions et l'ensemble de signataires accumulés.
+- **`extInfo`** — extras spécifiques au produit. Par exemple, `cpmm.createPool` retourne `extInfo.address.{poolId, lpMint, vaultA, vaultB}` ; `launchpad.createLaunchpad` retourne `extInfo.address` (un `LaunchpadPoolInfo` plus `poolId`).
+
+<Note>
+  Il n'existe aucun champ `innerTransactions` sur le type de retour — le déstructurer est une erreur
+  TypeScript. Les constructeurs dont le type de retour est `MakeMultiTxData` (par exemple
+  `clmm.harvestAllRewards`, `farm.harvestAllRewards`, `tradeV2.swap`,
+  `launchpad.createLaunchpad`) exposent `transactions` à la place, et leur `execute` **exige**
+  `{ sequentially: boolean }` et se résout en `{ txIds }` plutôt qu'en `{ txId }`.
+</Note>
 
 `txVersion` contrôle le format de transaction hérité par rapport à V0. V0 (tables de recherche d'adresses) est la recommandation par défaut — elle permet aux swaps plus importants de tenir dans une seule transaction.
 
@@ -96,14 +111,14 @@ Presque chaque constructeur récupère en interne l'état on-chain : les informa
 
 La façade CLMM a acquis des surfaces pour les nouvelles fonctionnalités de frais dynamiques, frais unilatéraux et ordres limites :
 
-- **`raydium.clmm.createCustomizablePool`** — sur-ensemble de `createPool` qui accepte `collectFeeOn`, `enableDynamicFee`, et `dynamicFeeConfigId`. Utilisez ceci pour tout nouveau pool qui a besoin des nouveaux paramètres ; le `createPool` classique continue de fonctionner pour les pools à frais par défaut.
-- **`raydium.clmm.openLimitOrder`** — ouvrir un ordre limite à un seul tick sur un pool qui les supporte. Prend `poolInfo`, `poolKeys`, `limitOrderConfig` (depuis `/main/clmm-limit-order-config`), `inputMint`, `inputAmount`, et le `tick` cible.
-- **`raydium.clmm.increaseLimitOrder` / `decreaseLimitOrder`** — ajuster la portion non remplie d'un ordre existant. La diminution revient sur un ordre entièrement rempli avec `InvalidOrderPhase`.
-- **`raydium.clmm.settleLimitOrder` / `settleAllLimitOrder`** — balayer la sortie remplie vers l'ATA du propriétaire. Soit le propriétaire de l'ordre, soit le gardien `limit_order_admin` du pool peuvent les appeler.
+- **`raydium.clmm.createCustomizablePool`** — sur-ensemble de `createPool` qui accepte `collectFeeOn` et `dynamicFeeConfig` (la `PublicKey` du compte de configuration). C'est le fait de fournir `dynamicFeeConfig` qui active les frais dynamiques ; il n'existe pas de drapeau `enableDynamicFee` distinct, ni de `dynamicFeeConfigId`. Le `createPool` classique continue de fonctionner pour les pools à frais par défaut.
+- **`raydium.clmm.openLimitOrder`** — ouvrir un ordre limite à un seul tick. Prend `poolInfo`, `baseIn` (direction), `orderTick`, `amount`, et éventuellement `tickArrayBitmap`, `noneIndex`, `ownerInfo`. Utilisez l'assistant exporté `getOrderTick({ baseIn, mintADecimal, mintBDecimal, tickSpacing, price })` pour quantifier le tick.
+- **`raydium.clmm.increaseLimitOrder` / `decreaseLimitOrder`** — ajuster la portion non remplie d'un ordre existant. Les deux prennent `{ poolInfo, limitOrder, amount }` ; `decreaseLimitOrder` ajoute un `slippage` optionnel. La diminution revient sur un ordre entièrement rempli avec `InvalidOrderPhase`.
+- **`raydium.clmm.settleLimitOrder` / `settleAllLimitOrder`** — balayer la sortie remplie vers l'ATA du propriétaire. `settleLimitOrder` ne prend que `{ limitOrder }` — pas de `poolInfo`. Soit le propriétaire de l'ordre, soit le gardien `limit_order_admin` du programme peuvent l'appeler.
 - **`raydium.clmm.closeLimitOrder` / `closeAllLimitOrder`** — fermer les ordres entièrement réglés pour récupérer le loyer.
-- **`raydium.api.getClmmDynamicConfigs()` / `getClmmLimitOrderConfigs()`** — assistants REST qui frappent les nouveaux points de terminaison `/main/clmm-dynamic-config` et `/main/clmm-limit-order-config`.
+- **`raydium.api.getClmmDynamicConfigs()`** — assistant REST qui frappe le nouveau point de terminaison `/main/clmm-dynamic-config`. (Il n'existe ni assistant ni point de terminaison de configuration d'ordre limite : les ordres limites sont indexés par tick, et non par un compte de configuration par pool.)
 
-Une petite réorganisation a également déplacé `utils/` vers `libraries/`. Le code qui importait depuis `@raydium-io/raydium-sdk-v2/utils/...` devrait passer à `@raydium-io/raydium-sdk-v2/libraries/...`. Le baril du package de haut niveau est inchangé, donc la plupart des utilisateurs ne voient jamais le renommage.
+Le paquet ne déclare aucun export de sous-chemin, donc `@raydium-io/raydium-sdk-v2/<anything>` ne se résout dans aucune orthographe — importez tout depuis le barrel de premier niveau. (En interne, `src/raydium/clmm/utils/` a été renommé en `src/raydium/clmm/libraries/`, mais cela n'a jamais été un point d'entrée public.)
 
 Les procédures pas à pas TypeScript de bout en bout se trouvent dans [`products/clmm/code-demos`](/fr/products/clmm/code-demos).
 
@@ -128,8 +143,9 @@ Le SDK n'ajoute pas de prix d'unité de calcul par défaut. Dans les fenêtres d
 ```ts
 const { execute } = await raydium.cpmm.swap({
   poolInfo,
+  baseIn,                    // required: which side inputAmount is denominated in
   inputAmount: new BN(...),
-  swapResult: ...,
+  swapResult: ...,           // required: from CurveCalculator.swapBaseInput/Output
   slippage: 0.005,
   txVersion: TxVersion.V0,
   computeBudgetConfig: {
@@ -162,7 +178,7 @@ Lors de la mise à niveau entre les versions mineures du SDK :
 1. Re-vérifiez le type de retour de chaque appel mutant — les changements de forme (par exemple `extInfo`) arrivent fréquemment.
 2. Régénérez les signatures de récupération `poolInfo` — un champ peut avoir été renommé.
 3. Re-vérifiez votre gestion du slippage ; le SDK a basculé entre les comportements de liaison automatique et de liaison opt-in entre les versions.
-4. Si vous utilisez `raydium.trade` (routage), re-vérifiez la forme de la route — c'est la partie la plus instable de la surface.
+4. Si vous utilisez `raydium.tradeV2` (routage), re-vérifiez la forme de la route — c'est la partie la plus instable de la surface. Notez que la façade a été renommée de `trade` en `tradeV2` ; l'ancien nom n'existe plus.
 
 ## Obtenir de l'aide
 
