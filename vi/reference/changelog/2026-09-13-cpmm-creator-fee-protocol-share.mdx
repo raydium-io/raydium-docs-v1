@@ -1,0 +1,144 @@
+---
+title: "2026-09-13 — CPMM: giao thức giữ lại một phần phí tạo pool"
+description: "CPMM hiện có thể giữ lại một phần phí tạo pool có thể cấu hình, được áp dụng khi phí được thu thập chứ không phải khi nó được tính. AmmConfig có creator_fee_share_rate (được cắt từ padding, cùng kích thước), một PDA CreatorFeeShare mới ghi đè nó cho từng tạo pool, và CreateCreatorFeeShare / CloseCreatorFeeShare quản lý nó. Cả hai đường dẫn CollectCreatorFee thay đổi danh sách tài khoản của chúng — phá vỡ đối với các client hiện có. UpdateAmmConfig có tham số 8. Không có mã lỗi mới, không có thay đổi PoolState, toán học swap không bị ảnh hưởng."
+---
+
+<Info>
+  **Trang này được dịch tự động bằng AI. Phiên bản tiếng Anh là bản chính thức.**
+
+  [Xem bản tiếng Anh →](/reference/changelog/2026-09-13-cpmm-creator-fee-protocol-share)
+</Info>
+
+<Info>
+  Mục này bao gồm một bản cập nhật chương trình CPMM sắp tới. Nó đã được xác minh so với nhánh phát hành cục bộ (`0dde43d`, 11 tháng 9 năm 2026) trước khi triển khai. Xác nhận chương trình được triển khai trước khi dựa vào các hướng dẫn mới hoặc danh sách tài khoản đã thay đổi.
+</Info>
+
+Phí tạo pool của CPMM luôn đi hoàn toàn cho người tạo pool. Bản phát hành này cho phép giao thức giữ lại một phần của nó — có thể thương lượng theo từng mức phí hoặc theo từng tạo pool trên một mức phí — mà không ảnh hưởng đến cách phí được tính.
+
+Lựa chọn thiết kế giữ cho bán kính tác động nhỏ: **sự chia tách xảy ra tại thời điểm thu thập, không phải tại thời điểm swap.** Một swap vẫn tính `creator_fee_rate` và vẫn tích lũy toàn bộ số tiền vào `creator_fees_token_{0,1}`. Khi `CollectCreatorFee` hoặc `CollectCreatorFeePermissionless` chạy, số dư tích lũy được chia, phần của giao thức được gắn nhãn lại là phí giao thức trên cùng một pool, và chỉ phần của tạo pool rời khỏi vault. Báo giá, đường cong, `k` và mọi đường dẫn hướng tới LP đều không bị ảnh hưởng.
+
+## TL;DR cho các nhà tích hợp
+
+- **Cả hai hướng dẫn thu thập phí tạo pool đã thay đổi danh sách tài khoản của chúng. Đây là một thay đổi phá vỡ.** `CollectCreatorFee` thêm `creator_fee_share` ở vị trí 5. `CollectCreatorFeePermissionless` thêm `amm_config` ở vị trí 5 và `creator_fee_share` ở vị trí 6. Cả hai chèn nằm trước các vault, vì vậy mọi thứ sau đó sẽ dịch chuyển. Xây dựng lại các giao dịch này; không cố gắng vá chúng.
+- **`creator_fee_share` phải được truyền ngay cả khi nó không tồn tại.** Nó được khai báo với ràng buộc seed nhưng được đọc như một tài khoản không được kiểm tra, vì vậy địa chỉ phải là PDA chính tắc tại `["creator_fee_share", creator, amm_config]` trong khi tài khoản chính nó là tùy chọn. Khi nó trống, chương trình quay lại `AmmConfig.creator_fee_share_rate`.
+- **`AmmConfig` có `creator_fee_share_rate`, được cắt từ padding.** Tài khoản vẫn là **236 byte** và mọi cấu hình hiện có vẫn tiếp tục deserialize — nhưng `u64` đầu tiên của `padding: [u64; 15]` cũ hiện là một trường hoạt động. Các bộ giải mã mô hình phần đuôi dưới dạng mảng 15 phần tử sẽ đọc tỷ lệ chia sẻ dưới dạng `padding[0]`.
+- **`PoolState` không thay đổi.** 637 byte, cùng offset, cùng trường. Phần chia sẻ của giao thức được ghi vào các bộ đếm `protocol_fees_token_{0,1}` hiện có — không có bộ đếm mới và không có hướng dẫn thu thập mới cho nó.
+- **`protocol_fees_token*` hiện tăng bên ngoài swap.** Bất kỳ monitor nào đối chiếu tích lũy giao thức với khối lượng giao dịch sẽ thấy các bước nhảy ở mỗi lần thu thập phí tạo pool.
+- **Một công cụ ước tính thanh toán tạo pool đọc `creator_fees_token*` hiện nêu quá cao.** Nhân với `(1 − share_rate / 1_000_000)`, được giải quyết cho cặp `(creator, amm_config)` đó.
+- **Hai hướng dẫn quản trị được thêm:** `CreateCreatorFeeShare` và `CloseCreatorFeeShare`. **Một tham số `UpdateAmmConfig` mới:** `8` → `creator_fee_share_rate`.
+- **Không có mã lỗi mới.** Các đường dẫn mới sử dụng lại `InvalidOwner` (`6001`), `InvalidInput` (`6003`) và `MathOverflow` (`6011`). `6000`–`6015` không thay đổi.
+- **Cần làm mới IDL** — hai hướng dẫn mới, một loại tài khoản mới, hai danh sách tài khoản đã thay đổi, một trường cấu hình mới.
+
+## Cách chia tách hoạt động
+
+Giải quyết, theo thứ tự ưu tiên:
+
+1. **`CreatorFeeShare` PDA** tại `["creator_fee_share", creator, amm_config]` — khi tài khoản tồn tại và được sở hữu bởi CPMM, `share_rate` của nó sẽ thắng.
+2. **`AmmConfig.creator_fee_share_rate`** — mặc định của mức phí, được sử dụng nếu không.
+
+Cả hai đều là `u64` trên `FEE_RATE_DENOMINATOR_VALUE = 1_000_000` và cả hai đều được kiểm tra so với giới hạn đó. Sau đó, cho mỗi phía token:
+
+```rust
+// states/creator_fee_share.rs
+shared_amount  = floor(creator_fee * share_rate / 1_000_000);
+creator_amount = creator_fee - shared_amount;
+```
+
+```rust
+// states/pool.rs — PoolState::settle_creator_fee
+self.protocol_fees_token_i = self.protocol_fees_token_i.checked_add(shared_amount_i)?;
+self.creator_fees_token_i  = 0;
+// creator_amount_i is returned and transferred out to the creator
+```
+
+Ba thuộc tính mà chương trình kiểm tra xác định:
+
+- **Làm tròn ưu tiên tạo pool.** Phần chia sẻ làm tròn xuống, vì vậy bụi vẫn ở với tạo pool — cùng hướng với `Fees::protocol_fee` và `Fees::fund_fee`, cũng cắt một phần từ một phí đã tích lũy. 20% của một phí 1 đơn vị là 0, không phải 1.
+- **Giá trị được bảo toàn.** `creator_amount + shared_amount == creator_fee` cho mọi tỷ lệ và mọi phí lên đến `u64::MAX`.
+- **`share_rate = 0` chính xác là hành vi cũ.** Cả giá trị cấu hình mặc định và một PDA bị thiếu đều cho tạo pool toàn bộ phí, vì vậy không có gì thay đổi cho bất kỳ pool hiện có nào cho đến khi quản trị viên đặt tỷ lệ.
+
+Vì `protocol_fees_token*` và `creator_fees_token*` đều đã được trừ trong `vault_amount_without_fee`, việc di chuyển giá trị giữa chúng không thay đổi cách nhìn của đường cong đối với vault. Không có LP nào thấy thay đổi giá trên một bộ sưu tập phí tạo pool, và kiểm tra `k` không bị ảnh hưởng.
+
+<Note>
+  **Tỷ lệ được đọc tại thời điểm thu thập, không phải tại thời điểm tích lũy.** Các phí tích lũy trong khi tỷ lệ là `0` sẽ được giải quyết ở bất kỳ tỷ lệ nào có hiệu lực khi ai đó cuối cùng gọi `Collect*`. Không có ảnh chụp mỗi epoch hoặc mỗi swap.
+</Note>
+
+## Thay đổi danh sách tài khoản
+
+`CollectCreatorFee` — một chèn:
+
+| # | Trước | Sau |
+|---|--------|-------|
+| 1–4 | `creator`, `authority`, `pool_state`, `amm_config` | không thay đổi |
+| 5 | `token_0_vault` | **`creator_fee_share`** (mới) |
+| 6.. | — | `token_0_vault` và mọi thứ sau, dịch chuyển bởi một |
+
+`CollectCreatorFeePermissionless` — hai chèn:
+
+| # | Trước | Sau |
+|---|--------|-------|
+| 1–4 | `payer`, `creator`, `authority`, `pool_state` | không thay đổi |
+| 5 | `token_0_vault` | **`amm_config`** (mới) |
+| 6 | `token_1_vault` | **`creator_fee_share`** (mới) |
+| 7.. | — | `token_0_vault` và mọi thứ sau, dịch chuyển bởi hai |
+
+<Warning>
+  Cả hai thay đổi đều không thất bại một cách rõ ràng theo cách hữu ích. Các tài khoản được chèn không ở cuối danh sách, vì vậy một client cũ không "thiếu một tài khoản" — nó trao cho chương trình một vault nơi một cấu hình được mong đợi và giao dịch không thành công khi deserialize. Tạo lại từ IDL mới và kiểm tra rằng bất kỳ phiên bản SDK nào bạn ghim mang các tài khoản mới trước khi chỉ nó tới chương trình được nâng cấp.
+</Warning>
+
+Bảng tài khoản đầy đủ trong [`products/cpmm/instructions`](/vi/products/cpmm/instructions#collectcreatorfee).
+
+## `CreateCreatorFeeShare` và `CloseCreatorFeeShare`
+
+```rust
+pub struct CreatorFeeShare {
+    pub bump: u8,
+    pub creator: Pubkey,
+    pub amm_config: Pubkey,
+    pub share_rate: u64,
+    pub padding: [u64; 8],
+}
+// CreatorFeeShare::LEN == 145
+```
+
+`CreateCreatorFeeShare(share_rate: u64)` khởi tạo PDA; `CloseCreatorFeeShare` đóng nó và trả tiền thuê cho người ký. Cả hai chấp nhận quản trị viên chương trình được chia sẻ **hoặc** một chủ sở hữu phí chia sẻ tạo pool chuyên dụng — một cặp khóa được mã hóa cứng mới theo cùng mẫu `cfg` devnet/mainnet như các cơ quan được ủy quyền khác của chương trình. Địa chỉ trong [`reference/program-addresses`](/vi/reference/program-addresses#cpmm-creator-fee-share-authority).
+
+Những điểm đáng lưu ý:
+
+- **Người tạo pool không phải là một bên trong cả hai hướng dẫn** và không ký. Tài khoản `creator` không được kiểm tra — PDA có thể được tạo cho một khóa chưa sở hữu bất kỳ pool nào.
+- **Một tài khoản bao gồm một cặp `(creator, amm_config)`**, vì vậy nó quản lý mọi pool mà tạo pool đó sở hữu trên mức phí đó. Một tạo pool có các pool trên hai mức cần hai tài khoản để được bao gồm trên cả hai.
+- **Không có đường dẫn cập nhật.** `init` không thành công khi tạo lần thứ hai cho cùng một cặp; để thay đổi tỷ lệ, hãy đóng và tạo lại.
+
+## Tham số `UpdateAmmConfig` 8
+
+```rust
+Some(8) => update_creator_fee_share_rate(amm_config, value),   // asserts value <= 1_000_000
+```
+
+Đặt chia sẻ mặc định của mức phí. Nó không liên quan đến `protocol_fee_rate` (tham số `1`), chia sẻ **phí giao dịch** — một điểm đáng cẩn thận trong công cụ quản trị, vì cả hai đều trông giống nhau và cả hai đều hạ cánh trong `protocol_fees_token*`.
+
+## Đi cùng
+
+**Sửa lỗi thứ tự `CollectExcessLamports`.** Hướng dẫn hiện thực hiện hai lần vượt qua `remaining_accounts` — mọi CPI chương trình token trước, sau đó là các khoản nợ trực tiếp của các PDA do CPMM sở hữu — thay vì gửi theo thứ tự gọi. Xen kẽ hai hướng dẫn bị hủy bỏ với `UnbalancedInstruction` của runtime ("tổng số dư tài khoản trước và sau hướng dẫn không khớp") bất cứ khi nào một PDA bị nợ trước một CPI, vì các thay đổi lamport đang chờ xử lý của người gọi chỉ được xóa vào các tài khoản mà CPI thực sự mang theo. Giao diện của hướng dẫn không thay đổi; người gọi vẫn chuyển các nguồn theo bất kỳ thứ tự nào, và bây giờ điều đó thực sự an toàn.
+
+**Siêu dữ liệu xây dựng có thể xác minh.** Không gian làm việc `Cargo.toml` khai báo `[workspace.metadata.cli] solana = "3.1.10"`, vì vậy một bản dựng có thể xác minh được giải quyết cùng Solana CLI mà chương trình được xây dựng. Không có tác động trên chuỗi.
+
+## Những gì không thay đổi
+
+- **`PoolState`** — 637 byte, cùng trường, cùng offset. Phần chia sẻ của giao thức sử dụng lại bộ giao thức hiện có thay vì thêm bộ đếm của riêng nó.
+- **`AmmConfig::LEN`** — vẫn là 236 byte.
+- **Toán học swap, báo giá và kiểm tra `k`.** Phí tạo pool được tính chính xác như trước.
+- **`CollectProtocolFee` / `CollectFundFee`** — cùng tài khoản, cùng người ký. `CollectProtocolFee` chỉ có nhiều hơn để thu thập.
+- **Mã lỗi.** `6000`–`6015` không thay đổi; không có gì được thêm vào.
+- **Mọi hướng dẫn khác** và ID chương trình.
+
+## Trang được cập nhật
+
+- `products/cpmm/fees` — phần "Chia sẻ giao thức của phí tạo pool" mới bao gồm giải quyết tỷ lệ, số học chia tách, làm tròn và hậu quả của nhà tích hợp; `creator_fee_share_rate` được thêm vào danh sách tỷ lệ/đơn vị và bảng tham số mặc định; bảng luồng thu thập được sắp xếp lại.
+- `products/cpmm/instructions` — cảnh báo thay đổi phá vỡ ở đầu; bảng tài khoản đầy đủ cho cả hai đường dẫn phí tạo pool; các phần `CreateCreatorFeeShare` và `CloseCreatorFeeShare` mới; tham số `UpdateAmmConfig` `8`; ghi chú thứ tự `CollectExcessLamports`; hàng tóm tắt và ma trận thay đổi trạng thái.
+- `products/cpmm/accounts` — phần tài khoản `CreatorFeeShare` mới; bố cục `AmmConfig` và cảnh báo cắt padding; ghi chú bộ đếm phí `PoolState`; hàng vòng đời tài khoản.
+- `products/cpmm/overview` — chú thích phí tạo pool và dấu đầu dòng "Phí có thể dự đoán".
+- `products/cpmm/math` — một ghi chú rằng sự chia tách được cố ý loại trừ khỏi toán học swap.
+- `products/cpmm/code-demos` — cảnh báo rằng các trình xây dựng SDK trước nâng cấp phát ra danh sách tài khoản cũ; đoạn phí tích lũy được chú thích.
+- `reference/program-addresses` — phần "Cơ quan chia sẻ phí tạo pool CPMM" mới; `creator_fee_share` được thêm vào khối hạt giống PDA.
+- `reference/fee-comparison` — `creator_fee_share_rate` được gọi ra như một tỷ lệ CPMM thứ tư với cơ sở khác.

@@ -1,0 +1,144 @@
+---
+title: "2026-09-13 — CPMM : le protocole prélève une part des frais de créateur"
+description: "CPMM peut désormais conserver une part configurable des frais de créateur, appliquée lors de la collecte plutôt que lors de la facturation. AmmConfig gagne creator_fee_share_rate (prélevé sur le padding, même taille), un nouveau PDA CreatorFeeShare le remplace par créateur, et CreateCreatorFeeShare / CloseCreatorFeeShare le gèrent. Les deux chemins CollectCreatorFee changent leurs listes de comptes — rupture pour les clients existants. UpdateAmmConfig gagne le paramètre 8. Aucun nouveau code d'erreur, aucun changement PoolState, la mathématique du swap est inchangée."
+---
+
+<Info>
+  **Cette page est traduite automatiquement par IA. La version anglaise fait foi.**
+
+  [Voir la version anglaise →](/reference/changelog/2026-09-13-cpmm-creator-fee-protocol-share)
+</Info>
+
+<Info>
+  Cette entrée couvre une mise à jour CPMM à venir. Elle a été vérifiée par rapport à la branche de version locale (`0dde43d`, 11 septembre 2026) avant le déploiement. Confirmez le programme déployé avant de vous fier aux nouvelles instructions ou aux listes de comptes modifiées.
+</Info>
+
+Les frais de créateur de CPMM ont toujours été entièrement versés au créateur du pool. Cette version permet au protocole de conserver une part — négociable par palier de frais, ou par créateur sur un palier — sans modifier la façon dont les frais sont facturés.
+
+Le choix de conception qui limite la portée de l'impact : **le partage se fait au moment de la collecte, non au moment du swap.** Un swap facture toujours `creator_fee_rate` et accumule le montant entier dans `creator_fees_token_{0,1}`. Quand `CollectCreatorFee` ou `CollectCreatorFeePermissionless` s'exécute, le solde accumulé est divisé, la part du protocole est reclassée comme frais de protocole sur le même pool, et seule la part du créateur quitte le coffre. Les devis, la courbe, `k`, et tous les chemins côté LP ne sont pas affectés.
+
+## TL;DR pour les intégrateurs
+
+- **Les deux instructions de collecte des frais de créateur ont changé leurs listes de comptes. C'est une rupture.** `CollectCreatorFee` gagne `creator_fee_share` à la position 5. `CollectCreatorFeePermissionless` gagne `amm_config` à la position 5 et `creator_fee_share` à la position 6. Les deux insertions se situent avant les coffres, donc tout ce qui suit se décale. Reconstruisez ces transactions ; ne les patchez pas.
+- **`creator_fee_share` doit être passé même s'il n'existe pas.** Il est déclaré avec une contrainte de seed mais lu comme un compte non vérifié, donc l'adresse doit être le PDA canonique à `["creator_fee_share", creator, amm_config]` tandis que le compte lui-même est optionnel. Quand il est vide, le programme revient à `AmmConfig.creator_fee_share_rate`.
+- **`AmmConfig` gagne `creator_fee_share_rate`, prélevé sur le padding.** Le compte fait toujours **236 octets** et chaque config existante continue de se désérialiser — mais le premier `u64` de l'ancien `padding: [u64; 15]` est maintenant un champ actif. Les décodeurs qui modélisent la queue comme un tableau de 15 éléments lisent le taux de partage comme `padding[0]`.
+- **`PoolState` est inchangé.** 637 octets, mêmes décalages, mêmes champs. La part du protocole est enregistrée dans les compteurs existants `protocol_fees_token_{0,1}` — il n'y a pas de nouveau compteur et pas de nouvelle instruction de collecte pour cela.
+- **`protocol_fees_token*` croît maintenant en dehors des swaps.** Tout moniteur qui rapproche l'accumulation de protocole au volume d'échanges verra des sauts à chaque collecte de frais de créateur.
+- **Un estimateur de paiement de créateur qui lit `creator_fees_token*` surestime maintenant.** Multipliez par `(1 − share_rate / 1_000_000)`, résolu pour cette paire `(creator, amm_config)`.
+- **Deux instructions d'administration sont ajoutées :** `CreateCreatorFeeShare` et `CloseCreatorFeeShare`. **Un nouveau paramètre `UpdateAmmConfig` :** `8` → `creator_fee_share_rate`.
+- **Aucun nouveau code d'erreur.** Les nouveaux chemins réutilisent `InvalidOwner` (`6001`), `InvalidInput` (`6003`) et `MathOverflow` (`6011`). `6000`–`6015` sont inchangés.
+- **Un rafraîchissement IDL est requis** — deux nouvelles instructions, un nouveau type de compte, deux listes de comptes modifiées, un nouveau champ de config.
+
+## Comment fonctionne le partage
+
+Résolution, par ordre de priorité :
+
+1. **PDA `CreatorFeeShare`** à `["creator_fee_share", creator, amm_config]` — quand le compte existe et est possédé par CPMM, son `share_rate` gagne.
+2. **`AmmConfig.creator_fee_share_rate`** — la valeur par défaut du palier de frais, utilisée sinon.
+
+Les deux sont `u64` sur `FEE_RATE_DENOMINATOR_VALUE = 1_000_000` et les deux sont vérifiés par rapport à ce plafond. Ensuite, par côté de token :
+
+```rust
+// states/creator_fee_share.rs
+shared_amount  = floor(creator_fee * share_rate / 1_000_000);
+creator_amount = creator_fee - shared_amount;
+```
+
+```rust
+// states/pool.rs — PoolState::settle_creator_fee
+self.protocol_fees_token_i = self.protocol_fees_token_i.checked_add(shared_amount_i)?;
+self.creator_fees_token_i  = 0;
+// creator_amount_i est retourné et transféré au créateur
+```
+
+Trois propriétés que les tests du programme épinglent :
+
+- **L'arrondi favorise le créateur.** Le partage arrondit vers le bas, donc la poussière reste avec le créateur — la même direction que `Fees::protocol_fee` et `Fees::fund_fee`, qui carvent aussi une part d'une commission déjà accumulée. 20 % d'une commission d'1 unité est 0, pas 1.
+- **La valeur est conservée.** `creator_amount + shared_amount == creator_fee` pour chaque taux et chaque commission jusqu'à `u64::MAX`.
+- **`share_rate = 0` est exactement l'ancien comportement.** La valeur par défaut de la config et un PDA manquant donnent tous deux au créateur la totalité de la commission, donc rien ne change pour aucun pool existant jusqu'à ce qu'un administrateur définisse un taux.
+
+Parce que `protocol_fees_token*` et `creator_fees_token*` sont tous deux déjà soustraits dans `vault_amount_without_fee`, déplacer la valeur entre eux ne change pas la vue de la courbe sur le coffre. Aucun LP ne voit un changement de prix lors d'une collecte de frais de créateur, et la vérification `k` est inchangée.
+
+<Note>
+  **Le taux est lu au moment de la collecte, non au moment de l'accumulation.** Les frais qui se sont accumulés alors que le taux était `0` se règlent au taux en vigueur quand quelqu'un appelle finalement `Collect*`. Il n'y a pas de snapshot par époque ou par swap.
+</Note>
+
+## Changements de listes de comptes
+
+`CollectCreatorFee` — une insertion :
+
+| # | Avant | Après |
+|---|-------|-------|
+| 1–4 | `creator`, `authority`, `pool_state`, `amm_config` | inchangé |
+| 5 | `token_0_vault` | **`creator_fee_share`** (nouveau) |
+| 6.. | — | `token_0_vault` et tout ce qui suit, décalé d'un |
+
+`CollectCreatorFeePermissionless` — deux insertions :
+
+| # | Avant | Après |
+|---|-------|-------|
+| 1–4 | `payer`, `creator`, `authority`, `pool_state` | inchangé |
+| 5 | `token_0_vault` | **`amm_config`** (nouveau) |
+| 6 | `token_1_vault` | **`creator_fee_share`** (nouveau) |
+| 7.. | — | `token_0_vault` et tout ce qui suit, décalé de deux |
+
+<Warning>
+  Aucun changement n'échoue bruyamment de manière utile. Les comptes insérés ne sont pas à la fin de la liste, donc un ancien client ne « manque pas un compte » — il remet au programme un coffre où une config est attendue et la transaction échoue à la désérialisation. Régénérez à partir du nouvel IDL, et vérifiez que toute version SDK que vous épinglez porte les nouveaux comptes avant de la pointer vers le programme mis à niveau.
+</Warning>
+
+Tableaux de comptes complets dans [`products/cpmm/instructions`](/fr/products/cpmm/instructions#collectcreatorfee).
+
+## `CreateCreatorFeeShare` et `CloseCreatorFeeShare`
+
+```rust
+pub struct CreatorFeeShare {
+    pub bump: u8,
+    pub creator: Pubkey,
+    pub amm_config: Pubkey,
+    pub share_rate: u64,
+    pub padding: [u64; 8],
+}
+// CreatorFeeShare::LEN == 145
+```
+
+`CreateCreatorFeeShare(share_rate: u64)` initialise le PDA ; `CloseCreatorFeeShare` le ferme et retourne le loyer au signataire. Les deux acceptent l'administrateur du programme partagé **ou** un propriétaire dédié de partage de frais de créateur — une nouvelle paire de clés codée en dur suivant le même modèle `cfg` devnet/mainnet que les autres autorités déléguées du programme. Les adresses dans [`reference/program-addresses`](/fr/reference/program-addresses#cpmm-creator-fee-share-authority).
+
+Points à noter :
+
+- **Le créateur du pool n'est pas une partie à l'une ou l'autre instruction** et ne signe pas. Le compte `creator` n'est pas vérifié — le PDA peut être créé pour une clé qui ne possède pas encore de pool.
+- **Un compte couvre une paire `(creator, amm_config)`**, donc il gouverne chaque pool que ce créateur possède sur ce palier de frais. Un créateur avec des pools sur deux paliers a besoin de deux comptes pour être couvert sur les deux.
+- **Il n'y a pas de chemin de mise à jour.** `init` échoue sur une deuxième création pour la même paire ; pour changer un taux, fermez et recréez.
+
+## Paramètre 8 de `UpdateAmmConfig`
+
+```rust
+Some(8) => update_creator_fee_share_rate(amm_config, value),   // asserts value <= 1_000_000
+```
+
+Définit le partage par défaut du palier de frais. Il n'est pas lié à `protocol_fee_rate` (paramètre `1`), qui divise les frais de **commerce** — un point à être prudent dans les outils d'administration, puisque les deux se lisent de la même manière et atterrissent tous deux dans `protocol_fees_token*`.
+
+## Accompagnements
+
+**Correction de l'ordre de `CollectExcessLamports`.** L'instruction fait maintenant deux passes sur `remaining_accounts` — chaque CPI du programme de token d'abord, puis les débits directs des PDAs possédés par CPMM — au lieu de dispatcher dans l'ordre de l'appelant. L'entrelacement des deux a échoué avec `UnbalancedInstruction` du runtime (« la somme des soldes de compte avant et après l'instruction ne correspond pas ») chaque fois qu'un PDA était débité avant un CPI, parce que les changements de lamport en attente de l'appelant ne sont vidés dans les comptes qu'un CPI porte réellement. L'interface de l'instruction est inchangée ; les appelants passent toujours les sources dans n'importe quel ordre, et maintenant c'est véritablement sûr.
+
+**Métadonnées de build vérifiable.** Le `Cargo.toml` de l'espace de travail déclare `[workspace.metadata.cli] solana = "3.1.10"`, donc un build vérifiable résout le même Solana CLI contre lequel le programme a été construit. Aucun effet on-chain.
+
+## Ce qui n'a pas changé
+
+- **`PoolState`** — 637 octets, mêmes champs, mêmes décalages. La part du protocole réutilise le bucket de protocole existant plutôt que d'ajouter ses propres compteurs.
+- **`AmmConfig::LEN`** — toujours 236 octets.
+- **Mathématique du swap, devis, et la vérification `k`.** Les frais de créateur sont facturés exactement comme avant.
+- **`CollectProtocolFee` / `CollectFundFee`** — mêmes comptes, mêmes signataires. `CollectProtocolFee` a simplement plus à collecter.
+- **Codes d'erreur.** `6000`–`6015` inchangés ; rien d'ajouté.
+- **Chaque autre instruction**, et l'ID du programme.
+
+## Pages mises à jour
+
+- `products/cpmm/fees` — nouvelle section « Part de protocole des frais de créateur » couvrant la résolution des taux, l'arithmétique du partage, l'arrondi, et les conséquences pour l'intégrateur ; `creator_fee_share_rate` ajouté à la liste des taux/unités et au tableau des paramètres par défaut ; tableau du flux de collecte refondu.
+- `products/cpmm/instructions` — avertissement de rupture en haut ; tableaux de comptes complets pour les deux chemins de frais de créateur ; nouvelles sections `CreateCreatorFeeShare` et `CloseCreatorFeeShare` ; paramètre `8` de `UpdateAmmConfig` ; note d'ordre de `CollectExcessLamports` ; lignes de résumé et de matrice de changement d'état.
+- `products/cpmm/accounts` — nouvelle section de compte `CreatorFeeShare` ; disposition de `AmmConfig` et avertissement de carve de padding ; notes de compteur de frais de `PoolState` ; lignes de cycle de vie de compte.
+- `products/cpmm/overview` — appel de frais de créateur et la puce « Frais prévisibles ».
+- `products/cpmm/math` — une note que le partage est délibérément absent de la mathématique du swap.
+- `products/cpmm/code-demos` — avertissement que les constructeurs SDK pré-mise à niveau émettent les anciennes listes de comptes ; extrait de frais accumulés annoté.
+- `reference/program-addresses` — nouvelle section « Autorité de partage des frais de créateur CPMM » ; `creator_fee_share` ajouté au bloc de seeds PDA.
+- `reference/fee-comparison` — `creator_fee_share_rate` appelé comme un quatrième taux CPMM avec une base différente.

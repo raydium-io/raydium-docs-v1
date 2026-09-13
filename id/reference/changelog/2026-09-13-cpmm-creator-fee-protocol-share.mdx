@@ -1,0 +1,144 @@
+---
+title: "2026-09-13 — CPMM: protokol mengambil bagian dari biaya kreator"
+description: "CPMM sekarang dapat mempertahankan bagian yang dapat dikonfigurasi dari biaya kreator, diterapkan saat biaya dikumpulkan daripada saat dikenakan. AmmConfig mendapatkan creator_fee_share_rate (diambil dari padding, ukuran sama), PDA CreatorFeeShare baru menimpanya per kreator, dan CreateCreatorFeeShare / CloseCreatorFeeShare mengelolanya. Kedua jalur CollectCreatorFee mengubah daftar akun mereka — breaking untuk klien yang ada. UpdateAmmConfig mendapatkan param 8. Tidak ada kode kesalahan baru, tidak ada perubahan PoolState, matematika swap tidak tersentuh."
+---
+
+<Info>
+  **Halaman ini diterjemahkan secara otomatis oleh AI. Versi bahasa Inggris adalah acuan resmi.**
+
+  [Lihat versi bahasa Inggris →](/reference/changelog/2026-09-13-cpmm-creator-fee-protocol-share)
+</Info>
+
+<Info>
+  Entri ini mencakup pembaruan program CPMM yang akan datang. Entri ini diverifikasi terhadap cabang rilis lokal (`0dde43d`, 11 September 2026) sebelum penerapan. Konfirmasi program yang diterapkan sebelum mengandalkan instruksi baru atau daftar akun yang berubah.
+</Info>
+
+Biaya kreator CPMM selalu sepenuhnya pergi ke kreator pool. Rilis ini memungkinkan protokol untuk menyimpan bagian darinya — dapat dinegosiasikan per tingkat biaya, atau per kreator pada tingkat biaya — tanpa mengubah cara biaya dikenakan.
+
+Pilihan desain yang membuat jangkauan ledakan tetap kecil: **pemisahan terjadi pada waktu pengumpulan, bukan pada waktu swap.** Swap masih mengenakan `creator_fee_rate` dan masih mengakumulasi seluruh jumlah ke `creator_fees_token_{0,1}`. Ketika `CollectCreatorFee` atau `CollectCreatorFeePermissionless` berjalan, saldo yang terakumulasi dibagi, bagian protokol dilabeli ulang sebagai biaya protokol pada pool yang sama, dan hanya bagian kreator yang meninggalkan vault. Kutipan, kurva, `k`, dan setiap jalur yang menghadap LP tidak terpengaruh.
+
+## TL;DR untuk integrator
+
+- **Kedua instruksi pengumpulan biaya kreator mengubah daftar akun mereka. Ini adalah breaking change.** `CollectCreatorFee` menambahkan `creator_fee_share` pada posisi 5. `CollectCreatorFeePermissionless` menambahkan `amm_config` pada 5 dan `creator_fee_share` pada 6. Kedua penyisipan berada sebelum vault, jadi semuanya sesudahnya bergeser. Bangun ulang transaksi ini; jangan patch.
+- **`creator_fee_share` harus dilewatkan bahkan ketika tidak ada.** Dideklarasikan dengan batasan seed tetapi dibaca sebagai akun yang tidak diperiksa, jadi alamat harus PDA kanonik di `["creator_fee_share", creator, amm_config]` sementara akun itu sendiri opsional. Ketika kosong, program kembali ke `AmmConfig.creator_fee_share_rate`.
+- **`AmmConfig` mendapatkan `creator_fee_share_rate`, diambil dari padding.** Akun masih **236 byte** dan setiap konfigurasi yang ada terus deserialize — tetapi `u64` pertama dari `padding: [u64; 15]` lama sekarang adalah bidang aktif. Decoder yang memodelkan ekor sebagai array 15 elemen membaca tingkat bagian sebagai `padding[0]`.
+- **`PoolState` tidak berubah.** 637 byte, offset sama, bidang sama. Bagian protokol dicatat ke dalam penghitung `protocol_fees_token_{0,1}` yang ada — tidak ada penghitung baru dan tidak ada instruksi pengumpulan baru untuk itu.
+- **`protocol_fees_token*` sekarang tumbuh di luar swap.** Monitor apa pun yang merekonsiliasi akrual protokol terhadap volume perdagangan akan melihat lompatan pada setiap pengumpulan biaya kreator.
+- **Estimator pembayaran kreator yang membaca `creator_fees_token*` sekarang menyatakan berlebihan.** Kalikan dengan `(1 − share_rate / 1_000_000)`, diselesaikan untuk pasangan `(creator, amm_config)` itu.
+- **Dua instruksi admin ditambahkan:** `CreateCreatorFeeShare` dan `CloseCreatorFeeShare`. **Satu param `UpdateAmmConfig` baru:** `8` → `creator_fee_share_rate`.
+- **Tidak ada kode kesalahan baru.** Jalur baru menggunakan kembali `InvalidOwner` (`6001`), `InvalidInput` (`6003`) dan `MathOverflow` (`6011`). `6000`–`6015` tidak berubah.
+- **Penyegaran IDL diperlukan** — dua instruksi baru, satu tipe akun baru, dua daftar akun yang berubah, satu bidang konfigurasi baru.
+
+## Cara pemisahan bekerja
+
+Resolusi, dalam urutan prioritas:
+
+1. **PDA `CreatorFeeShare`** di `["creator_fee_share", creator, amm_config]` — ketika akun ada dan dimiliki oleh CPMM, `share_rate` miliknya menang.
+2. **`AmmConfig.creator_fee_share_rate`** — default tingkat biaya, digunakan sebaliknya.
+
+Keduanya adalah `u64` di atas `FEE_RATE_DENOMINATOR_VALUE = 1_000_000` dan keduanya diperiksa terhadap batas itu. Kemudian, per sisi token:
+
+```rust
+// states/creator_fee_share.rs
+shared_amount  = floor(creator_fee * share_rate / 1_000_000);
+creator_amount = creator_fee - shared_amount;
+```
+
+```rust
+// states/pool.rs — PoolState::settle_creator_fee
+self.protocol_fees_token_i = self.protocol_fees_token_i.checked_add(shared_amount_i)?;
+self.creator_fees_token_i  = 0;
+// creator_amount_i is returned and transferred out to the creator
+```
+
+Tiga properti yang diuji program:
+
+- **Pembulatan menguntungkan kreator.** Bagian lantai, jadi debu tetap bersama kreator — arah yang sama dengan `Fees::protocol_fee` dan `Fees::fund_fee`, yang juga mengukir bagian dari biaya yang sudah terakumulasi. 20% dari biaya 1 unit adalah 0, bukan 1.
+- **Nilai dikonservasi.** `creator_amount + shared_amount == creator_fee` untuk setiap tingkat dan setiap biaya hingga `u64::MAX`.
+- **`share_rate = 0` adalah perilaku lama yang tepat.** Baik nilai konfigurasi default maupun PDA yang hilang memberikan kreator seluruh biaya, jadi tidak ada yang berubah untuk pool yang ada sampai admin menetapkan tingkat.
+
+Karena `protocol_fees_token*` dan `creator_fees_token*` keduanya sudah dikurangi dalam `vault_amount_without_fee`, memindahkan nilai di antara mereka tidak mengubah pandangan kurva tentang vault. Tidak ada LP yang melihat perubahan harga di seluruh pengumpulan biaya kreator, dan pemeriksaan `k` tidak tersentuh.
+
+<Note>
+  **Tingkat dibaca pada pengumpulan, bukan pada akrual.** Biaya yang terakumulasi saat tingkat adalah `0` diselesaikan pada tingkat apa pun yang berlaku ketika seseorang akhirnya memanggil `Collect*`. Tidak ada snapshot per-epoch atau per-swap.
+</Note>
+
+## Perubahan daftar akun
+
+`CollectCreatorFee` — satu penyisipan:
+
+| # | Sebelum | Sesudah |
+|---|--------|--------|
+| 1–4 | `creator`, `authority`, `pool_state`, `amm_config` | tidak berubah |
+| 5 | `token_0_vault` | **`creator_fee_share`** (baru) |
+| 6.. | — | `token_0_vault` dan semuanya sesudahnya, bergeser satu |
+
+`CollectCreatorFeePermissionless` — dua penyisipan:
+
+| # | Sebelum | Sesudah |
+|---|--------|--------|
+| 1–4 | `payer`, `creator`, `authority`, `pool_state` | tidak berubah |
+| 5 | `token_0_vault` | **`amm_config`** (baru) |
+| 6 | `token_1_vault` | **`creator_fee_share`** (baru) |
+| 7.. | — | `token_0_vault` dan semuanya sesudahnya, bergeser dua |
+
+<Warning>
+  Tidak ada perubahan yang gagal dengan cara yang membantu. Akun yang disisipkan tidak berada di akhir daftar, jadi klien lama tidak "kehilangan akun" — ia menyerahkan vault ke program di mana konfigurasi diharapkan dan transaksi gagal pada deserialisasi. Hasilkan ulang dari IDL baru, dan periksa bahwa rilis SDK apa pun yang Anda pin membawa akun baru sebelum mengarahkannya ke program yang ditingkatkan.
+</Warning>
+
+Tabel akun lengkap di [`products/cpmm/instructions`](/id/products/cpmm/instructions#collectcreatorfee).
+
+## `CreateCreatorFeeShare` dan `CloseCreatorFeeShare`
+
+```rust
+pub struct CreatorFeeShare {
+    pub bump: u8,
+    pub creator: Pubkey,
+    pub amm_config: Pubkey,
+    pub share_rate: u64,
+    pub padding: [u64; 8],
+}
+// CreatorFeeShare::LEN == 145
+```
+
+`CreateCreatorFeeShare(share_rate: u64)` menginisialisasi PDA; `CloseCreatorFeeShare` menutupnya dan mengembalikan sewa ke penandatangan. Keduanya menerima admin program bersama **atau** pemilik pembagian biaya kreator khusus — pasangan kunci yang dikodekan keras baru mengikuti pola `cfg` devnet/mainnet yang sama dengan otoritas delegasi lainnya dari program. Alamat di [`reference/program-addresses`](/id/reference/program-addresses#cpmm-creator-fee-share-authority).
+
+Poin yang patut diperhatikan:
+
+- **Kreator pool bukan pihak dalam instruksi apa pun** dan tidak menandatangani. Akun `creator` tidak diperiksa — PDA dapat dibuat untuk kunci yang belum memiliki pool.
+- **Satu akun mencakup pasangan `(creator, amm_config)`**, jadi mengatur setiap pool yang dimiliki kreator itu pada tingkat biaya itu. Kreator dengan pool pada dua tingkat membutuhkan dua akun untuk dicakup di keduanya.
+- **Tidak ada jalur pembaruan.** `init` gagal pada pembuatan kedua untuk pasangan yang sama; untuk mengubah tingkat, tutup dan buat ulang.
+
+## Param `UpdateAmmConfig` 8
+
+```rust
+Some(8) => update_creator_fee_share_rate(amm_config, value),   // asserts value <= 1_000_000
+```
+
+Menetapkan bagian default tingkat biaya. Ini tidak terkait dengan `protocol_fee_rate` (param `1`), yang membagi biaya **perdagangan** — poin yang patut hati-hati dalam alat admin, karena keduanya terlihat sama dan keduanya mendarat di `protocol_fees_token*`.
+
+## Naik bersama
+
+**Perbaikan pengurutan `CollectExcessLamports`.** Instruksi sekarang membuat dua lintasan di atas `remaining_accounts` — setiap CPI program token terlebih dahulu, kemudian debit langsung PDA milik CPMM — alih-alih mengirim dalam urutan pemanggil. Interleaving keduanya dibatalkan dengan `UnbalancedInstruction` runtime ("jumlah saldo akun sebelum dan sesudah instruksi tidak cocok") kapan pun PDA didebit sebelum CPI, karena perubahan lamport yang tertunda dari pemanggil hanya disiram ke akun yang benar-benar dibawa CPI. Antarmuka instruksi tidak berubah; pemanggil masih meneruskan sumber dalam urutan apa pun, dan sekarang itu benar-benar aman.
+
+**Metadata build yang dapat diverifikasi.** `Cargo.toml` workspace mendeklarasikan `[workspace.metadata.cli] solana = "3.1.10"`, jadi build yang dapat diverifikasi menyelesaikan CLI Solana yang sama dengan yang dibangun program. Tidak ada efek on-chain.
+
+## Apa yang tidak berubah
+
+- **`PoolState`** — 637 byte, bidang sama, offset sama. Bagian protokol menggunakan kembali bucket protokol yang ada daripada menambahkan penghitung sendiri.
+- **`AmmConfig::LEN`** — masih 236 byte.
+- **Matematika swap, kutipan, dan pemeriksaan `k`.** Biaya kreator dikenakan persis seperti sebelumnya.
+- **`CollectProtocolFee` / `CollectFundFee`** — akun sama, penandatangan sama. `CollectProtocolFee` hanya memiliki lebih banyak untuk dikumpulkan.
+- **Kode kesalahan.** `6000`–`6015` tidak berubah; tidak ada yang ditambahkan.
+- **Setiap instruksi lainnya**, dan ID program.
+
+## Halaman yang diperbarui
+
+- `products/cpmm/fees` — bagian "Bagian protokol dari biaya kreator" baru mencakup resolusi tingkat, aritmatika pemisahan, pembulatan, dan konsekuensi integrator; `creator_fee_share_rate` ditambahkan ke daftar tingkat/unit dan tabel parameter default; tabel alur pengumpulan dikerjakan ulang.
+- `products/cpmm/instructions` — peringatan breaking-change di atas; tabel akun lengkap untuk kedua jalur biaya kreator; bagian `CreateCreatorFeeShare` dan `CloseCreatorFeeShare` baru; param `UpdateAmmConfig` `8`; catatan pengurutan `CollectExcessLamports`; ringkasan dan baris matriks perubahan status.
+- `products/cpmm/accounts` — bagian akun `CreatorFeeShare` baru; tata letak `AmmConfig` dan peringatan padding-carve; catatan penghitung biaya `PoolState`; baris siklus hidup akun.
+- `products/cpmm/overview` — callout biaya kreator dan bullet "Biaya yang dapat diprediksi".
+- `products/cpmm/math` — catatan bahwa pemisahan sengaja tidak ada dalam matematika swap.
+- `products/cpmm/code-demos` — peringatan bahwa pembangun SDK pra-upgrade memancarkan daftar akun lama; cuplikan biaya terakumulasi dengan anotasi.
+- `reference/program-addresses` — bagian "Otoritas pembagian biaya kreator CPMM" baru; `creator_fee_share` ditambahkan ke blok benih PDA.
+- `reference/fee-comparison` — `creator_fee_share_rate` dipanggil sebagai tingkat CPMM keempat dengan basis berbeda.

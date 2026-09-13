@@ -1,0 +1,144 @@
+---
+title: "2026-09-13 — CPMM：協議分享創作者費用"
+description: "CPMM 現在可以保留創作者費用的可配置份額，在收取費用時而非收費時應用。AmmConfig 獲得 creator_fee_share_rate（從填充中分割，大小相同），新的 CreatorFeeShare PDA 可按創作者覆蓋它，CreateCreatorFeeShare / CloseCreatorFeeShare 管理它。兩個 CollectCreatorFee 路徑改變其帳戶列表 — 對現有客戶端造成破壞性變更。UpdateAmmConfig 獲得參數 8。沒有新的錯誤代碼，PoolState 無變化，交換數學未改動。"
+---
+
+<Info>
+  **本頁內容由 AI 自動翻譯，所有內容以英文版本為準。**
+
+  [查看英文版 →](/reference/changelog/2026-09-13-cpmm-creator-fee-protocol-share)
+</Info>
+
+<Info>
+  本條目涵蓋即將推出的 CPMM 程式更新。在部署前已根據本地發佈分支（`0dde43d`，2026 年 9 月 11 日）進行驗證。在依賴新指令或變更的帳戶列表之前，請確認已部署的程式。
+</Info>
+
+CPMM 的創作者費用一直完全流向資金池創作者。此版本讓協議保留其中一部分 — 可按費用等級或按費用等級的創作者協商 — 而不改變費用的收費方式。
+
+保持影響範圍小的設計選擇：**分割發生在收取時，而非交換時。** 交換仍然收取 `creator_fee_rate` 並將整個金額累積到 `creator_fees_token_{0,1}`。當 `CollectCreatorFee` 或 `CollectCreatorFeePermissionless` 運行時，累積的餘額被分割，協議的部分在同一資金池上被重新標記為協議費用，只有創作者的部分離開金庫。報價、曲線、`k` 和每個 LP 面向的路徑都不受影響。
+
+## 集成商速查表
+
+- **兩個創作者費用收取指令都改變了其帳戶列表。這是破壞性變更。** `CollectCreatorFee` 在位置 5 添加 `creator_fee_share`。`CollectCreatorFeePermissionless` 在位置 5 添加 `amm_config`，在位置 6 添加 `creator_fee_share`。兩個插入都在金庫之前，所以之後的所有內容都會移位。重新構建這些交易；不要修補它們。
+- **即使 `creator_fee_share` 不存在也必須傳遞。** 它使用種子約束聲明但作為未檢查帳戶讀取，所以地址必須是 `["creator_fee_share", creator, amm_config]` 處的規範 PDA，而帳戶本身是可選的。當它為空時，程式回退到 `AmmConfig.creator_fee_share_rate`。
+- **`AmmConfig` 獲得 `creator_fee_share_rate`，從填充中分割。** 帳戶仍然是 **236 位元組**，每個現有配置保持反序列化 — 但舊 `padding: [u64; 15]` 的第一個 `u64` 現在是活動欄位。將尾部建模為 15 元素陣列的解碼器將份額率讀取為 `padding[0]`。
+- **`PoolState` 未改變。** 637 位元組，相同偏移，相同欄位。協議的份額被記入現有的 `protocol_fees_token_{0,1}` 計數器 — 沒有新計數器，也沒有新的收取指令。
+- **`protocol_fees_token*` 現在在交換外增長。** 任何協調協議累積與交易量的監視器都會在每次創作者費用收取時看到跳躍。
+- **讀取 `creator_fees_token*` 的創作者支付估算器現在高估。** 乘以 `(1 − share_rate / 1_000_000)`，針對該 `(creator, amm_config)` 對解析。
+- **添加了兩個管理指令：** `CreateCreatorFeeShare` 和 `CloseCreatorFeeShare`。**一個新的 `UpdateAmmConfig` 參數：** `8` → `creator_fee_share_rate`。
+- **沒有新的錯誤代碼。** 新路徑重用 `InvalidOwner`（`6001`）、`InvalidInput`（`6003`）和 `MathOverflow`（`6011`）。`6000`–`6015` 未改變。
+- **需要 IDL 刷新** — 兩個新指令，一個新帳戶類型，兩個改變的帳戶列表，一個新配置欄位。
+
+## 分割如何工作
+
+解析，按優先順序：
+
+1. **`CreatorFeeShare` PDA** 在 `["creator_fee_share", creator, amm_config]` — 當帳戶存在且由 CPMM 擁有時，其 `share_rate` 獲勝。
+2. **`AmmConfig.creator_fee_share_rate`** — 費用等級的預設值，否則使用。
+
+兩者都是 `u64` 超過 `FEE_RATE_DENOMINATOR_VALUE = 1_000_000`，兩者都根據該上限進行檢查。然後，按每個代幣側：
+
+```rust
+// states/creator_fee_share.rs
+shared_amount  = floor(creator_fee * share_rate / 1_000_000);
+creator_amount = creator_fee - shared_amount;
+```
+
+```rust
+// states/pool.rs — PoolState::settle_creator_fee
+self.protocol_fees_token_i = self.protocol_fees_token_i.checked_add(shared_amount_i)?;
+self.creator_fees_token_i  = 0;
+// creator_amount_i is returned and transferred out to the creator
+```
+
+程式測試確定的三個屬性：
+
+- **四捨五入有利於創作者。** 份額向下取整，所以塵埃留給創作者 — 與 `Fees::protocol_fee` 和 `Fees::fund_fee` 相同方向，它們也從已累積的費用中分割份額。1 單位費用的 20% 是 0，不是 1。
+- **價值守恆。** 對於每個費率和每個費用直到 `u64::MAX`，`creator_amount + shared_amount == creator_fee`。
+- **`share_rate = 0` 完全是舊行為。** 預設配置值和缺失的 PDA 都給創作者整個費用，所以在管理員設置費率之前，任何現有資金池都不會改變。
+
+因為 `protocol_fees_token*` 和 `creator_fees_token*` 都已在 `vault_amount_without_fee` 中扣除，在它們之間移動價值不會改變曲線對金庫的看法。沒有 LP 會在創作者費用收取中看到價格變化，`k` 檢查未改動。
+
+<Note>
+  **費率在收取時讀取，而非在累積時。** 在費率為 `0` 時累積的費用在最終有人調用 `Collect*` 時以任何有效的費率結算。沒有按時期或按交換的快照。
+</Note>
+
+## 帳戶列表變更
+
+`CollectCreatorFee` — 一個插入：
+
+| # | 之前 | 之後 |
+|---|--------|-------|
+| 1–4 | `creator`、`authority`、`pool_state`、`amm_config` | 未改變 |
+| 5 | `token_0_vault` | **`creator_fee_share`**（新增） |
+| 6.. | — | `token_0_vault` 及之後所有內容，移位一個 |
+
+`CollectCreatorFeePermissionless` — 兩個插入：
+
+| # | 之前 | 之後 |
+|---|--------|-------|
+| 1–4 | `payer`、`creator`、`authority`、`pool_state` | 未改變 |
+| 5 | `token_0_vault` | **`amm_config`**（新增） |
+| 6 | `token_1_vault` | **`creator_fee_share`**（新增） |
+| 7.. | — | `token_0_vault` 及之後所有內容，移位兩個 |
+
+<Warning>
+  兩個變更都不會以有幫助的方式大聲失敗。插入的帳戶不在列表末尾，所以舊客戶端不會「缺少帳戶」— 它將金庫交給程式，而程式期望配置，交易在反序列化時失敗。從新 IDL 重新生成，並在指向升級程式之前檢查您固定的任何 SDK 版本是否包含新帳戶。
+</Warning>
+
+完整帳戶表在 [`products/cpmm/instructions`](/zh-Hant/products/cpmm/instructions#collectcreatorfee)。
+
+## `CreateCreatorFeeShare` 和 `CloseCreatorFeeShare`
+
+```rust
+pub struct CreatorFeeShare {
+    pub bump: u8,
+    pub creator: Pubkey,
+    pub amm_config: Pubkey,
+    pub share_rate: u64,
+    pub padding: [u64; 8],
+}
+// CreatorFeeShare::LEN == 145
+```
+
+`CreateCreatorFeeShare(share_rate: u64)` 初始化 PDA；`CloseCreatorFeeShare` 關閉它並將租金返還給簽署者。兩者都接受共享程式管理員**或**專用創作者費用分享所有者 — 一個新的硬編碼密鑰對，遵循與程式其他委派權限相同的 devnet/mainnet `cfg` 模式。地址在 [`reference/program-addresses`](/zh-Hant/reference/program-addresses#cpmm-creator-fee-share-authority)。
+
+值得注意的要點：
+
+- **資金池創作者不是任何指令的一方**，也不簽署。`creator` 帳戶未檢查 — PDA 可以為尚未擁有資金池的密鑰創建。
+- **一個帳戶涵蓋一個 `(creator, amm_config)` 對**，所以它管理該創作者在該費用等級上擁有的每個資金池。在兩個等級上擁有資金池的創作者需要兩個帳戶才能在兩者上被覆蓋。
+- **沒有更新路徑。** 對同一對的第二次創建失敗；要改變費率，關閉並重新創建。
+
+## `UpdateAmmConfig` 參數 8
+
+```rust
+Some(8) => update_creator_fee_share_rate(amm_config, value),   // asserts value <= 1_000_000
+```
+
+設置費用等級的預設份額。它與 `protocol_fee_rate`（參數 `1`）無關，後者分割**交易**費用 — 在管理工具中值得小心的一點，因為兩者看起來相似，都落入 `protocol_fees_token*`。
+
+## 搭便車
+
+**`CollectExcessLamports` 排序修復。** 指令現在對 `remaining_accounts` 進行兩次傳遞 — 每個代幣程式 CPI 首先，然後是 CPMM 擁有的 PDA 的直接扣款 — 而不是按調用者順序分派。當 PDA 在 CPI 之前被扣款時，交錯會因執行時的 `UnbalancedInstruction`（「指令前後帳戶餘額之和不匹配」）而中止，因為調用者的待處理 lamport 變更只在 CPI 實際執行的帳戶中刷新。指令的介面未改變；調用者仍以任何順序傳遞來源，現在這確實是安全的。
+
+**可驗證構建元資料。** 工作區 `Cargo.toml` 聲明 `[workspace.metadata.cli] solana = "3.1.10"`，所以可驗證構建解析程式構建時使用的相同 Solana CLI。沒有鏈上影響。
+
+## 未改變的內容
+
+- **`PoolState`** — 637 位元組，相同欄位，相同偏移。協議的份額重用現有協議桶而不是添加自己的計數器。
+- **`AmmConfig::LEN`** — 仍然是 236 位元組。
+- **交換數學、報價和 `k` 檢查。** 創作者費用的收費方式完全相同。
+- **`CollectProtocolFee` / `CollectFundFee`** — 相同帳戶，相同簽署者。`CollectProtocolFee` 只是有更多要收取。
+- **錯誤代碼。** `6000`–`6015` 未改變；沒有附加。
+- **每個其他指令**和程式 ID。
+
+## 更新的頁面
+
+- `products/cpmm/fees` — 新的「創作者費用的協議份額」部分，涵蓋費率解析、分割算術、四捨五入和集成商後果；`creator_fee_share_rate` 添加到費率/單位列表和預設參數表；收取流程表重新設計。
+- `products/cpmm/instructions` — 頂部的破壞性變更警告；兩個創作者費用路徑的完整帳戶表；新的 `CreateCreatorFeeShare` 和 `CloseCreatorFeeShare` 部分；`UpdateAmmConfig` 參數 `8`；`CollectExcessLamports` 排序注釋；摘要和狀態變更矩陣行。
+- `products/cpmm/accounts` — 新的 `CreatorFeeShare` 帳戶部分；`AmmConfig` 佈局和填充分割警告；`PoolState` 費用計數器注釋；帳戶生命週期行。
+- `products/cpmm/overview` — 創作者費用標註和「可預測費用」項目符號。
+- `products/cpmm/math` — 分割故意不在交換數學中的注釋。
+- `products/cpmm/code-demos` — 警告升級前 SDK 構建器發出舊帳戶列表；累積費用片段帶註釋。
+- `reference/program-addresses` — 新的「CPMM 創作者費用分享權限」部分；`creator_fee_share` 添加到 PDA 種子塊。
+- `reference/fee-comparison` — `creator_fee_share_rate` 作為具有不同基數的第四個 CPMM 費率被調出。

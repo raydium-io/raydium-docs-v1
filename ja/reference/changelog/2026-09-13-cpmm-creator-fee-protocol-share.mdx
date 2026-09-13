@@ -1,0 +1,144 @@
+---
+title: "2026-09-13 — CPMM: プロトコルがクリエイターフィーの一部を取得"
+description: "CPMMはクリエイターフィーの設定可能な一部を保持できるようになりました。フィーが請求される時点ではなく、徴収される時点で適用されます。AmmConfigはcreator_fee_share_rateを獲得し（パディングから確保、同じサイズ）、新しいCreatorFeeShare PDAはクリエイターごとにこれをオーバーライドします。CreateCreatorFeeShareとCloseCreatorFeeShareがこれを管理します。両方のCollectCreatorFeeパスはアカウントリストを変更します。既存クライアントにとって破壊的です。UpdateAmmConfigはパラメータ8を獲得します。新しいエラーコードはなく、PoolStateの変更もなく、スワップ数学は変わりません。"
+---
+
+<Info>
+  **このページは AI による自動翻訳です。すべての内容は英語版を正とします。**
+
+  [英語版を表示 →](/reference/changelog/2026-09-13-cpmm-creator-fee-protocol-share)
+</Info>
+
+<Info>
+  このエントリは、今後のCPMMプログラムアップデートについて説明しています。デプロイ前にローカルリリースブランチ（`0dde43d`、2026年9月11日）に対して検証されました。新しいインストラクションまたは変更されたアカウントリストに依存する前に、デプロイされたプログラムを確認してください。
+</Info>
+
+CPMMのクリエイターフィーは常にプール作成者に全額支払われていました。このリリースでは、プロトコルがその一部を保持できるようになります。フィーティアごと、またはフィーティア内のクリエイターごとに交渉可能です。ただし、フィーがどのように請求されるかには影響しません。
+
+爆発範囲を小さく保つ設計上の選択：**分割はスワップ時ではなく、徴収時に発生します。** スワップは依然として`creator_fee_rate`を請求し、全額を`creator_fees_token_{0,1}`に計上します。`CollectCreatorFee`または`CollectCreatorFeePermissionless`が実行されると、計上された残高が分割され、プロトコルの部分は同じプール上のプロトコルフィーとして再ラベル付けされ、クリエイターの部分だけがボールトから出ます。クォート、曲線、`k`、およびすべてのLP向けパスは影響を受けません。
+
+## インテグレーター向けTL;DR
+
+- **両方のクリエイターフィー徴収インストラクションはアカウントリストを変更しました。これは破壊的です。** `CollectCreatorFee`はポジション5に`creator_fee_share`を追加します。`CollectCreatorFeePermissionless`はポジション5に`amm_config`を、ポジション6に`creator_fee_share`を追加します。両方の挿入はボールトの前にあるため、その後のすべてがシフトします。これらのトランザクションを再構築してください。パッチを当てないでください。
+- **`creator_fee_share`が存在しない場合でも渡す必要があります。** シード制約で宣言されていますが、チェックされていないアカウントとして読み込まれるため、アドレスは`["creator_fee_share", creator, amm_config]`の正規PDAである必要があり、アカウント自体はオプションです。空の場合、プログラムは`AmmConfig.creator_fee_share_rate`にフォールバックします。
+- **`AmmConfig`は`creator_fee_share_rate`を獲得し、パディングから確保されます。** アカウントは依然として**236バイト**であり、すべての既存設定は逆シリアル化を続けます。ただし、古い`padding: [u64; 15]`の最初の`u64`は現在ライブフィールドです。テールを15要素配列としてモデル化するデコーダーは、シェアレートを`padding[0]`として読み込みます。
+- **`PoolState`は変更されていません。** 637バイト、同じオフセット、同じフィールド。プロトコルのシェアは既存の`protocol_fees_token_{0,1}`カウンターに記録されます。新しいカウンターはなく、新しい徴収インストラクションもありません。
+- **`protocol_fees_token*`はスワップ外で増加するようになりました。** プロトコル計上をトレードボリュームに対して調整するモニターは、各クリエイターフィー徴収時にジャンプを見ます。
+- **`creator_fees_token*`を読み取るクリエイター支払い推定器は過大評価するようになりました。** `(1 − share_rate / 1_000_000)`を乗じ、その`(creator, amm_config)`ペアに対して解決します。
+- **2つの管理インストラクションが追加されます：** `CreateCreatorFeeShare`と`CloseCreatorFeeShare`。**1つの新しい`UpdateAmmConfig`パラメータ：** `8` → `creator_fee_share_rate`。
+- **新しいエラーコードはありません。** 新しいパスは`InvalidOwner`（`6001`）、`InvalidInput`（`6003`）、`MathOverflow`（`6011`）を再利用します。`6000`–`6015`は変更されていません。
+- **IDLリフレッシュが必要です** — 2つの新しいインストラクション、1つの新しいアカウントタイプ、2つの変更されたアカウントリスト、1つの新しい設定フィールド。
+
+## 分割の仕組み
+
+解決、優先順位順：
+
+1. **`CreatorFeeShare` PDA** at `["creator_fee_share", creator, amm_config]` — アカウントが存在し、CPMMによって所有されている場合、その`share_rate`が優先されます。
+2. **`AmmConfig.creator_fee_share_rate`** — フィーティアのデフォルト、それ以外の場合に使用されます。
+
+どちらも`FEE_RATE_DENOMINATOR_VALUE = 1_000_000`に対する`u64`であり、両方がその上限に対してチェックされます。その後、トークンサイドごと：
+
+```rust
+// states/creator_fee_share.rs
+shared_amount  = floor(creator_fee * share_rate / 1_000_000);
+creator_amount = creator_fee - shared_amount;
+```
+
+```rust
+// states/pool.rs — PoolState::settle_creator_fee
+self.protocol_fees_token_i = self.protocol_fees_token_i.checked_add(shared_amount_i)?;
+self.creator_fees_token_i  = 0;
+// creator_amount_i is returned and transferred out to the creator
+```
+
+プログラムがテストする3つのプロパティ：
+
+- **丸めはクリエイターに有利です。** シェアはフロアされるため、ダストはクリエイターに残ります。これは`Fees::protocol_fee`と`Fees::fund_fee`と同じ方向です。これらも既に計上されたフィーからシェアを確保します。1ユニットフィーの20%は0であり、1ではありません。
+- **値は保存されます。** すべてのレートとすべてのフィーに対して`creator_amount + shared_amount == creator_fee`は`u64::MAX`までです。
+- **`share_rate = 0`は正確に古い動作です。** デフォルト設定値と欠落しているPDAの両方がクリエイターに全額フィーを与えるため、管理者がレートを設定するまで既存プールは何も変わりません。
+
+`protocol_fees_token*`と`creator_fees_token*`は両方とも既に`vault_amount_without_fee`で差し引かれているため、それらの間で値を移動しても曲線のボールトビューは変わりません。クリエイターフィー徴収全体でLP価格変更は見られず、`k`チェックは変わりません。
+
+<Note>
+  **レートは計上時ではなく、徴収時に読み込まれます。** レートが`0`の間に計上されたフィーは、誰かが最終的に`Collect*`を呼び出すときに有効なレートで決済されます。エポックごとまたはスワップごとのスナップショットはありません。
+</Note>
+
+## アカウントリストの変更
+
+`CollectCreatorFee` — 1つの挿入：
+
+| # | 前 | 後 |
+|---|--------|-------|
+| 1–4 | `creator`, `authority`, `pool_state`, `amm_config` | 変更なし |
+| 5 | `token_0_vault` | **`creator_fee_share`** (新規) |
+| 6.. | — | `token_0_vault`とその後のすべて、1つシフト |
+
+`CollectCreatorFeePermissionless` — 2つの挿入：
+
+| # | 前 | 後 |
+|---|--------|-------|
+| 1–4 | `payer`, `creator`, `authority`, `pool_state` | 変更なし |
+| 5 | `token_0_vault` | **`amm_config`** (新規) |
+| 6 | `token_1_vault` | **`creator_fee_share`** (新規) |
+| 7.. | — | `token_0_vault`とその後のすべて、2つシフト |
+
+<Warning>
+  どちらの変更も有用な方法で大きく失敗しません。挿入されたアカウントはリストの最後にないため、古いクライアントは「アカウントを見落とす」ことはありません。プログラムにボールトを渡し、設定が期待される場所で、トランザクションは逆シリアル化で失敗します。新しいIDLから再生成し、ピンするSDKリリースが新しいアカウントを含んでいることを確認してから、アップグレードされたプログラムを指してください。
+</Warning>
+
+完全なアカウントテーブルは[`products/cpmm/instructions`](/ja/products/cpmm/instructions#collectcreatorfee)にあります。
+
+## `CreateCreatorFeeShare`と`CloseCreatorFeeShare`
+
+```rust
+pub struct CreatorFeeShare {
+    pub bump: u8,
+    pub creator: Pubkey,
+    pub amm_config: Pubkey,
+    pub share_rate: u64,
+    pub padding: [u64; 8],
+}
+// CreatorFeeShare::LEN == 145
+```
+
+`CreateCreatorFeeShare(share_rate: u64)`はPDAを初期化します。`CloseCreatorFeeShare`はそれを閉じ、レントを署名者に返します。どちらも共有プログラム管理者**または**専用のクリエイターフィーシェア所有者を受け入れます。プログラムの他の委任された権限と同じdevnet/mainnet`cfg`パターンに従う新しいハードコードされたキーペア。アドレスは[`reference/program-addresses`](/ja/reference/program-addresses#cpmm-creator-fee-share-authority)にあります。
+
+注目すべき点：
+
+- **プール作成者はどちらのインストラクションの当事者でもなく、署名しません。** `creator`アカウントはチェックされていません。PDAはまだプールを所有していないキーに対して作成できます。
+- **1つのアカウントが`(creator, amm_config)`ペアをカバーします。** したがって、そのクリエイターがそのフィーティアで所有するすべてのプールを管理します。2つのティアにプールを持つクリエイターは、両方でカバーされるために2つのアカウントが必要です。
+- **更新パスはありません。** 同じペアに対する2番目の作成で初期化が失敗します。レートを変更するには、閉じて再作成します。
+
+## `UpdateAmmConfig`パラメータ8
+
+```rust
+Some(8) => update_creator_fee_share_rate(amm_config, value),   // asserts value <= 1_000_000
+```
+
+フィーティアのデフォルトシェアを設定します。これは`protocol_fee_rate`（パラメータ`1`）とは無関係です。これは**トレード**フィーを分割します。管理ツールで注意する価値のあるポイントです。2つは同じように見え、両方とも`protocol_fees_token*`に着地するためです。
+
+## 同時に実施
+
+**`CollectExcessLamports`順序修正。** インストラクションは`remaining_accounts`に対して2つのパスを実行するようになりました。すべてのトークンプログラムCPIが最初に、その後CPMMが所有するPDAの直接デビットが続きます。呼び出し元の順序で発送する代わりに。2つをインターリーブすると、PDAがCPIより前にデビットされるたびにランタイムの`UnbalancedInstruction`（「命令の前後のアカウント残高の合計が一致しない」）で中止されました。呼び出し元の保留中のラムポート変更は、CPIが実際に実行するアカウントにのみフラッシュされるためです。インストラクションのインターフェースは変更されていません。呼び出し元は依然としてソースを任意の順序で渡し、現在はそれは本当に安全です。
+
+**検証可能なビルドメタデータ。** ワークスペース`Cargo.toml`は`[workspace.metadata.cli] solana = "3.1.10"`を宣言しているため、検証可能なビルドはプログラムがビルドされたのと同じSolana CLIを解決します。オンチェーン効果はありません。
+
+## 変更されなかったもの
+
+- **`PoolState`** — 637バイト、同じフィールド、同じオフセット。プロトコルのシェアは既存のプロトコルバケットを再利用し、独自のカウンターを追加しません。
+- **`AmmConfig::LEN`** — 依然として236バイト。
+- **スワップ数学、クォート、`k`チェック。** クリエイターフィーは以前と同じように請求されます。
+- **`CollectProtocolFee` / `CollectFundFee`** — 同じアカウント、同じ署名者。`CollectProtocolFee`は単に収集するものが増えています。
+- **エラーコード。** `6000`–`6015`変更なし。何も追加されていません。
+- **その他すべてのインストラクション**、およびプログラムID。
+
+## 更新されたページ
+
+- `products/cpmm/fees` — レート解決、分割算術、丸め、インテグレーター結果をカバーする新しい「クリエイターフィーのプロトコルシェア」セクション。`creator_fee_share_rate`がレート/ユニットリストとデフォルトパラメータテーブルに追加されました。徴収フロー表が再構成されました。
+- `products/cpmm/instructions` — トップの破壊的変更警告。両方のクリエイターフィーパスの完全なアカウントテーブル。新しい`CreateCreatorFeeShare`と`CloseCreatorFeeShare`セクション。`UpdateAmmConfig`パラメータ`8`。`CollectExcessLamports`順序注記。概要と状態変更マトリックス行。
+- `products/cpmm/accounts` — 新しい`CreatorFeeShare`アカウントセクション。`AmmConfig`レイアウトとパディング確保警告。`PoolState`フィーカウンター注記。アカウントライフサイクル行。
+- `products/cpmm/overview` — クリエイターフィーコールアウトと「予測可能なフィー」箇条書き。
+- `products/cpmm/math` — 分割が意図的にスワップ数学から除外されていることの注記。
+- `products/cpmm/code-demos` — アップグレード前のSDKビルダーが古いアカウントリストを発行することの警告。計上フィースニペットに注釈が付けられました。
+- `reference/program-addresses` — 新しい「CPMM creator-fee-share authority」セクション。`creator_fee_share`がPDAシードブロックに追加されました。
+- `reference/fee-comparison` — `creator_fee_share_rate`が異なるベースを持つ4番目のCPMMレートとして呼び出されました。

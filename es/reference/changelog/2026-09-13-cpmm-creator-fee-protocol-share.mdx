@@ -1,0 +1,144 @@
+---
+title: "2026-09-13 — CPMM: el protocolo retiene una parte de la comisión del creador"
+description: "CPMM ahora puede retener una parte configurable de la comisión del creador, aplicada cuando se cobra la comisión en lugar de cuando se cobra. AmmConfig gana creator_fee_share_rate (tallado del relleno, mismo tamaño), un nuevo PDA CreatorFeeShare lo anula por creador, y CreateCreatorFeeShare / CloseCreatorFeeShare lo administran. Ambas rutas de CollectCreatorFee cambian sus listas de cuentas — ruptura para clientes existentes. UpdateAmmConfig gana parámetro 8. Sin nuevos códigos de error, sin cambio en PoolState, matemática de swap sin cambios."
+---
+
+<Info>
+  **Esta página fue traducida automáticamente por IA. La versión en inglés es la fuente autorizada.**
+
+  [Ver versión en inglés →](/reference/changelog/2026-09-13-cpmm-creator-fee-protocol-share)
+</Info>
+
+<Info>
+  Esta entrada cubre una actualización próxima del programa CPMM. Fue verificada contra la rama de lanzamiento local (`0dde43d`, 11 de septiembre de 2026) antes del despliegue. Confirma el programa desplegado antes de confiar en las nuevas instrucciones o en las listas de cuentas modificadas.
+</Info>
+
+La comisión del creador en CPMM siempre ha ido completamente al creador del pool. Este lanzamiento permite que el protocolo retenga una parte de ella — negociable por nivel de comisión, o por creador en un nivel de comisión — sin tocar cómo se cobra la comisión.
+
+La decisión de diseño que mantiene el radio de explosión pequeño: **la división ocurre en el momento de la recopilación, no en el momento del swap.** Un swap sigue cobrando `creator_fee_rate` y sigue acumulando el monto completo en `creator_fees_token_{0,1}`. Cuando se ejecuta `CollectCreatorFee` o `CollectCreatorFeePermissionless`, el saldo acumulado se divide, la parte del protocolo se reetiqueta como una comisión de protocolo en el mismo pool, y solo la parte del creador sale de la bóveda. Las cotizaciones, la curva, `k`, y cada ruta orientada a LP no se ven afectadas.
+
+## TL;DR para integradores
+
+- **Ambas instrucciones de recopilación de comisión del creador cambiaron sus listas de cuentas. Esto es una ruptura.** `CollectCreatorFee` gana `creator_fee_share` en la posición 5. `CollectCreatorFeePermissionless` gana `amm_config` en 5 y `creator_fee_share` en 6. Ambas inserciones se sientan antes de las bóvedas, por lo que todo lo demás se desplaza. Reconstruye estas transacciones; no las parches.
+- **`creator_fee_share` debe pasarse incluso cuando no existe.** Se declara con una restricción de semilla pero se lee como una cuenta sin verificar, por lo que la dirección debe ser el PDA canónico en `["creator_fee_share", creator, amm_config]` mientras que la cuenta en sí es opcional. Cuando está vacía, el programa recurre a `AmmConfig.creator_fee_share_rate`.
+- **`AmmConfig` gana `creator_fee_share_rate`, tallado del relleno.** La cuenta sigue siendo **236 bytes** y cada configuración existente sigue deserializándose — pero el primer `u64` del antiguo `padding: [u64; 15]` es ahora un campo activo. Los decodificadores que modelan la cola como una matriz de 15 elementos leen la tasa de participación como `padding[0]`.
+- **`PoolState` no ha cambiado.** 637 bytes, mismos desplazamientos, mismos campos. La parte del protocolo se registra en los contadores existentes `protocol_fees_token_{0,1}` — no hay nuevo contador ni nueva instrucción de recopilación para él.
+- **`protocol_fees_token*` ahora crece fuera de los swaps.** Cualquier monitor que reconcilie la acumulación de protocolo contra el volumen de operaciones verá saltos en cada recopilación de comisión del creador.
+- **Un estimador de pago del creador que lee `creator_fees_token*` ahora sobrestima.** Multiplica por `(1 − share_rate / 1_000_000)`, resuelto para ese par `(creator, amm_config)`.
+- **Se agregan dos instrucciones de administrador:** `CreateCreatorFeeShare` y `CloseCreatorFeeShare`. **Un nuevo parámetro `UpdateAmmConfig`:** `8` → `creator_fee_share_rate`.
+- **Sin nuevos códigos de error.** Las nuevas rutas reutilizan `InvalidOwner` (`6001`), `InvalidInput` (`6003`) e `MathOverflow` (`6011`). `6000`–`6015` no cambian.
+- **Se requiere una actualización de IDL** — dos nuevas instrucciones, un nuevo tipo de cuenta, dos listas de cuentas modificadas, un nuevo campo de configuración.
+
+## Cómo funciona la división
+
+Resolución, en orden de prioridad:
+
+1. **PDA `CreatorFeeShare`** en `["creator_fee_share", creator, amm_config]` — cuando la cuenta existe y es propiedad de CPMM, su `share_rate` gana.
+2. **`AmmConfig.creator_fee_share_rate`** — el valor predeterminado del nivel de comisión, utilizado de otra manera.
+
+Ambos son `u64` sobre `FEE_RATE_DENOMINATOR_VALUE = 1_000_000` y ambos se verifican contra ese techo. Luego, por lado de token:
+
+```rust
+// states/creator_fee_share.rs
+shared_amount  = floor(creator_fee * share_rate / 1_000_000);
+creator_amount = creator_fee - shared_amount;
+```
+
+```rust
+// states/pool.rs — PoolState::settle_creator_fee
+self.protocol_fees_token_i = self.protocol_fees_token_i.checked_add(shared_amount_i)?;
+self.creator_fees_token_i  = 0;
+// creator_amount_i is returned and transferred out to the creator
+```
+
+Tres propiedades que los tests del programa fijan:
+
+- **El redondeo favorece al creador.** La participación se redondea hacia abajo, por lo que el polvo se queda con el creador — la misma dirección que `Fees::protocol_fee` y `Fees::fund_fee`, que también tallan una participación de una comisión ya acumulada. El 20% de una comisión de 1 unidad es 0, no 1.
+- **El valor se conserva.** `creator_amount + shared_amount == creator_fee` para cada tasa y cada comisión hasta `u64::MAX`.
+- **`share_rate = 0` es exactamente el comportamiento antiguo.** Tanto el valor de configuración predeterminado como un PDA faltante dan al creador la comisión completa, por lo que nada cambia para ningún pool existente hasta que un administrador establezca una tasa.
+
+Debido a que `protocol_fees_token*` y `creator_fees_token*` ya se restan en `vault_amount_without_fee`, mover valor entre ellos no cambia la vista de la bóveda de la curva. Ningún LP ve un cambio de precio en una recopilación de comisión del creador, y la verificación de `k` no se toca.
+
+<Note>
+  **La tasa se lee en la recopilación, no en la acumulación.** Las comisiones que se acumularon mientras la tasa era `0` se liquidan a cualquier tasa que esté en vigor cuando alguien finalmente llama a `Collect*`. No hay una instantánea por época o por swap.
+</Note>
+
+## Cambios en la lista de cuentas
+
+`CollectCreatorFee` — una inserción:
+
+| # | Antes | Después |
+|---|-------|---------|
+| 1–4 | `creator`, `authority`, `pool_state`, `amm_config` | sin cambios |
+| 5 | `token_0_vault` | **`creator_fee_share`** (nuevo) |
+| 6.. | — | `token_0_vault` y todo lo demás, desplazado por uno |
+
+`CollectCreatorFeePermissionless` — dos inserciones:
+
+| # | Antes | Después |
+|---|-------|---------|
+| 1–4 | `payer`, `creator`, `authority`, `pool_state` | sin cambios |
+| 5 | `token_0_vault` | **`amm_config`** (nuevo) |
+| 6 | `token_1_vault` | **`creator_fee_share`** (nuevo) |
+| 7.. | — | `token_0_vault` y todo lo demás, desplazado por dos |
+
+<Warning>
+  Ninguno de los cambios falla de manera ruidosa y útil. Las cuentas insertadas no están al final de la lista, por lo que un cliente antiguo no "pierde una cuenta" — le entrega al programa una bóveda donde se espera una configuración y la transacción falla en la deserialización. Regenera desde el nuevo IDL, y verifica que cualquier lanzamiento de SDK que fijes lleve las nuevas cuentas antes de apuntarlo al programa actualizado.
+</Warning>
+
+Tablas de cuentas completas en [`products/cpmm/instructions`](/es/products/cpmm/instructions#collectcreatorfee).
+
+## `CreateCreatorFeeShare` y `CloseCreatorFeeShare`
+
+```rust
+pub struct CreatorFeeShare {
+    pub bump: u8,
+    pub creator: Pubkey,
+    pub amm_config: Pubkey,
+    pub share_rate: u64,
+    pub padding: [u64; 8],
+}
+// CreatorFeeShare::LEN == 145
+```
+
+`CreateCreatorFeeShare(share_rate: u64)` inicializa el PDA; `CloseCreatorFeeShare` lo cierra y devuelve la renta al firmante. Ambos aceptan el administrador del programa compartido **o** un propietario dedicado de participación de comisión del creador — un nuevo par de claves codificado que sigue el mismo patrón `cfg` devnet/mainnet que las otras autoridades delegadas del programa. Direcciones en [`reference/program-addresses`](/es/reference/program-addresses#cpmm-creator-fee-share-authority).
+
+Puntos dignos de mención:
+
+- **El creador del pool no es parte de ninguna instrucción** y no firma. La cuenta `creator` no se verifica — el PDA puede crearse para una clave que aún no posee ningún pool.
+- **Una cuenta cubre un par `(creator, amm_config)`**, por lo que rige cada pool que ese creador posee en ese nivel de comisión. Un creador con pools en dos niveles necesita dos cuentas para estar cubierto en ambos.
+- **No hay ruta de actualización.** `init` falla en un segundo create para el mismo par; para cambiar una tasa, cierra y recrea.
+
+## Parámetro 8 de `UpdateAmmConfig`
+
+```rust
+Some(8) => update_creator_fee_share_rate(amm_config, value),   // asserts value <= 1_000_000
+```
+
+Establece la participación predeterminada del nivel de comisión. No está relacionado con `protocol_fee_rate` (parámetro `1`), que divide la comisión de **operación** — un punto que vale la pena ser cuidadoso en las herramientas de administrador, ya que los dos se ven similares y ambos aterrizan en `protocol_fees_token*`.
+
+## Viajando junto
+
+**Corrección de ordenamiento de `CollectExcessLamports`.** La instrucción ahora hace dos pasadas sobre `remaining_accounts` — cada CPI del programa de tokens primero, luego los débitos directos de PDAs propiedad de CPMM — en lugar de despachar en orden del llamador. Intercalar los dos abortó con `UnbalancedInstruction` del tiempo de ejecución ("la suma de saldos de cuenta antes y después de la instrucción no coinciden") siempre que un PDA se debitaba antes de un CPI, porque los cambios de lamport pendientes del llamador solo se vacían en las cuentas que un CPI realmente lleva. La interfaz de la instrucción no cambia; los llamadores aún pasan fuentes en cualquier orden, y ahora eso es genuinamente seguro.
+
+**Metadatos de compilación verificable.** El `Cargo.toml` del espacio de trabajo declara `[workspace.metadata.cli] solana = "3.1.10"`, por lo que una compilación verificable resuelve el mismo Solana CLI contra el que se compiló el programa. Sin efecto en cadena.
+
+## Lo que no cambió
+
+- **`PoolState`** — 637 bytes, mismos campos, mismos desplazamientos. La parte del protocolo reutiliza el depósito de protocolo existente en lugar de agregar contadores propios.
+- **`AmmConfig::LEN`** — aún 236 bytes.
+- **Matemática de swap, cotización, y la verificación de `k`.** La comisión del creador se cobra exactamente como antes.
+- **`CollectProtocolFee` / `CollectFundFee`** — mismas cuentas, mismos firmantes. `CollectProtocolFee` simplemente tiene más para recopilar.
+- **Códigos de error.** `6000`–`6015` sin cambios; nada agregado.
+- **Cada otra instrucción**, y el ID del programa.
+
+## Páginas actualizadas
+
+- `products/cpmm/fees` — nueva sección "Participación del protocolo en la comisión del creador" que cubre resolución de tasa, aritmética de división, redondeo, y consecuencias del integrador; `creator_fee_share_rate` agregado a la lista de tasas/unidades y la tabla de parámetros predeterminados; tabla de flujo de recopilación reformulada.
+- `products/cpmm/instructions` — advertencia de cambio de ruptura en la parte superior; tablas de cuentas completas para ambas rutas de comisión del creador; nuevas secciones `CreateCreatorFeeShare` y `CloseCreatorFeeShare`; parámetro `8` de `UpdateAmmConfig`; nota de ordenamiento de `CollectExcessLamports`; filas de resumen y matriz de cambio de estado.
+- `products/cpmm/accounts` — nueva sección de cuenta `CreatorFeeShare`; diseño de `AmmConfig` y advertencia de tallado de relleno; notas de contador de comisión de `PoolState`; filas de ciclo de vida de cuenta.
+- `products/cpmm/overview` — llamada de comisión del creador y viñeta "Comisiones predecibles".
+- `products/cpmm/math` — una nota de que la división está deliberadamente ausente de la matemática de swap.
+- `products/cpmm/code-demos` — advertencia de que los constructores de SDK previos a la actualización emiten las listas de cuentas antiguas; fragmento de comisión acumulada anotado.
+- `reference/program-addresses` — nueva sección "Autoridad de participación de comisión del creador de CPMM"; `creator_fee_share` agregado al bloque de semillas de PDA.
+- `reference/fee-comparison` — `creator_fee_share_rate` llamado como una cuarta tasa de CPMM con una base diferente.

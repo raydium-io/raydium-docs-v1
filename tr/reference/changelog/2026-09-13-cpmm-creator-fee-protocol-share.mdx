@@ -1,0 +1,144 @@
+---
+title: "2026-09-13 — CPMM: protokol, yaratıcı ücretinin bir payını alır"
+description: "CPMM artık yaratıcı ücretinin yapılandırılabilir bir payını tutabilir; bu pay ücret tahsil edildiğinde (tahakkuk ettiğinde değil) uygulanır. AmmConfig, creator_fee_share_rate kazanır (padding'den çıkarılmış, aynı boyut), yeni CreatorFeeShare PDA bunu yaratıcı başına geçersiz kılar ve CreateCreatorFeeShare / CloseCreatorFeeShare bunu yönetir. Her iki CollectCreatorFee yolu da hesap listelerini değiştirir — mevcut istemciler için kırıcı değişiklik. UpdateAmmConfig, param 8 kazanır. Yeni hata kodu yok, PoolState değişmez, swap matematiği dokunulmamış."
+---
+
+<Info>
+  **Bu sayfa yapay zekâ tarafından otomatik olarak çevrilmiştir. İngilizce sürüm esas alınır.**
+
+  [İngilizce sürümü görüntüle →](/reference/changelog/2026-09-13-cpmm-creator-fee-protocol-share)
+</Info>
+
+<Info>
+  Bu giriş, yaklaşan bir CPMM program güncellemesini kapsar. Dağıtımdan önce yerel yayın dalına karşı doğrulanmıştır (`0dde43d`, 11 Eylül 2026). Yeni talimatları veya değiştirilmiş hesap listelerini kullanmadan önce dağıtılan programı doğrulayın.
+</Info>
+
+CPMM'nin yaratıcı ücreti her zaman tamamen havuz yaratıcısına gitti. Bu yayın, protokolün bunun bir payını tutmasını sağlar — ücret katmanı başına veya ücret katmanında yaratıcı başına müzakere edilebilir — ücretin nasıl tahsil edildiğini etkilemeden.
+
+Patlama yarıçapını küçük tutan tasarım seçimi: **bölünme tahsil zamanında gerçekleşir, swap zamanında değil.** Bir swap yine de `creator_fee_rate` tahsil eder ve tüm tutarı `creator_fees_token_{0,1}` içinde tahakkuk ettirir. `CollectCreatorFee` veya `CollectCreatorFeePermissionless` çalıştığında, tahakkuk eden bakiye bölünür, protokolün payı aynı havuzda protokol ücreti olarak yeniden etiketlenir ve yalnızca yaratıcının payı kasadan çıkar. Teklifler, eğri, `k` ve her LP'ye yönelik yol etkilenmez.
+
+## Entegratörler için TL;DR
+
+- **Her iki yaratıcı-ücret tahsil talimatı da hesap listelerini değiştirdi. Bu kırıcı bir değişikliktir.** `CollectCreatorFee`, 5. konumda `creator_fee_share` kazanır. `CollectCreatorFeePermissionless`, 5. konumda `amm_config` ve 6. konumda `creator_fee_share` kazanır. Her iki ekleme de kasaların önünde yer alır, bu nedenle sonraki her şey kaymış olur. Bu işlemleri yeniden oluşturun; onları yamalamayın.
+- **`creator_fee_share` var olmasa bile iletilmelidir.** Bir seed kısıtlaması ile bildirilir ancak işaretlenmemiş bir hesap olarak okunur, bu nedenle adres `["creator_fee_share", creator, amm_config]` konumundaki kanonik PDA olmalıdır ve hesabın kendisi isteğe bağlıdır. Boş olduğunda, program `AmmConfig.creator_fee_share_rate` öğesine geri döner.
+- **`AmmConfig`, `creator_fee_share_rate` kazanır, padding'den çıkarılmış.** Hesap yine de **236 bayt** ve her mevcut config deserialize olmaya devam eder — ancak eski `padding: [u64; 15]` öğesinin ilk `u64` değeri artık canlı bir alandır. Kuyrağı 15 öğeli bir dizi olarak modelleyen dekoderler, paylaşım oranını `padding[0]` olarak okur.
+- **`PoolState` değişmez.** 637 bayt, aynı ofsetler, aynı alanlar. Protokolün payı mevcut `protocol_fees_token_{0,1}` sayaçlarına kaydedilir — yeni sayaç yok ve bunun için yeni tahsil talimatı yok.
+- **`protocol_fees_token*` artık swapların dışında büyür.** Protokol tahakkukunu ticaret hacmine karşı uzlaştıran herhangi bir monitör, her yaratıcı-ücret tahsilinde sıçramalar görecektir.
+- **`creator_fees_token*` okuyan bir yaratıcı-ödeme tahmincisi artık fazla tahmin eder.** `(1 − share_rate / 1_000_000)` ile çarpın, bu `(creator, amm_config)` çifti için çözülmüş.
+- **İki yönetici talimatı eklenir:** `CreateCreatorFeeShare` ve `CloseCreatorFeeShare`. **Bir yeni `UpdateAmmConfig` param:** `8` → `creator_fee_share_rate`.
+- **Yeni hata kodu yok.** Yeni yollar `InvalidOwner` (`6001`), `InvalidInput` (`6003`) ve `MathOverflow` (`6011`) öğelerini yeniden kullanır. `6000`–`6015` değişmez.
+- **Bir IDL yenilemesi gereklidir** — iki yeni talimat, bir yeni hesap türü, iki değiştirilmiş hesap listesi, bir yeni config alanı.
+
+## Bölünme nasıl çalışır
+
+Çözüm, öncelik sırasında:
+
+1. **`CreatorFeeShare` PDA** `["creator_fee_share", creator, amm_config]` konumunda — hesap var olduğunda ve CPMM'ye ait olduğunda, onun `share_rate` kazanır.
+2. **`AmmConfig.creator_fee_share_rate`** — ücret katmanının varsayılanı, aksi takdirde kullanılır.
+
+Her ikisi de `FEE_RATE_DENOMINATOR_VALUE = 1_000_000` üzerinde `u64` ve her ikisi de bu tavanla karşı kontrol edilir. Ardından, token tarafı başına:
+
+```rust
+// states/creator_fee_share.rs
+shared_amount  = floor(creator_fee * share_rate / 1_000_000);
+creator_amount = creator_fee - shared_amount;
+```
+
+```rust
+// states/pool.rs — PoolState::settle_creator_fee
+self.protocol_fees_token_i = self.protocol_fees_token_i.checked_add(shared_amount_i)?;
+self.creator_fees_token_i  = 0;
+// creator_amount_i döndürülür ve yaratıcıya aktarılır
+```
+
+Programın test ettiği üç özellik:
+
+- **Yuvarlama yaratıcıyı tercih eder.** Paylaşım tabanı alır, bu nedenle toz yaratıcıda kalır — `Fees::protocol_fee` ve `Fees::fund_fee` ile aynı yön, bunlar da zaten tahakkuk etmiş bir ücretin bir payını oyar. 1 birimlik bir ücretin %20'si 1 değil 0'dır.
+- **Değer korunur.** `creator_amount + shared_amount == creator_fee` her oran ve `u64::MAX` kadar her ücret için.
+- **`share_rate = 0` tam olarak eski davranıştır.** Hem varsayılan config değeri hem de eksik PDA yaratıcıya tüm ücreti verir, bu nedenle bir yönetici bir oran ayarlayana kadar mevcut havuzlar için hiçbir şey değişmez.
+
+`protocol_fees_token*` ve `creator_fees_token*` her ikisi de `vault_amount_without_fee` içinde zaten çıkarıldığından, aralarında değer taşımak eğrinin kasaya bakışını değiştirmez. Hiçbir LP, yaratıcı-ücret tahsilinde fiyat değişikliği görmez ve `k` kontrolü dokunulmamış kalır.
+
+<Note>
+  **Oran tahsil zamanında okunur, tahakkuk zamanında değil.** Oran `0` iken tahakkuk eden ücretler, birisi sonunda `Collect*` çağırdığında yürürlükte olan oranla kapatılır. Epoch başına veya swap başına anlık görüntü yok.
+</Note>
+
+## Hesap listesi değişiklikleri
+
+`CollectCreatorFee` — bir ekleme:
+
+| # | Önce | Sonra |
+|---|------|-------|
+| 1–4 | `creator`, `authority`, `pool_state`, `amm_config` | değişmez |
+| 5 | `token_0_vault` | **`creator_fee_share`** (yeni) |
+| 6.. | — | `token_0_vault` ve sonrası, birer kaymış |
+
+`CollectCreatorFeePermissionless` — iki ekleme:
+
+| # | Önce | Sonra |
+|---|------|-------|
+| 1–4 | `payer`, `creator`, `authority`, `pool_state` | değişmez |
+| 5 | `token_0_vault` | **`amm_config`** (yeni) |
+| 6 | `token_1_vault` | **`creator_fee_share`** (yeni) |
+| 7.. | — | `token_0_vault` ve sonrası, ikişer kaymış |
+
+<Warning>
+  Her iki değişiklik de yardımcı bir şekilde yüksek sesle başarısız olmaz. Eklenen hesaplar listenin sonunda değildir, bu nedenle eski bir istemci "bir hesabı kaçırmaz" — program kasayı bir config yerine beklerken programa iletir ve işlem deserializasyonda başarısız olur. Yeni IDL'den yeniden oluşturun ve sabitlediğiniz herhangi bir SDK yayınının yükseltilmiş programa işaret etmeden önce yeni hesapları taşıdığını kontrol edin.
+</Warning>
+
+Tam hesap tabloları [`products/cpmm/instructions`](/tr/products/cpmm/instructions#collectcreatorfee) içinde.
+
+## `CreateCreatorFeeShare` ve `CloseCreatorFeeShare`
+
+```rust
+pub struct CreatorFeeShare {
+    pub bump: u8,
+    pub creator: Pubkey,
+    pub amm_config: Pubkey,
+    pub share_rate: u64,
+    pub padding: [u64; 8],
+}
+// CreatorFeeShare::LEN == 145
+```
+
+`CreateCreatorFeeShare(share_rate: u64)` PDA'yı başlatır; `CloseCreatorFeeShare` onu kapatır ve kirayı imzalayana döndürür. Her ikisi de paylaşılan program yöneticisini **veya** programın diğer devredilen yetkilerine aynı devnet/mainnet `cfg` modelini izleyen yeni bir hardcoded anahtar çiftini kabul eder. Adresler [`reference/program-addresses`](/tr/reference/program-addresses#cpmm-creator-fee-share-authority) içinde.
+
+Dikkat edilecek noktalar:
+
+- **Havuz yaratıcısı her iki talimata da taraf değildir** ve imzalamaz. `creator` hesabı işaretlenmemiştir — PDA, henüz havuz sahibi olmayan bir anahtar için oluşturulabilir.
+- **Bir hesap bir `(creator, amm_config)` çiftini kapsar**, bu nedenle o yaratıcının bu ücret katmanında sahip olduğu her havuzu yönetir. İki katmanda havuzu olan bir yaratıcının her ikisinde de kapsanması için iki hesaba ihtiyacı vardır.
+- **Güncelleme yolu yok.** Aynı çift için ikinci oluşturma başarısız olur; bir oranı değiştirmek için kapatın ve yeniden oluşturun.
+
+## `UpdateAmmConfig` param 8
+
+```rust
+Some(8) => update_creator_fee_share_rate(amm_config, value),   // value <= 1_000_000 olduğunu doğrular
+```
+
+Ücret katmanının varsayılan payını ayarlar. Bu `protocol_fee_rate` (param `1`) ile ilgisizdir, bu da **ticaret** ücretini böler — yönetici araçlarında dikkatli olunması gereken bir nokta, çünkü ikisi de benzer görünür ve her ikisi de `protocol_fees_token*` içine iner.
+
+## Birlikte gidiyor
+
+**`CollectExcessLamports` sıralama düzeltmesi.** Talimat artık `remaining_accounts` üzerinde iki geçiş yapar — önce her token-program CPI, sonra CPMM'ye ait PDA'ların doğrudan borçları — çağıran sırasında gönderme yerine. İkisini birleştirmek, çalışma zamanının `UnbalancedInstruction` ("hesap bakiyelerinin toplamı talimat öncesi ve sonrası eşleşmiyor") ile iptal oldu, çünkü çağıranın bekleyen lamport değişiklikleri yalnızca bir CPI'nin gerçekten taşıdığı hesaplara aktarılır. Talimatın arayüzü değişmez; çağıranlar kaynakları herhangi bir sırada iletmeye devam eder ve şimdi bu gerçekten güvenlidir.
+
+**Doğrulanabilir derleme meta verileri.** Çalışma alanı `Cargo.toml`, `[workspace.metadata.cli] solana = "3.1.10"` bildirir, bu nedenle doğrulanabilir bir derleme programın derlendiği Solana CLI'yi çözer. Zincir üstü etki yok.
+
+## Değişmeyen şeyler
+
+- **`PoolState`** — 637 bayt, aynı alanlar, aynı ofsetler. Protokolün payı, kendi sayaçları eklemek yerine mevcut protokol kovasını yeniden kullanır.
+- **`AmmConfig::LEN`** — yine 236 bayt.
+- **Swap matematiği, alıntı ve `k` kontrolü.** Yaratıcı ücreti tam olarak önceki gibi tahsil edilir.
+- **`CollectProtocolFee` / `CollectFundFee`** — aynı hesaplar, aynı imzalayanlar. `CollectProtocolFee` basitçe daha fazla tahsil etmek için.
+- **Hata kodları.** `6000`–`6015` değişmez; hiçbir şey eklenmez.
+- **Diğer her talimat** ve program kimliği.
+
+## Güncellenen sayfalar
+
+- `products/cpmm/fees` — oran çözümü, bölünme aritmetiği, yuvarlama ve entegratör sonuçlarını kapsayan yeni "Yaratıcı ücretinin protokol payı" bölümü; `creator_fee_share_rate` oranlar/birimler listesine ve varsayılan parametreler tablosuna eklenir; tahsil akışı tablosu yeniden çalışılır.
+- `products/cpmm/instructions` — üstte kırıcı değişiklik uyarısı; her iki yaratıcı-ücret yolu için tam hesap tabloları; yeni `CreateCreatorFeeShare` ve `CloseCreatorFeeShare` bölümleri; `UpdateAmmConfig` param `8`; `CollectExcessLamports` sıralama notu; özet ve durum değişikliği matris satırları.
+- `products/cpmm/accounts` — yeni `CreatorFeeShare` hesap bölümü; `AmmConfig` düzeni ve padding-oyma uyarısı; `PoolState` ücret-sayaç notları; hesap-yaşam döngüsü satırları.
+- `products/cpmm/overview` — yaratıcı-ücret çıkışı ve "Öngörülebilir ücretler" madde işareti.
+- `products/cpmm/math` — bölünmenin kasıtlı olarak swap matematikten hariç tutulduğuna dair bir not.
+- `products/cpmm/code-demos` — yükseltme öncesi SDK oluşturucularının eski hesap listelerini yayınladığına dair uyarı; tahakkuk eden ücret snippet'i açıklanmış.
+- `reference/program-addresses` — yeni "CPMM yaratıcı-ücret-paylaşım yetkilisi" bölümü; `creator_fee_share` PDA-seed bloğuna eklenir.
+- `reference/fee-comparison` — `creator_fee_share_rate`, farklı bir tabanı olan dördüncü CPMM oranı olarak çağrılır.

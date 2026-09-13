@@ -1,0 +1,144 @@
+---
+title: "2026-09-13 — CPMM：协议分享创建者费用"
+description: "CPMM 现在可以保留创建者费用的可配置份额，在收取费用时而非收费时应用。AmmConfig 获得 creator_fee_share_rate（从填充中分割，大小相同），新的 CreatorFeeShare PDA 可按创建者覆盖它，CreateCreatorFeeShare / CloseCreatorFeeShare 管理它。两个 CollectCreatorFee 路径改变了账户列表——对现有客户端有破坏性。UpdateAmmConfig 获得参数 8。没有新的错误代码，没有 PoolState 变化，交换数学未改动。"
+---
+
+<Info>
+  **本页内容由 AI 自动翻译，所有内容以英文版本为准。**
+
+  [查看英文版 →](/reference/changelog/2026-09-13-cpmm-creator-fee-protocol-share)
+</Info>
+
+<Info>
+  本条目涵盖即将推出的 CPMM 程序更新。在部署前已根据本地发布分支（`0dde43d`，2026 年 9 月 11 日）进行验证。在依赖新指令或更改的账户列表之前，请确认已部署的程序。
+</Info>
+
+CPMM 的创建者费用一直完全流向池创建者。此版本让协议保留其中一部分——可按费用等级协商，或按费用等级按创建者协商——而不改变费用的收费方式。
+
+保持影响范围小的设计选择：**分割发生在收取时，而不是交换时。** 交换仍然收取 `creator_fee_rate` 并将整个金额累积到 `creator_fees_token_{0,1}`。当 `CollectCreatorFee` 或 `CollectCreatorFeePermissionless` 运行时，累积的余额被分割，协议的部分在同一池上被重新标记为协议费用，只有创建者的部分离开金库。报价、曲线、`k` 和每个 LP 面向的路径都不受影响。
+
+## 集成商速览
+
+- **两个创建者费用收取指令都改变了账户列表。这是破坏性的。** `CollectCreatorFee` 在位置 5 添加 `creator_fee_share`。`CollectCreatorFeePermissionless` 在位置 5 添加 `amm_config`，在位置 6 添加 `creator_fee_share`。两个插入都在金库之前，所以之后的所有内容都会移位。重新构建这些交易；不要修补它们。
+- **即使 `creator_fee_share` 不存在也必须传递。** 它用种子约束声明但作为未检查账户读取，所以地址必须是 `["creator_fee_share", creator, amm_config]` 处的规范 PDA，而账户本身是可选的。当它为空时，程序回退到 `AmmConfig.creator_fee_share_rate`。
+- **`AmmConfig` 获得 `creator_fee_share_rate`，从填充中分割出来。** 账户仍然是 **236 字节**，每个现有配置保持反序列化——但旧 `padding: [u64; 15]` 的第一个 `u64` 现在是活跃字段。将尾部建模为 15 元素数组的解码器将共享率读取为 `padding[0]`。
+- **`PoolState` 未改变。** 637 字节，相同的偏移，相同的字段。协议的份额被记入现有的 `protocol_fees_token_{0,1}` 计数器——没有新计数器，也没有新的收取指令。
+- **`protocol_fees_token*` 现在在交换外增长。** 任何根据交易量协调协议累积的监视器都会在每次创建者费用收取时看到跳跃。
+- **读取 `creator_fees_token*` 的创建者支付估计器现在会高估。** 乘以 `(1 − share_rate / 1_000_000)`，为该 `(creator, amm_config)` 对解析。
+- **添加了两个管理指令：** `CreateCreatorFeeShare` 和 `CloseCreatorFeeShare`。**一个新的 `UpdateAmmConfig` 参数：** `8` → `creator_fee_share_rate`。
+- **没有新的错误代码。** 新路径重用 `InvalidOwner`（`6001`）、`InvalidInput`（`6003`）和 `MathOverflow`（`6011`）。`6000`–`6015` 未改变。
+- **需要 IDL 刷新**——两个新指令，一个新账户类型，两个改变的账户列表，一个新配置字段。
+
+## 分割如何工作
+
+按优先级顺序解析：
+
+1. **`CreatorFeeShare` PDA** 在 `["creator_fee_share", creator, amm_config]`——当账户存在且由 CPMM 拥有时，其 `share_rate` 获胜。
+2. **`AmmConfig.creator_fee_share_rate`**——费用等级的默认值，否则使用。
+
+两者都是 `u64` 超过 `FEE_RATE_DENOMINATOR_VALUE = 1_000_000`，两者都根据该上限进行检查。然后，按每个代币侧：
+
+```rust
+// states/creator_fee_share.rs
+shared_amount  = floor(creator_fee * share_rate / 1_000_000);
+creator_amount = creator_fee - shared_amount;
+```
+
+```rust
+// states/pool.rs — PoolState::settle_creator_fee
+self.protocol_fees_token_i = self.protocol_fees_token_i.checked_add(shared_amount_i)?;
+self.creator_fees_token_i  = 0;
+// creator_amount_i is returned and transferred out to the creator
+```
+
+程序测试固定的三个属性：
+
+- **舍入有利于创建者。** 份额向下舍入，所以灰尘留给创建者——与 `Fees::protocol_fee` 和 `Fees::fund_fee` 相同的方向，它们也从已累积的费用中分割份额。1 单位费用的 20% 是 0，不是 1。
+- **价值守恒。** 对于每个费率和每个费用直到 `u64::MAX`，`creator_amount + shared_amount == creator_fee`。
+- **`share_rate = 0` 完全是旧行为。** 默认配置值和缺失的 PDA 都给创建者整个费用，所以对任何现有池没有任何改变，直到管理员设置费率。
+
+因为 `protocol_fees_token*` 和 `creator_fees_token*` 都已经在 `vault_amount_without_fee` 中减去，在它们之间移动价值不会改变曲线对金库的看法。没有 LP 会在创建者费用收取中看到价格变化，`k` 检查未改动。
+
+<Note>
+  **费率在收取时读取，而不是在累积时。** 在费率为 `0` 时累积的费用在最终有人调用 `Collect*` 时以任何有效的费率结算。没有按时期或按交换的快照。
+</Note>
+
+## 账户列表变化
+
+`CollectCreatorFee`——一个插入：
+
+| # | 之前 | 之后 |
+|---|--------|-------|
+| 1–4 | `creator`, `authority`, `pool_state`, `amm_config` | 未改变 |
+| 5 | `token_0_vault` | **`creator_fee_share`**（新） |
+| 6.. | — | `token_0_vault` 及之后所有内容，移位一个 |
+
+`CollectCreatorFeePermissionless`——两个插入：
+
+| # | 之前 | 之后 |
+|---|--------|-------|
+| 1–4 | `payer`, `creator`, `authority`, `pool_state` | 未改变 |
+| 5 | `token_0_vault` | **`amm_config`**（新） |
+| 6 | `token_1_vault` | **`creator_fee_share`**（新） |
+| 7.. | — | `token_0_vault` 及之后所有内容，移位两个 |
+
+<Warning>
+  两个变化都不会以有帮助的方式大声失败。插入的账户不在列表末尾，所以旧客户端不会"缺少账户"——它将金库交给程序，而程序期望配置，交易在反序列化时失败。从新 IDL 重新生成，并在指向升级程序之前检查你固定的任何 SDK 版本是否包含新账户。
+</Warning>
+
+完整账户表在 [`products/cpmm/instructions`](/zh/products/cpmm/instructions#collectcreatorfee)。
+
+## `CreateCreatorFeeShare` 和 `CloseCreatorFeeShare`
+
+```rust
+pub struct CreatorFeeShare {
+    pub bump: u8,
+    pub creator: Pubkey,
+    pub amm_config: Pubkey,
+    pub share_rate: u64,
+    pub padding: [u64; 8],
+}
+// CreatorFeeShare::LEN == 145
+```
+
+`CreateCreatorFeeShare(share_rate: u64)` 初始化 PDA；`CloseCreatorFeeShare` 关闭它并将租金返回给签名者。两者都接受共享程序管理员**或**专用创建者费用共享所有者——一个新的硬编码密钥对，遵循与程序其他委托权限相同的 devnet/mainnet `cfg` 模式。地址在 [`reference/program-addresses`](/zh/reference/program-addresses#cpmm-creator-fee-share-authority)。
+
+值得注意的要点：
+
+- **池创建者不是任何指令的一方**，也不签名。`creator` 账户未检查——PDA 可以为尚未拥有池的密钥创建。
+- **一个账户覆盖一个 `(creator, amm_config)` 对**，所以它管理该创建者在该费用等级上拥有的每个池。在两个等级上有池的创建者需要两个账户才能在两个等级上被覆盖。
+- **没有更新路径。** `init` 在同一对的第二次创建时失败；要改变费率，关闭并重新创建。
+
+## `UpdateAmmConfig` 参数 8
+
+```rust
+Some(8) => update_creator_fee_share_rate(amm_config, value),   // asserts value <= 1_000_000
+```
+
+设置费用等级的默认份额。它与 `protocol_fee_rate`（参数 `1`）无关，后者分割**交易**费用——在管理工具中值得小心的一点，因为两者看起来相似，都落入 `protocol_fees_token*`。
+
+## 搭便车
+
+**`CollectExcessLamports` 排序修复。** 指令现在对 `remaining_accounts` 进行两次传递——首先是每个代币程序 CPI，然后是 CPMM 拥有的 PDA 的直接借记——而不是按调用者顺序分派。当 PDA 在 CPI 之前被借记时，交错会因运行时的 `UnbalancedInstruction`（"指令前后账户余额之和不匹配"）而中止，因为调用者的待处理 lamport 变化仅在 CPI 实际携带的账户中刷新。指令的接口未改变；调用者仍然可以按任何顺序传递源，现在这确实是安全的。
+
+**可验证构建元数据。** 工作区 `Cargo.toml` 声明 `[workspace.metadata.cli] solana = "3.1.10"`，所以可验证构建解析程序构建时使用的相同 Solana CLI。没有链上影响。
+
+## 未改变的内容
+
+- **`PoolState`**——637 字节，相同字段，相同偏移。协议的份额重用现有协议桶而不是添加自己的计数器。
+- **`AmmConfig::LEN`**——仍然是 236 字节。
+- **交换数学、报价和 `k` 检查。** 创建者费用的收费方式完全相同。
+- **`CollectProtocolFee` / `CollectFundFee`**——相同账户，相同签名者。`CollectProtocolFee` 只是有更多要收取。
+- **错误代码。** `6000`–`6015` 未改变；没有追加。
+- **每个其他指令**和程序 ID。
+
+## 更新的页面
+
+- `products/cpmm/fees`——新的"创建者费用的协议份额"部分，涵盖费率解析、分割算术、舍入和集成商后果；`creator_fee_share_rate` 添加到费率/单位列表和默认参数表；收取流程表重新制作。
+- `products/cpmm/instructions`——顶部的破坏性变化警告；两个创建者费用路径的完整账户表；新的 `CreateCreatorFeeShare` 和 `CloseCreatorFeeShare` 部分；`UpdateAmmConfig` 参数 `8`；`CollectExcessLamports` 排序注释；摘要和状态变化矩阵行。
+- `products/cpmm/accounts`——新的 `CreatorFeeShare` 账户部分；`AmmConfig` 布局和填充分割警告；`PoolState` 费用计数器注释；账户生命周期行。
+- `products/cpmm/overview`——创建者费用标注和"可预测费用"项目符号。
+- `products/cpmm/math`——分割故意不在交换数学中的注释。
+- `products/cpmm/code-demos`——警告升级前 SDK 构建器发出旧账户列表；累积费用片段注释。
+- `reference/program-addresses`——新的"CPMM 创建者费用共享权限"部分；`creator_fee_share` 添加到 PDA 种子块。
+- `reference/fee-comparison`——`creator_fee_share_rate` 作为具有不同基数的第四个 CPMM 费率被调出。
