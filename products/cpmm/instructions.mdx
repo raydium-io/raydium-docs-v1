@@ -9,6 +9,10 @@ description: "Every instruction on the CPMM program, with its arguments, account
   The 2026-09 program upgrade rebuilt CPMM on Anchor 1.0.2 / Solana 3.1.10, added the admin instruction `CollectExcessLamports`, removed the hardcoded Token-2022 mint whitelist, and changed what `CreateAmmConfig` writes into `protocol_owner` / `fund_owner`. No user-facing instruction changed its accounts, arguments or math. See the [2026-09-09 changelog entry](/reference/changelog/2026-09-09-cpmm-anchor-1-and-excess-lamports).
 </Info>
 
+<Warning>
+  **Both creator-fee collection instructions changed their account lists on 2026-09-13.** `CollectCreatorFee` gains `creator_fee_share`; `CollectCreatorFeePermissionless` gains `amm_config` **and** `creator_fee_share`, inserted before the vaults, so every account after them shifts position. A client built against the older layout fails to deserialize. Two admin instructions — `CreateCreatorFeeShare` and `CloseCreatorFeeShare` — are added, and `UpdateAmmConfig` takes a new `param = 8`. See the [2026-09-13 changelog entry](/reference/changelog/2026-09-13-cpmm-creator-fee-protocol-share).
+</Warning>
+
 ## Instruction summary
 
 | Discriminator name | Who signs | What it does |
@@ -21,8 +25,8 @@ description: "Every instruction on the CPMM program, with its arguments, account
 | `SwapBaseOutput` | swapper | Exact-output swap (≤ `maximum_amount_in` in, `amount_out` out). |
 | `CollectProtocolFee` | `protocol_owner` (from `AmmConfig`) | Sweep accrued protocol fees from vaults. |
 | `CollectFundFee` | `fund_owner` (from `AmmConfig`) | Sweep accrued fund fees from vaults. |
-| `CollectCreatorFee` | `pool_creator` | Sweep accrued creator fees (if creator fee was enabled). |
-| `CollectCreatorFeePermissionless` | any payer | Sweep all accrued creator fees to the `pool_creator`'s canonical token accounts. The payer can create missing recipient ATAs but cannot redirect the transfer. |
+| `CollectCreatorFee` | `pool_creator` | Sweep accrued creator fees (if creator fee was enabled), net of the protocol's share, which is booked into the pool's protocol bucket. |
+| `CollectCreatorFeePermissionless` | any payer | Sweep accrued creator fees to the `pool_creator`'s canonical token accounts, net of the same protocol share. The payer can create missing recipient ATAs but cannot redirect the transfer. |
 | `UpdatePoolStatus` | `admin` | Pause / resume specific operations on a pool via a bitmask. |
 | `UpdateAmmConfig` | `admin` | Change fee rates or the protocol/fund owner on an `AmmConfig`. |
 | `CreateAmmConfig` | `admin` | Create a new fee tier (new `AmmConfig` account). |
@@ -31,6 +35,8 @@ description: "Every instruction on the CPMM program, with its arguments, account
 | `CreateSupportMintAssociated` | `admin` or the dedicated support-mint owner | Register a Token-2022 mint that would otherwise fail the extension allow-list, by creating its `SupportMintAssociated` PDA. |
 | `CloseSupportMintAssociated` | `admin` or the dedicated support-mint owner | Remove a mint's registration. |
 | `CollectExcessLamports` | `admin` or the dedicated collect-lamports wallet | Sweep lamports above the rent-exempt minimum from CPMM-controlled vaults, LP mints and PDAs. Added 2026-09. |
+| `CreateCreatorFeeShare` | `admin` or the dedicated creator-fee-share owner | Set a custom protocol share of the creator fee for one `(creator, amm_config)` pair, overriding `AmmConfig.creator_fee_share_rate`. Added 2026-09-13. |
+| `CloseCreatorFeeShare` | `admin` or the dedicated creator-fee-share owner | Remove that override; the pair falls back to the config default. Added 2026-09-13. |
 
 Status bitmask: each pool's `status` is a `u8` where bit 0 = deposit disabled, bit 1 = withdraw disabled, bit 2 = swap disabled (`PoolStatusBitIndex { Deposit, Withdraw, Swap }` in the program). A clear bit means the operation is allowed; a set bit means it is paused. `UpdatePoolStatus` takes a raw `u8` and overwrites the existing value.
 
@@ -307,13 +313,54 @@ Same shape as `CollectProtocolFee` but signed by `amm_config.fund_owner` — or,
 
 ## `CollectCreatorFee`
 
-Signed by `pool_state.pool_creator`. It transfers the full `creator_fees_token_0` and `creator_fees_token_1` balances to the creator's token accounts, then zeros both counters. It returns `NoFeeCollect` when both counters are zero.
+Signed by `pool_state.pool_creator`. It settles the accrued creator fee and transfers the creator's part to the creator's token accounts.
+
+**Arguments** — none.
+
+**Accounts**
+
+| # | Name | W | S | Notes |
+|---|------|---|---|-------|
+| 1 | `creator` | W | S | Constrained `address = pool_state.pool_creator`. |
+| 2 | `authority` |   |   | CPMM global vault authority PDA. |
+| 3 | `pool_state` | W |   | Holds the accrued creator-fee counters. |
+| 4 | `amm_config` |   |   | Constrained `address = pool_state.amm_config`. Carries the default `creator_fee_share_rate`. |
+| 5 | `creator_fee_share` |   |   | **Added 2026-09-13.** PDA at `["creator_fee_share", creator, amm_config]`. Must be passed on every call, but is **not required to exist** — when it is empty or not owned by CPMM the program falls back to `amm_config.creator_fee_share_rate`. The seed constraint still applies, so the address must be the canonical PDA. |
+| 6 | `token_0_vault` | W |   | Must match the pool's token 0 vault. |
+| 7 | `token_1_vault` | W |   | Must match the pool's token 1 vault. |
+| 8 | `vault_0_mint` |   |   | Must match `token_0_vault.mint`. |
+| 9 | `vault_1_mint` |   |   | Must match `token_1_vault.mint`. |
+| 10 | `creator_token_0` | W |   | Destination for the creator's part of token 0. |
+| 11 | `creator_token_1` | W |   | Destination for the creator's part of token 1. |
+| 12 | `token_0_program` |   |   | SPL Token or Token-2022, matching token 0. |
+| 13 | `token_1_program` |   |   | SPL Token or Token-2022, matching token 1. |
+| 14 | `associated_token_program` |   |   | |
+| 15 | `system_program` |   |   | |
+
+**Effect**
+
+```
+share_rate = creator_fee_share.share_rate   (if the account exists)
+           | amm_config.creator_fee_share_rate   (otherwise)
+
+shared_i  = floor(creator_fees_token_i * share_rate / 1_000_000)
+creator_i = creator_fees_token_i - shared_i
+
+transfer creator_i from vault_i to creator_token_i
+pool_state.protocol_fees_token_i += shared_i     // stays in the vault
+pool_state.creator_fees_token_i   = 0
+pool_state.recent_epoch = current epoch
+```
+
+The protocol's share never leaves the vault here — it is re-labelled as a protocol fee and waits for `CollectProtocolFee`. Both counters are already excluded from the curve's view of the vault, so the pool's price does not move. Full derivation in [`products/cpmm/fees`](/products/cpmm/fees#protocol-share-of-the-creator-fee).
+
+**Common errors** — `NoFeeCollect` when both creator counters are zero (checked before the split), `InvalidInput` (`6003`) if the resolved `share_rate` exceeds `1_000_000`, `MathOverflow` (`6011`) if booking the share would overflow `protocol_fees_token_*`, and Anchor's `ConstraintSeeds` error if `creator_fee_share` is not the canonical PDA.
 
 ## `CollectCreatorFeePermissionless`
 
-Anyone can trigger creator-fee collection. The instruction always sends the full accrued balances to the canonical associated token accounts owned by `pool_state.pool_creator`; the caller cannot choose another creator or destination. If either ATA is missing, the payer funds its creation.
+Anyone can trigger creator-fee collection. The instruction always sends the creator's part to the canonical associated token accounts owned by `pool_state.pool_creator`; the caller cannot choose another creator or destination. If either ATA is missing, the payer funds its creation.
 
-The original `CollectCreatorFee` remains callable, so existing clients stay compatible.
+The original `CollectCreatorFee` remains callable, so a creator who wants to sign for their own collection still can.
 
 **Arguments** — none.
 
@@ -325,22 +372,24 @@ The original `CollectCreatorFee` remains callable, so existing clients stay comp
 | 2 | `creator` |   |   | Must equal `pool_state.pool_creator`; does not sign. |
 | 3 | `authority` |   |   | CPMM global vault authority PDA. |
 | 4 | `pool_state` | W |   | Holds the accrued creator-fee counters. |
-| 5 | `token_0_vault` | W |   | Must match the pool's token 0 vault. |
-| 6 | `token_1_vault` | W |   | Must match the pool's token 1 vault. |
-| 7 | `vault_0_mint` |   |   | Must match `token_0_vault.mint`. |
-| 8 | `vault_1_mint` |   |   | Must match `token_1_vault.mint`. |
-| 9 | `creator_token_0` | W |   | Creator's canonical ATA for `vault_0_mint`; created if missing. |
-| 10 | `creator_token_1` | W |   | Creator's canonical ATA for `vault_1_mint`; created if missing. |
-| 11 | `token_0_program` |   |   | SPL Token or Token-2022, matching token 0. |
-| 12 | `token_1_program` |   |   | SPL Token or Token-2022, matching token 1. |
-| 13 | `associated_token_program` |   |   | Creates a missing recipient ATA. |
-| 14 | `system_program` |   |   | Funds account creation from `payer`. |
+| 5 | `amm_config` |   |   | **Added 2026-09-13.** Constrained `address = pool_state.amm_config`. |
+| 6 | `creator_fee_share` |   |   | **Added 2026-09-13.** Same PDA and same optional-existence rule as on `CollectCreatorFee`. |
+| 7 | `token_0_vault` | W |   | Must match the pool's token 0 vault. |
+| 8 | `token_1_vault` | W |   | Must match the pool's token 1 vault. |
+| 9 | `vault_0_mint` |   |   | Must match `token_0_vault.mint`. |
+| 10 | `vault_1_mint` |   |   | Must match `token_1_vault.mint`. |
+| 11 | `creator_token_0` | W |   | Creator's canonical ATA for `vault_0_mint`; created if missing. |
+| 12 | `creator_token_1` | W |   | Creator's canonical ATA for `vault_1_mint`; created if missing. |
+| 13 | `token_0_program` |   |   | SPL Token or Token-2022, matching token 0. |
+| 14 | `token_1_program` |   |   | SPL Token or Token-2022, matching token 1. |
+| 15 | `associated_token_program` |   |   | Creates a missing recipient ATA. |
+| 16 | `system_program` |   |   | Funds account creation from `payer`. |
 
-**Effect**
+<Warning>
+  The two new accounts are inserted at positions 5 and 6, **before** the vaults. Every account from `token_0_vault` onward moved by two. A transaction built against the pre-2026-09 fourteen-account layout does not fail a constraint — it misreads the vaults as config accounts and fails deserialization. Rebuild it, do not patch it.
+</Warning>
 
-- Transfers all of `creator_fees_token_0` and `creator_fees_token_1` from the pool vaults to the creator ATAs.
-- Zeros both creator-fee counters and updates `pool_state.recent_epoch`.
-- Returns `NoFeeCollect` when both counters are zero.
+**Effect** — identical to `CollectCreatorFee` above: the share is resolved from `creator_fee_share` or `amm_config`, the protocol's part is booked into `protocol_fees_token_{0,1}`, the creator's part is transferred to the creator ATAs, both creator counters are zeroed, and `recent_epoch` is updated. Returns `NoFeeCollect` when both counters are zero.
 
 ## `UpdatePoolStatus`
 
@@ -413,10 +462,66 @@ Change fee rates or ownership on an existing `AmmConfig`. Takes a `param: u8` (w
 - `param = 5` → `create_pool_fee`
 - `param = 6` → `disable_create_pool` (any non-zero `value` disables)
 - `param = 7` → `creator_fee_rate` (asserts `creator_fee_rate + trade_fee_rate < 1_000_000`)
+- `param = 8` → `creator_fee_share_rate` (asserts `≤ 1_000_000`). Added 2026-09-13. The protocol's default share **of the creator fee** on this tier; see [`products/cpmm/fees`](/products/cpmm/fees#protocol-share-of-the-creator-fee). It is not related to `protocol_fee_rate`, which splits the trade fee.
 
 Any other `param` returns `InvalidInput`.
 
 Changes are signed by the admin and affect **every pool bound to this `AmmConfig`** on the next swap. No migration; pools simply read the new values.
+
+## `CreateCreatorFeeShare`
+
+Set a custom protocol share of the creator fee for one `(creator, amm_config)` pair, overriding `AmmConfig.creator_fee_share_rate` for every pool that creator owns on that fee tier. Added in the 2026-09-13 creator-fee-share upgrade.
+
+**Arguments**
+
+```
+share_rate: u64   // protocol's share OF the creator fee, over FEE_RATE_DENOMINATOR = 1_000_000
+```
+
+**Accounts**
+
+| # | Name | W | S | Notes |
+|---|------|---|---|-------|
+| 1 | `owner` | W | S | Must be the CPMM program admin **or** the dedicated creator-fee-share owner — see [`reference/program-addresses`](/reference/program-addresses#cpmm-creator-fee-share-authority). Any other signer fails with `InvalidOwner` (`6001`). Pays rent. |
+| 2 | `creator` |   |   | The pool creator the rate applies to. Unchecked — it does not have to be an existing pool creator, and it does not sign. |
+| 3 | `amm_config` |   |   | The fee tier the rate applies to. |
+| 4 | `creator_fee_share` | W |   | `init`ed here at `["creator_fee_share", creator, amm_config]`, `space = 145`. |
+| 5 | `system_program` |   |   | |
+
+**Preconditions**
+
+- `share_rate <= 1_000_000`, otherwise `InvalidInput` (`6003`).
+- The PDA must not already exist — Anchor's `init` fails on a second call for the same pair. To change a rate, close the account and create it again.
+
+**Postconditions**
+
+- `creator_fee_share` stores `bump`, `creator`, `amm_config` and `share_rate`.
+- Every subsequent `CollectCreatorFee` / `CollectCreatorFeePermissionless` on a pool created by `creator` under `amm_config` resolves the share from this account instead of the config.
+
+<Note>
+  The pool creator is not a party to this instruction and does not sign it. The rate is read at collection time, so an override created after fees have already accrued applies to that accrued balance too.
+</Note>
+
+## `CloseCreatorFeeShare`
+
+Remove the override. The pair falls back to `AmmConfig.creator_fee_share_rate`.
+
+**Arguments** — none.
+
+**Accounts**
+
+| # | Name | W | S | Notes |
+|---|------|---|---|-------|
+| 1 | `owner` | W | S | Same two accepted signers as `CreateCreatorFeeShare`; receives the rent. |
+| 2 | `creator` |   |   | The pool creator the rate applied to. |
+| 3 | `amm_config` |   |   | The fee tier the rate applied to. |
+| 4 | `creator_fee_share` | W |   | Closed to `owner`. Must be the canonical PDA for the pair. |
+| 5 | `system_program` |   |   | |
+
+**Postconditions**
+
+- The account is closed and its lamports go to `owner`.
+- Collections for that pair resolve the share from `amm_config.creator_fee_share_rate` again — which is `0` unless an admin has set `UpdateAmmConfig` param `8`.
 
 ## `CollectExcessLamports`
 
@@ -435,6 +540,10 @@ Only the excess moves. Token balances, account data, owners, pool state and the 
 | 3 | `token_program` |   |   | SPL Token. |
 | 4 | `token_program_2022` |   |   | Token-2022. Both are required unconditionally; the program picks per source account. |
 | 5.. | `remaining_accounts` | W |   | `M` source accounts to sweep, any number, any order. |
+
+<Note>
+  **Ordering fix, 2026-09-13.** The program now makes two passes over `remaining_accounts` — every token-program CPI first, then the direct debits of CPMM-owned PDAs. Interleaving them aborted with the runtime's `UnbalancedInstruction` ("sum of account balances before and after instruction do not match") whenever a PDA was debited ahead of a CPI, because the caller's pending lamport changes are only flushed into accounts a CPI actually carries. Callers do not have to group or sort the list themselves.
+</Note>
 
 **How each source account is handled**
 
@@ -466,9 +575,11 @@ Because it takes an unbounded `remaining_accounts` list, transaction size is the
 | `SwapBaseOutput` | — | + in, − out | + `trade_fee` split into protocol/fund; + `creator_fee` if enabled | + (if interval elapsed) |
 | `CollectProtocolFee` | — | − (by protocol buckets) | `protocol_*` → 0 | — |
 | `CollectFundFee` | — | − (by fund buckets) | `fund_*` → 0 | — |
-| `CollectCreatorFee` | — | − (by creator buckets) | `creator_*` → 0 | — |
-| `CollectCreatorFeePermissionless` | — | − (by creator buckets) | `creator_*` → 0 | — |
+| `CollectCreatorFee` | — | − (by the creator's part only) | `creator_*` → 0; `protocol_*` += the shared part | — |
+| `CollectCreatorFeePermissionless` | — | − (by the creator's part only) | `creator_*` → 0; `protocol_*` += the shared part | — |
 | `UpdatePoolStatus` | — | — | — | — |
+| `CreateCreatorFeeShare` | — | — | — | — |
+| `CloseCreatorFeeShare` | — | — | — | — |
 | `CollectExcessLamports` | — | — (token balances unchanged) | — | — |
 
 ## Where to go next
