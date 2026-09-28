@@ -5,6 +5,8 @@ description: "Complete CLMM instruction reference: pool lifecycle, position mana
 
 <Info>
   This page pairs with [`products/clmm/accounts`](/products/clmm/accounts) (what the accounts are) and [`products/clmm/math`](/products/clmm/math) (what the math is). It is authoritative for arguments and account ordering; specific byte layouts come from the IDL.
+
+  The 2026-09 program upgrade rebuilt CLMM on Anchor 1.0.2 / Solana 3.1.10, added the admin instruction `CollectExcessLamports`, and changed what `CreateAmmConfig` writes into `owner` / `fund_owner`. No user-facing instruction changed its accounts, arguments or math. See the [2026-09-30 changelog entry](/reference/changelog/2026-09-30-clmm-anchor-1-and-excess-lamports).
 </Info>
 
 ## Instruction inventory
@@ -44,6 +46,7 @@ description: "Complete CLMM instruction reference: pool lifecycle, position mana
 | Rewards | `TransferRewardOwner` | Transfer the authority that can set or top up a reward stream. |
 | Rewards | `CollectRemainingRewards` | After a reward stream's `end_time`, sweep any unallocated tokens back to the funder. |
 | Admin | `CloseSupportMintAssociated` | Remove a mint's `SupportMintAssociated` registration and refund its rent. |
+| Admin | `CollectExcessLamports` | Sweep lamports above the rent-exempt minimum from one pool's `PoolState` and vaults, plus any CLMM-owned PDAs passed in. `admin` or the dedicated collect-lamports wallet. Added 2026-09. |
 
 <Note>
   **There is no init-tick-array instruction, and none is needed.** A tick array is created *inside*
@@ -53,7 +56,7 @@ description: "Complete CLMM instruction reference: pool lifecycle, position mana
   `OpenLimitOrder` does the same for its single `tick_array`.
 </Note>
 
-Most admin-only instructions (`CreateAmmConfig`, `UpdateAmmConfig`, `UpdatePoolStatus`, `CreateOperationAccount`, `UpdateOperationAccount`, `CloseProtocolPosition`) are gated by the program's hardcoded `admin` pubkey. `CreatePermissionPda` / `ClosePermissionPda` accept either the `admin` pubkey **or** a dedicated `permission_pda_admin` key; `CreateSupportMintAssociated` / `CloseSupportMintAssociated` accept either the `admin` pubkey **or** a dedicated support-mint owner key. Reward-stream admin instructions (`TransferRewardOwner`, `CollectRemainingRewards`) are gated by the reward funder, not the program admin.
+Most admin-only instructions (`CreateAmmConfig`, `UpdateAmmConfig`, `UpdatePoolStatus`, `CreateOperationAccount`, `UpdateOperationAccount`, `CloseProtocolPosition`) are gated by the program's hardcoded `admin` pubkey. `CreatePermissionPda` / `ClosePermissionPda` accept either the `admin` pubkey **or** a dedicated `permission_pda_admin` key; `CreateSupportMintAssociated` / `CloseSupportMintAssociated` accept either the `admin` pubkey **or** a dedicated support-mint owner key; `CollectExcessLamports` accepts either the `admin` pubkey **or** a dedicated collect-lamports wallet. Reward-stream admin instructions (`TransferRewardOwner`, `CollectRemainingRewards`) are gated by the reward funder, not the program admin.
 
 V2 suffix means "supports Token-2022 on vaults / NFT, requires bitmap-extension slot". The SDK picks V2 by default for new pools.
 
@@ -650,6 +653,58 @@ Sweep accrued protocol/fund fees from the pool's vaults to a recipient, zeroing 
 | 10 | `token_program` |   |   | |
 | 11 | `token_program_2022` |   |   | |
 
+<Note>
+  **Changed in 2026-09: new configs no longer take their fee owners from the signer.** `create_amm_config` now writes the program's hardcoded `protocol_fee_owner::ID` into `owner` and `fund_fee_owner::ID` into `fund_owner`. Before, it copied the admin signer's key into both. On mainnet these are the same keys already stored on all 21 existing configs. Addresses are in [`reference/program-addresses`](/reference/program-addresses#clmm-fee-owner-wallets).
+
+  The accepted signers above are unchanged. The admin can still collect from any config, and **existing `AmmConfig` accounts are not rewritten**. Read `owner` / `fund_owner` off the account instead of assuming either value. `UpdateAmmConfig` params `3` and `4` still rotate them.
+</Note>
+
+## `CollectExcessLamports`
+
+Admin sweep of lamports above the rent-exempt minimum on accounts CLMM controls. It was added in the 2026-09 upgrade to reclaim the over-funding that the [SIMD-0437 rent reduction](/solana-fundamentals/rent-and-reclaimable-rent) leaves on accounts created before each step.
+
+Only the excess moves. Token balances, account data, owners, pool state and the price curve are untouched. An account already at its minimum is left as is, so the instruction can be re-run safely after each rollout step.
+
+**Arguments**: none.
+
+**Accounts**
+
+| # | Name | W | S | Notes |
+|---|------|---|---|-------|
+| 1 | `collect_lamports_wallet` | W | S | Receives every swept lamport. Must be the CLMM program admin or the dedicated collect-lamports wallet (see [`reference/program-addresses`](/reference/program-addresses#excess-lamports-collection-wallets)). Any other signer fails with `NotApproved`. |
+| 2 | `pool_state` | W |   | The pool being swept. Its PDA seeds sign the token-program CPIs, and the account is always swept itself. |
+| 3 | `token_program` |   |   | SPL Token. |
+| 4 | `token_program_2022` |   |   | Token-2022. Both programs are required; the instruction picks one per source account. |
+| 5.. | `remaining_accounts` | W |   | `M` source accounts, any number, any order. |
+
+**Scope: one pool per call.** CLMM has no program-wide vault authority. Each pool's vaults are owned by its own `PoolState`. Every token-program source must therefore have the `pool_state` in slot 2 as its authority: `token_vault_0`, `token_vault_1`, or one of that pool's reward vaults. If you pass another pool's vault or a user's token account, the token program's owner check fails and the whole instruction reverts. It is not skipped. Position NFT mints cannot be swept, because their mint authority is revoked when the position is opened.
+
+**How each source account is handled**
+
+The program makes two passes over `remaining_accounts`: every token-program CPI first, then the direct debits. Interleaving the two aborts with the runtime's `UnbalancedInstruction` error, so the order is fixed in the program and you don't have to sort the list yourself.
+
+| Pass | Source account owner | Handling |
+|---|---|---|
+| 1 | SPL Token or Token-2022, non-native token account | CPI `WithdrawExcessLamports` (token-program discriminant `38`), signed by `pool_state`. |
+| 1 | SPL Token or Token-2022, **native** (wSOL) token account | `WithdrawExcessLamports` rejects native accounts. The program CPIs `SyncNative`, measures how much the wrapped `amount` grew, and calls `UnwrapLamports` (discriminant `45`) for exactly that delta. It then requires the wrapped balance to equal its pre-sync value, or fails with `LamportsCalculateError` (`6052`). A SOL-side pool vault keeps its full liquidity. |
+| 2 | `pool_state` (slot 2) | Debited directly down to `rent.minimum_balance(data_len)`. |
+| 2 | The CLMM program: `AmmConfig`, `ObservationState`, `TickArrayBitmapExtension`, `TickArrayState`, `PersonalPositionState`, `LimitOrderState`, and so on | Debited directly down to `rent.minimum_balance(data_len)`. The account does **not** have to belong to the pool in slot 2. |
+| — | Anything else | **Skipped silently.** No error, no lamports moved. |
+
+<Warning>
+  **Pass 2 covers accounts whose rent a user paid.** A `PersonalPositionState` or `LimitOrderState` passed here gives up its excess like any other CLMM-owned account. It stays rent-exempt and keeps its data. When it is later closed, the owner gets back whatever the account holds at that point, which after a sweep is the current rent minimum.
+</Warning>
+
+Transaction size is the real limit on how many sources fit in one call. It is the same constraint as the wallet-side sweep described in [`solana-fundamentals/rent-and-reclaimable-rent`](/solana-fundamentals/rent-and-reclaimable-rent#batching-how-many-fit-in-one-transaction).
+
+**Common errors**:
+- `NotApproved` (`6000`): wrong signer.
+- `LamportsCalculateError` (`6052`): the wSOL round-trip did not net to zero.
+- A token-program owner-mismatch error: a token source is not owned by `pool_state`.
+- `InsufficientFunds`: a program-owned account holds less than its own rent minimum.
+
+**No SDK builder.** `@raydium-io/raydium-sdk-v2` does not ship a builder for this admin path. Encode it by hand from the IDL.
+
 ## `InitializeReward`
 
 Add a new reward stream to a pool. Up to 3 streams may be active at once.
@@ -726,6 +781,7 @@ reward, in the order `reward_token_vault(W)`, `recipient_token_account(W)`, `rew
 | `CloseLimitOrder` | — | — | — | — | — |
 | `CreateCustomizablePool` | 0 | 0 | — | — | — |
 | `UpdateRewardInfos` | — | — | + | — | — |
+| `CollectExcessLamports` | — | — | — | — | — (lamports only; token balances unchanged) |
 
 ## Where to go next
 

@@ -1,0 +1,131 @@
+---
+title: "2026-09-30 — CLMM : Anchor 1.0, récupération des lamports excédentaires et propriétaires de frais fixes"
+description: "CLMM passe à Anchor 1.0.2 sur Agave 3.1.10 et ajoute une instruction admin CollectExcessLamports pour les loyers libérés par SIMD-0437, balayés un pool à la fois avec le PDA du pool comme signataire. CreateAmmConfig écrit maintenant les propriétaires de frais de protocole et de fonds codés en dur au lieu du signataire. L'erreur 6052 est ajoutée. Aucune instruction ou disposition de compte visible par l'utilisateur n'a changé."
+---
+
+<Info>
+  **Cette page est traduite automatiquement par IA. La version anglaise fait foi.**
+
+  [Voir la version anglaise →](/reference/changelog/2026-09-30-clmm-anchor-1-and-excess-lamports)
+</Info>
+
+<Info>
+  Cette entrée couvre une mise à jour du programme CLMM à venir. Elle a été vérifiée par rapport à la branche `chore/upgrade-anchor` de `raydium-clmm` (head `a72f9e1`) avant le déploiement. Confirmez le programme déployé avant de vous fier à la nouvelle instruction ou au comportement modifié de `CreateAmmConfig`.
+</Info>
+
+CLMM reçoit maintenant la même migration de framework que CPMM et LaunchLab ont déployée le [2026-09-09](/fr/reference/changelog/2026-09-09-cpmm-anchor-1-and-excess-lamports). Anchor passe de `0.32.1` à `=1.0.2`, et la chaîne d'outils de compilation passe d'Agave 2.3.0 à 3.1.10. Deux changements côté admin accompagnent cette migration : une nouvelle instruction `CollectExcessLamports` et des propriétaires de frais fixes dans `CreateAmmConfig`.
+
+Chaque instruction qu'un trader, un LP, un utilisateur de limite d'ordre ou un créateur de pool appelle conserve sa liste de comptes, ses arguments et ses calculs.
+
+## TL;DR pour les intégrateurs
+
+- **Aucune instruction visible par l'utilisateur n'a changé.** `CreatePool`, `CreateCustomizablePool`, `CreatePermissionedPool`, tous les chemins `OpenPosition*` / `IncreaseLiquidity*` / `DecreaseLiquidity*`, `ClosePosition`, `Swap` / `SwapV2` / `SwapRouterBaseIn`, les cinq instructions de limite d'ordre et les instructions de récompense sont identiques sur le fil. Aucune disposition de compte n'a changé.
+- **Une instruction est ajoutée : `CollectExcessLamports`.** Elle est réservée à l'admin et ne prend aucun argument. Elle balaye **un pool par appel** : le `PoolState` du pool est toujours balayé, et le PDA du pool signe pour ses coffres, que vous passez dans `remaining_accounts`. Tout autre compte appartenant à CLMM dans `remaining_accounts` est également balayé. Voir [`products/clmm/instructions`](/fr/products/clmm/instructions#collectexcesslamports).
+- **Un code d'erreur est ajouté : `6052` `LamportsCalculateError`.** Les codes `6000`–`6051` restent inchangés.
+- **`CreateAmmConfig` ne copie plus le signataire dans `owner` / `fund_owner`.** Les nouvelles configurations obtiennent des clés `protocol_fee_owner` et `fund_fee_owner` codées en dur. Sur mainnet, ce sont les deux mêmes clés déjà stockées sur les 21 configurations existantes. **Les comptes `AmmConfig` existants restent inchangés**, continuez donc à lire les champs du compte.
+- **Actualisez votre IDL.** Il ajoute une instruction et une variante d'erreur, pour 39 instructions et 53 erreurs.
+- **Vous pouvez maintenant mettre CPMM et CLMM dans une seule caisse.** Les deux dépôts épinglent `anchor-lang` / `anchor-spl` `=1.0.2` sur leurs branches `chore/upgrade-anchor`, donc un seul programme peut faire un CPI dans les deux. Voir [`sdk-api/rust-cpi`](/fr/sdk-api/rust-cpi#cargo-dependencies).
+- **Le paquet client TypeScript est renommé.** La suite de tests passe de `@coral-xyz/anchor` `0.32.1` à `@anchor-lang/core` `1.0.2`.
+
+## `CollectExcessLamports`
+
+L'étape 1 de [SIMD-0437](/fr/solana-fundamentals/rent-and-reclaimable-rent) s'est activée sur mainnet le 3 septembre 2026. Chaque compte CLMM créé avant une étape est maintenant surfinancé, et seul le programme CLMM peut déplacer des lamports hors d'un compte qu'il possède. Cela couvre les coffres de pool, les coffres de récompense, `PoolState`, `AmmConfig`, `ObservationState`, `TickArrayBitmapExtension` et le reste.
+
+L'instruction prend quatre comptes fixes, puis un nombre quelconque de comptes source dans `remaining_accounts` :
+
+| # | Compte | Rôle |
+|---|---|---|
+| 1 | `collect_lamports_wallet` (W, S) | Signataire et destination. Il doit être l'admin du programme partagé ou le portefeuille dédié de collecte de lamports CLMM, sinon l'appel échoue avec `NotApproved` (`6000`). |
+| 2 | `pool_state` (W) | Signe les CPI du programme de jetons via ses graines PDA, et est toujours balayé lui-même. |
+| 3 | `token_program` | SPL Token. |
+| 4 | `token_program_2022` | Token-2022. Les deux sont requis ; le programme en choisit un par compte source. |
+
+**Le pool est l'autorité de signature, pas un PDA à l'échelle du programme.** CPMM signe avec une autorité `vault_and_lp_mint_auth_seed` globale unique. Les coffres de jetons CLMM sont possédés par leur `PoolState`, donc un seul appel ne peut signer que pour le pool passé dans l'emplacement 2. Chaque compte de programme de jetons doit avoir ce pool comme autorité : `token_vault_0`, `token_vault_1`, ou l'un des coffres de récompense du pool. Un compte de jetons d'un autre pool, ou un compte de jetons d'un utilisateur, échoue la vérification du propriétaire du programme de jetons et annule l'instruction entière. Le programme ne le saute pas. Les mints NFT de position ne sont pas balayables non plus, car leur autorité de mint est révoquée à l'ouverture de la position. Balayez pool par pool.
+
+L'instruction fait deux passes, et cet ordre est fixe :
+
+1. **Les CPI du programme de jetons en premier.** Pour chaque source possédée par SPL Token ou Token-2022, un compte non natif obtient `WithdrawExcessLamports` (discriminant `38`). Un coffre wSOL natif obtient le cycle `SyncNative` → `UnwrapLamports` (discriminant `45`), qui se termine par une vérification que le solde enveloppé égale sa valeur pré-synchronisation. S'il ne l'est pas, l'appel échoue avec `LamportsCalculateError`. **Un coffre côté SOL conserve sa liquidité complète**, et aucune cotation de swap ne change lors d'un balayage.
+2. **Les débits directs en second.** La passe 2 débite `pool_state` en premier, puis chaque source possédée par le programme CLMM, jusqu'à `rent.minimum_balance(data_len)`.
+
+Les sources possédées par tout autre programme sont ignorées silencieusement. Cet ordre à deux passes est celui que CPMM a adopté le [2026-09-19](/fr/reference/changelog/2026-09-19-cpmm-creator-fee-protocol-share). CLMM l'a depuis sa première version. Si un PDA est débité avant un CPI, le runtime s'arrête avec `UnbalancedInstruction`, donc les appelants peuvent passer les sources dans n'importe quel ordre.
+
+<Warning>
+  **La passe possédée par le programme ne vérifie pas quel pool ou quel utilisateur un compte appartient.** Tout compte possédé par le programme CLMM est éligible, y compris certains dont un utilisateur a payé le loyer : `PersonalPositionState`, `LimitOrderState` et `TickArrayState`. Seul l'excédent au-dessus du minimum exempt de loyer se déplace. Le compte conserve ses données et reste exempt de loyer. Lorsqu'une position ou une commande est fermée ultérieurement, le programme rembourse le solde que le compte détient à ce moment. Après un balayage, ce solde est le minimum de loyer actuel.
+</Warning>
+
+Les adresses de portefeuille sont listées dans [`reference/program-addresses`](/fr/reference/program-addresses#excess-lamports-collection-wallets).
+
+## `CreateAmmConfig` écrit les propriétaires de frais fixes
+
+Avant cette version, `create_amm_config` définissait les deux champs de propriétaire de frais à partir du signataire appelant :
+
+```rust
+amm_config.owner      = ctx.accounts.owner.key();
+amm_config.fund_owner = ctx.accounts.owner.key();
+```
+
+Il écrit maintenant les constantes du programme :
+
+```rust
+amm_config.owner      = crate::protocol_fee_owner::ID;
+amm_config.fund_owner = crate::fund_fee_owner::ID;
+```
+
+`CreateAmmConfig` est toujours limité à `crate::admin::ID`. Avant cette version, chaque nouveau palier de frais commençait avec l'admin dans les deux champs et devait être pivoté avec le paramètre `UpdateAmmConfig` `3` / `4`. Maintenant, il commence avec les portefeuilles opérationnels. Sur mainnet, les constantes sont les mêmes clés déjà stockées comme `owner` / `fund_owner` sur les 21 configurations existantes. Le programme écrit maintenant une valeur que les opérations avaient l'habitude de définir manuellement.
+
+Les signataires de collecte ne changent pas. `CollectProtocolFee` accepte `amm_config.owner` **ou** `crate::admin::ID`, et `CollectFundFee` accepte `amm_config.fund_owner` **ou** `crate::admin::ID`, avant et après cette version.
+
+Sur devnet, les deux constantes se résolvent à la même clé. Voir [`reference/program-addresses`](/fr/reference/program-addresses#clmm-fee-owner-wallets).
+
+<Warning>
+  **Ce n'est pas une migration.** Chaque `AmmConfig` existant conserve le `owner` et le `fund_owner` qu'il possède déjà. Lisez les champs plutôt que de coder en dur l'une des constantes ou la clé d'admin.
+</Warning>
+
+## Changements de chaîne d'outils et de dépendances
+
+| Élément | Avant | Après |
+|---|---|---|
+| `anchor-lang` / `anchor-spl` (programme) | `=0.32.1` | `=1.0.2` |
+| Chaîne d'outils `Anchor.toml` | `[tool-chain]`, `solana-version = "2.3.0"` | `[toolchain]`, `solana_version = "3.1.10"` |
+| `Cargo.toml` de l'espace de travail | — | `[workspace.metadata.cli] solana = "3.1.10"` |
+| `anchor-client` / `anchor-lang` (caisse client) | `0.32.1` | `1.0.2` |
+| `solana-sdk` / `-client` / `-account-decoder` / `-transaction-status` (caisse client) | `2.3.0` | `3` |
+| `spl-token` / `spl-token-2022` (caisse client) | `7.0.0` / `7.0.0` | `9.0` / `11.0` |
+| `spl-associated-token-account` / `spl-memo` / `spl-token-client` (caisse client) | `6.0.0` / `6.0.0` / `0.14.0` | `8.0` / `7.0` / `0.19` |
+| `mpl-token-metadata` (caisse client) | `5.1.0` | `=5.1.2-alpha.2` |
+| Nouvelles caisses client | — | `solana-system-interface` `3.2`, `solana-commitment-config` `3`, `solana-compute-budget-interface` `3` |
+| Image Docker | `solanafoundation/anchor:v0.32.1` | `solanafoundation/anchor:v1.0.2` |
+| `@coral-xyz/anchor` | `0.32.1` | remplacé par `@anchor-lang/core` `1.0.2` |
+| `typescript` | `^4.3.5` | `^5.6.3` |
+
+Les changements Anchor 1.0 aux sites d'appel CPI sont les mêmes que ceux que les intégrateurs CPMM ont déjà gérés. `CpiContext::new` prend le `Pubkey` du programme plutôt que son `AccountInfo`, et `Context` a un paramètre de durée de vie au lieu de quatre. Dans la caisse client, `RequestBuilder::instructions()` retourne maintenant `Vec<Instruction>` sans `Result`, et `system_program` a été déplacé vers `solana-system-interface`. Voir [`sdk-api/rust-cpi`](/fr/sdk-api/rust-cpi#cargo-dependencies).
+
+Détails du système de compilation sans effet sur la chaîne :
+
+- **Admin localnet.** La fonctionnalité `localnet` ne compile plus une clé de test fixe sauvegardée par une fixture engagée. Au lieu de cela, elle lit l'admin à partir de la variable d'environnement `CLMM_LOCALNET_ADMIN` au moment de la compilation, que `yarn test:local-admin` définit à partir de votre portefeuille local. L'exception `.gitignore` de la fixture est supprimée.
+- **Profil de version.** Le bloc `[profile.release]` dupliqué dans `programs/amm/Cargo.toml` a été supprimé. Cargo ignore `[profile]` en dehors de la racine de l'espace de travail, donc le bloc racine était déjà celui en vigueur, et le `panic = "abort"` au niveau du programme n'a jamais été appliqué.
+- **Anchor.toml.** `seeds = false` devient `resolution = true` plus `skip-lint = false`, et l'URL `[registry]` obsolète est supprimée.
+- **Lints.** `programs/amm/Cargo.toml` ajoute une liste d'autorisation `[lints.rust] unexpected_cfgs` pour les cfgs de fonctionnalité que les macros Anchor et Solana émettent.
+- **README.** Sur cette branche, le README vous dit toujours d'exécuter `rustup default 1.86.0` et `avm install 0.32.1` à partir de `coral-xyz/anchor`. Suivez plutôt `Anchor.toml` et [`solana-fundamentals/toolchain`](/fr/solana-fundamentals/toolchain).
+
+## Ce qui n'a pas changé
+
+- **Chaque disposition de compte.** `PoolState`, `AmmConfig`, `TickArrayState`, `TickArrayBitmapExtension`, `PersonalPositionState`, `ObservationState`, `LimitOrderState`, `DynamicFeeConfig`, `Permission` et `SupportMintAssociated` conservent les mêmes tailles et décalages.
+- **Codes d'erreur `6000`–`6051`.**
+- **Swap, liquidité, frais, frais dynamiques et mathématiques de limite d'ordre.** `CollectExcessLamports` déplace les lamports qui n'ont jamais fait partie des réserves d'aucun pool.
+- **Gel NFT de position** du [2026-08-17](/fr/reference/changelog/2026-08-17-clmm-restricted-position-nft-freeze), y compris la règle du pool comme autorité de gel et le chemin de dégel `ClosePosition`.
+- **`spl_memo`.** La contrainte du programme mémo de `DecreaseLiquidityV2` a été déplacée de `spl_memo::id()` à `anchor_spl::memo::ID`. Les deux nomment la même adresse ; `anchor-spl` a juste renommé l'export.
+- **ID du programme.**
+
+## Pages mises à jour
+
+- `products/clmm/instructions` : bannière de mise à niveau ; section `CollectExcessLamports` avec sa liste de comptes, tableau de dispatch à deux passes et portée par pool ; lignes d'inventaire, de limitation admin et de matrice de changement d'état ; note de propriétaire de frais sur `CollectProtocolFee` / `CollectFundFee`.
+- `products/clmm/accounts` : commentaires du propriétaire `AmmConfig` et note sur ce que `CreateAmmConfig` écrit.
+- `products/clmm/code-demos` : bannière de version et squelette CPI Rust déplacés vers Anchor 1.0.
+- `products/cpmm/code-demos` : note « ne peut pas partager une caisse avec CLMM » supprimée.
+- `reference/error-codes` : `6052` documenté.
+- `reference/program-addresses` : nouvelle section « Portefeuilles propriétaires de frais CLMM » ; CLMM ajouté à « Portefeuilles de collecte de lamports excédentaires ».
+- `sdk-api/rust-cpi`, `sdk-api/anchor-idl`, `solana-fundamentals/toolchain` : épingles Anchor 1.0 pour `raydium-clmm`, et l'avertissement de division de caisse retiré.
+- `solana-fundamentals/rent-and-reclaimable-rent` : CLMM ajouté à « Ce que les programmes Raydium balayent de leur côté ».
+- `security/admin-and-multisig` : rôle de collecteur de lamports excédentaires CLMM.
+- `protocol-overview/versions-and-migration` : puce d'historique de mise à niveau CLMM.
