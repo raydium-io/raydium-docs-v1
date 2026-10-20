@@ -1,0 +1,103 @@
+---
+title: "2026-10-22 — CLMM: CreateCustomizablePoolV2 opens multi-pool creation to everyone"
+description: "CreatePermissionedPool is renamed to CreateCustomizablePoolV2 and its Permission PDA gate is removed, so any payer can create additional CLMM pools for the same pair and fee tier at a seed_index-derived address. The Permission account and the CreatePermissionPda / ClosePermissionPda admin instructions are deleted. Breaking for clients that call the old instruction; no account layout or error code changed."
+---
+
+<Info>
+  This entry covers a CLMM program upgrade scheduled for **2026-10-22**. It was verified against the `feat/create-customizable-pool-v2` branch of `raydium-clmm` (head `18f5db1`) before deployment. Confirm the deployed program before relying on the new instruction name or account list.
+</Info>
+
+The [2026-07-30 release](/reference/changelog/2026-07-30-clmm-permissioned-pools) added `CreatePermissionedPool`, which lets a caller create more than one pool for the same `(amm_config, token_mint_0, token_mint_1)` by folding a `seed_index` into the pool PDA. It was gated: the payer had to hold a `Permission` PDA issued by an admin.
+
+This release removes that gate. The instruction is renamed to **`CreateCustomizablePoolV2`**, anyone can call it, and the whole permission machinery is deleted from the program. Pool math, swap, liquidity, limit orders, fees and rewards are untouched.
+
+## TL;DR for integrators
+
+- **`CreatePermissionedPool` → `CreateCustomizablePoolV2`.** Same arguments (`CreateCustomizableParams`, `seed_index: u16`) and same pool-address derivation. The Anchor discriminator changes with the name, so a transaction built against the old instruction fails after the upgrade. Rebuild it against the new IDL.
+- **The `permission` account is gone from the account list.** It sat in slot 3, so every account from `amm_config` onward moves up one position. See [the new account list](#createcustomizablepoolv2-account-list).
+- **Multi-pool creation is now permissionless.** Any payer can create additional pools for a pair and fee tier with a non-zero `seed_index`. Treat a pair as potentially having many CLMM pools per fee tier, created by anyone.
+- **`Permission`, `CreatePermissionPda` and `ClosePermissionPda` are removed.** The program and IDL no longer know the `Permission` type.
+- **Refresh your IDL.** It drops two instructions and one account type, for 37 instructions and 53 errors.
+- **No account layout changed and no error code was added.** `PoolState.seed_index` keeps its offset; only its meaning widens from "permissioned pool" to "any V2 pool".
+
+## What changed in the program
+
+### `CreatePermissionedPool` renamed to `CreateCustomizablePoolV2`
+
+The handler is the same code under a new name. It still:
+
+- requires `seed_index > 0`;
+- derives the pool at `["pool", amm_config, token_mint_0, token_mint_1, seed_index.to_le_bytes()]`;
+- takes the same `CreateCustomizableParams` as `CreateCustomizablePool`, so single-sided fee (`collect_fee_on`) and the dynamic-fee opt-in work the same way;
+- applies the same Token-2022 support-mint checks as `CreatePool`;
+- records `pool_creator` as `pool_state.owner` and writes `seed_index` into `PoolState`;
+- emits `PoolCreatedEvent`.
+
+The `Permission` PDA check is the only behaviour removed.
+
+| | Old discriminator | New discriminator |
+|---|---|---|
+| Instruction | `create_permissioned_pool` → `[36, 243, 179, 35, 42, 239, 53, 229]` | `create_customizable_pool_v2` → `[29, 172, 106, 188, 103, 45, 70, 100]` |
+
+### `CreateCustomizablePoolV2` account list
+
+| # | Account | W | S | Notes |
+|---|---|---|---|---|
+| 1 | `payer` | W | S | Pays rent for every new account. Any wallet. |
+| 2 | `pool_creator` | | | Written to `pool_state.owner`. Not a signer and not checked. |
+| 3 | `amm_config` | | | Fee tier the pool binds to. |
+| 4 | `pool_state` | W | | `init` at the `seed_index`-derived PDA. |
+| 5 | `token_mint_0` | | | Must sort before `token_mint_1`. |
+| 6 | `token_mint_1` | | | |
+| 7 | `token_vault_0` | W | | PDA `["pool_vault", pool_state, token_mint_0]`. |
+| 8 | `token_vault_1` | W | | PDA `["pool_vault", pool_state, token_mint_1]`. |
+| 9 | `observation_state` | W | | PDA `["observation", pool_state]`. |
+| 10 | `tick_array_bitmap` | W | | PDA `["pool_tick_array_bitmap_extension", pool_state]`. |
+| 11 | `token_program_0` | | | Program that owns `token_mint_0`. |
+| 12 | `token_program_1` | | | Program that owns `token_mint_1`. |
+| 13 | `system_program` | | | |
+| 14 | `rent` | | | |
+
+`remaining_accounts` are unchanged: the support-mint registry PDAs when a Token-2022 mint needs them, and the `DynamicFeeConfig` **last** when `enable_dynamic_fee = true`.
+
+<Warning>
+  `pool_creator` is not authenticated. Any payer can write any address into `pool_state.owner`. That address gains the right to call `InitializeReward` on the pool, but it cannot be used as proof of who created it. Don't rank, label or trust a V2 pool by its `owner` field.
+</Warning>
+
+### Removed: `Permission`, `CreatePermissionPda`, `ClosePermissionPda`
+
+- The `Permission` account type (`["permission", authority]`, 280 bytes) is deleted from the program.
+- `CreatePermissionPda` and `ClosePermissionPda` are deleted, along with the dedicated `permission_pda_admin` key that could sign them.
+- Permission PDAs created before the upgrade stay on-chain. The program no longer reads them and no longer has an instruction that closes them.
+
+## Error codes
+
+No change. `6000`–`6052` keep their numbers. `NotApproved` (`6000`) no longer has a "signer is neither `admin` nor `permission_pda_admin`" case, because those instructions are gone.
+
+## Migration notes
+
+- **Pool creators.** Switch from `CreatePermissionedPool` to `CreateCustomizablePoolV2`, drop the `permission` account, and shift the remaining accounts up one slot. You no longer need an admin grant.
+- **Indexers and routers.** Index CLMM pools from `PoolCreatedEvent` or by scanning `PoolState` accounts, not by deriving the four-seed PDA. Store `seed_index` for any pool where it is non-zero, because you need it to re-derive the address. Expect more non-canonical pools now that anyone can create them, and don't assume the canonical pool is the deepest.
+- **UIs.** A pair and fee tier can have many pools with different starting prices. Show liquidity and the pool address, and don't present a pool as official because of its `owner`.
+- **IDL consumers.** Remove any decoder or client code for `Permission`, `CreatePermissionPda` and `ClosePermissionPda`.
+
+## What did not change
+
+- **Every account layout**, including `PoolState` (the `seed_index` field and its offset are the same).
+- **`CreatePool` and `CreateCustomizablePool`.** They still create the single canonical pool per pair and tier, with `seed_index = [0, 0]`.
+- **Pools created through `CreatePermissionedPool` before the upgrade.** Their addresses, state and `seed_index` are unchanged.
+- **Error codes, swap, liquidity, fee, dynamic-fee, reward and limit-order behaviour.**
+- **Program ID.**
+
+## Pages updated
+
+- `products/clmm/instructions`: upgrade banner; inventory and admin-gating rows; `CreateCustomizablePoolV2` section with the new account list.
+- `products/clmm/accounts`: `Permission` removed from the inventory and documented as retired; `seed_index` description; PDA helper renamed to `deriveCustomizablePoolV2`; lifecycle rows.
+- `products/clmm/overview`: "What's new" note.
+- `security/admin-and-multisig`: `permission_pda_admin` role removed from the CLMM table.
+- `reference/error-codes`: `NotApproved` description.
+- `reference/token-2022-support`: CLMM pool-creation paths.
+- `sdk-api/anchor-idl`: CLMM instruction count.
+- `protocol-overview/versions-and-migration`: CLMM upgrade history bullet.
+
+**Verified against**: `raydium-clmm` branch `feat/create-customizable-pool-v2` (`18f5db1`): `instructions/create_customizable_pool_v2.rs`, `instructions/mod.rs`, `instructions/admin/mod.rs`, `states/mod.rs`, `states/pool.rs`, `lib.rs`, and the deleted `admin/create_permission_pda.rs`, `admin/close_permission_pda.rs`, `states/permission.rs`.

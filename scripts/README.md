@@ -49,6 +49,17 @@ python3 scripts/translate.py --overwrite
 
 Useful after upstream English edits that should propagate to all locales.
 
+### Check existing translations (no API calls)
+
+```bash
+python3 scripts/translate.py --check            # broken pages only; exits 1 if any
+python3 scripts/translate.py --check --verbose  # also list pages that are out of date with English
+```
+
+"Broken" means the page will not build or is visibly cut off: frontmatter that does not parse (e.g. `« »` used as quotes), unbalanced JSX tags, a repetition loop, or missing trailing sections. "Out of date" means the English was edited after the page was translated.
+
+Long pages are translated section by section (split on `##` headings, ~12k characters per request). Any response that stops on `max_tokens` or loses a heading, code fence or JSX tag is retried, and after three failures the target file is left untouched — so a failed run never writes a half-translated page.
+
 ### Dry run
 
 ```bash
