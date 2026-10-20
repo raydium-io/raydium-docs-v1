@@ -10,14 +10,14 @@ USAGE
 =====
   export ANTHROPIC_API_KEY=sk-ant-...
   python3 scripts/translate.py [--locales zh,ja,...] [--paths foo/bar.mdx,...]
-                               [--model claude-sonnet-4-6] [--concurrency 8]
+                               [--model claude-sonnet-5-5] [--concurrency 8]
                                [--overwrite] [--dry-run]
 
 DEFAULTS
 ========
   Locales:     zh, zh-Hant, ja, ko, ru, es, de, fr, pt, tr, vi, id, ar
                (skip whichever you want with --locales)
-  Model:       claude-haiku-4-5   (override per --model)
+  Model:       claude-haiku-5-5   (override per --model)
   Concurrency: 8 in-flight requests (gentle on rate limits)
   Skip rule:   MDX  – if the target file already differs from the auto-generated
                        stub (i.e. someone has translated or hand-edited it),
@@ -122,6 +122,8 @@ except ImportError:
 
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
+
+DEFAULT_MODEL = "claude-haiku-5-5"
 
 # ---------- Locale config ---------------------------------------------------
 
@@ -519,6 +521,13 @@ def _wrap_like(original, new_text: str):
     return DoubleQuotedScalarString(new_text)
 
 
+def _is_permanent_error(e: Exception) -> bool:
+    """4xx request errors (bad parameter, auth, unknown model) will fail the
+    same way on every retry, except 408 timeout and 429 rate limit."""
+    code = getattr(e, "status_code", None)
+    return isinstance(code, int) and 400 <= code < 500 and code not in (408, 429)
+
+
 def _batched(seq: list, n: int):
     for i in range(0, len(seq), n):
         yield seq[i : i + n]
@@ -544,7 +553,6 @@ def _translate_string_batch(
             resp = client.messages.create(
                 model=model,
                 max_tokens=16000,
-                temperature=0,
                 system=system,
                 messages=[{"role": "user", "content": user_msg}],
             )
@@ -571,8 +579,10 @@ def _translate_string_batch(
             return translated
         except Exception as e:
             last_err = e
+            if _is_permanent_error(e):
+                break
             time.sleep(2 ** attempt)
-    raise RuntimeError(f"translation batch failed after 3 attempts: {last_err}")
+    raise RuntimeError(f"translation batch failed: {last_err}")
 
 
 def translate_yaml_text(
@@ -705,7 +715,7 @@ def is_yaml_stub(target: Path, source: Path) -> bool:
 CHUNK_CHARS = 12000
 MAX_OUTPUT_TOKENS = 16000
 
-_FENCE_RE = re.compile(r"^(```|~~~)", re.M)
+_FENCE_RE = re.compile(r"^[ \t]*(```|~~~)", re.M)
 _JSX_TAGS = (
     "Info", "Tip", "Note", "Warning", "Check", "Update", "Card", "CardGroup",
     "Tabs", "Tab", "Steps", "Step", "Accordion", "AccordionGroup", "Frame",
@@ -805,7 +815,7 @@ def _chunk_page(src_text: str) -> list[str]:
 
 
 CONTINUATION_NOTE = (
-    "IMPORTANT: this is part {idx} of {total} of a longer page. It is a fragment, "
+    "IMPORTANT: this is part {idx} of {total} of a longer page (or a piece of that part). It is a fragment, "
     "not a whole file: it has no frontmatter, so do NOT add frontmatter and do NOT "
     "add the AI-translation banner. Translate the fragment only, keep every "
     "heading, code fence and JSX tag that appears in it, and return just the "
@@ -813,11 +823,97 @@ CONTINUATION_NOTE = (
 )
 
 
+def _split_in_two(text: str) -> tuple[str, str] | None:
+    """Split a piece near its middle at a heading, else at a blank line, never
+    inside a code fence or a JSX block. Returns None if no safe point exists."""
+    lines = text.splitlines(keepends=True)
+    in_fence, depth, safe_heading, safe_blank = False, 0, [], []
+    open_re = re.compile(r"^\s*<(%s)(\s[^>]*)?>\s*$" % "|".join(_JSX_TAGS))
+    close_re = re.compile(r"^\s*</(%s)>\s*$" % "|".join(_JSX_TAGS))
+    for i, line in enumerate(lines):
+        if _FENCE_RE.match(line.lstrip()):
+            in_fence = not in_fence
+            continue
+        if in_fence or i == 0:
+            continue
+        if open_re.match(line):
+            depth += 1
+        elif close_re.match(line):
+            depth = max(0, depth - 1)
+        elif depth == 0:
+            if re.match(r"^#{2,4} ", line):
+                safe_heading.append(i)
+            elif not line.strip() and i + 1 < len(lines) and lines[i + 1].strip() \
+                    and not lines[i + 1].lstrip().startswith("|"):
+                safe_blank.append(i + 1)
+    mid = len(text) / 2
+    def pos(i): return sum(len(l) for l in lines[:i])
+    for cands in (safe_heading, safe_blank):
+        good = [i for i in cands if 0.25 * len(text) < pos(i) < 0.75 * len(text)]
+        if good:
+            i = min(good, key=lambda i: abs(pos(i) - mid))
+            return "".join(lines[:i]), "".join(lines[i:])
+    return None
+
+
+def _unwrap_output(text: str, first: bool) -> str:
+    """Undo the two ways models most often wrap the file despite the prompt:
+    an outer ```mdx ... ``` fence, and a line of preamble ("Here is ...")
+    before the frontmatter."""
+    text = text.strip("\n")
+    m = re.match(r"\A```[a-zA-Z]*\n(.*)\n```\s*\Z", text, re.S)
+    if m:
+        text = m.group(1).strip("\n")
+    if first and not text.startswith("---"):
+        m = re.search(r"^---\s*\n(?=[\w-]+:)", text, re.M)
+        if m and m.start() < 400:  # only a short preamble, never real content
+            text = text[m.start():]
+    return text
+
+
+FAILURE_DIR = REPO_ROOT / "scripts" / ".translate-failures"
+
+
+def _dump_failure(locale: str, en_rel: Path, label: str, depth: int, raw: str) -> str:
+    """Save the model's raw output for a chunk that failed validation, so the
+    cause can be inspected. Returns the repo-relative path, or "" if empty."""
+    if not raw:
+        return ""
+    stem = str(en_rel.with_suffix("")).replace("/", "__")
+    out = FAILURE_DIR / locale / f"{stem}.chunk{label}{'.d%d' % depth if depth else ''}.txt"
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(raw)
+    return str(out.relative_to(REPO_ROOT))
+
+
+def _rebuild_frontmatter(client, model: str, locale: str, src_piece: str, text: str) -> str:
+    """The model returned the body without frontmatter. Translate the source's
+    title / description on their own and prepend a rebuilt frontmatter that
+    keeps every other key exactly as in the source."""
+    m = FRONTMATTER_RE.match(src_piece)
+    if not m:
+        return text
+    lines = m.group(1).splitlines()
+    keys, vals = [], []
+    for i, line in enumerate(lines):
+        mm = re.match(r'^(title|description):\s*"(.*)"\s*$', line)
+        if mm:
+            keys.append(i)
+            vals.append(mm.group(2).replace('\\"', '"'))
+    if vals:
+        translated = _translate_string_batch(client, vals, locale, model)
+        for i, t in zip(keys, translated):
+            key = lines[i].split(":", 1)[0]
+            lines[i] = f"{key}: {json.dumps(t, ensure_ascii=False)}"
+    # Drop anything the model put before its body (a stray preamble line).
+    body = text.lstrip()
+    return "---\n" + "\n".join(lines) + "\n---\n\n" + body
+
+
 def _call(client, model, system, user_msg) -> str:
     resp = client.messages.create(
         model=model,
         max_tokens=MAX_OUTPUT_TOKENS,
-        temperature=0,
         system=system,
         messages=[{"role": "user", "content": user_msg}],
     )
@@ -847,39 +943,63 @@ def _translate_mdx(
         style_notes=cfg.get("style_notes", "(no locale-specific notes)"),
     )
 
-    chunks = _chunk_page(src_text)
-    out_parts: list[str] = []
-    for idx, chunk in enumerate(chunks, 1):
-        first = idx == 1
-        note = "" if first else CONTINUATION_NOTE.format(idx=idx, total=len(chunks)) + "\n"
+    banner_re = re.compile(
+        r"\A\s*<Info>\s*\n\s*\*\*%s\*\*.*?</Info>\s*" % re.escape(cfg["banner"]),
+        re.S,
+    )
+
+    def translate_piece(piece: str, first: bool, label: str, depth: int = 0) -> str:
+        """Translate one piece; on max_tokens, split it in two and recurse."""
+        note = "" if first else CONTINUATION_NOTE.format(idx=label, total=len(chunks)) + "\n"
         user_msg = (
             f"{note}"
             f"english_link: /{english_link}\n"
             f"locale_code: {locale}\n"
             f"--- BEGIN SOURCE ---\n"
-            f"{chunk}\n"
+            f"{piece}\n"
             f"--- END SOURCE ---\n"
         )
         last_err = "unknown"
-        part = None
+        raw = ""
         for attempt in range(3):
             try:
-                text = _call(client, model, system, user_msg).strip("\n")
+                raw = _call(client, model, system, user_msg)
+                text = _unwrap_output(raw, first)
+                if first and not FRONTMATTER_RE.match(text):
+                    text = _rebuild_frontmatter(client, model, locale, piece, text)
+                if not first:
+                    # Models sometimes add the banner to a fragment anyway; drop it.
+                    text = banner_re.sub("", text, count=1)
                 if first:
                     fm_err = _frontmatter_problem(text + "\n")
                     if fm_err:
                         raise RuntimeError(fm_err)
-                probs = _structure_problems(chunk, text, banner_added=first)
+                probs = _structure_problems(piece, text, banner_added=first)
                 if probs:
                     raise RuntimeError("; ".join(probs[:3]))
-                part = text
-                break
+                return text
             except Exception as e:
                 last_err = str(e)
+                if _is_permanent_error(e):
+                    break
+                if "max_tokens" in last_err and depth < 3:
+                    halves = _split_in_two(piece)
+                    if halves:
+                        a, b = halves
+                        return (translate_piece(a, first, label, depth + 1) + "\n\n"
+                                + translate_piece(b, False, label, depth + 1))
                 time.sleep(2 ** attempt)
-        if part is None:
-            return target, f"error: chunk {idx}/{len(chunks)}: {last_err}"
-        out_parts.append(part)
+        dump = _dump_failure(locale, en_rel, label, depth, raw)
+        raise RuntimeError(f"chunk {label}/{len(chunks)}: {last_err}"
+                           + (f" (raw output: {dump})" if dump else ""))
+
+    chunks = _chunk_page(src_text)
+    out_parts: list[str] = []
+    try:
+        for idx, chunk in enumerate(chunks, 1):
+            out_parts.append(translate_piece(chunk, idx == 1, str(idx)))
+    except RuntimeError as e:
+        return target, f"error: {e}"
 
     translated = "\n\n".join(out_parts).rstrip() + "\n"
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -1013,7 +1133,7 @@ def main():
             "to translate. Default: all English source mdx files."
         ),
     )
-    ap.add_argument("--model", default="claude-haiku-4-5")
+    ap.add_argument("--model", default=DEFAULT_MODEL)
     ap.add_argument("--concurrency", type=int, default=8)
     ap.add_argument("--overwrite", action="store_true",
                     help="Overwrite even if target is no longer a stub.")
@@ -1086,6 +1206,7 @@ def main():
                 target, status = fut.result()
                 key = (
                     "error" if status.startswith("error")
+                    else "wrote" if status.startswith("wrote")
                     else status
                 )
                 counts[key] = counts.get(key, 0) + 1
