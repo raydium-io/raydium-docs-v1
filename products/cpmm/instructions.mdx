@@ -7,6 +7,8 @@ description: "Every instruction on the CPMM program, with its arguments, account
   This page is the authoritative instruction reference. For code that actually composes these instructions, see [`products/cpmm/code-demos`](/products/cpmm/code-demos). For error-code meanings see [`reference/error-codes`](/reference/error-codes).
 
   The 2026-09 program upgrade rebuilt CPMM on Anchor 1.0.2 / Solana 3.1.10, added the admin instruction `CollectExcessLamports`, removed the hardcoded Token-2022 mint whitelist, and changed what `CreateAmmConfig` writes into `protocol_owner` / `fund_owner`. No user-facing instruction changed its accounts, arguments or math. See the [2026-09-09 changelog entry](/reference/changelog/2026-09-09-cpmm-anchor-1-and-excess-lamports).
+
+  The 2026-10-30 upgrade adds [`InitializeV2`](#initializev2): permissionless pool creation where the creator chooses whether to enable the creator fee and on which side. It is purely additive. `Initialize`, `InitializeWithPermission` and every other instruction keep their discriminators, accounts and arguments. See the [2026-10-30 changelog entry](/reference/changelog/2026-10-30-cpmm-initialize-v2).
 </Info>
 
 <Warning>
@@ -18,6 +20,7 @@ description: "Every instruction on the CPMM program, with its arguments, account
 | Discriminator name | Who signs | What it does |
 |-------|-----------|--------------|
 | `Initialize` | pool creator | Create a new CPMM pool from two mints and an `AmmConfig`. Permissionless; anyone can call it. Hardcodes `enable_creator_fee = false` on the new pool. The `pool_state` account can be either the canonical PDA or a fresh random keypair (see Initialize accounts). |
+| `InitializeV2` | pool creator | Same as `Initialize`, plus an optional `creator_fee_on` argument. Permissionless. `Some(...)` stores `enable_creator_fee = true` with the chosen side; `None` stores the same creator-fee settings as `Initialize`. Same accounts as `Initialize` minus the trailing `rent` sysvar. Added 2026-10-30. |
 | `InitializeWithPermission` | payer + a holder of a `Permission` PDA | Permissioned variant of `Initialize`. The caller (`payer`) must own a `Permission` PDA derived from their own pubkey. Used by platforms that need gated pool creation (e.g. LaunchLab graduations). Lets the caller pin `creator_fee_on` (`BothToken` / `OnlyToken0` / `OnlyToken1`) and forces `enable_creator_fee = true` on the new pool. The `creator` field on `pool_state` is set to a separately-passed `creator` account, not the payer. Same canonical-PDA-or-random-keypair flexibility for `pool_state` as `Initialize`. |
 | `Deposit` | LP | Add liquidity in both tokens; receive LP tokens. |
 | `Withdraw` | LP | Burn LP tokens; receive both underlying tokens pro-rata. |
@@ -95,7 +98,7 @@ open_time:     u64   // Unix timestamp; swaps rejected before this
 - `observation_state` is initialized; `observation_index = 0` and `pool_id = pool_state.key()`.
 - `create_pool_fee` lamports are transferred from the creator to the receiver and synced as native SOL (it is a wSOL ATA).
 - The pool's status bitmask is `0` (deposit / withdraw / swap all enabled).
-- `enable_creator_fee = false` and `creator_fee_on = BothToken`. `Initialize` does **not** support enabling the creator fee — that path is `InitializeWithPermission`.
+- `enable_creator_fee = false` and `creator_fee_on = BothToken`. `Initialize` does **not** support enabling the creator fee. Use [`InitializeV2`](#initializev2) to enable it without a permission grant.
 - `open_time` is bumped to `block_timestamp + 1` if the caller passed a value `<= block_timestamp`. Swaps are rejected before `open_time`; deposits and withdrawals work immediately.
 
 **Common errors** (full list in [`reference/error-codes`](/reference/error-codes))
@@ -103,6 +106,84 @@ open_time:     u64   // Unix timestamp; swaps rejected before this
 - `InvalidInput` — mints unsorted, or identical mints.
 - `NotSupportMint` — blocked Token-2022 extension.
 - `ExceededSlippage` — rarely; if `init_amount_0/1` result in zero LP due to decimals mismatch.
+
+## `InitializeV2`
+
+Create a new CPMM pool and choose its creator-fee settings. Added in the 2026-10-30 upgrade.
+
+`InitializeV2` runs the same creation flow as `Initialize`. The only difference is what it writes into `enable_creator_fee` and `creator_fee_on` on the new pool. Before this instruction, only `InitializeWithPermission` could create a pool with the creator fee enabled, and that path needs an admin-issued `Permission` PDA.
+
+**Arguments**
+
+```
+init_amount_0:  u64
+init_amount_1:  u64
+open_time:      u64                    // Unix timestamp; swaps rejected before this
+creator_fee_on: Option<CreatorFeeOn>   // None = creator fee off
+                                       // Some(BothToken | OnlyToken0 | OnlyToken1) = creator fee on
+```
+
+`CreatorFeeOn` is a Borsh enum, so the argument encodes as one tag byte for the `Option`, plus one variant byte when it is `Some`:
+
+| Value | Bytes | Stored on `pool_state` |
+|-------|-------|------------------------|
+| `None` | `00` | `enable_creator_fee = false`, `creator_fee_on = 0` (`BothToken`) |
+| `Some(BothToken)` | `01 00` | `enable_creator_fee = true`, `creator_fee_on = 0` |
+| `Some(OnlyToken0)` | `01 01` | `enable_creator_fee = true`, `creator_fee_on = 1` |
+| `Some(OnlyToken1)` | `01 02` | `enable_creator_fee = true`, `creator_fee_on = 2` |
+
+Any other byte fails Anchor's argument deserialization before the handler runs.
+
+Discriminator: `initialize_v2` → `[67, 153, 175, 39, 218, 16, 38, 32]`.
+
+**Accounts** (W = writable, S = signer)
+
+The first 19 accounts are identical to [`Initialize`](#initialize), in the same order. `InitializeV2` drops only the trailing `rent` sysvar.
+
+| # | Name | W | S | Notes |
+|---|------|---|---|-------|
+| 1 | `creator` | W | S | Pays rent, the create-pool fee and the initial liquidity. Recorded as `pool_state.pool_creator`, so the creator fee goes to this signer. |
+| 2 | `amm_config` |   |   | The chosen fee tier. Its `creator_fee_rate` is the rate the pool charges. |
+| 3 | `authority` |   |   | CPMM global authority PDA. |
+| 4 | `pool_state` | W | S* | Canonical PDA **or** a fresh random keypair, exactly as on `Initialize`. |
+| 5 | `token_0_mint` |   |   | Sorted: `token_0_mint < token_1_mint`. |
+| 6 | `token_1_mint` |   |   | |
+| 7 | `lp_mint` | W |   | `init`ed here. |
+| 8 | `creator_token_0` | W |   | Source account for `init_amount_0`. |
+| 9 | `creator_token_1` | W |   | Source account for `init_amount_1`. |
+| 10 | `creator_lp_token` | W |   | Creator's ATA on `lp_mint`. `init`ed here. |
+| 11 | `token_0_vault` | W |   | `init`ed here. |
+| 12 | `token_1_vault` | W |   | |
+| 13 | `create_pool_fee` | W |   | Destination for the `create_pool_fee`. |
+| 14 | `observation_state` | W |   | `init`ed here. |
+| 15 | `token_program` |   |   | SPL Token (for LP mint). |
+| 16 | `token_0_program` |   |   | SPL Token or Token-2022. |
+| 17 | `token_1_program` |   |   | SPL Token or Token-2022. |
+| 18 | `associated_token_program` |   |   | |
+| 19 | `system_program` |   |   | |
+
+`*` `pool_state` signs only on the random-keypair path.
+
+`remaining_accounts` work the same way as on `Initialize`: append the `SupportMintAssociated` PDA for any Token-2022 mint that needs the registry bypass.
+
+<Note>
+  Because the first 19 accounts match, you can adapt an existing `Initialize` builder: change the discriminator, append the `creator_fee_on` bytes, and drop `rent`. If you leave `rent` in, Anchor passes it through as a `remaining_accounts` entry, and the support-mint scan skips it because it is not a CPMM-owned account. Drop it anyway to save the account slot.
+</Note>
+
+**Preconditions** — the same as `Initialize`. There is no permission check and no new constraint on `creator_fee_on`.
+
+**Postconditions** — the same as `Initialize`, except:
+
+- `enable_creator_fee` and `creator_fee_on` are set from the argument, as in the table above.
+- `pool_creator` is always the signing `creator`. On `InitializeWithPermission` the creator is a separate, non-signing account; on `InitializeV2` it cannot be set to anyone else.
+
+<Note>
+  **Enabling the creator fee does not choose its rate.** The pool charges `AmmConfig.creator_fee_rate` of the fee tier it binds to. On a tier where that rate is `0`, an enabled pool accrues nothing. Read the config before you pick a tier. The choice is also permanent: no instruction changes `enable_creator_fee` or `creator_fee_on` after creation. See [`products/cpmm/fees`](/products/cpmm/fees#creator-fee).
+</Note>
+
+When the fee is enabled, swaps accrue it to `creator_fees_token_{0,1}`. The creator collects it through `CollectCreatorFee` or `CollectCreatorFeePermissionless`, and the protocol share from the 2026-09-19 upgrade applies as usual.
+
+**Common errors** — the same as `Initialize`.
 
 ## `Deposit`
 
@@ -568,6 +649,7 @@ Because it takes an unbounded `remaining_accounts` list, transaction size is the
 | Instruction | `lp_supply` | Vault balances | Accrued-fee fields | `observation` |
 |-------------|------------|---------------|-------------------|---------------|
 | `Initialize` | + init LP | + `init_amount_{0,1}` | 0 | init |
+| `InitializeV2` | + init LP | + `init_amount_{0,1}` | 0 | init |
 | `InitializeWithPermission` | + init LP | + `init_amount_{0,1}` | 0 | init |
 | `Deposit` | + | + both | — | — |
 | `Withdraw` | − | − both | — | — |

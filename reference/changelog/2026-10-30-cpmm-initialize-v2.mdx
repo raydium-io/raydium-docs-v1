@@ -1,0 +1,103 @@
+---
+title: "2026-10-30 — CPMM: InitializeV2 opens the creator fee to every pool creator"
+description: "CPMM adds InitializeV2, a permissionless pool-creation instruction that takes an optional creator_fee_on argument. Any creator can now enable the creator fee and choose its side without a Permission PDA. Initialize, InitializeWithPermission and every other instruction are unchanged. Additive: no account layout, error code or existing account list changed."
+---
+
+<Info>
+  This entry covers a CPMM program upgrade scheduled for **2026-10-30**. It was verified against the `feat/initialize-v2` branch of `raydium-cp-swap` (head `40cbd81`) before deployment. Confirm the deployed program before relying on the new instruction.
+</Info>
+
+Every CPMM pool has an `enable_creator_fee` flag and a `creator_fee_on` side, both fixed at creation. Until now, a creator could only set them through `InitializeWithPermission`, which needs an admin-issued `Permission` PDA. The public `Initialize` always stored the fee as disabled. In practice, only LaunchLab graduations and other gated flows could create a pool that charges a creator fee.
+
+This release adds **`InitializeV2`**. It is `Initialize` with one extra argument, `creator_fee_on: Option<CreatorFeeOn>`, and anyone can call it. Pool math, swap, liquidity, fee collection and the protocol share of the creator fee are untouched.
+
+## TL;DR for integrators
+
+- **New instruction: `InitializeV2`.** Permissionless. Arguments are `init_amount_0`, `init_amount_1`, `open_time` and `creator_fee_on: Option<CreatorFeeOn>`. Discriminator `[67, 153, 175, 39, 218, 16, 38, 32]`.
+- **`Some(side)` enables the creator fee on that side; `None` leaves it off.** `None` stores exactly what `Initialize` stores.
+- **Same accounts as `Initialize`, minus `rent`.** The first 19 accounts are identical and in the same order. See [the account list](/products/cpmm/instructions#initializev2).
+- **The creator is the signer.** `pool_state.pool_creator` is the signing `creator`. Unlike `InitializeWithPermission`, the beneficiary cannot be set to another address.
+- **The creator picks on/off and the side, not the rate.** The pool charges its fee tier's `AmmConfig.creator_fee_rate`. That rate defaults to `0`, so an enabled pool on such a tier accrues nothing.
+- **Nothing existing changed.** `Initialize` and `InitializeWithPermission` keep their discriminators, accounts, arguments and behaviour. No account layout or error code changed.
+- **Refresh your IDL** to get the new instruction. Clients that never call it need no change.
+
+## What changed in the program
+
+### New instruction: `InitializeV2`
+
+`InitializeV2` runs the same creation code as `Initialize`. It:
+
+- accepts either the canonical pool PDA or a signed random keypair as `pool_state`;
+- applies the same Token-2022 allow-list and `SupportMintAssociated` checks, through `remaining_accounts`;
+- rejects creation when `amm_config.disable_create_pool` is set;
+- bumps `open_time` to `block_timestamp + 1` when it is not in the future;
+- locks 100 LP base units and mints the rest to the creator;
+- charges `amm_config.create_pool_fee`.
+
+The only difference is what it writes into the new `PoolState`:
+
+| `creator_fee_on` argument | Borsh bytes | `enable_creator_fee` | `creator_fee_on` |
+|---|---|---|---|
+| `None` | `00` | `false` | `0` (`BothToken`) |
+| `Some(BothToken)` | `01 00` | `true` | `0` |
+| `Some(OnlyToken0)` | `01 01` | `true` | `1` |
+| `Some(OnlyToken1)` | `01 02` | `true` | `2` |
+
+An invalid tag or variant byte fails Anchor's argument deserialization. No new error code is involved.
+
+| | Discriminator |
+|---|---|
+| `initialize` (unchanged) | `[175, 175, 109, 31, 13, 152, 155, 237]` |
+| `initialize_with_permission` (unchanged) | `[63, 55, 254, 65, 49, 178, 89, 121]` |
+| `initialize_v2` (new) | `[67, 153, 175, 39, 218, 16, 38, 32]` |
+
+### How the three creation paths compare
+
+| | `Initialize` | `InitializeV2` | `InitializeWithPermission` |
+|---|---|---|---|
+| Who can call | Anyone | Anyone | Holder of a `Permission` PDA |
+| Creator fee | Always off | Creator's choice | Always on |
+| Side (`creator_fee_on`) | `BothToken` (unused) | Creator's choice | Caller's choice |
+| Recorded `pool_creator` | Signing `creator` | Signing `creator` | Separate `creator` account, not a signer |
+| Payer | `creator` | `creator` | Separate `payer` |
+| Trailing `rent` sysvar | Yes | No | No |
+
+### Internal refactor
+
+The three handlers now share one `initialize_pool` routine. The refactor does not change the accounts, arguments, checks or stored values of `Initialize` or `InitializeWithPermission`. The new tests also check that a plain `Initialize` on the same config still stores the creator fee as disabled.
+
+## What creators should know
+
+- **Check the fee tier first.** The creator fee rate belongs to the `AmmConfig`, not the pool. Choose a tier whose `creator_fee_rate` is what you want to charge. Rates are listed in [`products/cpmm/fees`](/products/cpmm/fees).
+- **The choice is permanent.** No instruction changes `enable_creator_fee` or `creator_fee_on` after creation. To change it, you must create a new pool.
+- **Traders pay it on top of the trade fee.** The creator fee is a separate rate added to the swap. It does not reduce the LP, protocol or fund shares, but it does make the pool more expensive to trade against than a pool on the same tier with the fee off.
+- **Collection is unchanged.** Use `CollectCreatorFee` or `CollectCreatorFeePermissionless`. The protocol's share from the [2026-09-19 release](/reference/changelog/2026-09-19-cpmm-creator-fee-protocol-share) applies, and you can't opt out of it at creation.
+
+## Migration notes
+
+- **Pool creators.** Switch from `Initialize` to `InitializeV2` only if you want the creator fee on. Pass `Some(side)` and drop the `rent` account. `Initialize` keeps working.
+- **SDK users.** `raydium.cpmm.createPool` in `@raydium-io/raydium-sdk-v2@0.2.64-alpha` builds `Initialize`. Until a release ships an `InitializeV2` builder, encode it from the refreshed IDL.
+- **Indexers and routers.** Expect more pools with `enable_creator_fee = true`, created by ordinary wallets rather than LaunchLab. Quote from each pool's own `enable_creator_fee` and `creator_fee_on`, never from the creation path or the tier alone. Decode the new instruction if you track pool creation from instructions. Tracking from `PoolState` accounts needs no change.
+- **UIs.** Show whether a pool charges a creator fee and at what rate, since two pools on the same tier can now differ.
+- **LaunchLab and other permissioned flows.** No change. `InitializeWithPermission` is still the path when the payer and the recorded creator must differ.
+
+## What did not change
+
+- **Every account layout**, including `PoolState` and `AmmConfig`.
+- **`Initialize` and `InitializeWithPermission`**: discriminators, accounts, arguments and stored values.
+- **`Permission`, `CreatePermissionPda` and `ClosePermissionPda`.**
+- **Swap, deposit and withdraw math**, the creator-fee charge, and the protocol share of the creator fee.
+- **Error codes.** `6000`–`6015` are unchanged; nothing appended.
+- **Program ID.**
+
+## Pages updated
+
+- `products/cpmm/instructions`: upgrade banner; summary and state-change matrix rows; new `InitializeV2` section with arguments, encoding and account list; `Initialize` postcondition now points to `InitializeV2`.
+- `products/cpmm/fees`: "Creator fee" section lists all three creation paths and notes that enabling the fee does not set its rate.
+- `products/cpmm/accounts`: `poolState` and pool-ID notes; `creator_fee_on` / `enable_creator_fee` field notes; `Permission` note; account-lifecycle row.
+- `products/cpmm/overview`: "What's new" callout and the "Predictable fees" bullet.
+- `products/cpmm/code-demos`: note that `createPool` builds `Initialize` and how to reach `InitializeV2`.
+- `protocol-overview/shared-infrastructure`: creator fees are no longer limited to LaunchLab-graduated pools.
+- `reference/token-2022-support`: CPMM pool-creation paths.
+
+**Verified against**: `raydium-cp-swap` branch `feat/initialize-v2` (`40cbd81`): `programs/cp-swap/src/lib.rs`, `instructions/initialize_v2.rs`, `instructions/initialize.rs`, `instructions/initialize_with_permission.rs`, `instructions/mod.rs`, `states/pool.rs`, and `tests/initialize_v2.test.ts`.
