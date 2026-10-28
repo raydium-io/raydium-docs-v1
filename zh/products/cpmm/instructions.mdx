@@ -13,6 +13,8 @@ description: "CPMM 程序上的每条指令，包括其参数、账户列表、�
   本页是权威的指令参考。如需实际编写这些指令的代码，请参阅 [`products/cpmm/code-demos`](/zh/products/cpmm/code-demos)。错误代码含义见 [`reference/error-codes`](/zh/reference/error-codes)。
 
   2026-09 程序升级在 Anchor 1.0.2 / Solana 3.1.10 上重建了 CPMM，添加了管理员指令 `CollectExcessLamports`，移除了硬编码的 Token-2022 mint 白名单，并改变了 `CreateAmmConfig` 写入 `protocol_owner` / `fund_owner` 的内容。没有用户面向的指令改变其账户、参数或数学逻辑。详见 [2026-09-09 更新日志条目](/zh/reference/changelog/2026-09-09-cpmm-anchor-1-and-excess-lamports)。
+
+  2026-10-30 升级添加了 [`InitializeV2`](#initializev2)：无权限的池创建，由创建者选择是否启用创建者费用以及在哪一侧收取。这是纯增量变更。`Initialize`、`InitializeWithPermission` 和所有其他指令都保留其判别器、账户和参数。详见 [2026-10-30 更新日志条目](/zh/reference/changelog/2026-10-30-cpmm-initialize-v2)。
 </Info>
 
 <Warning>
@@ -24,6 +26,7 @@ description: "CPMM 程序上的每条指令，包括其参数、账户列表、�
 | 判别器名称 | 谁签名 | 功能 |
 |-------|-----------|--------------|
 | `Initialize` | 池创建者 | 从两个 mint 和一个 `AmmConfig` 创建新的 CPMM 池。无权限；任何人都可以调用。在新池上硬编码 `enable_creator_fee = false`。`pool_state` 账户可以是规范 PDA 或新的随机密钥对（见 Initialize 账户）。 |
+| `InitializeV2` | 池创建者 | 与 `Initialize` 相同，外加一个可选的 `creator_fee_on` 参数。无权限。`Some(...)` 存储 `enable_creator_fee = true` 及所选的一侧；`None` 存储与 `Initialize` 相同的创建者费用设置。账户与 `Initialize` 相同，但去掉了末尾的 `rent` sysvar。于 2026-10-30 添加。 |
 | `InitializeWithPermission` | 支付者 + `Permission` PDA 持有者 | `Initialize` 的权限版本。调用者（`payer`）必须拥有从其自己的公钥派生的 `Permission` PDA。由需要门控池创建的平台使用（例如 LaunchLab 毕业）。让调用者固定 `creator_fee_on`（`BothToken` / `OnlyToken0` / `OnlyToken1`）并在新池上强制 `enable_creator_fee = true`。`pool_state` 上的 `creator` 字段设置为单独传递的 `creator` 账户，而不是支付者。与 `Initialize` 相同的规范 PDA 或随机密钥对灵活性用于 `pool_state`。 |
 | `Deposit` | LP | 在两个代币中添加流动性；接收 LP 代币。 |
 | `Withdraw` | LP | 销毁 LP 代币；按比例接收两个基础代币。 |
@@ -101,7 +104,7 @@ open_time:     u64   // Unix 时间戳；此前拒绝交换
 - `observation_state` 被初始化；`observation_index = 0` 和 `pool_id = pool_state.key()`。
 - `create_pool_fee` lamport 从创建者转移到接收者并同步为原生 SOL（它是 wSOL ATA）。
 - 池的状态位掩码是 `0`（存款/提取/交换全部启用）。
-- `enable_creator_fee = false` 和 `creator_fee_on = BothToken`。`Initialize` **不**支持启用创建者费用 — 该路径是 `InitializeWithPermission`。
+- `enable_creator_fee = false` 和 `creator_fee_on = BothToken`。`Initialize` **不**支持启用创建者费用。如需在没有权限授予的情况下启用，请使用 [`InitializeV2`](#initializev2)。
 - 如果调用者传递的值 `<= block_timestamp`，`open_time` 被提升到 `block_timestamp + 1`。交换在 `open_time` 之前被拒绝；存款和提取立即工作。
 
 **常见错误**（完整列表见 [`reference/error-codes`](/zh/reference/error-codes)）
@@ -109,6 +112,84 @@ open_time:     u64   // Unix 时间戳；此前拒绝交换
 - `InvalidInput` — mint 未排序或相同。
 - `NotSupportMint` — 被阻止的 Token-2022 扩展。
 - `ExceededSlippage` — 罕见；如果 `init_amount_0/1` 由于小数位不匹配导致零 LP。
+
+## `InitializeV2`
+
+创建新的 CPMM 池并选择其创建者费用设置。在 2026-10-30 升级中添加。
+
+`InitializeV2` 运行与 `Initialize` 相同的创建流程。唯一的区别是它写入新池 `enable_creator_fee` 和 `creator_fee_on` 的内容。在此指令之前，只有 `InitializeWithPermission` 能创建启用创建者费用的池，而该路径需要管理员签发的 `Permission` PDA。
+
+**参数**
+
+```
+init_amount_0:  u64
+init_amount_1:  u64
+open_time:      u64                    // Unix 时间戳；此前拒绝交换
+creator_fee_on: Option<CreatorFeeOn>   // None = 关闭创建者费用
+                                       // Some(BothToken | OnlyToken0 | OnlyToken1) = 开启创建者费用
+```
+
+`CreatorFeeOn` 是一个 Borsh 枚举，因此该参数编码为 `Option` 的一个标签字节，当其为 `Some` 时再加一个变体字节：
+
+| 值 | 字节 | 存储在 `pool_state` 上 |
+|-------|-------|------------------------|
+| `None` | `00` | `enable_creator_fee = false`，`creator_fee_on = 0`（`BothToken`） |
+| `Some(BothToken)` | `01 00` | `enable_creator_fee = true`，`creator_fee_on = 0` |
+| `Some(OnlyToken0)` | `01 01` | `enable_creator_fee = true`，`creator_fee_on = 1` |
+| `Some(OnlyToken1)` | `01 02` | `enable_creator_fee = true`，`creator_fee_on = 2` |
+
+任何其他字节都会在处理程序运行之前于 Anchor 的参数反序列化阶段失败。
+
+判别器：`initialize_v2` → `[67, 153, 175, 39, 218, 16, 38, 32]`。
+
+**账户**（W = 可写，S = 签名者）
+
+前 19 个账户与 [`Initialize`](#initialize) 完全相同，顺序也相同。`InitializeV2` 仅去掉了末尾的 `rent` sysvar。
+
+| # | 名称 | W | S | 备注 |
+|---|------|---|---|-------|
+| 1 | `creator` | W | S | 支付租金、创建池费用和初始流动性。记录为 `pool_state.pool_creator`，因此创建者费用归此签名者所有。 |
+| 2 | `amm_config` |   |   | 选定的费用等级。其 `creator_fee_rate` 是池收取的费率。 |
+| 3 | `authority` |   |   | CPMM 全局权限 PDA。 |
+| 4 | `pool_state` | W | S* | 规范 PDA **或**新的随机密钥对，与 `Initialize` 完全相同。 |
+| 5 | `token_0_mint` |   |   | 排序：`token_0_mint < token_1_mint`。 |
+| 6 | `token_1_mint` |   |   | |
+| 7 | `lp_mint` | W |   | 在此处 `init`。 |
+| 8 | `creator_token_0` | W |   | `init_amount_0` 的源账户。 |
+| 9 | `creator_token_1` | W |   | `init_amount_1` 的源账户。 |
+| 10 | `creator_lp_token` | W |   | 创建者在 `lp_mint` 上的 ATA。在此处 `init`。 |
+| 11 | `token_0_vault` | W |   | 在此处 `init`。 |
+| 12 | `token_1_vault` | W |   | |
+| 13 | `create_pool_fee` | W |   | `create_pool_fee` 的目标账户。 |
+| 14 | `observation_state` | W |   | 在此处 `init`。 |
+| 15 | `token_program` |   |   | SPL Token（用于 LP mint）。 |
+| 16 | `token_0_program` |   |   | SPL Token 或 Token-2022。 |
+| 17 | `token_1_program` |   |   | SPL Token 或 Token-2022。 |
+| 18 | `associated_token_program` |   |   | |
+| 19 | `system_program` |   |   | |
+
+`*` `pool_state` 仅在随机密钥对路径上签名。
+
+`remaining_accounts` 的用法与 `Initialize` 相同：为任何需要注册表绕过的 Token-2022 mint 附加 `SupportMintAssociated` PDA。
+
+<Note>
+  由于前 19 个账户一致，你可以改造现有的 `Initialize` 构建器：更改判别器，附加 `creator_fee_on` 字节，并去掉 `rent`。如果保留 `rent`，Anchor 会将其作为 `remaining_accounts` 条目传入，而支持 mint 扫描会跳过它，因为它不是 CPMM 拥有的账户。即便如此，仍应去掉它以节省账户槽位。
+</Note>
+
+**前置条件** — 与 `Initialize` 相同。没有权限检查，也没有对 `creator_fee_on` 的新约束。
+
+**后置条件** — 与 `Initialize` 相同，但以下除外：
+
+- `enable_creator_fee` 和 `creator_fee_on` 按上表根据参数设置。
+- `pool_creator` 始终是签名的 `creator`。在 `InitializeWithPermission` 上，创建者是一个单独的非签名账户；在 `InitializeV2` 上，它不能被设置为其他任何人。
+
+<Note>
+  **启用创建者费用并不会选择其费率。** 池收取其绑定的费用等级的 `AmmConfig.creator_fee_rate`。在该费率为 `0` 的等级上，已启用的池不会累积任何费用。选择等级之前请读取配置。这一选择也是永久性的：创建后没有任何指令可以更改 `enable_creator_fee` 或 `creator_fee_on`。详见 [`products/cpmm/fees`](/zh/products/cpmm/fees#creator-fee)。
+</Note>
+
+启用费用后，交换会将其累积到 `creator_fees_token_{0,1}`。创建者通过 `CollectCreatorFee` 或 `CollectCreatorFeePermissionless` 收取，2026-09-19 升级引入的协议份额照常适用。
+
+**常见错误** — 与 `Initialize` 相同。
 
 ## `Deposit`
 
@@ -574,6 +655,7 @@ share_rate: u64   // 协议的创建者费用份额，超过 FEE_RATE_DENOMINATO
 | 指令 | `lp_supply` | 金库余额 | 累积费用字段 | `observation` |
 |-------------|------------|---------------|-------------------|---------------|
 | `Initialize` | + init LP | + `init_amount_{0,1}` | 0 | init |
+| `InitializeV2` | + init LP | + `init_amount_{0,1}` | 0 | init |
 | `InitializeWithPermission` | + init LP | + `init_amount_{0,1}` | 0 | init |
 | `Deposit` | + | + 两者 | — | — |
 | `Withdraw` | − | − 两者 | — | — |
